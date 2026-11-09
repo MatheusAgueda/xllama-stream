@@ -571,6 +571,9 @@ void run_d3d12_memprobe(const std::function<void(const std::string&)>& emit) {
         #include "ggml_d3d12_elt_quant_q8_k_dxil.h"
         #include "ggml_d3d12_elt_rms_norm_dxil.h"
         #include "ggml_d3d12_get_rows_q6_k_dxil.h"
+        #include "ggml_d3d12_mmid_emu.h"
+        #include "ggml_d3d12_mmid_iq4_xs_t128_dxil.h"
+        #include "ggml_d3d12_mmid_iq4_xs_t64_dxil.h"
         #include "ggml_d3d12_mmv_iq3_s_t128_dxil.h"
         #include "ggml_d3d12_mmv_iq3_s_t64_dxil.h"
         #include "ggml_d3d12_mmv_iq4_xs_t128_dxil.h"
@@ -601,6 +604,9 @@ enum Pso {
     kPsoCount = 6
 };
 enum Elt { kEltBinary = 0, kEltRmsNorm = 1, kEltQuantQ8K = 2, kEltCount = 3 };
+// Root constants: the 8 every kernel reads, then MUL_MAT_ID's 5
+// (shaders/ggml_d3d12_mmid_iq4_xs.hlsl).
+constexpr UINT kOpConstants = 13;
 
 int pso_for(ggml_type t) {
     switch (t) {
@@ -630,6 +636,8 @@ struct Gpu {
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12PipelineState> pso[kPsoCount][2]; // [type][0 = 64 threads, 1 = 128]
     ComPtr<ID3D12PipelineState> pso_get_rows;      // Q6_K
+    // MUL_MAT_ID, IQ4_XS experts in an EXPERT_CACHE buffer this device claims.
+    ComPtr<ID3D12PipelineState> pso_mmid[2];
     // shaders/ggml_d3d12_elt.hlsl; without them (elt_ok false) those ops and
     // the q8_K quantization run on the CPU inside graph_compute.
     ComPtr<ID3D12PipelineState> pso_elt[kEltCount];
@@ -668,21 +676,23 @@ constexpr UINT64 kStagingBytes = 8ull << 20;
 
 ComPtr<ID3D12RootSignature> make_root_sig(ID3D12Device* device, std::string* err) {
     // b0 constants, t0 weights, u0 output, u1 activations, u2 / u3 (elt: b or
-    // norm weight, fused-MUL output).
-    D3D12_ROOT_PARAMETER p[6] = {};
+    // norm weight, fused-MUL output), t1 (MUL_MAT_ID: expert ids).
+    D3D12_ROOT_PARAMETER p[7] = {};
     p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     p[0].Constants.ShaderRegister = 0;
-    p[0].Constants.Num32BitValues = 8;
+    p[0].Constants.Num32BitValues = kOpConstants;
     p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
     p[1].Descriptor.ShaderRegister = 0;
     for (UINT i = 0; i < 4; ++i) {
         p[2 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
         p[2 + i].Descriptor.ShaderRegister = i;
     }
+    p[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    p[6].Descriptor.ShaderRegister = 1;
     for (auto& q : p)
         q.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     D3D12_ROOT_SIGNATURE_DESC desc = {};
-    desc.NumParameters = 6;
+    desc.NumParameters = 7;
     desc.pParameters = p;
     auto serialize = d3d12_dyn::SerializeRootSignature();
     if (!serialize) {
@@ -774,6 +784,21 @@ bool init_gpu(Gpu& g) {
         if (FAILED(hr)) {
             err = d3d12c::hr_message("CreateComputePipelineState", hr);
             return false;
+        }
+    }
+    {
+        const void* mb[2] = {kGgmlD3d12MmidIq4XsT64Dxil, kGgmlD3d12MmidIq4XsT128Dxil};
+        const size_t ms[2] = {kGgmlD3d12MmidIq4XsT64DxilSize, kGgmlD3d12MmidIq4XsT128DxilSize};
+        for (int wd = 0; wd < 2; ++wd) {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
+            pd.pRootSignature = g.root.Get();
+            pd.CS.pShaderBytecode = mb[wd];
+            pd.CS.BytecodeLength = ms[wd];
+            hr = g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.pso_mmid[wd]));
+            if (FAILED(hr)) {
+                err = d3d12c::hr_message("CreateComputePipelineState (mmid)", hr);
+                return false;
+            }
         }
     }
     {
@@ -1202,6 +1227,24 @@ bool is_ours(ggml_backend_buffer_type_t buft) {
     return buft == &kHostBuft || buft == &kWeightsBuft;
 }
 
+// The expert cache's buffer type (llama.cpp patch 0004) offered to this device
+// by llama_expert_cache_use_host_of: claiming it puts the resident expert slots
+// in D3D12_Host buffers, which the MUL_MAT_ID kernel reads in place while the
+// cache's CPU ops keep reading the experts into them (unified memory).
+bool is_expert_cache(ggml_backend_buffer_type_t buft) {
+    return buft && buft->device && buft->device == kHostBuft.device && buft->iface.get_name &&
+           std::strcmp(buft->iface.get_name(buft), "EXPERT_CACHE") == 0;
+}
+
+// An expert tensor the MUL_MAT_ID kernel can read: in a D3D12_Host buffer (by
+// its iface — the buffer's buft is the cache's) of a cache this device claimed.
+// When D3D12_Host cannot hold the slots, the cache falls back to CPU buffers
+// and points its type at the CPU device, so neither test passes.
+bool in_expert_cache(const ggml_tensor* t) {
+    const ggml_backend_buffer_t b = t ? t->buffer : nullptr;
+    return b && is_expert_cache(b->buft) && b->iface.get_base == kHostBufIface.get_base;
+}
+
 // --- Backend ---
 
 const char* backend_name(ggml_backend_t) {
@@ -1294,6 +1337,19 @@ bool elt_rows(const ggml_tensor* t) {
     return d3d12_elt_rows_supported(t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
 }
 
+// SwiGLU operands: rows from kD3d12GluMinRow wide (the expert FFNs of
+// Qwen3.6-35B-A3B are 512) and [n_ff, n_expert_used, n_tokens] expert outputs,
+// whose evenly spaced rows the binary kernel takes as ne1 * ne2 rows. The
+// SwiGLU then joins the matmuls on either side of it in one submission.
+constexpr std::int64_t kD3d12GluMinRow = 256;
+bool glu_rows(const ggml_tensor* t) {
+    if (t->ne[3] != 1 || (t->ne[2] > 1 && t->nb[2] != t->ne[1] * t->nb[1]))
+        return false;
+    const std::int64_t rows = t->ne[1] * t->ne[2];
+    return t->ne[0] >= kD3d12GluMinRow && rows >= 1 && rows <= kD3d12MaxGroups &&
+           (t->ne[0] + 255) / 256 <= kD3d12MaxGroups && t->ne[0] * rows <= (std::int64_t(1) << 28);
+}
+
 bool same_or_apart(const ggml_tensor* d, const ggml_tensor* s) {
     if (d->data == s->data && d->nb[1] == s->nb[1])
         return true;
@@ -1308,16 +1364,20 @@ float* row_f32(const ggml_tensor* t, std::int64_t r) {
 void cpu_binary(const ggml_tensor* d, int kind) {
     const ggml_tensor* a = d->src[0];
     const ggml_tensor* b = d->src[1];
-    GGML_ASSERT(d->ne[2] == 1 && d->ne[3] == 1 && b->ne[2] == 1 && b->ne[3] == 1);
-    for (std::int64_t r = 0; r < d->ne[1]; ++r) {
-        const float* pa = row_f32(a, r);
-        const float* pb = row_f32(b, b->ne[1] == 1 ? 0 : r);
-        float* pd = row_f32(d, r);
-        for (std::int64_t i = 0; i < d->ne[0]; ++i) {
-            const float x = pa[i], y = pb[i];
-            pd[i] = kind == 0 ? x + y : kind == 1 ? x * y : x / (1.0f + std::exp(-x)) * y;
+    GGML_ASSERT(d->ne[3] == 1 && b->ne[3] == 1 && (b->ne[2] == 1 || b->ne[2] == d->ne[2]));
+    auto row = [](const ggml_tensor* t, std::int64_t i2, std::int64_t r) {
+        return reinterpret_cast<float*>(static_cast<char*>(t->data) + i2 * t->nb[2] + r * t->nb[1]);
+    };
+    for (std::int64_t i2 = 0; i2 < d->ne[2]; ++i2)
+        for (std::int64_t r = 0; r < d->ne[1]; ++r) {
+            const float* pa = row(a, i2, r);
+            const float* pb = row(b, b->ne[2] == 1 ? 0 : i2, b->ne[1] == 1 ? 0 : r);
+            float* pd = row(d, i2, r);
+            for (std::int64_t i = 0; i < d->ne[0]; ++i) {
+                const float x = pa[i], y = pb[i];
+                pd[i] = kind == 0 ? x + y : kind == 1 ? x * y : x / (1.0f + std::exp(-x)) * y;
+            }
         }
-    }
 }
 
 void cpu_rms_norm(const ggml_tensor* d, float eps) {
@@ -1340,13 +1400,15 @@ void cpu_rms_norm(const ggml_tensor* d, float eps) {
 // parameters left 0 are bound to u[0]; the kernel does not read them.
 struct Op {
     ID3D12PipelineState* pso = nullptr;
-    std::uint32_t c[8] = {};
+    std::uint32_t c[kOpConstants] = {};
     D3D12_GPU_VIRTUAL_ADDRESS t0 = 0;
+    D3D12_GPU_VIRTUAL_ADDRESS t1 = 0;
     D3D12_GPU_VIRTUAL_ADDRESS u[4] = {};
     UINT gx = 0, gy = 0;
 };
 
 void set_c(Op& op, std::initializer_list<std::uint64_t> c) {
+    GGML_ASSERT(c.size() <= kOpConstants);
     std::size_t i = 0;
     for (const std::uint64_t v : c)
         op.c[i++] = static_cast<std::uint32_t>(v);
@@ -1373,10 +1435,11 @@ bool submit_ops(Gpu& g, const std::vector<Op>& ops) {
                 cl->SetPipelineState(op.pso);
                 bound = op.pso;
             }
-            cl->SetComputeRoot32BitConstants(0, 8, op.c, 0);
+            cl->SetComputeRoot32BitConstants(0, kOpConstants, op.c, 0);
             cl->SetComputeRootShaderResourceView(1, op.t0 ? op.t0 : op.u[0]);
             for (UINT i = 0; i < 4; ++i)
                 cl->SetComputeRootUnorderedAccessView(2 + i, op.u[i] ? op.u[i] : op.u[0]);
+            cl->SetComputeRootShaderResourceView(6, op.t1 ? op.t1 : op.u[0]);
             cl->Dispatch(op.gx, op.gy, 1);
             ++n;
         }
@@ -1411,6 +1474,7 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
             continue;
         switch (node->op) {
         case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID:
         case GGML_OP_GET_ROWS:
         case GGML_OP_ADD:
         case GGML_OP_MUL:
@@ -1506,6 +1570,44 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
         const auto lo = reinterpret_cast<std::uintptr_t>(g.xq_ptr + off);
         return Rng{lo, lo + bytes};
     };
+    // ncols f32 columns of x, nb1 apart, as the vec_dot type of weights `wt`
+    // in g.xq at *off: a copy an earlier matmul of this submission made, else
+    // q8_K on the GPU or the CPU quantizer (q8_0 for Q4_0 weights).
+    auto quantize = [&](const ggml_tensor* x, ggml_type wt, int ncols, std::size_t* off) -> bool {
+        const ggml_type at = d3d12_activation_type(wt);
+        const int k = static_cast<int>(x->ne[0]);
+        const std::uint32_t row = static_cast<std::uint32_t>(ggml_row_size(at, k));
+        const std::size_t bytes = static_cast<std::size_t>(row) * ncols;
+        *off = SIZE_MAX;
+        for (const Quantized& q : done)
+            if (q.data == x->data && q.nb1 == x->nb[1] && q.type == at && q.row == row &&
+                q.ncols >= ncols)
+                *off = q.off;
+        if (*off != SIZE_MAX)
+            return true;
+        const Rng xr = rng_of(x);
+        const bool gpu_q = g.elt_ok && at == GGML_TYPE_Q8_K && elt_operand(x) &&
+                           ncols <= static_cast<int>(kD3d12MaxGroups);
+        if (!gpu_q && any_overlap(batch_w, xr) && !flush())
+            return false;
+        if (!reserve(bytes, off))
+            return false;
+        if (gpu_q) {
+            Op q;
+            q.pso = g.pso_elt[kEltQuantQ8K].Get();
+            set_c(q, {static_cast<std::uint64_t>(k / kD3d12Chunk), x->nb[1] / sizeof(float), row});
+            q.u[0] = xq_va(*off);
+            q.u[1] = tensor_va(x);
+            q.gx = static_cast<UINT>(k / kD3d12Chunk);
+            q.gy = static_cast<UINT>(ncols);
+            record(q, {xr}, {xq_rng(*off, bytes)});
+        } else {
+            d3d12_quantize_activations(wt, static_cast<const float*>(x->data),
+                                       x->nb[1] / sizeof(float), k, ncols, g.xq_ptr + *off);
+        }
+        done.push_back({x->data, x->nb[1], at, *off, row, ncols, xr});
+        return true;
+    };
 
     for (std::size_t i = 0; i < nodes.size(); ++i) {
         ggml_tensor* node = nodes[i];
@@ -1550,40 +1652,12 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
             GGML_ASSERT(w->buffer && w->buffer->buft == &kWeightsBuft);
             GGML_ASSERT(x->buffer && ggml_backend_buffer_is_host(x->buffer));
             const ggml_type at = d3d12_activation_type(w->type);
-            const int k = static_cast<int>(x->ne[0]);
             const int ncols = static_cast<int>(x->ne[1]);
-            const std::uint32_t row = static_cast<std::uint32_t>(ggml_row_size(at, k));
+            const std::uint32_t row = static_cast<std::uint32_t>(ggml_row_size(at, x->ne[0]));
             const std::size_t bytes = static_cast<std::size_t>(row) * ncols;
-            std::size_t off = SIZE_MAX;
-            for (const Quantized& q : done)
-                if (q.data == x->data && q.nb1 == x->nb[1] && q.type == at && q.row == row &&
-                    q.ncols >= ncols)
-                    off = q.off;
-            if (off == SIZE_MAX) {
-                const Rng xr = rng_of(x);
-                // q8_K on the GPU; q8_0 (Q4_0 weights) on the CPU.
-                const bool gpu_q = g.elt_ok && at == GGML_TYPE_Q8_K && elt_operand(x) &&
-                                   ncols <= static_cast<int>(kD3d12MaxGroups);
-                if (!gpu_q && any_overlap(batch_w, xr) && !flush())
-                    return GGML_STATUS_FAILED;
-                if (!reserve(bytes, &off))
-                    return GGML_STATUS_FAILED;
-                if (gpu_q) {
-                    Op q;
-                    q.pso = g.pso_elt[kEltQuantQ8K].Get();
-                    set_c(q, {static_cast<std::uint64_t>(k / kD3d12Chunk), x->nb[1] / sizeof(float),
-                              row});
-                    q.u[0] = xq_va(off);
-                    q.u[1] = tensor_va(x);
-                    q.gx = static_cast<UINT>(k / kD3d12Chunk);
-                    q.gy = static_cast<UINT>(ncols);
-                    record(q, {xr}, {xq_rng(off, bytes)});
-                } else {
-                    d3d12_quantize_activations(w->type, static_cast<const float*>(x->data),
-                                               x->nb[1] / sizeof(float), k, ncols, g.xq_ptr + off);
-                }
-                done.push_back({x->data, x->nb[1], at, off, row, ncols, xr});
-            }
+            std::size_t off = 0;
+            if (!quantize(x, w->type, ncols, &off))
+                return GGML_STATUS_FAILED;
             const D3d12Dispatch d = d3d12_mm_dispatch(node->ne[0], node->ne[1]);
             const int wide = d3d12_mm_threads(w->ne[0]) == kD3d12MmvThreadsLong ? 1 : 0;
             Op m;
@@ -1599,6 +1673,61 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
             record(m, {xq_rng(off, bytes)}, {rng_of(node)});
             break;
         }
+        case GGML_OP_MUL_MAT_ID: {
+            const ggml_tensor* x = b;
+            const ggml_tensor* ids = node->src[2];
+            D3d12MmidPlan plan;
+            GGML_ASSERT(in_expert_cache(a) && d3d12_mmid_plan(node, &plan));
+            GGML_ASSERT(x->buffer && ggml_backend_buffer_is_host(x->buffer));
+            GGML_ASSERT(ids->buffer && ggml_backend_buffer_is_host(ids->buffer));
+            // Columns nb1 apart across tokens too: the one-dispatch q8_K path.
+            const int ncols = static_cast<int>(x->ne[1] * x->ne[2]);
+            const bool flat = x->ne[2] == 1 || x->nb[2] == x->ne[1] * x->nb[1];
+            const bool gpu_q =
+                flat && g.elt_ok && elt_operand(x) && ncols <= static_cast<int>(kD3d12MaxGroups);
+            // Ids and X share the scratch: flush first if either must, so the
+            // second reservation cannot recycle the first.
+            if ((any_overlap(batch_w, rng_of(ids)) ||
+                 (!gpu_q && any_overlap(batch_w, rng_of(x)))) &&
+                !flush())
+                return GGML_STATUS_FAILED;
+            const std::size_t need = ((plan.ids_bytes + 255) & ~std::size_t(255)) +
+                                     ((plan.x_bytes + 255) & ~std::size_t(255));
+            if (used + need > g.xq_bytes && (!flush() || !ensure_xq(g, need)))
+                return GGML_STATUS_FAILED;
+            // The kernel does not bound-check slot ids; ggml-cpu asserts the same.
+            const auto* idp = static_cast<const std::uint8_t*>(ids->data);
+            for (std::int64_t t = 0; t < ids->ne[1]; ++t)
+                for (std::int64_t j = 0; j < ids->ne[0]; ++j) {
+                    std::int32_t id = 0;
+                    std::memcpy(&id, idp + t * ids->nb[1] + j * sizeof(std::int32_t), sizeof(id));
+                    GGML_ASSERT(id >= 0 && id < a->ne[2]);
+                }
+            std::size_t ioff = 0, xoff = 0;
+            if (!reserve(plan.ids_bytes, &ioff))
+                return GGML_STATUS_FAILED;
+            std::memcpy(g.xq_ptr + ioff, ids->data, plan.ids_bytes);
+            if (flat) {
+                if (!quantize(x, a->type, ncols, &xoff))
+                    return GGML_STATUS_FAILED;
+            } else {
+                if (!reserve(plan.x_bytes, &xoff))
+                    return GGML_STATUS_FAILED;
+                d3d12_mmid_quantize_activations(node, x->data, g.xq_ptr + xoff);
+            }
+            Op m;
+            m.pso = g.pso_mmid[plan.threads == kD3d12MmvThreadsLong ? 1 : 0].Get();
+            static_assert(sizeof(plan.params) == sizeof(m.c), "13 root constants");
+            std::memcpy(m.c, &plan.params, sizeof(m.c));
+            m.t0 = tensor_va(a);
+            m.t1 = xq_va(ioff);
+            m.u[0] = tensor_va(node);
+            m.u[1] = xq_va(xoff);
+            m.gx = plan.groups_x;
+            m.gy = plan.groups_y;
+            record(m, {xq_rng(xoff, plan.x_bytes), xq_rng(ioff, plan.ids_bytes)}, {rng_of(node)});
+            break;
+        }
         case GGML_OP_ADD:
         case GGML_OP_MUL:
         case GGML_OP_GLU: {
@@ -1606,19 +1735,24 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
             // supports_op admits these shapes only: b is a's shape or one row.
             GGML_ASSERT(ggml_are_same_shape(node, a) && b->ne[0] == node->ne[0] &&
                         (b->ne[1] == 1 || b->ne[1] == node->ne[1]));
-            if (g.elt_ok && elt_rows(node) && elt_operand(node) && elt_operand(a) &&
-                elt_operand(b) && same_or_apart(node, a) && same_or_apart(node, b)) {
+            // SwiGLU rows may be [n_ff, n_expert_used, n_tokens], flattened.
+            const bool glu = kind == 2;
+            const bool rows_ok = elt_rows(node) || (glu && glu_rows(node) && glu_rows(a) &&
+                                                    glu_rows(b) && ggml_are_same_shape(node, b));
+            const std::int64_t rows = glu ? node->ne[1] * node->ne[2] : node->ne[1];
+            if (g.elt_ok && rows_ok && elt_operand(node) && elt_operand(a) && elt_operand(b) &&
+                same_or_apart(node, a) && same_or_apart(node, b)) {
                 Op e;
                 e.pso = g.pso_elt[kEltBinary].Get();
-                set_c(e, {static_cast<std::uint64_t>(node->ne[0]),
-                          static_cast<std::uint64_t>(node->ne[1]), a->nb[1] / sizeof(float),
-                          b->ne[1] == 1 ? 0 : b->nb[1] / sizeof(float), node->nb[1] / sizeof(float),
-                          static_cast<std::uint64_t>(kind)});
+                set_c(e, {static_cast<std::uint64_t>(node->ne[0]), static_cast<std::uint64_t>(rows),
+                          a->nb[1] / sizeof(float),
+                          b->ne[1] == 1 && !glu ? 0 : b->nb[1] / sizeof(float),
+                          node->nb[1] / sizeof(float), static_cast<std::uint64_t>(kind)});
                 e.u[0] = tensor_va(node);
                 e.u[1] = tensor_va(a);
                 e.u[2] = tensor_va(b);
                 e.gx = static_cast<UINT>((node->ne[0] + 255) / 256);
-                e.gy = static_cast<UINT>(node->ne[1]);
+                e.gy = static_cast<UINT>(rows);
                 record(e, {rng_of(a), rng_of(b)}, {rng_of(node)});
             } else {
                 GGML_ASSERT(ggml_backend_buffer_is_host(a->buffer) &&
@@ -1845,12 +1979,31 @@ bool dev_supports_op(ggml_backend_dev_t, const ggml_tensor* op) {
         d.src0_in_weight_buffer = w->buffer && w->buffer->buft == &kWeightsBuft;
         return d3d12_get_rows_supported(d);
     }
+    case GGML_OP_MUL_MAT_ID: {
+        // The routed experts of a MoE layer, read in place from the expert
+        // cache's slots; activations and ids reach D3D12_Host as split inputs.
+        D3d12MmidPlan plan;
+        const ggml_tensor* x = op->src[1];
+        const ggml_tensor* ids = op->src[2];
+        return gpu().pso_mmid[0] && in_expert_cache(op->src[0]) && d3d12_mmid_plan(op, &plan) &&
+               static_cast<std::uint64_t>(x->ne[1]) * x->ne[2] <= kD3d12MaxGroups &&
+               (!x->buffer || ggml_backend_buffer_is_host(x->buffer)) &&
+               (!ids->buffer || ggml_backend_buffer_is_host(ids->buffer));
+    }
     case GGML_OP_ADD:
     case GGML_OP_MUL:
     case GGML_OP_GLU:
     case GGML_OP_RMS_NORM: {
         const ggml_tensor* a = op->src[0];
         const ggml_tensor* b = op->src[1];
+        if (op->op == GGML_OP_GLU && a && gpu().elt_ok && glu_rows(op) && !elt_rows(op)) {
+            // The routed experts' SwiGLU, between two MUL_MAT_IDs on the GPU.
+            const ggml_tensor* src = base_of(a);
+            return ggml_get_glu_op(op) == GGML_GLU_OP_SWIGLU && b && elt_f32(op) && elt_f32(a) &&
+                   elt_f32(b) && op->op_params[1] == 0 && ggml_are_same_shape(op, a) &&
+                   ggml_are_same_shape(op, b) && src->op == GGML_OP_MUL_MAT_ID &&
+                   in_expert_cache(src->src[0]);
+        }
         if (!gpu().elt_ok || !elt_f32(op) || !elt_f32(a) || !elt_rows(op) ||
             !ggml_are_same_shape(op, a))
             return false;
@@ -1876,7 +2029,7 @@ bool dev_supports_op(ggml_backend_dev_t, const ggml_tensor* op) {
     }
 }
 bool dev_supports_buft(ggml_backend_dev_t, ggml_backend_buffer_type_t buft) {
-    return is_ours(buft);
+    return is_ours(buft) || (is_expert_cache(buft) && gpu().pso_mmid[0]);
 }
 
 const ggml_backend_device_i kDeviceIface = {
@@ -2401,6 +2554,161 @@ D3d12SelftestRow run_get_rows_case(ggml_backend_t backend, int n, int k) {
     return row;
 }
 
+// The buffer type llama_expert_cache_use_host_of hands this device: its name
+// and device are what is_expert_cache checks, its buffers are D3D12_Host ones.
+const char* selftest_expert_cache_name(ggml_backend_buffer_type_t) {
+    return "EXPERT_CACHE";
+}
+ggml_backend_buffer_t selftest_expert_cache_alloc(ggml_backend_buffer_type_t buft, size_t size);
+ggml_backend_buffer_type kSelftestExpertCacheBuft = {
+    /* .iface = */
+    {
+        /* .get_name         = */ selftest_expert_cache_name,
+        /* .alloc_buffer     = */ selftest_expert_cache_alloc,
+        /* .alloc_buffer_n   = */ nullptr,
+        /* .get_alignment    = */ buft_alignment,
+        /* .get_max_size     = */ nullptr,
+        /* .get_alloc_size   = */ nullptr,
+        /* .get_alloc_size_n = */ nullptr,
+        /* .is_host          = */ buft_is_host_true,
+    },
+    /* .device  = */ nullptr,
+    /* .context = */ nullptr,
+};
+ggml_backend_buffer_t selftest_expert_cache_alloc(ggml_backend_buffer_type_t buft, size_t size) {
+    return alloc_buf(buft, size, true);
+}
+
+// MUL_MAT_ID over IQ4_XS expert slots (Qwen3.6-35B-A3B's routed experts):
+// ne11 = 1 is gate/up (one activation per token), ne11 = n_ids is down (one
+// per expert). Reference: the CPU backend's q8_K from_float and vec_dot.
+D3d12SelftestRow run_mmid_case(ggml_backend_t backend, int n, int k, int ne11, int n_tok) {
+    constexpr int kSlots = 12;
+    constexpr int kIds = 8;
+    D3d12SelftestRow row;
+    row.type = "mmid_iq4_xs";
+    row.n = n;
+    row.k = k;
+    row.ncols = kIds * n_tok;
+
+    kSelftestExpertCacheBuft.device = kHostBuft.device;
+    ggml_init_params ip = {};
+    ip.mem_size = 8 * ggml_tensor_overhead() + ggml_graph_overhead();
+    ip.no_alloc = true;
+    ggml_context* ctx_w = ggml_init(ip);
+    ggml_context* ctx_x = ggml_init(ip);
+    ggml_context* ctx_g = ggml_init(ip);
+    ggml_tensor* as = ggml_new_tensor_3d(ctx_w, GGML_TYPE_IQ4_XS, k, n, kSlots);
+    ggml_tensor* x = ggml_new_tensor_3d(ctx_x, GGML_TYPE_F32, k, ne11, n_tok);
+    ggml_tensor* ids = ggml_new_tensor_2d(ctx_x, GGML_TYPE_I32, kIds, n_tok);
+    ggml_backend_buffer_t wbuf =
+        ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, &kSelftestExpertCacheBuft);
+    ggml_backend_buffer_t xbuf = ggml_backend_alloc_ctx_tensors_from_buft(ctx_x, &kHostBuft);
+    ggml_gallocr_t galloc = nullptr;
+    auto cleanup = [&] {
+        if (galloc)
+            ggml_gallocr_free(galloc);
+        if (wbuf)
+            ggml_backend_buffer_free(wbuf);
+        if (xbuf)
+            ggml_backend_buffer_free(xbuf);
+        ggml_free(ctx_g);
+        ggml_free(ctx_x);
+        ggml_free(ctx_w);
+    };
+    if (!wbuf || !xbuf) {
+        row.error = "buffer allocation failed";
+        cleanup();
+        return row;
+    }
+    if (!in_expert_cache(as)) {
+        row.error = "expert slots not recognised as EXPERT_CACHE";
+        cleanup();
+        return row;
+    }
+
+    std::mt19937 rng(4242u + static_cast<unsigned>(n + k + ne11 + n_tok));
+    std::uniform_real_distribution<float> uni(-1.f, 1.f);
+    std::vector<float> wf(static_cast<std::size_t>(n) * k * kSlots);
+    for (float& v : wf)
+        v = uni(rng);
+    std::vector<std::uint8_t> q(ggml_nbytes(as));
+    ggml_quantize_chunk(GGML_TYPE_IQ4_XS, wf.data(), q.data(), 0,
+                        static_cast<std::int64_t>(n) * kSlots, k, nullptr);
+    ggml_backend_tensor_set(as, q.data(), 0, q.size());
+    std::vector<float> xf(static_cast<std::size_t>(k) * ne11 * n_tok);
+    for (float& v : xf)
+        v = uni(rng);
+    ggml_backend_tensor_set(x, xf.data(), 0, xf.size() * sizeof(float));
+    // Distinct slots per token, as top-k routing gives, including the last.
+    std::vector<std::int32_t> idv(static_cast<std::size_t>(kIds) * n_tok);
+    for (int t = 0; t < n_tok; ++t)
+        for (int i = 0; i < kIds; ++i)
+            idv[static_cast<std::size_t>(t) * kIds + i] = (kSlots - 1 + 7 * i + 5 * t) % kSlots;
+    ggml_backend_tensor_set(ids, idv.data(), 0, idv.size() * sizeof(std::int32_t));
+
+    ggml_tensor* y = ggml_mul_mat_id(ctx_g, as, x, ids);
+    ggml_cgraph* gf = ggml_new_graph(ctx_g);
+    ggml_build_forward_expand(gf, y);
+    galloc = ggml_gallocr_new(&kHostBuft);
+    if (!ggml_gallocr_alloc_graph(galloc, gf)) {
+        row.error = "graph allocation failed";
+        cleanup();
+        return row;
+    }
+    ggml_status st = ggml_backend_graph_compute(backend, gf);
+    std::vector<double> ms;
+    for (int i = 0; i < kSelftestTimedRuns && st == GGML_STATUS_SUCCESS; ++i) {
+        st = ggml_backend_graph_compute(backend, gf);
+        ms.push_back(gpu().last_gpu_ms);
+    }
+    row.d3d12_ran = st == GGML_STATUS_SUCCESS;
+    if (!row.d3d12_ran) {
+        row.error = "graph_compute failed";
+        cleanup();
+        return row;
+    }
+    std::nth_element(ms.begin(), ms.begin() + ms.size() / 2, ms.end());
+    row.gpu_ms = ms[ms.size() / 2];
+    // Bytes of the experts the dispatch reads: kIds of them per token.
+    row.packed_gbs =
+        row.gpu_ms > 0.0 ? static_cast<double>(as->nb[2]) * kIds * n_tok / 1e6 / row.gpu_ms : 0.0;
+
+    std::vector<float> yf(static_cast<std::size_t>(n) * kIds * n_tok);
+    ggml_backend_tensor_get(y, yf.data(), 0, yf.size() * sizeof(float));
+    ggml_cpu_init();
+    const auto* wt = ggml_get_type_traits_cpu(GGML_TYPE_IQ4_XS);
+    std::vector<std::uint8_t> xq(ggml_row_size(wt->vec_dot_type, k));
+    double max_ref = 0.0, max_diff = 0.0;
+    for (int t = 0; t < n_tok; ++t)
+        for (int i = 0; i < kIds; ++i) {
+            const int slot = idv[static_cast<std::size_t>(t) * kIds + i];
+            const std::size_t col = static_cast<std::size_t>(t) * ne11 + (ne11 == 1 ? 0 : i);
+            ggml_get_type_traits_cpu(wt->vec_dot_type)
+                ->from_float(xf.data() + col * k, xq.data(), k);
+            for (int r = 0; r < n; ++r) {
+                float ref = 0.f;
+                wt->vec_dot(k, &ref, 0, q.data() + slot * as->nb[2] + r * as->nb[1], 0, xq.data(),
+                            0, 1);
+                const double got = yf[(static_cast<std::size_t>(t) * kIds + i) * n + r];
+                if (!std::isfinite(ref) || !std::isfinite(got)) {
+                    row.rel_err = std::numeric_limits<double>::infinity();
+                    row.error = "non-finite mul_mat_id reference or output";
+                    cleanup();
+                    return row;
+                }
+                max_ref = std::max(max_ref, std::fabs(static_cast<double>(ref)));
+                max_diff = std::max(max_diff, std::fabs(static_cast<double>(ref) - got));
+            }
+        }
+    row.rel_err = max_ref > 0.0 ? max_diff / max_ref : max_diff;
+    row.ok = row.rel_err <= kD3d12SelftestRelTol;
+    if (!row.ok)
+        row.error = "mismatch vs the CPU backend (q8_K vec_dot, mul_mat_id)";
+    cleanup();
+    return row;
+}
+
 } // namespace
 
 void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
@@ -2447,6 +2755,14 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
         out->push_back(run_case(backend, sc));
     out->push_back(run_get_rows_case(backend, 151936, 2048)); // Coder-3B tied token_embd
     out->push_back(run_get_rows_case(backend, 65536, 1024));  // LFM2.5-350M
+    if (gpu().pso_mmid[0]) {
+        // Qwen3.6-35B-A3B experts: gate/up 2048 -> 512, down 512 -> 2048;
+        // one token (decode) and five (a prefill ubatch, both blobs).
+        out->push_back(run_mmid_case(backend, 512, 2048, 1, 1));
+        out->push_back(run_mmid_case(backend, 2048, 512, 8, 1));
+        out->push_back(run_mmid_case(backend, 512, 2048, 1, 5));
+        out->push_back(run_mmid_case(backend, 2048, 512, 8, 5));
+    }
     ggml_backend_free(backend);
 }
 
