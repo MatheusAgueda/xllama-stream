@@ -51,7 +51,7 @@ jobs:
 
       - name: Compile
         env:
-          TARGETS: ${{ inputs.targets || 'mmv_iq3_s' }}
+          TARGETS: ${{ inputs.targets || 'attn' }}
         run: |
           # shellcheck disable=SC2086 # TARGETS is a word list
           ./scripts/compile-gpugemv-shader.sh $TARGETS 2> "$RUNNER_TEMP/dxc.err" || {
