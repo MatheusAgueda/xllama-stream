@@ -71,8 +71,8 @@ per model at a time, `n_ubatch` capped at `N / n_expert_used`, not for
 `LLM_ARCH_GRANITE_SWITCH` (it calls `ggml_mul_mat_id` outside
 `build_moe_ffn`). Hits, misses, swaps, MiB read and the time the reads took are
 logged every 64 ubatches and when the model is freed.
-Pre-gating prefetch (env `LLAMA_EXPERT_PREFETCH` = k, default `n_expert_used`,
-0 = off, max 64; `qwen35moe` and `llama` graphs): from layer 1 on, the layer's
+Pre-gating prefetch (env `LLAMA_EXPERT_PREFETCH` = k, 0 = off, the default, max
+64; `qwen35moe` and `llama` graphs): from layer 1 on, the layer's
 own router is applied to its input residual through the pre-FFN RMS norm right
 after the attention norm (`build_moe_pregate`, on the GPU split with the
 projections), and a fourth op after the attention projections
@@ -82,16 +82,42 @@ overlap the attention. The plan settles the round first: unstarted reads are
 cancelled (the slot gets its old expert back, its data was never overwritten),
 running ones are waited for. Routing is untouched, so the output stays exact.
 Offline on the 35B's routing trace (32 slots): 63.0% hits without, 90.4% with
-k = 8. The stats line adds prefetch reads, how many the plan used, dropped
-reads and the time the plan waited; `llama_model` stops the I/O threads before
-freeing the buffers.
+k = 8. Measured on the bench runner (run 42643773195, 32 slots, 2 threads,
+reads the bottleneck) k = 8 lifted the hits to 89.8% but read 25% more and
+decoded slower (1.54 → 1.16 tok/s exact, 2.62 → 1.35 with swap 0.7), hence off
+by default; worth an A/B where compute dominates the reads. The stats line adds
+prefetch reads, how many the plan used, dropped reads and the time the plan
+waited; `llama_model` stops the I/O threads before freeing the buffers.
+Expert-major ubatches (env `LLAMA_EXPERT_MAJOR` = the largest one, 0 = off, the
+default; `n_ubatch` is then capped at the larger of the two): a ubatch with
+more tokens than `N / n_expert_used` (a prompt) does not go through the plan
+and load. Each cached expert tensor's `mul_mat_id` becomes two custom ops
+(`llama_expert_cache_build_mm_id`): the activations quantized to the expert
+type's CPU `vec_dot_type` (as ggml's `mul_mat_id` does) with the pairs grouped
+by expert, then the threads take the experts one at a time, busiest first, and
+compute each for all its tokens from its slot if resident, else from one read:
+one read per expert, layer and tensor however many tokens use it, so a long
+prompt reads at most the model's experts once per ubatch instead of once per
+4-token ubatch. The first expert tensor of the layer gives the missing experts
+with the most tokens the least recently used slots (the ubatch's resident ones
+pinned): their reads land there and they stay resident for the decode that
+follows; the rest go to a per-thread staging buffer. Exact up to the summation
+order; no prefetch or swap on those ubatches; needs the CPU backend linked in
+(not `GGML_BACKEND_DL`) and a CPU dot product for every expert type, else off
+with a warning. A graph stopped by its abort callback between the plan and the
+load, or in the middle of an expert-major round, leaves no slot pointing at
+data that never arrived: the next op of the layer empties those slots. The
+stats line adds expert-major ubatches, reads, MiB, resident hits, experts kept
+in slots and the time the matmuls took.
 `tests/test_expert_cache.cpp` decodes a small MoE with 2 and 3 of its 4 experts
 resident and checks the tokens and logits against the same model fully
-resident, with prefetch on (it must read ahead somewhere) and off, and that a
-swap ratio of 0.5 reads less (`.github/workflows/expert-cache-host.yml`); its
-opt-in "expert-cache bench" measures speed, hit rate, top-1 agreement and KL
-per `ratio[:k]` config on the 35B and keeps the routing trace
-(`.github/workflows/expert-cache-bench.yml`).
+resident, with prefetch on (it must read ahead somewhere) and off, that a
+swap ratio of 0.5 reads less, and that expert-major prompts (with and without
+experts resident from earlier tokens, and with every slot free so the decode
+starts from the experts the prompt kept) give the same tokens and logits
+(`.github/workflows/expert-cache-host.yml`); its opt-in "expert-cache bench"
+measures speed, hit rate, top-1 agreement and KL per `ratio[:k[:em]]` config
+on the 35B and keeps the routing trace (`.github/workflows/expert-cache-bench.yml`).
 
 `0005-graph-order-shared-input-projections.patch` (applies after 0004): the D3D12 backend runs only the matmuls, so every
 switch between it and the CPU is one submit plus a fence wait (~90 µs measured on
