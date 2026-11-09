@@ -113,6 +113,21 @@ lands in the CPU split that already holds il's plan and load, after them: no
 switch of its own, no contention with il's reads, and its reads overlap il's
 expert matmuls and il+1's attention. The prediction is one layer older, so less
 exact; the stats line ends its prefetch part with `, ahead`.
+The console's next A/B (build 1.7.12.26, 41 slots, swap 0.7) put the loss in
+the waits: k = 1 ahead read 185 experts, 182 of them used, and its plans waited
+1535 ms for them, about 8 ms each where one expert takes about 1 ms at the
+disk's speed, while 1079 of the 1264 jobs had not started when their plan came.
+The graph's six threads spin between ops (`poll` = 50) on the six cores the app
+gets, so an I/O thread whose read completes waits for a core, likely up to a
+scheduler quantum. Two changes, both on by default when k > 0: the I/O threads
+run at `THREAD_PRIORITY_HIGHEST` on Windows (env `LLAMA_EXPERT_PREFETCH_PRIO`:
+0 normal, 1 highest, 2 time critical; they sleep in their reads, so the
+priority costs no compute), and a plan waiting for a read in flight takes the
+job's parts no I/O thread has taken out of the queue and reads them itself on
+its compute thread (env `LLAMA_EXPERT_PREFETCH_HELP=0`: wait only). The stats
+line adds the reads waited for, the parts the plans read, and per read the time
+from queued to its first part taken and from there to done, then `, help` and
+`, prio N` when they apply.
 Expert-major ubatches (env `LLAMA_EXPERT_MAJOR` = the largest one, 0 = off, the
 default; `n_ubatch` is then capped at the larger of the two): a ubatch with
 more tokens than `N / n_expert_used` (a prompt) does not go through the plan
@@ -155,8 +170,9 @@ buffered whole reads give the same tokens and logits bit for bit as the
 unbuffered split ones (which must happen on Linux), that prefetch with whole
 jobs gives the same tokens as with parts and logits within 1e-4 of the fully
 resident model, that prefetch ahead does too (and must read ahead somewhere),
-that a
-swap ratio of 0.5 reads less, and that expert-major prompts (with and without
+that plans which only wait for the I/O threads give the same tokens and read no
+part themselves (with help on, never more parts than the reads they waited
+for hold), that a swap ratio of 0.5 reads less, and that expert-major prompts (with and without
 experts resident from earlier tokens, and with every slot free so the decode
 starts from the experts the prompt kept) give the same tokens and logits
 (`.github/workflows/expert-cache-host.yml`); its opt-in "expert-cache bench"
