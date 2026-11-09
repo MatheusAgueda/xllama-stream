@@ -721,6 +721,7 @@ std::vector<ManifestEntry> parse_manifest(winrt::hstring const& text) {
         e.expert_swap = obj.GetNamedNumber(L"expert_swap", 0);
         e.expert_prefetch = static_cast<int>(obj.GetNamedNumber(L"expert_prefetch", 0));
         e.expert_major = static_cast<int>(obj.GetNamedNumber(L"expert_major", 0));
+        e.expert_prefetch_ahead = obj.GetNamedBoolean(L"expert_prefetch_ahead", false);
         if (obj.HasKey(L"files")) {
             for (auto const& f : obj.GetNamedArray(L"files")) {
                 auto fo = f.GetObject();
@@ -887,6 +888,7 @@ SessionParams CatalogueSessionParams(const std::string& model) {
         c.expert_swap = static_cast<float>(entry->expert_swap);
         c.expert_prefetch = entry->expert_prefetch;
         c.expert_major = entry->expert_major;
+        c.expert_prefetch_ahead = entry->expert_prefetch_ahead;
         c.lora = wstring_to_utf8(entry->lora);
         c.lora_scale = static_cast<float>(entry->lora_scale);
     }

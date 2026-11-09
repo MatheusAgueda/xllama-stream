@@ -114,6 +114,8 @@ struct ManifestEntry {
     // per token and the largest expert-major prompt ubatch (0 = off).
     int expert_prefetch = 0;
     int expert_major = 0;
+    // "expert_prefetch_ahead": with expert_prefetch, predict a layer early.
+    bool expert_prefetch_ahead = false;
 };
 
 // Load the model catalogue: InstalledPath\models\manifest.json (bundled) is

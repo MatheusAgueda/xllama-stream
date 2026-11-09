@@ -88,9 +88,10 @@ inline bool gguf_embedding_info(const std::string& path, ggml_type* embd_type, b
 // layer stay resident; the others are read from the file when routed to. The
 // heap is fixed-size, unlike a mapping, which the AppContainer caps per process.
 // expert_swap > 0: cache-aware routing (llama_model_params::expert_swap_ratio).
-// expert_prefetch / expert_major: the cache reads them from the environment
-// when the model loads (LLAMA_EXPERT_PREFETCH, LLAMA_EXPERT_MAJOR); set every
-// load so a reload with other values takes them.
+// expert_prefetch / expert_major / expert_prefetch_ahead: the cache reads them
+// from the environment when the model loads (LLAMA_EXPERT_PREFETCH,
+// LLAMA_EXPERT_MAJOR, LLAMA_EXPERT_PREFETCH_AHEAD); set every load so a reload
+// with other values takes them.
 inline void set_env_int(const char* name, int v) {
     const std::string s = std::to_string(v);
 #ifdef _WIN32
@@ -102,7 +103,7 @@ inline void set_env_int(const char* name, int v) {
 
 inline void apply_gguf_residency(bool stream, llama_model_params& mparams, int expert_slots = 0,
                                  float expert_swap = 0.0f, int expert_prefetch = 0,
-                                 int expert_major = 0) {
+                                 int expert_major = 0, bool expert_prefetch_ahead = false) {
     if (expert_slots > 0) {
 #ifdef LLAMA_HAS_EXPERT_SLOTS
         mparams.load_mode = LLAMA_LOAD_MODE_NONE;
@@ -110,15 +111,17 @@ inline void apply_gguf_residency(bool stream, llama_model_params& mparams, int e
         mparams.expert_swap_ratio = expert_swap;
         set_env_int("LLAMA_EXPERT_PREFETCH", expert_prefetch);
         set_env_int("LLAMA_EXPERT_MAJOR", expert_major);
+        set_env_int("LLAMA_EXPERT_PREFETCH_AHEAD", expert_prefetch_ahead ? 1 : 0);
         log_output("[xllama] gguf weights: heap, expert cache of " + std::to_string(expert_slots) +
                    " experts per layer, swap ratio " + std::to_string(expert_swap) + ", prefetch " +
-                   std::to_string(expert_prefetch) + ", expert-major " +
-                   std::to_string(expert_major) + "\n");
+                   std::to_string(expert_prefetch) + (expert_prefetch_ahead ? " ahead" : "") +
+                   ", expert-major " + std::to_string(expert_major) + "\n");
         return;
 #else
         (void)expert_swap;
         (void)expert_prefetch;
         (void)expert_major;
+        (void)expert_prefetch_ahead;
         log_output("[xllama] gguf expert cache: this llama.cpp lacks patch 0004, ignored\n");
 #endif
     }

@@ -1487,7 +1487,7 @@ std::unique_ptr<Session> create_llama(const SessionParams& sp, std::string* err)
     const bool cpu_only = sp.stream_weights && sp.expert_slots <= 0;
     const int gpu_layers = apply_gguf_gpu_layers(cpu_only ? 0 : sp.n_gpu_layers, mparams, abs_path);
     apply_gguf_residency(sp.stream_weights, mparams, sp.expert_slots, sp.expert_swap,
-                         sp.expert_prefetch, sp.expert_major);
+                         sp.expert_prefetch, sp.expert_major, sp.expert_prefetch_ahead);
 
     install_llama_log();
     llama_model* raw_model = llama_model_load_from_file(abs_path.c_str(), mparams);
