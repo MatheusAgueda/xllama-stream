@@ -1,0 +1,78 @@
+name: session-hybrid
+
+# The Session KV paths (#170a-c, #169, #173) against a hybrid cache: the
+# opt-in model cases of tests/test_session.cpp on Qwen3.5-0.8B, the same
+# Gated DeltaNet + attention family as the console's 35B-A3B. No other
+# workflow sets XLLAMA_TEST_MODEL, so elsewhere those cases return at once.
+# Release build: a Debug ggml takes minutes per case on this model.
+
+on:
+  push:
+    # ec-bench carries the same commits for expert-cache-bench.yml only.
+    branches-ignore: [ec-bench]
+    paths:
+      - src/bridge/session.cpp
+      - src/bridge/decode_loop.h
+      - tests/test_session.cpp
+      - .github/workflows/session-hybrid.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # qwen35: hybrid (Gated DeltaNet + full attention), ChatML, Q4_0, 563 MB.
+  TEST_MODEL_URL: https://huggingface.co/ggml-org/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_0.gguf
+  TEST_MODEL_SHA256: 57d1997790d1744fba5b40a7317df71ea5e2acee28c47e78f0cce39c0703f8cf
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential libcurl4-openssl-dev
+
+      - name: Apply the UWP llama.cpp patches
+        run: bash scripts/apply-uwp-patches.sh
+
+      - name: Configure (Release, tests)
+        run: cmake --preset linux-release -DXLLAMA_BUILD_TESTS=ON -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+
+      - name: Build the unit tests
+        run: cmake --build build/linux-release --target xllama-tests -j"$(nproc)"
+
+      - name: Fetch the test model
+        run: |
+          curl -fL --retry 3 --no-progress-meter -o "$RUNNER_TEMP/model.gguf" "$TEST_MODEL_URL"
+          echo "$TEST_MODEL_SHA256  $RUNNER_TEMP/model.gguf" | sha256sum -c -
+
+      - name: Session cases on the hybrid model
+        env:
+          XLLAMA_TEST_MODEL: ${{ runner.temp }}/model.gguf
+        run: |
+          set -o pipefail
+          ./build/linux-release/tests/xllama-tests --test-case='Session: *' 2>&1 |
+            tee "$RUNNER_TEMP/session.log"
+          # The restore path must have run, not only the fallbacks around it.
+          grep -q 'KV checkpoint restore' "$RUNNER_TEMP/session.log"
+          grep -E '\(#170c?\)|context shift|can_shift' "$RUNNER_TEMP/session.log" >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Keep the log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: session-hybrid
+          path: ${{ runner.temp }}/session.log
+          if-no-files-found: ignore
