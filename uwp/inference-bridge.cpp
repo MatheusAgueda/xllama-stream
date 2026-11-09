@@ -160,13 +160,14 @@ void run_kv_bench(const std::string& model_name, const std::string& sys, const s
 } // namespace
 
 int gguf_gpu_layers_knob() {
-#ifdef XLLAMA_USE_LLAMA
+    #ifdef XLLAMA_USE_LLAMA
     // Placement knobs that only matter when layers go to D3D12, refreshed at
     // the same point as the layer count so a session reload picks them up.
     const int max_mib = read_local_int("d3d12_max_buf_mib.txt", 0);
-    ::xllama::ggml_d3d12_set_weights_max_buffer(max_mib > 0 ? static_cast<std::size_t>(max_mib) << 20 : 0);
+    ::xllama::ggml_d3d12_set_weights_max_buffer(
+        max_mib > 0 ? static_cast<std::size_t>(max_mib) << 20 : 0);
     ::xllama::gguf_set_output_on_cpu(read_local_int("gguf_output_cpu.txt", 0) != 0);
-#endif
+    #endif
     return read_local_int("gguf_gpu_layers.txt", ::xllama::kGgufGpuLayersKnobAbsent);
 }
 #endif // XLLAMA_UWP
@@ -745,7 +746,8 @@ void run_gpumem() {
     });
     if (fp)
         fclose(fp);
-    FILE* done = _wfopen(utf8_to_wstring(resolve_local_path("gpumem-result.txt.done")).c_str(), L"w");
+    FILE* done =
+        _wfopen(utf8_to_wstring(resolve_local_path("gpumem-result.txt.done")).c_str(), L"w");
     if (done) {
         fputs("done\n", done);
         fclose(done);

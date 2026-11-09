@@ -462,8 +462,9 @@ IAsyncAction ModelDownloader::DownloadAsync(std::wstring hf_repo_url, std::wstri
                     if (!resume)
                         have_part = 0;
                     std::filesystem::create_directories(part_path.parent_path(), part_ec);
-                    std::ofstream out(part_path, resume ? (std::ios::binary | std::ios::in | std::ios::out)
-                                                        : (std::ios::binary | std::ios::out | std::ios::trunc));
+                    std::ofstream out(
+                        part_path, resume ? (std::ios::binary | std::ios::in | std::ios::out)
+                                          : (std::ios::binary | std::ios::out | std::ios::trunc));
                     if (out && resume)
                         out.seekp(static_cast<std::streamoff>(have_part));
                     if (!out) {
@@ -471,7 +472,8 @@ IAsyncAction ModelDownloader::DownloadAsync(std::wstring hf_repo_url, std::wstri
                         break;
                     }
                     log_output(("[downloader] fetch " + ::xllama::wstring_to_utf8(f.filename) +
-                                (resume ? " resuming at " + std::to_string(have_part) : std::string(" from 0")) +
+                                (resume ? " resuming at " + std::to_string(have_part)
+                                        : std::string(" from 0")) +
                                 " (HTTP " + std::to_string(code) + ")\n")
                                    .c_str());
                     bytes_done = bytes_file_start + have_part;
@@ -488,8 +490,8 @@ IAsyncAction ModelDownloader::DownloadAsync(std::wstring hf_repo_url, std::wstri
                     while (!read_failed) {
                         IBuffer read_buf{nullptr};
                         try {
-                            read_buf = co_await content_stream.ReadAsync(buf, kBufSize,
-                                                                         InputStreamOptions::Partial);
+                            read_buf = co_await content_stream.ReadAsync(
+                                buf, kBufSize, InputStreamOptions::Partial);
                         } catch (...) {
                             read_failed = true;
                         }

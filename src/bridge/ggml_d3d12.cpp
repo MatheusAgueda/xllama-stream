@@ -175,13 +175,14 @@ float thread_chunk(ggml_type t, const std::uint8_t* w, std::uint32_t row_off, st
         const std::uint32_t qs = ld32(w, bb + 2u + 8u * ib32 + 4u * h);
         const std::uint32_t hb = (w[bb + 66u + ib32] >> (4u * h)) & 0xFu;
         const std::uint32_t sg = ld16(w, bb + 74u + 4u * ib32 + 2u * h);
-        const std::int32_t ls =
-            2 * static_cast<std::int32_t>((w[bb + 106u + (ib32 >> 1)] >> (4u * (ib32 & 1u))) & 0xFu) +
-            1;
+        const std::int32_t ls = 2 * static_cast<std::int32_t>(
+                                        (w[bb + 106u + (ib32 >> 1)] >> (4u * (ib32 & 1u))) & 0xFu) +
+                                1;
         std::int32_t sumi = 0;
         for (std::uint32_t k = 0; k < 4; ++k) {
-            const std::uint32_t g = iq3s_signed4(
-                kIq3sGrid[((qs >> (8u * k)) & 0xFFu) | (((hb >> k) & 1u) << 8)], (sg >> (4u * k)) & 0xFu);
+            const std::uint32_t g =
+                iq3s_signed4(kIq3sGrid[((qs >> (8u * k)) & 0xFFu) | (((hb >> k) & 1u) << 8)],
+                             (sg >> (4u * k)) & 0xFu);
             for (std::uint32_t j = 0; j < 4; ++j)
                 sumi += sbyte(g, j) * qx[e + 4u * k + j];
         }
@@ -636,7 +637,8 @@ D3D12_HEAP_PROPERTIES custom_l0_props() {
     return hp;
 }
 
-ComPtr<ID3D12Heap> create_heap(ID3D12Device* device, UINT64 bytes, bool custom_l0, HRESULT* hr_out) {
+ComPtr<ID3D12Heap> create_heap(ID3D12Device* device, UINT64 bytes, bool custom_l0,
+                               HRESULT* hr_out) {
     D3D12_HEAP_DESC hd = {};
     hd.SizeInBytes = bytes;
     if (custom_l0)
@@ -655,7 +657,8 @@ ComPtr<ID3D12Heap> create_heap(ID3D12Device* device, UINT64 bytes, bool custom_l
 
 // Reserved buffer of `bytes` (rounded up to 64 KiB) whose tiles are mapped,
 // in order, onto kTiledHeapBytes heaps (DEFAULT, else CUSTOM L0 per heap).
-ComPtr<ID3D12Resource> create_tiled_buffer(Gpu& g, UINT64 bytes, std::vector<ComPtr<ID3D12Heap>>* heaps,
+ComPtr<ID3D12Resource> create_tiled_buffer(Gpu& g, UINT64 bytes,
+                                           std::vector<ComPtr<ID3D12Heap>>* heaps,
                                            std::string* err) {
     D3D12_FEATURE_DATA_D3D12_OPTIONS o = {};
     if (FAILED(g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof(o))) ||
@@ -876,9 +879,9 @@ ggml_backend_buffer_t alloc_buf(ggml_backend_buffer_type_t buft, size_t size, bo
         const char* fallback = nullptr;
         if (!c->res) {
             std::string err_l0;
-            c->res = d3d12c::create_buffer_props(g.device.Get(), size, custom_l0_props(),
-                                                 D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON,
-                                                 "D3D12_Weights_L0", &err_l0);
+            c->res = d3d12c::create_buffer_props(
+                g.device.Get(), size, custom_l0_props(), D3D12_RESOURCE_FLAG_NONE,
+                D3D12_RESOURCE_STATE_COMMON, "D3D12_Weights_L0", &err_l0);
             if (c->res)
                 fallback = "CUSTOM L0 committed";
             else
@@ -894,7 +897,8 @@ ggml_backend_buffer_t alloc_buf(ggml_backend_buffer_type_t buft, size_t size, bo
         }
         if (fallback) {
             char msg[256];
-            std::snprintf(msg, sizeof(msg), "[xllama] d3d12: weights %.1f MiB: DEFAULT committed failed, %s\n",
+            std::snprintf(msg, sizeof(msg),
+                          "[xllama] d3d12: weights %.1f MiB: DEFAULT committed failed, %s\n",
                           static_cast<double>(size) / 1048576.0, fallback);
             log_output(msg);
         }
@@ -1453,7 +1457,8 @@ void ggml_d3d12_set_weights_max_buffer(std::size_t bytes) {
 namespace {
 
 constexpr std::size_t kProbeStep = 64ull << 20;
-constexpr std::size_t kProbeHeapFloorMb = 256; // same margin as ramceil: stop before the PLM kills us
+constexpr std::size_t kProbeHeapFloorMb =
+    256; // same margin as ramceil: stop before the PLM kills us
 
 std::string probe_state(Gpu& g) {
     char b[256];
@@ -1472,7 +1477,8 @@ std::string probe_state(Gpu& g) {
             nl_usage = static_cast<std::size_t>(i.CurrentUsage >> 20);
         }
     }
-    std::snprintf(b, sizeof(b), "dxgi_local %zu/%zu MB, dxgi_nonlocal %zu/%zu MB, avail_phys %zu MB, ws %zu MB",
+    std::snprintf(b, sizeof(b),
+                  "dxgi_local %zu/%zu MB, dxgi_nonlocal %zu/%zu MB, avail_phys %zu MB, ws %zu MB",
                   usage, budget, nl_usage, nl_budget, avail_phys_mb(), working_set_mb());
     return b;
 }
@@ -1516,15 +1522,16 @@ std::size_t probe_fill(Gpu& g, const char* kind, std::size_t cap_mb, ProbeHold* 
             }
         } else if (std::strcmp(kind, "default") == 0) {
             auto r = d3d12c::create_buffer(g.device.Get(), kProbeStep, D3D12_HEAP_TYPE_DEFAULT,
-                                           D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON, "probe", &err);
+                                           D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON,
+                                           "probe", &err);
             if (r) {
                 hold->res.push_back(r);
                 ok = true;
             }
         } else if (std::strcmp(kind, "custom_l0") == 0) {
             auto r = d3d12c::create_buffer_props(g.device.Get(), kProbeStep, custom_l0_props(),
-                                                 D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON, "probe",
-                                                 &err);
+                                                 D3D12_RESOURCE_FLAG_NONE,
+                                                 D3D12_RESOURCE_STATE_COMMON, "probe", &err);
             if (r) {
                 hold->res.push_back(r);
                 ok = true;
@@ -1545,10 +1552,11 @@ std::size_t probe_fill(Gpu& g, const char* kind, std::size_t cap_mb, ProbeHold* 
         }
         mb += kProbeStep >> 20;
         if (mb % 1024 == 0)
-            emit(std::string("  fill ") + kind + " " + std::to_string(mb) + " MB: " + probe_state(g));
+            emit(std::string("  fill ") + kind + " " + std::to_string(mb) +
+                 " MB: " + probe_state(g));
     }
-    emit(std::string("fill ") + kind + " total " + std::to_string(mb) + " MB (stop: " + stop + "); " +
-         probe_state(g));
+    emit(std::string("fill ") + kind + " total " + std::to_string(mb) + " MB (stop: " + stop +
+         "); " + probe_state(g));
     return mb;
 }
 
@@ -1577,8 +1585,8 @@ void probe_tiled(Gpu& g, std::size_t mb, const std::function<void(const std::str
         });
         same = std::memcmp(g.staging_ptr, g.readback_ptr, 1u << 20) == 0;
     }
-    emit("tiled " + std::to_string(mb) + " MB: ok, " + std::to_string(heaps.size()) + " heaps, readback " +
-         (same ? "MATCH" : "MISMATCH") + "; " + probe_state(g));
+    emit("tiled " + std::to_string(mb) + " MB: ok, " + std::to_string(heaps.size()) +
+         " heaps, readback " + (same ? "MATCH" : "MISMATCH") + "; " + probe_state(g));
 }
 
 } // namespace
@@ -1599,16 +1607,18 @@ void run_d3d12_memprobe(const std::function<void(const std::string&)>& emit) {
         g.device->CheckFeatureSupport(D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT, &va, sizeof(va));
         g.device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE1, &arch, sizeof(arch));
         char b[256];
-        std::snprintf(b, sizeof(b),
-                      "caps: uma=%d cc_uma=%d tiled_tier=%d heap_tier=%d va_bits_res=%u va_bits_proc=%u",
-                      arch.UMA ? 1 : 0, arch.CacheCoherentUMA ? 1 : 0, static_cast<int>(o.TiledResourcesTier),
-                      static_cast<int>(o.ResourceHeapTier), va.MaxGPUVirtualAddressBitsPerResource,
-                      va.MaxGPUVirtualAddressBitsPerProcess);
+        std::snprintf(
+            b, sizeof(b),
+            "caps: uma=%d cc_uma=%d tiled_tier=%d heap_tier=%d va_bits_res=%u va_bits_proc=%u",
+            arch.UMA ? 1 : 0, arch.CacheCoherentUMA ? 1 : 0, static_cast<int>(o.TiledResourcesTier),
+            static_cast<int>(o.ResourceHeapTier), va.MaxGPUVirtualAddressBitsPerResource,
+            va.MaxGPUVirtualAddressBitsPerProcess);
         emit(b);
         emit("start: " + probe_state(g));
     }
     // A: one allocation of each size, released at once.
-    static const std::size_t sizes_mb[] = {64, 128, 256, 384, 512, 640, 704, 768, 800, 832, 896, 1024, 1536, 2048};
+    static const std::size_t sizes_mb[] = {64,  128, 256, 384, 512,  640,  704,
+                                           768, 800, 832, 896, 1024, 1536, 2048};
     for (const char* kind : {"default", "custom_l0", "heapobj"}) {
         std::string line = std::string("single ") + kind + ":";
         for (std::size_t mb : sizes_mb) {
@@ -1616,11 +1626,13 @@ void run_d3d12_memprobe(const std::function<void(const std::string&)>& emit) {
             bool ok = false;
             const UINT64 bytes = static_cast<UINT64>(mb) << 20;
             if (std::strcmp(kind, "default") == 0) {
-                ok = d3d12c::create_buffer(g.device.Get(), bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
-                                           D3D12_RESOURCE_STATE_COMMON, "probe", &err) != nullptr;
+                ok = d3d12c::create_buffer(g.device.Get(), bytes, D3D12_HEAP_TYPE_DEFAULT,
+                                           D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON,
+                                           "probe", &err) != nullptr;
             } else if (std::strcmp(kind, "custom_l0") == 0) {
-                ok = d3d12c::create_buffer_props(g.device.Get(), bytes, custom_l0_props(), D3D12_RESOURCE_FLAG_NONE,
-                                                 D3D12_RESOURCE_STATE_COMMON, "probe", &err) != nullptr;
+                ok = d3d12c::create_buffer_props(
+                         g.device.Get(), bytes, custom_l0_props(), D3D12_RESOURCE_FLAG_NONE,
+                         D3D12_RESOURCE_STATE_COMMON, "probe", &err) != nullptr;
             } else {
                 ok = create_heap(g.device.Get(), bytes, false, nullptr) != nullptr;
             }
@@ -1881,14 +1893,21 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
     ggml_backend_t backend = dev_init_backend(&kDevice, nullptr);
     // Shapes of the D2 target models; q6_k 2048x11008 has 2-byte-aligned rows.
     const SelftestCase cases[] = {
-        {GGML_TYPE_Q4_0, "q4_0", 8192, 2048, 1},   {GGML_TYPE_Q4_0, "q4_0", 2048, 8192, 1},
-        {GGML_TYPE_Q4_K, "q4_k", 11008, 2048, 1},  {GGML_TYPE_Q4_K, "q4_k", 2048, 11008, 1},
-        {GGML_TYPE_Q6_K, "q6_k", 2048, 11008, 1},  {GGML_TYPE_Q6_K, "q6_k", 65536, 1024, 1},
-        {GGML_TYPE_Q4_0, "q4_0", 1024, 1024, 7},   {GGML_TYPE_Q4_K, "q4_k", 1024, 1024, 7},
-        {GGML_TYPE_Q6_K, "q6_k", 1024, 1024, 7},   {GGML_TYPE_Q4_0, "q4_0", 1024, 1024, 512},
-        {GGML_TYPE_Q4_K, "q4_k", 1024, 1024, 512}, {GGML_TYPE_Q6_K, "q6_k", 1024, 1024, 512},
+        {GGML_TYPE_Q4_0, "q4_0", 8192, 2048, 1},
+        {GGML_TYPE_Q4_0, "q4_0", 2048, 8192, 1},
+        {GGML_TYPE_Q4_K, "q4_k", 11008, 2048, 1},
+        {GGML_TYPE_Q4_K, "q4_k", 2048, 11008, 1},
+        {GGML_TYPE_Q6_K, "q6_k", 2048, 11008, 1},
+        {GGML_TYPE_Q6_K, "q6_k", 65536, 1024, 1},
+        {GGML_TYPE_Q4_0, "q4_0", 1024, 1024, 7},
+        {GGML_TYPE_Q4_K, "q4_k", 1024, 1024, 7},
+        {GGML_TYPE_Q6_K, "q6_k", 1024, 1024, 7},
+        {GGML_TYPE_Q4_0, "q4_0", 1024, 1024, 512},
+        {GGML_TYPE_Q4_K, "q4_k", 1024, 1024, 512},
+        {GGML_TYPE_Q6_K, "q6_k", 1024, 1024, 512},
         // Qwen3.5-9B IQ3_M: ffn_gate/up 4096->12288 and ffn_down 12288->4096 are IQ3_S.
-        {GGML_TYPE_IQ3_S, "iq3_s", 12288, 4096, 1}, {GGML_TYPE_IQ3_S, "iq3_s", 4096, 12288, 1},
+        {GGML_TYPE_IQ3_S, "iq3_s", 12288, 4096, 1},
+        {GGML_TYPE_IQ3_S, "iq3_s", 4096, 12288, 1},
         {GGML_TYPE_IQ3_S, "iq3_s", 1024, 1024, 7},
     };
     for (const auto& sc : cases)
