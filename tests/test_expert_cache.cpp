@@ -96,8 +96,9 @@ EmStats em_of(const std::string& line) {
     const char* p = std::strstr(line.c_str(), "; expert-major ");
     unsigned long long u = 0, r = 0, h = 0, k = 0;
     double mib = 0.0;
-    if (p && std::sscanf(p, "; expert-major %llu ubatches, %llu read (%lf MiB), %llu resident, %llu kept",
-                         &u, &r, &mib, &h, &k) == 5) {
+    if (p && std::sscanf(
+                 p, "; expert-major %llu ubatches, %llu read (%lf MiB), %llu resident, %llu kept",
+                 &u, &r, &mib, &h, &k) == 5) {
         s.ubatches = static_cast<long long>(u);
         s.reads = static_cast<long long>(r);
         s.resident = static_cast<long long>(h);
@@ -431,7 +432,8 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
     llama_log_set(nullptr, nullptr);
 }
 
-TEST_CASE("expert cache: expert-major prompts match the resident model (opt-in: XLLAMA_EC_TEST_MODEL)") {
+TEST_CASE(
+    "expert cache: expert-major prompts match the resident model (opt-in: XLLAMA_EC_TEST_MODEL)") {
     const char* path = std::getenv("XLLAMA_EC_TEST_MODEL");
     if (!path)
         return;
@@ -529,7 +531,8 @@ TEST_CASE("expert-cache bench (opt-in: XLLAMA_EC_BENCH_MODEL)") {
         "while a third one is loaded. Because the yard is covered, the crew no longer stops work "
         "when it rains, and the forklifts stay dry overnight. The move took eleven days: four to "
         "pack, two to transport the machines and five to install and test them. The paint booth "
-        "was the slowest part, since its extraction duct had to be rebuilt to fit the lower ceiling "
+        "was the slowest part, since its extraction duct had to be rebuilt to fit the lower "
+        "ceiling "
         "of the new hall. During the move the team kept a small stock of finished units at a "
         "rented garage, so that no customer order was delayed. Electricity costs went up by about "
         "a tenth, mostly because of the larger heated area, but the time saved on deliveries more "
@@ -557,7 +560,8 @@ TEST_CASE("expert-cache bench (opt-in: XLLAMA_EC_BENCH_MODEL)") {
         char label[64];
         int at = std::snprintf(label, sizeof(label), "ratio %.2f", cfg.swap);
         if (cfg.pf >= 0)
-            at += std::snprintf(label + at, sizeof(label) - static_cast<size_t>(at), " pf %d", cfg.pf);
+            at += std::snprintf(label + at, sizeof(label) - static_cast<size_t>(at), " pf %d",
+                                cfg.pf);
         if (cfg.em >= 0)
             std::snprintf(label + at, sizeof(label) - static_cast<size_t>(at), " em %d", cfg.em);
         CAPTURE(label);
@@ -598,8 +602,8 @@ TEST_CASE("expert-cache bench (opt-in: XLLAMA_EC_BENCH_MODEL)") {
         REQUIRE(ctx);
         const llama_vocab* vocab = llama_model_get_vocab(model);
         const int32_t n_vocab = llama_vocab_n_tokens(vocab);
-        std::printf("[ec-bench] %s: load %.1f s, %u slots, n_ubatch %u, %d threads\n",
-                    label, load_s, slots, llama_n_ubatch(ctx), n_threads);
+        std::printf("[ec-bench] %s: load %.1f s, %u slots, n_ubatch %u, %d threads\n", label,
+                    load_s, slots, llama_n_ubatch(ctx), n_threads);
 
         int gen_total = 0;
         double gen_s_total = 0.0;
