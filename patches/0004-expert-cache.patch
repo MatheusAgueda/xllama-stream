@@ -69,10 +69,10 @@ index 07b4c61..8414093 100644
              cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
 diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
 new file mode 100644
-index 0000000..4de6eec
+index 0000000..ff0407b
 --- /dev/null
 +++ b/src/llama-expert-cache.cpp
-@@ -0,0 +1,818 @@
+@@ -0,0 +1,852 @@
 +#include "llama-expert-cache.h"
 +
 +#include "llama-impl.h"
@@ -170,6 +170,7 @@ index 0000000..4de6eec
 +    float    swap_ratio    = 0.0f;
 +
 +    ggml_backend_buffer_type buft {};
++    ggml_backend_buffer_type_t inner = nullptr; // a GPU device's host buft holding the slots, nullptr = CPU
 +
 +    std::vector<std::unique_ptr<ec_file>> files;
 +    std::vector<ec_tensor> tensors;
@@ -238,17 +239,34 @@ index 0000000..4de6eec
 +    return ggml_backend_dev_buffer_type(dev);
 +}
 +
++static ggml_backend_buffer_type_t ec_inner_buft(ggml_backend_buffer_type_t buft) {
++    const llama_expert_cache * cache = (const llama_expert_cache *) buft->context;
++    return cache->inner ? cache->inner : ec_cpu_buft();
++}
++
 +static ggml_backend_buffer_t ec_buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-+    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(ec_cpu_buft(), size);
++    llama_expert_cache * cache = (llama_expert_cache *) buft->context;
++    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(ec_inner_buft(buft), size);
++    if (buf == nullptr && cache->inner != nullptr) {
++        // back to the CPU before any graph is scheduled: the GPU device stops claiming the type
++        LLAMA_LOG_WARN("expert cache: %s could not hold %.1f MiB, slots in CPU memory instead\n",
++                ggml_backend_buft_name(cache->inner), size/1024.0/1024.0);
++        cache->inner       = nullptr;
++        cache->buft.device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++        buf = ggml_backend_buft_alloc_buffer(ec_cpu_buft(), size);
++    }
 +    if (buf) {
-+        buf->buft = buft; // CPU buffer whose tensors are sized by this type
++        buf->buft = buft; // a host buffer (CPU or a GPU's) whose tensors are sized by this type
 +    }
 +    return buf;
 +}
 +
 +static size_t ec_buft_get_alignment(ggml_backend_buffer_type_t buft) {
-+    GGML_UNUSED(buft);
-+    return ggml_backend_buft_get_alignment(ec_cpu_buft());
++    return std::max(ggml_backend_buft_get_alignment(ec_inner_buft(buft)), ggml_backend_buft_get_alignment(ec_cpu_buft()));
++}
++
++static size_t ec_buft_get_max_size(ggml_backend_buffer_type_t buft) {
++    return ggml_backend_buft_get_max_size(ec_inner_buft(buft));
 +}
 +
 +static bool ec_buft_is_host(ggml_backend_buffer_type_t buft) {
@@ -721,7 +739,7 @@ index 0000000..4de6eec
 +            /* .alloc_buffer     = */ ec_buft_alloc_buffer,
 +            /* .alloc_buffer_n   = */ nullptr,
 +            /* .get_alignment    = */ ec_buft_get_alignment,
-+            /* .get_max_size     = */ nullptr,
++            /* .get_max_size     = */ ec_buft_get_max_size,
 +            /* .get_alloc_size   = */ nullptr, // the tensors are shrunk, ggml_nbytes is their size
 +            /* .get_alloc_size_n = */ nullptr,
 +            /* .is_host          = */ ec_buft_is_host,
@@ -735,6 +753,22 @@ index 0000000..4de6eec
 +
 +ggml_backend_buffer_type_t llama_expert_cache_buft(llama_expert_cache & cache) {
 +    return &cache.buft;
++}
++
++bool llama_expert_cache_use_host_of(llama_expert_cache & cache, ggml_backend_dev_t dev) {
++    ggml_backend_buffer_type_t host = dev != nullptr ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
++    if (host == nullptr || !ggml_backend_buft_is_host(host)) {
++        return false;
++    }
++    // the device decides: it claims the type only if its kernels can read the slots in place
++    cache.inner       = host;
++    cache.buft.device = dev;
++    if (ggml_backend_dev_supports_buft(dev, &cache.buft)) {
++        return true;
++    }
++    cache.inner       = nullptr;
++    cache.buft.device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++    return false;
 +}
 +
 +uint32_t llama_expert_cache_n_slots(const llama_expert_cache & cache) {
@@ -893,10 +927,10 @@ index 0000000..4de6eec
 +}
 diff --git a/src/llama-expert-cache.h b/src/llama-expert-cache.h
 new file mode 100644
-index 0000000..d7ab499
+index 0000000..068b82c
 --- /dev/null
 +++ b/src/llama-expert-cache.h
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,83 @@
 +#pragma once
 +
 +#include "ggml.h"
@@ -921,14 +955,22 @@ index 0000000..d7ab499
 +// applied to its input residual predicts its routing before the attention; a fourth op queues the
 +// predicted experts that are missing for background I/O threads, and the plan drops the reads not
 +// started and waits for the running ones. Routing is unchanged: the output stays exact.
-+// The expert matmuls run on the CPU (other layers may be offloaded), one context per model at a
-+// time, n_ubatch <= n_slots / n_expert_used.
++// The slots live in CPU memory and the expert matmuls run on the CPU (other layers may be
++// offloaded), unless a GPU device of the model claims the cache's buffer type with the slots in its
++// host buft (unified memory: the custom ops and the reads write them, its kernels read them in
++// place). One context per model at a time, n_ubatch <= n_slots / n_expert_used.
 +
 +struct llama_expert_cache;
 +
 +std::shared_ptr<llama_expert_cache> llama_expert_cache_init(uint32_t n_slots, uint32_t n_expert_used, float swap_ratio);
 +
 +ggml_backend_buffer_type_t llama_expert_cache_buft(llama_expert_cache & cache);
++
++// before the model's tensors are created: put the slots in dev's host buft (is_host) if dev claims
++// the cache's buffer type - its supports_buft sees the type with device == dev and name
++// "EXPERT_CACHE" (buffers keep the host buft's iface and context; only buffer->buft is the cache's).
++// false (CPU slots) otherwise; an allocation the host buft refuses also falls back to the CPU
++bool llama_expert_cache_use_host_of(llama_expert_cache & cache, ggml_backend_dev_t dev);
 +
 +uint32_t llama_expert_cache_n_slots(const llama_expert_cache & cache);
 +
@@ -1220,7 +1262,7 @@ index 9e51d0c..f36bdc1 100644
      llama_fver  fver;
  
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 97e0cee..c4d92ec 100644
+index 97e0cee..b322acc 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -6,6 +6,7 @@
@@ -1241,7 +1283,7 @@ index 97e0cee..c4d92ec 100644
      for (auto * lora : loras) {
          delete lora;
      }
-@@ -1550,6 +1554,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1550,6 +1554,33 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
          pimpl->gpu_buft_list.emplace(dev.dev, std::move(buft_list));
      }
  
@@ -1253,17 +1295,29 @@ index 97e0cee..c4d92ec 100644
 +            LLAMA_LOG_WARN("%s: expert cache not supported for %s, loading all experts\n", __func__, llm_arch_name(arch));
 +        } else {
 +            expert_cache = llama_expert_cache_init(params.n_expert_slots, hparams.n_expert_used_max(), params.expert_swap_ratio);
++            // unified memory: a GPU that claims the cache's type reads the slots in place
++            const char * slots_in = "CPU";
++            if (n_gpu_layers > 0) {
++                for (const auto & dev : devices) {
++                    const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev.dev);
++                    if ((type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) &&
++                            llama_expert_cache_use_host_of(*expert_cache, dev.dev)) {
++                        slots_in = ggml_backend_dev_name(dev.dev);
++                        break;
++                    }
++                }
++            }
 +            ml.expert_cache_buft = llama_expert_cache_buft(*expert_cache);
-+            LLAMA_LOG_INFO("%s: expert cache: %u of %u experts resident per layer, read from the model file on demand, swap ratio %.2f, prefetch %u\n",
++            LLAMA_LOG_INFO("%s: expert cache: %u of %u experts resident per layer, read from the model file on demand, swap ratio %.2f, prefetch %u, slots in %s memory\n",
 +                __func__, llama_expert_cache_n_slots(*expert_cache), hparams.n_expert, llama_expert_cache_swap_ratio(*expert_cache),
-+                llama_expert_cache_prefetch(*expert_cache));
++                llama_expert_cache_prefetch(*expert_cache), slots_in);
 +        }
 +    }
 +
      ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
      if (cpu_dev == nullptr) {
          throw std::runtime_error(format("%s: no CPU backend found", __func__));
-@@ -2935,6 +2954,8 @@ llama_model_params llama_model_default_params() {
+@@ -2935,6 +2966,8 @@ llama_model_params llama_model_default_params() {
          /*.progress_callback           =*/ nullptr,
          /*.progress_callback_user_data =*/ nullptr,
          /*.kv_overrides                =*/ nullptr,
