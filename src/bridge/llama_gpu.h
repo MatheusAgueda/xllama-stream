@@ -166,7 +166,7 @@ inline int apply_gguf_gpu_layers(int requested, llama_model_params& mparams,
     // one copy: the duplicate finds the original in the same buffer context.
     ggml_type embd_type = GGML_TYPE_COUNT;
     bool has_output = true;
-    static llama_model_tensor_buft_override overrides[3] = {};
+    static llama_model_tensor_buft_override overrides[4] = {};
     int n_overrides = 0;
     const bool have_info = gguf_embedding_info(model_path, &embd_type, &has_output);
     if (have_info && d3d12_place_tied_embedding(embd_type, has_output)) {
@@ -180,6 +180,14 @@ inline int apply_gguf_gpu_layers(int requested, llama_model_params& mparams,
         overrides[n_overrides++] = {"^output\\.weight$", ggml_backend_cpu_buffer_type()};
         log_output("[xllama] gguf gpu layers: output.weight kept on the CPU\n");
     }
+    // The small f32 weights of the linear-attention layers (qwen35 / qwen35moe:
+    // conv kernel, A, dt bias, gated-norm weight; ~4 MiB on the 35B) go to
+    // D3D12_Host, which both the delta-net kernels and the CPU read: a layer's
+    // whole chain can then run in one D3D12 split, and the CPU still runs any op
+    // the device declines. An override skips llama.cpp's supports_op probe,
+    // which these ops' other operands (activations) would fail at load time.
+    overrides[n_overrides++] = {"^blk\\.[0-9]+\\.ssm_(a|dt\\.bias|norm\\.weight|conv1d\\.weight)$",
+                                ggml_backend_dev_buffer_type(d3d12[0])};
     overrides[n_overrides] = {nullptr, nullptr};
     if (n_overrides > 0)
         mparams.tensor_buft_overrides = overrides;
@@ -212,6 +220,11 @@ inline uint32_t gguf_gpu_outputs_max(bool embeddings, bool prompt_lookup) {
 // the pages it touches (#309).
 inline void apply_gguf_gpu_context(int applied_layers, llama_context_params& cparams,
                                    uint32_t outputs_max) {
+    // The recurrent states of linear-attention layers (qwen35 / qwen35moe) go
+    // to the device buffer, CPU-visible D3D12_Host, which the delta-net kernels
+    // read and write in place (llama.cpp patch 0010; the CPU uses it as well
+    // where they cannot run). Set on every context so a CPU reload clears it.
+    set_env_int("LLAMA_RS_ON_DEVICE", applied_layers > 0 ? 1 : 0);
     if (applied_layers > 0) {
         cparams.offload_kqv = false;
         if (cparams.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO)

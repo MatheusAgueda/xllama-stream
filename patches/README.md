@@ -196,6 +196,15 @@ sigmoid: the two matmuls join the shared expert's GPU split and the sigmoid join
 the router's CPU split (softmax, top-k). Only the order changes; the results stay
 the same.
 
+`0010-recurrent-state-on-device.patch` (applies after 0009): with
+`LLAMA_RS_ON_DEVICE` set (and not `0`), `llama_memory_recurrent` puts each
+layer's conv and SSM states in that layer's device buffer type even when
+`offload_kqv` is off. xllama sets it whenever layers run on D3D12
+(`apply_gguf_gpu_context`): the states then sit in D3D12_Host, which the
+delta-net kernels (`shaders/ggml_d3d12_ssm.hlsl`) read and write in place and
+the CPU reads as host memory, so a linear-attention layer's chain runs in one
+GPU split instead of one per state access. Unset, the placement is upstream's.
+
 ## Applying
 
 ```bash

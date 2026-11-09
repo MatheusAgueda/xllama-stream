@@ -613,6 +613,12 @@ void run_d3d12_memprobe(const std::function<void(const std::string&)>& emit) {
         #include "ggml_d3d12_moe_combine_dxil.h"
         #include "ggml_d3d12_moe_emu.h"
         #include "ggml_d3d12_moe_tail_dxil.h"
+        #include "ggml_d3d12_ssm_conv_dxil.h"
+        #include "ggml_d3d12_ssm_copy_dxil.h"
+        #include "ggml_d3d12_ssm_emu.h"
+        #include "ggml_d3d12_ssm_gdn_dxil.h"
+        #include "ggml_d3d12_ssm_get_rows_dxil.h"
+        #include "ggml_d3d12_ssm_unary_dxil.h"
         #include "xllama/d3d12_dyn.h"
         #include "xllama/platform.h"
 
@@ -633,6 +639,8 @@ enum Pso {
 };
 enum Elt { kEltBinary = 0, kEltRmsNorm = 1, kEltQuantQ8K = 2, kEltCount = 3 };
 enum Moe { kMoeCombine = 0, kMoeTail = 1, kMoeCount = 2 };
+// shaders/ggml_d3d12_ssm.hlsl, KERNEL 1..5 (ggml_d3d12_ssm_emu.h).
+enum Ssm { kSsmUnary = 0, kSsmCopy = 1, kSsmGetRows = 2, kSsmConv = 3, kSsmGdn = 4, kSsmCount = 5 };
 // Root constants: the 8 every kernel reads, then MUL_MAT_ID's 5
 // (shaders/ggml_d3d12_mmid_iq4_xs.hlsl).
 constexpr UINT kOpConstants = 13;
@@ -677,6 +685,10 @@ struct Gpu {
     // shared expert's gate + both residual adds, each one dispatch.
     ComPtr<ID3D12PipelineState> pso_moe[kMoeCount];
     bool moe_ok = false;
+    // The linear-attention layers' ops (gated delta net, conv, the recurrent
+    // state copies); without them those stay on the CPU.
+    ComPtr<ID3D12PipelineState> pso_ssm[kSsmCount];
+    bool ssm_ok = false;
     ComPtr<ID3D12QueryHeap> ts;
     ComPtr<ID3D12Resource> ts_rb;
     ComPtr<ID3D12Resource> staging;  // weight upload ring (kStagingBytes)
@@ -890,6 +902,28 @@ bool init_gpu(Gpu& g) {
                            d3d12c::hr_message("CreateComputePipelineState (moe)", hr) +
                            " — the MoE tail stays on the CPU\n");
                 g.moe_ok = false;
+            }
+        }
+    }
+    {
+        const void* sb[kSsmCount] = {kGgmlD3d12SsmUnaryDxil, kGgmlD3d12SsmCopyDxil,
+                                     kGgmlD3d12SsmGetRowsDxil, kGgmlD3d12SsmConvDxil,
+                                     kGgmlD3d12SsmGdnDxil};
+        const size_t ss[kSsmCount] = {kGgmlD3d12SsmUnaryDxilSize, kGgmlD3d12SsmCopyDxilSize,
+                                      kGgmlD3d12SsmGetRowsDxilSize, kGgmlD3d12SsmConvDxilSize,
+                                      kGgmlD3d12SsmGdnDxilSize};
+        g.ssm_ok = g.elt_ok; // the chain's ADD / MUL / RMS_NORM are elementwise kernels
+        for (int i = 0; i < kSsmCount && g.ssm_ok; ++i) {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
+            pd.pRootSignature = g.root.Get();
+            pd.CS.pShaderBytecode = sb[i];
+            pd.CS.BytecodeLength = ss[i];
+            hr = g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.pso_ssm[i]));
+            if (FAILED(hr)) {
+                log_output("[xllama] d3d12: " +
+                           d3d12c::hr_message("CreateComputePipelineState (ssm)", hr) +
+                           " — the linear-attention ops stay on the CPU\n");
+                g.ssm_ok = false;
             }
         }
     }
@@ -1473,44 +1507,162 @@ bool same_or_apart(const ggml_tensor* d, const ggml_tensor* s) {
     return !overlaps(rng_of(d), rng_of(s));
 }
 
+// --- The linear-attention (gated delta net) chain (ggml_d3d12_ssm_emu.h) ---
+
+// Rows of t as the elementwise kernels walk them, nb1 apart: ne1 * ne2 * ne3
+// when the outer dims are packed over the rows, else 0.
+std::int64_t flat_rows(const ggml_tensor* t) {
+    if ((t->ne[2] > 1 && t->nb[2] != t->ne[1] * t->nb[1]) ||
+        (t->ne[3] > 1 && t->nb[3] != t->ne[2] * t->nb[2]))
+        return 0;
+    return t->ne[1] * t->ne[2] * t->ne[3];
+}
+
+// The elementwise kernels' limits over flat rows of any width: the delta net's
+// [32, T] gates and [128, heads] q, k and outputs are narrower than
+// kD3d12EltMinRow, which keeps the CPU's small ops off the GPU elsewhere.
+bool flat_ok(const ggml_tensor* t) {
+    const std::int64_t rows = flat_rows(t);
+    return t->ne[0] >= 1 && rows >= 1 && rows <= kD3d12MaxGroups &&
+           (t->ne[0] + 255) / 256 <= kD3d12MaxGroups && t->ne[0] * rows <= (std::int64_t(1) << 28);
+}
+
+// An operand of the delta-net kernels: f32 in D3D12_Host, 32-bit offsets.
+bool ssm_operand(const ggml_tensor* t) {
+    return t && t->buffer && t->buffer->buft == &kHostBuft && t->type == GGML_TYPE_F32 &&
+           ggml_nbytes(t) <= 0xffffffffull;
+}
+
+// The output of a one-thread-per-element kernel may be its input exactly (an
+// in-place op) or lie apart from it.
+bool ssm_same_or_apart(const ggml_tensor* d, const ggml_tensor* s) {
+    if (d->data == s->data && std::equal(std::begin(d->nb), std::end(d->nb), std::begin(s->nb)))
+        return true;
+    return !overlaps(rng_of(d), rng_of(s));
+}
+
+// "blk.N.ssm_*" but ssm_out, whose matmul ends the layer's chain.
+bool ssm_weight_name(const char* name) {
+    if (std::strncmp(name, "blk.", 4) != 0)
+        return false;
+    const char* p = std::strchr(name + 4, '.');
+    return p && std::strncmp(p + 1, "ssm_", 4) == 0 && std::strncmp(p + 1, "ssm_out", 7) != 0;
+}
+
+// Where a delta-net chain starts (qwen35moe build_layer_attn_linear): the
+// recurrent states (llama-memory-recurrent.cpp), a layer's ssm_* weights or
+// the matmuls by them, and the z projection, whose SILU gates the output
+// (a full-attention layer gates with a SIGMOID instead).
+bool ssm_anchor(const ggml_tensor* t, const ggml_tensor* user) {
+    if (t->op == GGML_OP_NONE)
+        return std::strncmp(t->name, "cache_r_l", 9) == 0 ||
+               std::strncmp(t->name, "cache_s_l", 9) == 0 || ssm_weight_name(t->name);
+    if (t->op != GGML_OP_MUL_MAT || !t->src[0])
+        return false;
+    const char* w = t->src[0]->name;
+    if (ssm_weight_name(w))
+        return true;
+    const char* gate = std::strstr(w, ".attn_gate.");
+    return gate && user->op == GGML_OP_UNARY && ggml_get_unary_op(user) == GGML_UNARY_OP_SILU;
+}
+
+bool ssm_op(const ggml_tensor* t) {
+    switch (t->op) {
+    case GGML_OP_UNARY:
+    case GGML_OP_SCALE:
+    case GGML_OP_CPY:
+    case GGML_OP_CONT:
+    case GGML_OP_DUP:
+    case GGML_OP_CONCAT:
+    case GGML_OP_GET_ROWS:
+    case GGML_OP_SSM_CONV:
+    case GGML_OP_GATED_DELTA_NET:
+    case GGML_OP_ADD:
+    case GGML_OP_MUL:
+    case GGML_OP_RMS_NORM:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Whether t belongs to a delta-net chain: an operand is an anchor, or a chain
+// op whose own operands reach one within `depth` more steps. Only these small
+// ops move to the GPU; the same op types elsewhere stay where they ran.
+bool ssm_chain(const ggml_tensor* t, int depth = 3) {
+    for (const ggml_tensor* s : t->src) {
+        if (!s)
+            continue;
+        const ggml_tensor* b = base_of(s);
+        if (ssm_anchor(b, t) || (depth > 0 && ssm_op(b) && ssm_chain(b, depth - 1)))
+            return true;
+    }
+    return false;
+}
+
+// An f32 operand of the delta-net kernels as supports_op sees it.
+bool ssm_f32(const ggml_tensor* t) {
+    const ggml_tensor* b = base_of(t);
+    return t->type == GGML_TYPE_F32 && (!b->buffer || b->buffer->buft == &kHostBuft);
+}
+
+// The bytes one non-empty block of a copy plan writes into `node`.
+Rng copy_rng(const ggml_tensor* node, const D3d12SsmCopy& c) {
+    std::uint64_t last = 0;
+    for (int k = 0; k < 4; ++k)
+        last += static_cast<std::uint64_t>(c.params.ne[k] - 1) * c.params.dst_stride[k];
+    const auto lo = reinterpret_cast<std::uintptr_t>(node->data) + c.dst_offset;
+    return {lo, lo + (last + 1) * sizeof(float)};
+}
+
+static_assert(sizeof(D3d12SsmUnaryParams) <= kOpConstants * sizeof(std::uint32_t) &&
+                  sizeof(D3d12SsmCopyParams) <= kOpConstants * sizeof(std::uint32_t) &&
+                  sizeof(D3d12SsmGetRowsParams) <= kOpConstants * sizeof(std::uint32_t) &&
+                  sizeof(D3d12SsmConvParams) <= kOpConstants * sizeof(std::uint32_t) &&
+                  sizeof(D3d12GdnParams) <= kOpConstants * sizeof(std::uint32_t),
+              "the delta-net constants fit the root signature");
+
 // CPU versions of the elementwise kernels, for operands the GPU path refuses.
-float* row_f32(const ggml_tensor* t, std::int64_t r) {
-    return reinterpret_cast<float*>(static_cast<char*>(t->data) + r * t->nb[1]);
+float* row4_f32(const ggml_tensor* t, std::int64_t i1, std::int64_t i2, std::int64_t i3) {
+    return reinterpret_cast<float*>(static_cast<char*>(t->data) + i3 * t->nb[3] + i2 * t->nb[2] +
+                                    i1 * t->nb[1]);
 }
 
 void cpu_binary(const ggml_tensor* d, int kind) {
     const ggml_tensor* a = d->src[0];
     const ggml_tensor* b = d->src[1];
-    GGML_ASSERT(d->ne[3] == 1 && b->ne[3] == 1 && (b->ne[2] == 1 || b->ne[2] == d->ne[2]));
-    auto row = [](const ggml_tensor* t, std::int64_t i2, std::int64_t r) {
-        return reinterpret_cast<float*>(static_cast<char*>(t->data) + i2 * t->nb[2] + r * t->nb[1]);
-    };
-    for (std::int64_t i2 = 0; i2 < d->ne[2]; ++i2)
-        for (std::int64_t r = 0; r < d->ne[1]; ++r) {
-            const float* pa = row(a, i2, r);
-            const float* pb = row(b, b->ne[2] == 1 ? 0 : i2, b->ne[1] == 1 ? 0 : r);
-            float* pd = row(d, i2, r);
-            for (std::int64_t i = 0; i < d->ne[0]; ++i) {
-                const float x = pa[i], y = pb[i];
-                pd[i] = kind == 0 ? x + y : kind == 1 ? x * y : x / (1.0f + std::exp(-x)) * y;
+    for (int k = 1; k < GGML_MAX_DIMS; ++k)
+        GGML_ASSERT(b->ne[k] == 1 || b->ne[k] == d->ne[k]);
+    for (std::int64_t i3 = 0; i3 < d->ne[3]; ++i3)
+        for (std::int64_t i2 = 0; i2 < d->ne[2]; ++i2)
+            for (std::int64_t i1 = 0; i1 < d->ne[1]; ++i1) {
+                const float* pa = row4_f32(a, i1, i2, i3);
+                const float* pb = row4_f32(b, b->ne[1] == 1 ? 0 : i1, b->ne[2] == 1 ? 0 : i2,
+                                           b->ne[3] == 1 ? 0 : i3);
+                float* pd = row4_f32(d, i1, i2, i3);
+                for (std::int64_t i = 0; i < d->ne[0]; ++i) {
+                    const float x = pa[i], y = pb[i];
+                    pd[i] = kind == 0 ? x + y : kind == 1 ? x * y : x / (1.0f + std::exp(-x)) * y;
+                }
             }
-        }
 }
 
 void cpu_rms_norm(const ggml_tensor* d, float eps) {
     const ggml_tensor* a = d->src[0];
-    GGML_ASSERT(d->ne[2] == 1 && d->ne[3] == 1 && ggml_are_same_shape(d, a));
-    for (std::int64_t r = 0; r < d->ne[1]; ++r) {
-        const float* pa = row_f32(a, r);
-        double sum = 0.0; // as ggml-cpu
-        for (std::int64_t i = 0; i < d->ne[0]; ++i)
-            sum += static_cast<double>(pa[i] * pa[i]);
-        const float mean = static_cast<float>(sum / static_cast<double>(d->ne[0]));
-        const float scale = 1.0f / std::sqrt(mean + eps);
-        float* pd = row_f32(d, r);
-        for (std::int64_t i = 0; i < d->ne[0]; ++i)
-            pd[i] = pa[i] * scale;
-    }
+    GGML_ASSERT(ggml_are_same_shape(d, a));
+    for (std::int64_t i3 = 0; i3 < d->ne[3]; ++i3)
+        for (std::int64_t i2 = 0; i2 < d->ne[2]; ++i2)
+            for (std::int64_t i1 = 0; i1 < d->ne[1]; ++i1) {
+                const float* pa = row4_f32(a, i1, i2, i3);
+                double sum = 0.0; // as ggml-cpu
+                for (std::int64_t i = 0; i < d->ne[0]; ++i)
+                    sum += static_cast<double>(pa[i] * pa[i]);
+                const float mean = static_cast<float>(sum / static_cast<double>(d->ne[0]));
+                const float scale = 1.0f / std::sqrt(mean + eps);
+                float* pd = row4_f32(d, i1, i2, i3);
+                for (std::int64_t i = 0; i < d->ne[0]; ++i)
+                    pd[i] = pa[i] * scale;
+            }
 }
 
 // One recorded command: a dispatch, or a UAV barrier (pso null). Root
@@ -1521,7 +1673,7 @@ struct Op {
     D3D12_GPU_VIRTUAL_ADDRESS t0 = 0;
     D3D12_GPU_VIRTUAL_ADDRESS t1 = 0;
     D3D12_GPU_VIRTUAL_ADDRESS u[5] = {};
-    UINT gx = 0, gy = 0;
+    UINT gx = 0, gy = 0, gz = 1;
 };
 
 void set_c(Op& op, std::initializer_list<std::uint64_t> c) {
@@ -1559,7 +1711,7 @@ std::uint64_t record_ops(Gpu& g, ID3D12GraphicsCommandList* cl, const std::vecto
             cl->SetComputeRootUnorderedAccessView(2 + i, op.u[i] ? op.u[i] : op.u[0]);
         cl->SetComputeRootShaderResourceView(6, op.t1 ? op.t1 : op.u[0]);
         cl->SetComputeRootUnorderedAccessView(7, op.u[4] ? op.u[4] : op.u[0]);
-        cl->Dispatch(op.gx, op.gy, 1);
+        cl->Dispatch(op.gx, op.gy, op.gz);
         ++n;
     }
     if (ts) {
@@ -1573,7 +1725,7 @@ bool same_op(const Op& a, const Op& b) {
     return a.pso == b.pso && std::equal(std::begin(a.c), std::end(a.c), std::begin(b.c)) &&
            a.t0 == b.t0 && a.t1 == b.t1 &&
            std::equal(std::begin(a.u), std::end(a.u), std::begin(b.u)) && a.gx == b.gx &&
-           a.gy == b.gy;
+           a.gy == b.gy && a.gz == b.gz;
 }
 
 std::uint64_t ops_hash(const std::vector<Op>& ops, bool ts) {
@@ -1591,6 +1743,7 @@ std::uint64_t ops_hash(const std::vector<Op>& ops, bool ts) {
         for (const D3D12_GPU_VIRTUAL_ADDRESS u : op.u)
             mix(u);
         mix((static_cast<std::uint64_t>(op.gx) << 32) | op.gy);
+        mix(op.gz);
     }
     return h;
 }
@@ -1724,6 +1877,14 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
         case GGML_OP_MUL:
         case GGML_OP_GLU:
         case GGML_OP_RMS_NORM:
+        case GGML_OP_UNARY:
+        case GGML_OP_SCALE:
+        case GGML_OP_CPY:
+        case GGML_OP_CONT:
+        case GGML_OP_DUP:
+        case GGML_OP_CONCAT:
+        case GGML_OP_SSM_CONV:
+        case GGML_OP_GATED_DELTA_NET:
             nodes.push_back(node);
             node_idx.push_back(i);
             break;
@@ -1944,13 +2105,42 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
         const ggml_tensor* b = node->src[1];
         switch (node->op) {
         case GGML_OP_GET_ROWS: {
-            GGML_ASSERT(a->buffer && a->buffer->buft == &kWeightsBuft);
             GGML_ASSERT(b->buffer && ggml_backend_buffer_is_host(b->buffer));
             // Row ids are tiny: stage them next to the quantized activations.
             const std::size_t bytes = static_cast<std::size_t>(b->ne[0]) * sizeof(std::int32_t);
             std::size_t off = 0;
             if (any_overlap(batch_w, rng_of(b)) && !flush())
                 return GGML_STATUS_FAILED;
+            if (!a->buffer || a->buffer->buft != &kWeightsBuft) {
+                // A recurrent state's rows (build_rs): KERNEL 3, f32.
+                D3d12SsmGetRowsPlan p;
+                GGML_ASSERT(d3d12_ssm_get_rows_plan(node, &p));
+                const auto* in = static_cast<const std::int32_t*>(b->data);
+                for (std::int64_t j = 0; j < b->ne[0]; ++j)
+                    GGML_ASSERT(in[j] >= 0 && in[j] < a->ne[1]);
+                if (!g.ssm_ok || !ssm_operand(a) || !ssm_operand(node) ||
+                    overlaps(rng_of(a), rng_of(node))) {
+                    if (!flush())
+                        return GGML_STATUS_FAILED;
+                    d3d12_ssm_get_rows_emulate(p.params, p.groups_x, p.groups_y,
+                                               static_cast<const float*>(a->data), in,
+                                               static_cast<float*>(node->data));
+                    break;
+                }
+                if (!reserve(bytes, &off))
+                    return GGML_STATUS_FAILED;
+                std::memcpy(g.xq_ptr + off, b->data, bytes);
+                Op op;
+                op.pso = g.pso_ssm[kSsmGetRows].Get();
+                std::memcpy(op.c, &p.params, sizeof(p.params));
+                op.u[0] = tensor_va(node);
+                op.u[1] = tensor_va(a);
+                op.u[2] = xq_va(off);
+                op.gx = p.groups_x;
+                op.gy = p.groups_y;
+                record(op, {rng_of(a), xq_rng(off, bytes)}, {rng_of(node)});
+                break;
+            }
             if (!reserve(bytes, &off))
                 return GGML_STATUS_FAILED;
             std::memcpy(g.xq_ptr + off, b->data, bytes);
@@ -2067,6 +2257,135 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
             record(m, {xq_rng(xoff, plan.x_bytes), xq_rng(ioff, plan.ids_bytes)}, {rng_of(node)});
             break;
         }
+        // The delta net's kernels (ggml_d3d12_ssm_emu.h). supports_op admits
+        // only nodes their plans take; an operand the GPU path refuses runs the
+        // kernel's arithmetic on the CPU, after the submission so far.
+        case GGML_OP_UNARY:
+        case GGML_OP_SCALE: {
+            D3d12SsmUnaryPlan p;
+            GGML_ASSERT(d3d12_ssm_unary_plan(node, &p));
+            const ggml_tensor* s = p.src;
+            if (!g.ssm_ok || !ssm_operand(node) || !ssm_operand(s) || !ssm_same_or_apart(node, s)) {
+                if (!flush())
+                    return GGML_STATUS_FAILED;
+                d3d12_ssm_unary_emulate(p.params, p.groups_x, p.groups_y,
+                                        static_cast<const float*>(s->data),
+                                        static_cast<float*>(node->data));
+                break;
+            }
+            Op op;
+            op.pso = g.pso_ssm[kSsmUnary].Get();
+            std::memcpy(op.c, &p.params, sizeof(p.params));
+            op.u[0] = tensor_va(node);
+            op.u[1] = tensor_va(s);
+            op.gx = p.groups_x;
+            op.gy = p.groups_y;
+            record(op, {rng_of(s)}, {rng_of(node)});
+            break;
+        }
+        case GGML_OP_CPY:
+        case GGML_OP_CONT:
+        case GGML_OP_DUP:
+        case GGML_OP_CONCAT: {
+            D3d12SsmCopyPlan p;
+            GGML_ASSERT(d3d12_ssm_copy_plan(node, &p));
+            bool gpu_ok = g.ssm_ok && ssm_operand(node);
+            for (const D3d12SsmCopy& c : p.copies)
+                gpu_ok = gpu_ok && (c.groups_x == 0 ||
+                                    (ssm_operand(c.src) && !overlaps(rng_of(c.src), rng_of(node))));
+            for (const D3d12SsmCopy& c : p.copies) {
+                if (c.groups_x == 0)
+                    continue;
+                if (!gpu_ok) {
+                    if (!flush())
+                        return GGML_STATUS_FAILED;
+                    d3d12_ssm_copy_emulate(
+                        c.params, c.groups_x, static_cast<const float*>(c.src->data),
+                        reinterpret_cast<float*>(static_cast<char*>(node->data) + c.dst_offset));
+                    continue;
+                }
+                Op op;
+                op.pso = g.pso_ssm[kSsmCopy].Get();
+                std::memcpy(op.c, &c.params, sizeof(c.params));
+                op.u[0] = tensor_va(node) + c.dst_offset;
+                op.u[1] = tensor_va(c.src);
+                op.gx = c.groups_x;
+                op.gy = 1;
+                record(op, {rng_of(c.src)}, {copy_rng(node, c)});
+            }
+            break;
+        }
+        case GGML_OP_SSM_CONV: {
+            // With the SILU after it as one dispatch when nothing else reads
+            // the conv and the SILU's memory is not the conv input's.
+            ggml_tensor* s = i + 1 < nodes.size() ? nodes[i + 1] : nullptr;
+            D3d12SsmConvPlan p;
+            const bool fuse =
+                s && s->op == GGML_OP_UNARY && s->src[0] == node && d3d12_ssm_conv_plan(s, &p) &&
+                ssm_operand(s) && !overlaps(rng_of(s), rng_of(p.x)) &&
+                !overlaps(rng_of(s), rng_of(p.w)) && moe_fusable(cgraph, node_idx[i], p.nodes, s);
+            if (!fuse)
+                GGML_ASSERT(d3d12_ssm_conv_plan(node, &p));
+            ggml_tensor* out = fuse ? s : node;
+            if (fuse)
+                ++i; // the SILU is done
+            if (!g.ssm_ok || !ssm_operand(out) || !ssm_operand(p.x) || !ssm_operand(p.w) ||
+                overlaps(rng_of(out), rng_of(p.x)) || overlaps(rng_of(out), rng_of(p.w))) {
+                if (!flush())
+                    return GGML_STATUS_FAILED;
+                d3d12_ssm_conv_emulate(p.params, p.groups_x, p.groups_y, p.groups_z,
+                                       static_cast<const float*>(p.x->data),
+                                       static_cast<const float*>(p.w->data),
+                                       static_cast<float*>(out->data));
+                break;
+            }
+            Op op;
+            op.pso = g.pso_ssm[kSsmConv].Get();
+            std::memcpy(op.c, &p.params, sizeof(p.params));
+            op.t0 = tensor_va(p.w);
+            op.u[0] = tensor_va(out);
+            op.u[1] = tensor_va(p.x);
+            op.gx = p.groups_x;
+            op.gy = p.groups_y;
+            op.gz = p.groups_z;
+            record(op, {rng_of(p.x), rng_of(p.w)}, {rng_of(out)});
+            break;
+        }
+        case GGML_OP_GATED_DELTA_NET: {
+            D3d12GdnPlan p;
+            GGML_ASSERT(d3d12_gdn_plan(node, &p));
+            const ggml_tensor* in[6] = {p.q, p.k, p.v, p.g, p.beta, p.state};
+            bool gpu_ok = g.ssm_ok && ssm_operand(node);
+            for (const ggml_tensor* t : in)
+                gpu_ok = gpu_ok && ssm_operand(t) && !overlaps(rng_of(t), rng_of(node));
+            if (!gpu_ok) {
+                if (!flush())
+                    return GGML_STATUS_FAILED;
+                auto f = [](const ggml_tensor* t) { return static_cast<const float*>(t->data); };
+                d3d12_gdn_emulate(p.params, p.groups_x, p.groups_y, p.groups_z, f(p.q), f(p.k),
+                                  f(p.v), f(p.g), f(p.beta), f(p.state),
+                                  static_cast<float*>(node->data));
+                break;
+            }
+            Op op;
+            op.pso = g.pso_ssm[kSsmGdn].Get();
+            std::memcpy(op.c, &p.params, sizeof(p.params));
+            op.u[0] = tensor_va(node);
+            op.u[1] = tensor_va(p.q);
+            op.u[2] = tensor_va(p.k);
+            op.u[3] = tensor_va(p.v);
+            op.u[4] = tensor_va(p.g);
+            op.t0 = tensor_va(p.beta);
+            op.t1 = tensor_va(p.state);
+            op.gx = p.groups_x;
+            op.gy = p.groups_y;
+            op.gz = p.groups_z;
+            record(op,
+                   {rng_of(p.q), rng_of(p.k), rng_of(p.v), rng_of(p.g), rng_of(p.beta),
+                    rng_of(p.state)},
+                   {rng_of(node)});
+            break;
+        }
         case GGML_OP_ADD:
         case GGML_OP_MUL:
         case GGML_OP_GLU: {
@@ -2083,18 +2402,23 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
             // supports_op admits these shapes only: b is a's shape or one row.
             GGML_ASSERT(ggml_are_same_shape(node, a) && b->ne[0] == node->ne[0] &&
                         (b->ne[1] == 1 || b->ne[1] == node->ne[1]));
-            // SwiGLU rows may be [n_ff, n_expert_used, n_tokens], flattened.
+            // SwiGLU rows may be [n_ff, n_expert_used, n_tokens], flattened;
+            // the delta net's rows are flat over ne1..ne3, b a's shape or one row.
             const bool glu = kind == 2;
-            const bool rows_ok = elt_rows(node) || (glu && glu_rows(node) && glu_rows(a) &&
-                                                    glu_rows(b) && ggml_are_same_shape(node, b));
-            const std::int64_t rows = glu ? node->ne[1] * node->ne[2] : node->ne[1];
+            const bool ssm = g.ssm_ok && !glu && flat_ok(node) && flat_ok(a) &&
+                             (ggml_nrows(b) == 1 || (flat_ok(b) && ggml_are_same_shape(node, b)));
+            const bool rows_ok = (elt_rows(node) && (b->ne[1] == 1 || b->ne[1] == node->ne[1])) ||
+                                 ssm ||
+                                 (glu && glu_rows(node) && glu_rows(a) && glu_rows(b) &&
+                                  ggml_are_same_shape(node, b));
+            const std::int64_t rows = glu ? node->ne[1] * node->ne[2] : flat_rows(node);
             if (g.elt_ok && rows_ok && elt_operand(node) && elt_operand(a) && elt_operand(b) &&
                 same_or_apart(node, a) && same_or_apart(node, b)) {
                 Op e;
                 e.pso = g.pso_elt[kEltBinary].Get();
                 set_c(e, {static_cast<std::uint64_t>(node->ne[0]), static_cast<std::uint64_t>(rows),
                           a->nb[1] / sizeof(float),
-                          b->ne[1] == 1 && !glu ? 0 : b->nb[1] / sizeof(float),
+                          ggml_nrows(b) == 1 && !glu ? 0 : b->nb[1] / sizeof(float),
                           node->nb[1] / sizeof(float), static_cast<std::uint64_t>(kind)});
                 e.u[0] = tensor_va(node);
                 e.u[1] = tensor_va(a);
@@ -2122,10 +2446,13 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
             const ggml_tensor* w = m ? m->src[1] : nullptr;
             const bool fuse = m && m->op == GGML_OP_MUL && m->src[0] == node && w &&
                               elt_operand(m) && elt_operand(w) && ggml_are_same_shape(m, node) &&
-                              ggml_nrows(w) == 1 && w->ne[0] == node->ne[0] &&
+                              flat_ok(m) && ggml_nrows(w) == 1 && w->ne[0] == node->ne[0] &&
                               same_or_apart(m, node) && same_or_apart(m, a) &&
                               !overlaps(rng_of(m), rng_of(w));
-            if (g.elt_ok && elt_rows(node) && elt_operand(node) && elt_operand(a) &&
+            // The delta net's: q and k by head ([128, 16] views of the conv
+            // output), its output by head before the gated norm.
+            const bool ssm = g.ssm_ok && flat_ok(node) && flat_ok(a);
+            if (g.elt_ok && (elt_rows(node) || ssm) && elt_operand(node) && elt_operand(a) &&
                 same_or_apart(node, a)) {
                 Op e;
                 e.pso = g.pso_elt[kEltRmsNorm].Get();
@@ -2134,7 +2461,7 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
                           fuse ? m->nb[1] / sizeof(float) : 0u});
                 e.u[0] = tensor_va(node);
                 e.u[1] = tensor_va(a);
-                e.gx = static_cast<UINT>(node->ne[1]);
+                e.gx = static_cast<UINT>(flat_rows(node));
                 e.gy = 1;
                 if (fuse) {
                     e.u[2] = tensor_va(w);
@@ -2351,7 +2678,44 @@ bool dev_supports_op(ggml_backend_dev_t, const ggml_tensor* op) {
         d.src0_contiguous = ggml_is_contiguous(w);
         d.src1_contiguous = ggml_is_contiguous(ids);
         d.src0_in_weight_buffer = w->buffer && w->buffer->buft == &kWeightsBuft;
-        return d3d12_get_rows_supported(d);
+        if (d3d12_get_rows_supported(d))
+            return true;
+        // A recurrent state's rows (build_rs), f32 in D3D12_Host.
+        D3d12SsmGetRowsPlan p;
+        return gpu().ssm_ok && !d.src0_in_weight_buffer && ssm_f32(op) && ssm_f32(w) &&
+               d3d12_ssm_get_rows_plan(op, &p) && ssm_chain(op);
+    }
+    case GGML_OP_UNARY:
+    case GGML_OP_SCALE: {
+        D3d12SsmUnaryPlan p;
+        return gpu().ssm_ok && ssm_f32(op) && ssm_f32(op->src[0]) && d3d12_ssm_unary_plan(op, &p) &&
+               ssm_chain(op);
+    }
+    case GGML_OP_CPY:
+    case GGML_OP_CONT:
+    case GGML_OP_DUP:
+    case GGML_OP_CONCAT: {
+        D3d12SsmCopyPlan p;
+        if (!gpu().ssm_ok || !ssm_f32(op) || !d3d12_ssm_copy_plan(op, &p) || !ssm_chain(op))
+            return false;
+        for (const D3d12SsmCopy& c : p.copies)
+            if (!ssm_f32(c.src))
+                return false;
+        return true;
+    }
+    case GGML_OP_SSM_CONV: {
+        D3d12SsmConvPlan p;
+        return gpu().ssm_ok && ssm_f32(op) && d3d12_ssm_conv_plan(op, &p) && ssm_f32(p.x) &&
+               ssm_f32(p.w) && ssm_chain(op);
+    }
+    case GGML_OP_GATED_DELTA_NET: {
+        D3d12GdnPlan p;
+        if (!gpu().ssm_ok || !ssm_f32(op) || !d3d12_gdn_plan(op, &p) || !ssm_chain(op))
+            return false;
+        for (const ggml_tensor* t : {p.q, p.k, p.v, p.g, p.beta, p.state})
+            if (!ssm_f32(t))
+                return false;
+        return true;
     }
     case GGML_OP_MUL_MAT_ID: {
         // The routed experts of a MoE layer, read in place from the expert
@@ -2378,6 +2742,15 @@ bool dev_supports_op(ggml_backend_dev_t, const ggml_tensor* op) {
             // one combine, or binary kernels over the views when it cannot fuse.
             return gpu().elt_ok && elt_rows(op) && elt_f32(op) && elt_f32(a) && elt_f32(b) &&
                    ggml_are_same_shape(op, a) && ggml_are_same_shape(op, b);
+        // The delta net's: rows of any width, flat over ne1..ne3; b a's shape
+        // or one row (ssm_dt, ssm_a, the gated norm's weight).
+        if (op->op != GGML_OP_GLU && a && gpu().ssm_ok && flat_ok(op) && flat_ok(a) &&
+            ggml_are_same_shape(op, a) && elt_f32(op) && ssm_f32(op) && elt_f32(a) && ssm_f32(a) &&
+            (op->op == GGML_OP_RMS_NORM ||
+             (b && elt_f32(b) && ssm_f32(b) && b->ne[0] == op->ne[0] &&
+              (ggml_nrows(b) == 1 || (flat_ok(b) && ggml_are_same_shape(op, b))))) &&
+            ssm_chain(op))
+            return true;
         if (op->op == GGML_OP_GLU && a && gpu().elt_ok && glu_rows(op) && !elt_rows(op)) {
             // A SwiGLU narrower than kD3d12EltMinRow: the routed experts' between two
             // MUL_MAT_IDs, or a shared expert's (n_ff_shexp 512 on Qwen3.6-35B-A3B)
@@ -3223,6 +3596,201 @@ D3d12SelftestRow run_moe_case(ggml_backend_t backend, int mode, int ne0, int n, 
     return row;
 }
 
+// The delta net's kernels at Qwen3.6-35B-A3B's decode shapes (one token),
+// on the GPU against their host emulations: the copies and get_rows bit for
+// bit, the rest within the emulation tests' tolerances. kind 0 SIGMOID [32]
+// (beta), 1 SOFTPLUS [32] (the gate), 2 SILU [128, 32] (z), 3 SCALE [128, 16]
+// (q), 4 CONCAT of the conv states and the transposed qkv, 5 GET_ROWS of a
+// conv state, 6 SILU(SSM_CONV), 7 GATED_DELTA_NET.
+D3d12SelftestRow run_ssm_case(ggml_backend_t backend, int kind) {
+    static const char* const kNames[] = {"ssm_sigmoid", "ssm_softplus", "ssm_silu", "ssm_scale",
+                                         "ssm_concat",  "ssm_get_rows", "ssm_conv", "ssm_gdn"};
+    constexpr std::int64_t kCh = 8192, kConv = 4, kSv = kD3d12GdnSv, kHk = 16, kHv = 32;
+    D3d12SelftestRow row;
+    row.type = kNames[kind];
+    row.ncols = 1;
+
+    ggml_init_params ip = {};
+    ip.mem_size = 32 * ggml_tensor_overhead() + ggml_graph_overhead();
+    ip.no_alloc = true;
+    ggml_context* ctx_x = ggml_init(ip);
+    ggml_context* ctx_g = ggml_init(ip);
+    std::vector<ggml_tensor*> in; // the operands, filled with uniform(-1, 1)
+    auto add = [&](std::int64_t n0, std::int64_t n1, std::int64_t n2 = 1, std::int64_t n3 = 1) {
+        in.push_back(ggml_new_tensor_4d(ctx_x, GGML_TYPE_F32, n0, n1, n2, n3));
+        return in.back();
+    };
+    ggml_tensor* ids = nullptr;
+    switch (kind) {
+    case 0:
+    case 1:
+        add(kHv, 1);
+        break;
+    case 2:
+        add(kSv, kHv);
+        break;
+    case 3:
+        add(kSv, kHk);
+        break;
+    case 4:
+        add(kConv - 1, kCh); // conv states
+        add(kCh, 1);         // qkv
+        break;
+    case 5:
+        add((kConv - 1) * kCh, 2); // two cells' conv states
+        ids = ggml_new_tensor_1d(ctx_x, GGML_TYPE_I32, 1);
+        break;
+    case 6:
+        add(kConv, kCh, 1); // conv input [d_conv - 1 + T, channels, S]
+        add(kConv, kCh);    // conv1d
+        break;
+    default:
+        add(kSv, kHk, 1, 1);   // q
+        add(kSv, kHk, 1, 1);   // k
+        add(kSv, kHv, 1, 1);   // v
+        add(1, kHv, 1, 1);     // g
+        add(1, kHv, 1, 1);     // beta
+        add(kSv, kSv, kHv, 1); // state
+        break;
+    }
+    ggml_backend_buffer_t xbuf = ggml_backend_alloc_ctx_tensors_from_buft(ctx_x, &kHostBuft);
+    ggml_gallocr_t galloc = nullptr;
+    auto cleanup = [&] {
+        if (galloc)
+            ggml_gallocr_free(galloc);
+        if (xbuf)
+            ggml_backend_buffer_free(xbuf);
+        ggml_free(ctx_g);
+        ggml_free(ctx_x);
+    };
+    if (!xbuf) {
+        row.error = "buffer allocation failed";
+        cleanup();
+        return row;
+    }
+    std::mt19937 rng(4242u + static_cast<unsigned>(kind));
+    std::uniform_real_distribution<float> uni(-1.f, 1.f);
+    std::vector<std::vector<float>> vals;
+    for (ggml_tensor* t : in) {
+        std::vector<float> v(static_cast<std::size_t>(ggml_nelements(t)));
+        for (float& x : v)
+            x = uni(rng);
+        ggml_backend_tensor_set(t, v.data(), 0, v.size() * sizeof(float));
+        vals.push_back(std::move(v));
+    }
+    const std::int32_t id = 1;
+    if (ids)
+        ggml_backend_tensor_set(ids, &id, 0, sizeof(id));
+
+    ggml_tensor* out = nullptr;
+    switch (kind) {
+    case 0:
+        out = ggml_sigmoid(ctx_g, in[0]);
+        break;
+    case 1:
+        out = ggml_softplus(ctx_g, in[0]);
+        break;
+    case 2:
+        out = ggml_silu(ctx_g, in[0]);
+        break;
+    case 3:
+        out = ggml_scale(ctx_g, in[0], 1.0f / std::sqrt(static_cast<float>(kSv)));
+        break;
+    case 4:
+        out = ggml_concat(ctx_g, in[0], ggml_transpose(ctx_g, in[1]), 0);
+        break;
+    case 5:
+        out = ggml_get_rows(ctx_g, in[0], ids);
+        break;
+    case 6:
+        out = ggml_silu(ctx_g, ggml_ssm_conv(ctx_g, in[0], in[1]));
+        break;
+    default:
+        out = ggml_gated_delta_net(ctx_g, in[0], in[1], in[2], in[3], in[4], in[5], 1);
+        break;
+    }
+    row.n = static_cast<int>(out->ne[0]);
+    row.k = static_cast<int>(out->ne[1]);
+    ggml_cgraph* gf = ggml_new_graph(ctx_g);
+    ggml_build_forward_expand(gf, out);
+    galloc = ggml_gallocr_new(&kHostBuft);
+    if (!ggml_gallocr_alloc_graph(galloc, gf)) {
+        row.error = "graph allocation failed";
+        cleanup();
+        return row;
+    }
+    const std::uint64_t d0 = gpu().n_dispatches;
+    row.d3d12_ran = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+    const std::uint64_t dispatches = gpu().n_dispatches - d0;
+    if (!row.d3d12_ran) {
+        row.error = "graph_compute failed";
+        cleanup();
+        return row;
+    }
+    row.gpu_ms = gpu().last_gpu_ms;
+
+    std::vector<float> got(static_cast<std::size_t>(ggml_nelements(out)));
+    ggml_backend_tensor_get(out, got.data(), 0, got.size() * sizeof(float));
+    std::vector<float> ref(got.size(), 0.0f);
+    bool planned = false;
+    std::uint64_t want = 1;
+    double tol = 0.0; // bit for bit
+    if (kind <= 3) {
+        D3d12SsmUnaryPlan p;
+        planned = d3d12_ssm_unary_plan(out, &p);
+        if (planned)
+            d3d12_ssm_unary_emulate(p.params, p.groups_x, p.groups_y, vals[0].data(), ref.data());
+        tol = kind == 3 ? 0.0 : 1e-5;
+    } else if (kind == 4) {
+        D3d12SsmCopyPlan p;
+        planned = d3d12_ssm_copy_plan(out, &p) && p.copies.size() == 2;
+        if (planned)
+            for (const D3d12SsmCopy& c : p.copies)
+                d3d12_ssm_copy_emulate(c.params, c.groups_x,
+                                       (base_of(c.src) == in[0] ? vals[0] : vals[1]).data(),
+                                       ref.data() + c.dst_offset / sizeof(float));
+        want = 2;
+    } else if (kind == 5) {
+        D3d12SsmGetRowsPlan p;
+        planned = d3d12_ssm_get_rows_plan(out, &p);
+        if (planned)
+            d3d12_ssm_get_rows_emulate(p.params, p.groups_x, p.groups_y, vals[0].data(), &id,
+                                       ref.data());
+    } else if (kind == 6) {
+        D3d12SsmConvPlan p;
+        planned = d3d12_ssm_conv_plan(out, &p) && p.params.silu == 1;
+        if (planned)
+            d3d12_ssm_conv_emulate(p.params, p.groups_x, p.groups_y, p.groups_z, vals[0].data(),
+                                   vals[1].data(), ref.data());
+        tol = 1e-5;
+    } else {
+        D3d12GdnPlan p;
+        planned = d3d12_gdn_plan(out, &p);
+        if (planned)
+            d3d12_gdn_emulate(p.params, p.groups_x, p.groups_y, p.groups_z, vals[0].data(),
+                              vals[1].data(), vals[2].data(), vals[3].data(), vals[4].data(),
+                              vals[5].data(), ref.data());
+        tol = 1e-4;
+    }
+    if (!planned) {
+        row.error = "no delta-net plan for the graph";
+        cleanup();
+        return row;
+    }
+    row.rel_err = d3d12_ssm_max_err(got.data(), ref.data(), got.size());
+    const bool match = tol == 0.0
+                           ? std::memcmp(got.data(), ref.data(), got.size() * sizeof(float)) == 0
+                           : row.rel_err <= tol;
+    row.ok = match && dispatches == want;
+    if (dispatches != want)
+        row.error = std::to_string(dispatches) + " dispatches, want " + std::to_string(want);
+    else if (!match)
+        row.error = tol == 0.0 ? "mismatch vs the host emulation (bit for bit)"
+                               : "mismatch vs the host emulation";
+    cleanup();
+    return row;
+}
+
 // The fixed cost of one graph_compute: an empty command list submitted and
 // waited for, median wall of 256 (in gpu_ms). Every CPU<->GPU split of a
 // model pays it once per ubatch.
@@ -3316,6 +3884,9 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
         out->push_back(run_moe_case(backend, 2, 2048, 1, 1));
         out->push_back(run_moe_case(backend, 2, 2048, 1, 5));
     }
+    if (gpu().ssm_ok)
+        for (int kind = 0; kind < 8; ++kind)
+            out->push_back(run_ssm_case(backend, kind));
     out->push_back(run_submit_rtt());
     ggml_backend_free(backend);
 }
