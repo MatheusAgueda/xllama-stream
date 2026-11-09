@@ -25,7 +25,9 @@ namespace xllama {
 
 // llama/ggml log lines worth keeping in xllama.log on every GGUF load, CPU or
 // d3d12: placement and buffer sizes, graph splits, the expert cache's hit/read
-// stats (patch 0004, "expert cache (running|final)"), and every warning or error.
+// stats (patch 0004, "expert cache (running|final)"), the scheduler's per-split
+// profile (patch 0011, GGML_SCHED_PROFILE: "sched profile" / "sched split"), and
+// every warning or error.
 // Before this was installed for all loads, a CPU-only load's warnings went to
 // llama's default stderr logger, which UWP never shows (found in a community
 // fork, SamirCharleston/xllama). Runs on llama.cpp's threads through a C
@@ -36,7 +38,8 @@ inline void llama_bridge_log(ggml_log_level level, const char* text, void*) noex
     const bool keep = level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR ||
                       std::strstr(text, "buffer size") || std::strstr(text, "offload") ||
                       std::strstr(text, "graph splits") || std::strstr(text, "splits = ") ||
-                      std::strstr(text, "D3D12") || std::strstr(text, "expert cache (");
+                      std::strstr(text, "D3D12") || std::strstr(text, "expert cache (") ||
+                      std::strstr(text, "sched profile") || std::strstr(text, "sched split");
     if (!keep)
         return;
     try {
