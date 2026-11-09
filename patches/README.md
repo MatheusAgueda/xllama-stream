@@ -37,8 +37,30 @@ on top of the weights already placed overflows the title's single ~5 GB pool
 `ggml_backend_tensor_set(..., offset, len)`. `--check-tensors` keeps the
 whole-tensor path, since `ggml_validate_row_data` needs the full buffer.
 
-`0005-graph-order-shared-input-projections.patch` (applies after 0003; 0004 is
-reserved for the expert cache): the D3D12 backend runs only the matmuls, so every
+`0004-expert-cache.patch` (applies after 0003): a routed-expert cache for MoE
+models larger than the title's memory, `llama_model_params::n_expert_slots`
+(`LLAMA_HAS_EXPERT_SLOTS`; catalogue `"expert_slots": N`,
+`apply_gguf_residency`). The `"stream": true` mapping from 0002 does not get
+there: the AppContainer caps the mapped total per process at 1.0–1.5 GiB
+(measured 2026-11-09), below the ~1.6 GB of non-expert weights of a 35B-A3B.
+With the cache, each routed `*_exps.weight` tensor is created with N experts
+instead of the GGUF's count (a CPU buffer type, `EXPERT_CACHE`), the loader
+records where the tensor lives in the file instead of reading it, and
+`build_moe_ffn` adds two custom ops per layer before the expert matmuls: a
+one-thread plan that maps the router's ids to slots (LRU per layer) and lists
+the misses, and a load that reads the missed experts with positional reads
+(`ReadFile` + `OVERLAPPED` on Windows, `pread` elsewhere) spread over the
+compute threads. The `mul_mat_id` ops take the slot ids; router weights,
+biases and per-expert scales keep the real ids. Every other weight is read into
+the heap as before (`load_mode` `NONE`). Limits: CPU only, one context per
+model at a time, `n_ubatch` capped at `N / n_expert_used`, not for
+`LLM_ARCH_GRANITE_SWITCH` (it calls `ggml_mul_mat_id` outside
+`build_moe_ffn`). Hits, misses and MiB read are logged every 64 ubatches and
+when the model is freed. `tests/test_expert_cache.cpp` decodes a small MoE with
+2 and 3 of its 4 experts resident and checks the tokens and logits against the
+same model fully resident (`.github/workflows/expert-cache-host.yml`).
+
+`0005-graph-order-shared-input-projections.patch` (applies after 0004): the D3D12 backend runs only the matmuls, so every
 switch between it and the CPU is one submit plus a fence wait (~90 µs measured on
 Series X). The graph is built depth first from the outputs, which puts the CPU
 ops of the q projection between it and the k projection, and the same for the

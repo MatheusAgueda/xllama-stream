@@ -142,6 +142,9 @@
     <ClCompile Include="..\llama.cpp\src\llama-grammar.cpp">
       <Filter>llama.cpp\llama</Filter>
     </ClCompile>
+    <ClCompile Include="..\llama.cpp\src\llama-expert-cache.cpp">
+      <Filter>llama.cpp\llama</Filter>
+    </ClCompile>
     <ClCompile Include="..\llama.cpp\src\llama-graph.cpp">
       <Filter>llama.cpp\llama</Filter>
     </ClCompile>

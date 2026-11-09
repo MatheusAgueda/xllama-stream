@@ -61,6 +61,18 @@ TEST_CASE("resolve_session_params: one resolver for every surface (ADR 0007)") {
     CatalogueLoad os = ort;
     os.stream = true;
     CHECK_FALSE(resolve_session_params("smollm2", os, "D:\\m\\smollm2", -1).stream_weights);
+
+    // An expert-cached GGUF also stays on the CPU; a negative count is off.
+    CatalogueLoad ec = g;
+    ec.expert_slots = 32;
+    const auto ect = resolve_session_params("moe", ec, "D:\\m\\moe", 16);
+    CHECK(ect.expert_slots == 32);
+    CHECK(ect.n_gpu_layers == 0);
+    CHECK(a.expert_slots == 0);
+    ec.expert_slots = -4;
+    CHECK(resolve_session_params("moe", ec, "D:\\m\\moe", -1).expert_slots == 0);
+    os.expert_slots = 32;
+    CHECK(resolve_session_params("smollm2", os, "D:\\m\\smollm2", -1).expert_slots == 0);
 }
 
 TEST_CASE("same_load: an adapter, context or GPU split is a different model in RAM") {
@@ -74,7 +86,7 @@ TEST_CASE("same_load: an adapter, context or GPU split is a different model in R
     other.n_threads = 6; // a tuning knob, not the load
     other.n_batch = 256;
     CHECK(same_load(base, other));
-    for (int field = 0; field < 6; ++field) {
+    for (int field = 0; field < 7; ++field) {
         auto changed = base;
         switch (field) {
         case 0:
@@ -94,6 +106,9 @@ TEST_CASE("same_load: an adapter, context or GPU split is a different model in R
             break;
         case 5:
             changed.stream_weights = true; // mapped vs heap: a different load
+            break;
+        case 6:
+            changed.expert_slots = 32; // a different set of weights in RAM
             break;
         }
         CHECK_MESSAGE(!same_load(base, changed), field);

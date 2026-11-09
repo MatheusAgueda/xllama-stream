@@ -22,7 +22,8 @@ struct CatalogueLoad {
     int gpu_layers = 0; // catalogue default; the operator knob may override it
     std::string lora;   // adapter file relative to the model directory
     float lora_scale = 1.0f;
-    bool stream = false; // "stream": weights stay file-backed (SessionParams::stream_weights)
+    bool stream = false;  // "stream": weights stay file-backed (SessionParams::stream_weights)
+    int expert_slots = 0; // "expert_slots": experts kept per MoE layer (SessionParams)
 };
 
 // `model_dir` is where the model's files live (resolve_model_path on the bare
@@ -40,9 +41,12 @@ inline SessionParams resolve_session_params(const std::string& model, const Cata
         return sp;
     sp.backend = Backend::LlamaCpp;
     sp.stream_weights = c.stream;
-    // A streamed model is larger than any GPU budget: d3d12 layers would copy
-    // their experts into video memory, so the knob does not apply to it.
-    sp.n_gpu_layers = c.stream ? 0 : resolve_gguf_gpu_layers(c.gpu_layers, gpu_layers_knob);
+    sp.expert_slots = c.expert_slots > 0 ? c.expert_slots : 0;
+    // A streamed or expert-cached model is larger than any GPU budget: d3d12
+    // layers would copy their experts into video memory, so the knob does not
+    // apply to it.
+    const bool cpu_only = c.stream || sp.expert_slots > 0;
+    sp.n_gpu_layers = cpu_only ? 0 : resolve_gguf_gpu_layers(c.gpu_layers, gpu_layers_knob);
     if (!c.lora.empty()) {
         sp.lora_path = model_dir;
         if (!sp.lora_path.empty() && sp.lora_path.back() != '\\' && sp.lora_path.back() != '/')
@@ -59,7 +63,7 @@ inline bool same_load(const SessionParams& a, const SessionParams& b) {
     return a.model_path == b.model_path && a.backend == b.backend && a.n_ctx == b.n_ctx &&
            a.n_gpu_layers == b.n_gpu_layers && a.lora_path == b.lora_path &&
            a.lora_scale == b.lora_scale && a.kv_q8 == b.kv_q8 &&
-           a.stream_weights == b.stream_weights;
+           a.stream_weights == b.stream_weights && a.expert_slots == b.expert_slots;
 }
 
 } // namespace xllama

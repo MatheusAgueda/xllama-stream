@@ -717,6 +717,7 @@ std::vector<ManifestEntry> parse_manifest(winrt::hstring const& text) {
         // 0 / absent → CPU; the operator knob still overrides (D3).
         e.gpu_layers = static_cast<int>(obj.GetNamedNumber(L"gpu_layers", 0));
         e.stream = obj.GetNamedBoolean(L"stream", false);
+        e.expert_slots = static_cast<int>(obj.GetNamedNumber(L"expert_slots", 0));
         if (obj.HasKey(L"files")) {
             for (auto const& f : obj.GetNamedArray(L"files")) {
                 auto fo = f.GetObject();
@@ -879,6 +880,7 @@ SessionParams CatalogueSessionParams(const std::string& model) {
         c.n_ctx = entry->n_ctx;
         c.gpu_layers = entry->gpu_layers;
         c.stream = entry->stream;
+        c.expert_slots = entry->expert_slots;
         c.lora = wstring_to_utf8(entry->lora);
         c.lora_scale = static_cast<float>(entry->lora_scale);
     }
