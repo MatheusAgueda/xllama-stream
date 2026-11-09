@@ -81,6 +81,9 @@ struct SessionParams {
     // expert-major, each expert read once (LLAMA_EXPERT_MAJOR). 0 = off.
     int expert_prefetch = 0;
     int expert_major = 0;
+    // With expert_prefetch: predict each layer's experts one layer earlier, so
+    // the reads overlap a whole layer (LLAMA_EXPERT_PREFETCH_AHEAD).
+    bool expert_prefetch_ahead = false;
 };
 
 struct GenerateParams {
