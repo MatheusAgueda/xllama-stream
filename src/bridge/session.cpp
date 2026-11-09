@@ -517,6 +517,18 @@ class LlamaSession final : public Session {
                 cparams.n_ubatch = static_cast<uint32_t>(m_n_ubatch);
             apply_gguf_gpu_context(m_gpu_layers, cparams,
                                    gguf_gpu_outputs_max(for_embedding, m_prompt_lookup));
+    #ifdef XLLAMA_UWP
+            // The session's decode loop asks for the same rows on the CPU, so
+            // the CPU path takes the cap too: the default reserve is n_ubatch
+            // logits rows, 512 x 248320 x 4 B = 529 MiB on Qwen3.5, which kept
+            // a 4.2 GB IQ3_M from getting a context under the Series X's
+            // 4.86 GB heap (2026-11-09).
+            if (m_gpu_layers <= 0) {
+                const uint32_t outputs_max = gguf_gpu_outputs_max(for_embedding, m_prompt_lookup);
+                if (outputs_max > 0)
+                    cparams.n_outputs_max = outputs_max;
+            }
+    #endif
             if (for_embedding) {
                 // Non-causal embedding graphs cannot split a sequence into
                 // physical micro-batches (llama.cpp asserts instead of failing).
