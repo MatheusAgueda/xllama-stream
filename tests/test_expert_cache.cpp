@@ -6,11 +6,19 @@
 // same logits after the prompt) while really reading experts from the file
 // (misses > 0 in the cache's final log line).
 //
+// With a swap ratio (cache-aware routing) the same run reads fewer experts.
+//
 // Opt-in: XLLAMA_EC_TEST_MODEL = a small MoE GGUF whose experts are not all
 // used per token (CI: ggml-org/stories15M_MOE Q8_0, 4 experts, 2 used —
 // .github/workflows/expert-cache-host.yml). SKIPs when unset; compiled only
 // against a llama.cpp with the patch (LLAMA_HAS_EXPERT_SLOTS), so the unpatched
 // build-linux job sees an empty file.
+//
+// "expert-cache bench" (opt-in: XLLAMA_EC_BENCH_MODEL = a real MoE GGUF) is a
+// measurement, not a check: decode speed, hit rate and read time per swap
+// ratio, the agreement of each ratio's tokens with exact routing, and the
+// exact run's routing as a trace for offline cache-policy simulation
+// (.github/workflows/expert-cache-bench.yml).
 
 #include <doctest/doctest.h>
 
@@ -18,6 +26,7 @@
 
 #ifdef LLAMA_HAS_EXPERT_SLOTS
 
+    #include <chrono>
     #include <cmath>
     #include <cstdio>
     #include <cstdlib>
@@ -25,6 +34,11 @@
     #include <mutex>
     #include <string>
     #include <vector>
+
+    #ifdef __linux__
+        #include <fcntl.h>
+        #include <unistd.h>
+    #endif
 
 namespace {
 
@@ -50,6 +64,15 @@ long long misses_of(const std::string& line) {
     return static_cast<long long>(misses);
 }
 
+// The "N swaps" count of a stats line, or -1 when it is not one.
+long long swaps_of(const std::string& line) {
+    const char* p = std::strstr(line.c_str(), " hit), ");
+    unsigned long long swaps = 0;
+    if (!p || std::sscanf(p, " hit), %llu swaps", &swaps) != 1)
+        return -1;
+    return static_cast<long long>(swaps);
+}
+
 struct EcRun {
     bool ok = false;
     uint32_t n_ubatch = 0;
@@ -60,7 +83,7 @@ struct EcRun {
 // used_override > 0 replaces the model's experts-per-token, which is what bounds
 // n_ubatch under the cache (n_slots / used): used 1 makes multi-token ubatches.
 EcRun run_greedy(const char* path, uint32_t slots, uint32_t n_ubatch, int64_t used_override,
-                 int n_gen) {
+                 int n_gen, float swap = 0.0f) {
     EcRun r;
     llama_model_kv_override kv[2] = {};
     if (used_override > 0) {
@@ -83,6 +106,7 @@ EcRun run_greedy(const char* path, uint32_t slots, uint32_t n_ubatch, int64_t us
     mp.n_gpu_layers = 0;
     mp.load_mode = LLAMA_LOAD_MODE_NONE;
     mp.n_expert_slots = slots;
+    mp.expert_swap_ratio = swap;
     if (used_override > 0)
         mp.kv_overrides = kv;
     llama_model* model = llama_model_load_from_file(path, mp);
@@ -135,6 +159,88 @@ float max_abs_diff(const std::vector<float>& a, const std::vector<float>& b) {
     return d;
 }
 
+// ---- expert-cache bench ----
+
+int env_int(const char* name, int def) {
+    const char* v = std::getenv(name);
+    return v && *v ? std::atoi(v) : def;
+}
+
+std::vector<float> env_ratios(const char* name, const char* def) {
+    const char* v = std::getenv(name);
+    const std::string s = v && *v ? v : def;
+    std::vector<float> out;
+    size_t pos = 0;
+    while (pos <= s.size()) {
+        const size_t comma = s.find(',', pos);
+        const std::string item = s.substr(pos, comma == std::string::npos ? comma : comma - pos);
+        if (!item.empty())
+            out.push_back(std::strtof(item.c_str(), nullptr));
+        if (comma == std::string::npos)
+            break;
+        pos = comma + 1;
+    }
+    return out;
+}
+
+double seconds_since(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
+void log_softmax(const float* lg, int32_t n, std::vector<float>& out) {
+    out.resize(static_cast<size_t>(n));
+    float mx = lg[0];
+    for (int32_t v = 1; v < n; ++v)
+        mx = std::fmax(mx, lg[v]);
+    double sum = 0.0;
+    for (int32_t v = 0; v < n; ++v)
+        sum += std::exp(static_cast<double>(lg[v] - mx));
+    const float lse = mx + static_cast<float>(std::log(sum));
+    for (int32_t v = 0; v < n; ++v)
+        out[static_cast<size_t>(v)] = lg[v] - lse;
+}
+
+// Drops the model file's clean pages, so every ratio starts from the same cold
+// page cache and its reads cost what they would on first touch.
+void drop_page_cache(const char* path) {
+    #ifdef __linux__
+    const int fd = open(path, O_RDONLY);
+    if (fd >= 0) {
+        posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+        close(fd);
+    }
+    #else
+    (void)path;
+    #endif
+}
+
+// Routing trace: one line per layer and ubatch, "layer n_tok" and then the
+// n_tok x n_used expert ids, read through the strides (argsort_top_k's result
+// is a view). f == nullptr still observes, so every ratio pays the same split
+// overhead.
+struct EcTrace {
+    FILE* f = nullptr;
+};
+
+bool ec_trace_cb(ggml_tensor* t, bool ask, void* user_data) {
+    static constexpr char kTopk[] = "ffn_moe_topk-";
+    const bool topk = std::strncmp(t->name, kTopk, sizeof(kTopk) - 1) == 0;
+    if (ask)
+        return topk;
+    auto* tr = static_cast<EcTrace*>(user_data);
+    if (!topk || !tr->f || t->type != GGML_TYPE_I32 || !t->buffer ||
+        !ggml_backend_buffer_is_host(t->buffer))
+        return true;
+    std::fprintf(tr->f, "%s %lld", t->name + sizeof(kTopk) - 1, static_cast<long long>(t->ne[1]));
+    const auto* base = static_cast<const char*>(t->data);
+    for (int64_t j = 0; j < t->ne[1]; ++j)
+        for (int64_t i = 0; i < t->ne[0]; ++i)
+            std::fprintf(tr->f, " %d",
+                         *reinterpret_cast<const int32_t*>(base + i * t->nb[0] + j * t->nb[1]));
+    std::fputc('\n', tr->f);
+    return true;
+}
+
 } // namespace
 
 TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST_MODEL)") {
@@ -170,7 +276,26 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
             final_line = log.final_line;
         }
         MESSAGE(final_line);
-        CHECK(misses_of(final_line) > 0);
+        const long long misses = misses_of(final_line);
+        CHECK(misses > 0);
+        CHECK(swaps_of(final_line) == 0);
+
+        // Cache-aware routing: a resident expert stands in for a missing one
+        // with at least half its probability, so the same run reads less.
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            log.final_line.clear();
+        }
+        const EcRun swapped = run_greedy(path, c.slots, 512, c.used, 24, 0.5f);
+        REQUIRE(swapped.ok);
+        CHECK(swapped.n_ubatch == cached.n_ubatch);
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            MESSAGE(log.final_line);
+            CHECK(swaps_of(log.final_line) > 0);
+            CHECK(misses_of(log.final_line) >= 0);
+            CHECK(misses_of(log.final_line) < misses);
+        }
 
         // Same ubatch size: the CPU kernels differ between batch shapes.
         const EcRun full = run_greedy(path, 0, cached.n_ubatch, c.used, 24);
@@ -192,6 +317,190 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
     {
         std::lock_guard<std::mutex> lock(log.mtx);
         CHECK(log.final_line.empty());
+    }
+
+    llama_log_set(nullptr, nullptr);
+}
+
+// A measurement, not a check (the hyphen keeps it out of "expert cache*"): per
+// swap ratio, prefill and decode speed and the cache's final stats; for every
+// ratio after the first, the top-1 agreement and the mean KL against the first
+// ratio's greedy run, teacher-forced on its tokens so a diverging continuation
+// cannot hide or inflate the difference. Env: XLLAMA_EC_BENCH_SLOTS (32),
+// _SWAPS ("0,0.5,0.7"), _TOKENS (64), _THREADS (4), _TRACE (path: the first
+// ratio's routing, for offline cache-policy simulation).
+TEST_CASE("expert-cache bench (opt-in: XLLAMA_EC_BENCH_MODEL)") {
+    const char* path = std::getenv("XLLAMA_EC_BENCH_MODEL");
+    if (!path)
+        return;
+    const auto slots = static_cast<uint32_t>(env_int("XLLAMA_EC_BENCH_SLOTS", 32));
+    const int n_gen = env_int("XLLAMA_EC_BENCH_TOKENS", 64);
+    const int n_threads = env_int("XLLAMA_EC_BENCH_THREADS", 4);
+    const std::vector<float> ratios = env_ratios("XLLAMA_EC_BENCH_SWAPS", "0,0.5,0.7");
+    const char* trace_path = std::getenv("XLLAMA_EC_BENCH_TRACE");
+    REQUIRE(!ratios.empty());
+    REQUIRE(n_gen > 0);
+
+    // Chat format with an empty think block: answers, not reasoning, in n_gen tokens.
+    static const char* const prompts[] = {
+        "Explica em português de Portugal, em três frases, como funciona uma bomba de calor.",
+        "Write a Python function that reads a CSV file and returns the mean of its \"price\" "
+        "column.",
+        "A train leaves at 14:35 and arrives at 17:10 after a 20 minute stop. For how long was it "
+        "moving? Answer briefly.",
+    };
+    constexpr size_t n_prompts = sizeof(prompts) / sizeof(prompts[0]);
+
+    llama_backend_init();
+    EcLog log;
+    llama_log_set(ec_log_cb, &log);
+    EcTrace trace;
+
+    std::vector<llama_token> ref_tokens[n_prompts];
+    std::vector<std::vector<float>> ref_logp[n_prompts];
+    std::vector<float> logp;
+
+    for (size_t r = 0; r < ratios.size(); ++r) {
+        const bool reference = r == 0;
+        CAPTURE(ratios[r]);
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            log.final_line.clear();
+        }
+        drop_page_cache(path);
+        llama_model_params mp = llama_model_default_params();
+        mp.n_gpu_layers = 0;
+        mp.load_mode = LLAMA_LOAD_MODE_NONE;
+        mp.n_expert_slots = slots;
+        mp.expert_swap_ratio = ratios[r];
+        auto t_load = std::chrono::steady_clock::now();
+        llama_model* model = llama_model_load_from_file(path, mp);
+        REQUIRE(model);
+        const double load_s = seconds_since(t_load);
+
+        if (reference && trace_path) {
+            trace.f = std::fopen(trace_path, "w");
+            CHECK(trace.f);
+        }
+        llama_context_params cp = llama_context_default_params();
+        cp.n_ctx = 1024;
+        cp.n_batch = 512;
+        cp.n_ubatch = 512;
+        cp.n_threads = n_threads;
+        cp.n_threads_batch = n_threads;
+        if (trace_path) {
+            cp.cb_eval = ec_trace_cb;
+            cp.cb_eval_user_data = &trace;
+        }
+        llama_context* ctx = llama_init_from_model(model, cp);
+        REQUIRE(ctx);
+        const llama_vocab* vocab = llama_model_get_vocab(model);
+        const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+        std::printf("[ec-bench] ratio %.2f: load %.1f s, %u slots, n_ubatch %u, %d threads\n",
+                    ratios[r], load_s, slots, llama_n_ubatch(ctx), n_threads);
+
+        int gen_total = 0;
+        double gen_s_total = 0.0;
+        double kl_sum = 0.0;
+        int agree_total = 0;
+        int steps_total = 0;
+        for (size_t p = 0; p < n_prompts; ++p) {
+            llama_memory_clear(llama_get_memory(ctx), true);
+            if (trace.f)
+                std::fprintf(trace.f, "# prompt %zu\n", p);
+            const std::string text = std::string("<|im_start|>user\n") + prompts[p] +
+                                     "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+            std::vector<llama_token> toks(text.size() + 16);
+            const int32_t n =
+                llama_tokenize(vocab, text.c_str(), static_cast<int32_t>(text.size()), toks.data(),
+                               static_cast<int32_t>(toks.size()), true, true);
+            REQUIRE(n > 0);
+            toks.resize(static_cast<size_t>(n));
+
+            auto t0 = std::chrono::steady_clock::now();
+            REQUIRE(llama_decode(ctx, llama_batch_get_one(toks.data(), n)) == 0);
+            const double prompt_s = seconds_since(t0);
+
+            // The reference generates; the other ratios replay its tokens.
+            const int steps = reference ? n_gen : static_cast<int>(ref_tokens[p].size());
+            int agree = 0;
+            int decoded = 0;
+            double kl = 0.0;
+            std::string out;
+            t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < steps; ++i) {
+                const float* lg = llama_get_logits_ith(ctx, -1);
+                llama_token best = 0;
+                for (llama_token v = 1; v < n_vocab; ++v)
+                    if (lg[v] > lg[best])
+                        best = v;
+                llama_token next = best;
+                if (reference) {
+                    ref_tokens[p].push_back(best);
+                    log_softmax(lg, n_vocab, logp);
+                    ref_logp[p].push_back(logp);
+                    char piece[256];
+                    const int32_t len =
+                        llama_token_to_piece(vocab, best, piece, sizeof(piece), 0, false);
+                    if (len > 0)
+                        out.append(piece, static_cast<size_t>(len));
+                } else {
+                    next = ref_tokens[p][static_cast<size_t>(i)];
+                    agree += best == next;
+                    log_softmax(lg, n_vocab, logp);
+                    const std::vector<float>& ref = ref_logp[p][static_cast<size_t>(i)];
+                    double d = 0.0;
+                    for (int32_t v = 0; v < n_vocab; ++v) {
+                        const auto k = static_cast<size_t>(v);
+                        d += std::exp(static_cast<double>(ref[k])) * (ref[k] - logp[k]);
+                    }
+                    kl += d;
+                }
+                if (llama_vocab_is_eog(vocab, next))
+                    break;
+                REQUIRE(llama_decode(ctx, llama_batch_get_one(&next, 1)) == 0);
+                ++decoded;
+            }
+            const double gen_s = seconds_since(t0);
+            gen_total += decoded;
+            gen_s_total += gen_s;
+            std::printf("[ec-bench] ratio %.2f prompt %zu: prefill %d tok %.2f s (%.2f tok/s), "
+                        "decode %d tok %.2f s (%.2f tok/s)",
+                        ratios[r], p, n, prompt_s, n / prompt_s, decoded, gen_s,
+                        decoded > 0 ? decoded / gen_s : 0.0);
+            if (reference) {
+                std::printf("\n[ec-bench] text %zu: %s\n", p, out.c_str());
+            } else {
+                const int scored = static_cast<int>(ref_tokens[p].size());
+                agree_total += agree;
+                steps_total += scored;
+                kl_sum += kl;
+                std::printf(", top-1 %d/%d, mean KL %.5f\n", agree, scored,
+                            scored > 0 ? kl / scored : 0.0);
+            }
+            std::fflush(stdout);
+        }
+        llama_free(ctx);
+        if (trace.f) {
+            std::fclose(trace.f);
+            trace.f = nullptr;
+        }
+        llama_model_free(model); // the cache logs its final stats here
+        std::string final_line;
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            final_line = log.final_line;
+        }
+        std::printf("[ec-bench] ratio %.2f total: decode %.2f tok/s", ratios[r],
+                    gen_s_total > 0.0 ? gen_total / gen_s_total : 0.0);
+        if (!reference)
+            std::printf(", top-1 %.1f%%, mean KL %.5f",
+                        steps_total > 0 ? 100.0 * agree_total / steps_total : 0.0,
+                        steps_total > 0 ? kl_sum / steps_total : 0.0);
+        std::printf("\n[ec-bench] ratio %.2f %s", ratios[r],
+                    final_line.empty() ? "no cache stats\n" : final_line.c_str());
+        std::fflush(stdout);
+        CHECK(swaps_of(final_line) >= 0);
     }
 
     llama_log_set(nullptr, nullptr);

@@ -104,8 +104,12 @@ struct ManifestEntry {
     // (MoE larger than the RAM budget; CPU only). SessionParams::stream_weights.
     bool stream = false;
     // "expert_slots": N → MoE experts read from the file on demand, N per layer
-    // kept in the heap (CPU only; wins over "stream"). SessionParams::expert_slots.
+    // kept in the heap (expert matmuls on the CPU, "gpu_layers" offloads the
+    // rest; wins over "stream"). SessionParams::expert_slots.
     int expert_slots = 0;
+    // "expert_swap": (0, 1] → cache-aware routing with expert_slots, fewer reads
+    // for a small change in output. SessionParams::expert_swap.
+    double expert_swap = 0.0;
 };
 
 // Load the model catalogue: InstalledPath\models\manifest.json (bundled) is

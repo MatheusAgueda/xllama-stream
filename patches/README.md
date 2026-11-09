@@ -52,13 +52,25 @@ the misses, and a load that reads the missed experts with positional reads
 (`ReadFile` + `OVERLAPPED` on Windows, `pread` elsewhere) spread over the
 compute threads. The `mul_mat_id` ops take the slot ids; router weights,
 biases and per-expert scales keep the real ids. Every other weight is read into
-the heap as before (`load_mode` `NONE`). Limits: CPU only, one context per
-model at a time, `n_ubatch` capped at `N / n_expert_used`, not for
+the heap as before (`load_mode` `NONE`). The expert matmuls run on the CPU (the
+buffer type is a host one no GPU backend claims), so `n_gpu_layers` may still
+offload the rest of each layer. `llama_model_params::expert_swap_ratio`
+(catalogue `"expert_swap"`, 0 = off) adds cache-aware routing, a third op that
+replaces the top-k: a resident expert outside a token's top-k takes the place
+of a missing one inside it when its router score is at least that fraction of
+the missing one's (weakest missing first, strongest resident first); the
+weights are still the router's for the ids chosen. Fewer reads, output no longer
+exact; not for logit-weighted gating (`SOFTMAX_WEIGHT`). Limits: one context
+per model at a time, `n_ubatch` capped at `N / n_expert_used`, not for
 `LLM_ARCH_GRANITE_SWITCH` (it calls `ggml_mul_mat_id` outside
-`build_moe_ffn`). Hits, misses and MiB read are logged every 64 ubatches and
-when the model is freed. `tests/test_expert_cache.cpp` decodes a small MoE with
-2 and 3 of its 4 experts resident and checks the tokens and logits against the
-same model fully resident (`.github/workflows/expert-cache-host.yml`).
+`build_moe_ffn`). Hits, misses, swaps, MiB read and the time the reads took are
+logged every 64 ubatches and when the model is freed.
+`tests/test_expert_cache.cpp` decodes a small MoE with 2 and 3 of its 4 experts
+resident and checks the tokens and logits against the same model fully
+resident, and that a swap ratio of 0.5 reads less
+(`.github/workflows/expert-cache-host.yml`); its opt-in "expert-cache bench"
+measures speed, hit rate, top-1 agreement and KL per swap ratio on the 35B and
+keeps the routing trace (`.github/workflows/expert-cache-bench.yml`).
 
 `0005-graph-order-shared-input-projections.patch` (applies after 0004): the D3D12 backend runs only the matmuls, so every
 switch between it and the CPU is one submit plus a fence wait (~90 µs measured on

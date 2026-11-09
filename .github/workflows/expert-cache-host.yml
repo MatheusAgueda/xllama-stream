@@ -10,6 +10,8 @@ on:
   # A new workflow file is dispatchable only once it is on the default branch;
   # until then a push touching the patch, the test or the plumbing runs it.
   push:
+    # ec-bench carries the same commits for expert-cache-bench.yml only.
+    branches-ignore: [ec-bench]
     paths:
       - patches/**
       - scripts/apply-uwp-patches.sh

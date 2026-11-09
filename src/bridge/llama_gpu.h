@@ -84,15 +84,19 @@ inline bool gguf_embedding_info(const std::string& path, ggml_type* embd_type, b
 // read into the heap except the MoE experts, of which only expert_slots per
 // layer stay resident; the others are read from the file when routed to. The
 // heap is fixed-size, unlike a mapping, which the AppContainer caps per process.
-inline void apply_gguf_residency(bool stream, llama_model_params& mparams, int expert_slots = 0) {
+// expert_swap > 0: cache-aware routing (llama_model_params::expert_swap_ratio).
+inline void apply_gguf_residency(bool stream, llama_model_params& mparams, int expert_slots = 0,
+                                 float expert_swap = 0.0f) {
     if (expert_slots > 0) {
 #ifdef LLAMA_HAS_EXPERT_SLOTS
         mparams.load_mode = LLAMA_LOAD_MODE_NONE;
         mparams.n_expert_slots = static_cast<uint32_t>(expert_slots);
+        mparams.expert_swap_ratio = expert_swap;
         log_output("[xllama] gguf weights: heap, expert cache of " + std::to_string(expert_slots) +
-                   " experts per layer\n");
+                   " experts per layer, swap ratio " + std::to_string(expert_swap) + "\n");
         return;
 #else
+        (void)expert_swap;
         log_output("[xllama] gguf expert cache: this llama.cpp lacks patch 0004, ignored\n");
 #endif
     }

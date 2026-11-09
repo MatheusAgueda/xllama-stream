@@ -68,9 +68,14 @@ struct SessionParams {
     // GGUF only (llama.cpp patch 0004): keep this many experts per MoE layer in
     // the heap and read the others from the model file when the router picks
     // them, so a MoE larger than the title's memory runs from a fixed-size cache
-    // rather than a mapping the AppContainer caps. 0 = off. Forces the CPU (no
-    // d3d12 layers) and takes precedence over stream_weights. apply_gguf_residency.
+    // rather than a mapping the AppContainer caps. 0 = off. The expert matmuls
+    // run on the CPU; n_gpu_layers still offloads the rest of each layer. Takes
+    // precedence over stream_weights. apply_gguf_residency.
     int expert_slots = 0;
+    // With expert_slots: cache-aware routing, (0, 1]. A resident expert just
+    // outside a token's top-k replaces a missing one when its router score is at
+    // least this fraction of the missing one's. 0 = exact routing.
+    float expert_swap = 0.0f;
 };
 
 struct GenerateParams {
