@@ -558,6 +558,7 @@ void run_d3d12_memprobe(const std::function<void(const std::string&)>& emit) {
         #include <chrono>
         #include <cstdint>
         #include <cstdlib>
+        #include <map>
         #include <mutex>
         #include <random>
 
@@ -663,6 +664,13 @@ struct Gpu {
     std::uint64_t n_submits = 0;
     double wall_ms = 0.0;
     double gpu_ms = 0.0;
+    // graph_compute calls by their first and last node, layer suffix dropped:
+    // where the scheduler hands work to the CPU and back (seg_name).
+    struct SegStat {
+        std::uint64_t n = 0;
+        double ms = 0.0;
+    };
+    std::map<std::string, SegStat> segs;
     std::mutex mu;
     bool ok = false;
     std::string error;
@@ -1262,10 +1270,36 @@ void backend_free(ggml_backend_t b) {
                       static_cast<unsigned long long>(g.n_submits),
                       static_cast<unsigned long long>(g.n_dispatches), g.wall_ms, g.gpu_ms);
         log_output(msg);
+        std::vector<std::pair<std::string, Gpu::SegStat>> top(g.segs.begin(), g.segs.end());
+        std::sort(top.begin(), top.end(),
+                  [](const auto& x, const auto& y) { return x.second.ms > y.second.ms; });
+        if (top.size() > 24)
+            top.resize(24);
+        for (const auto& [key, s] : top) {
+            char line[384];
+            std::snprintf(line, sizeof(line), "[xllama] d3d12 split: %8llu x %9.1f ms  %s\n",
+                          static_cast<unsigned long long>(s.n), s.ms, key.c_str());
+            log_output(line);
+        }
         g.n_calls = g.n_submits = g.n_dispatches = 0;
         g.wall_ms = g.gpu_ms = 0.0;
+        g.segs.clear();
     }
     delete b;
+}
+
+// A node's name without its layer suffix or view decoration ("ffn_moe_up-12
+// (view)" -> "ffn_moe_up"), so the same split of every layer is one key.
+std::string seg_name(const ggml_tensor* t) {
+    std::string s = t->name[0] ? t->name : ggml_op_desc(t);
+    const std::size_t paren = s.find(" (");
+    if (paren != std::string::npos)
+        s.resize(paren);
+    const std::size_t dash = s.rfind('-');
+    if (dash != std::string::npos && dash + 1 < s.size() &&
+        s.find_first_not_of("0123456789", dash + 1) == std::string::npos)
+        s.resize(dash);
+    return s;
 }
 
 // Grow the q8 activation scratch. Caller holds g.mu and has nothing in flight.
@@ -1812,8 +1846,13 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
         return GGML_STATUS_FAILED;
     ++g.n_calls;
     g.gpu_ms += g.last_gpu_ms;
-    g.wall_ms +=
+    const double ms =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    g.wall_ms += ms;
+    Gpu::SegStat& seg = g.segs[seg_name(nodes.front()) + " .. " + seg_name(nodes.back()) + " /" +
+                               std::to_string(nodes.size())];
+    ++seg.n;
+    seg.ms += ms;
     return GGML_STATUS_SUCCESS;
 }
 
@@ -2709,6 +2748,32 @@ D3d12SelftestRow run_mmid_case(ggml_backend_t backend, int n, int k, int ne11, i
     return row;
 }
 
+// The fixed cost of one graph_compute: an empty command list submitted and
+// waited for, median wall of 256 (in gpu_ms). Every CPU<->GPU split of a
+// model pays it once per ubatch.
+D3d12SelftestRow run_submit_rtt() {
+    D3d12SelftestRow row;
+    row.type = "submit_rtt";
+    row.n = 256;
+    Gpu& g = gpu();
+    std::vector<double> ms;
+    std::lock_guard<std::mutex> lock(g.mu);
+    for (int i = 0; i < row.n; ++i) {
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!run_now(g, [](ID3D12GraphicsCommandList*) {})) {
+            row.error = "submit failed";
+            return row;
+        }
+        ms.push_back(
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                .count());
+    }
+    std::sort(ms.begin(), ms.end());
+    row.gpu_ms = ms[ms.size() / 2];
+    row.d3d12_ran = row.ok = true;
+    return row;
+}
+
 } // namespace
 
 void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
@@ -2763,6 +2828,7 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
         out->push_back(run_mmid_case(backend, 512, 2048, 1, 5));
         out->push_back(run_mmid_case(backend, 2048, 512, 8, 5));
     }
+    out->push_back(run_submit_rtt());
     ggml_backend_free(backend);
 }
 

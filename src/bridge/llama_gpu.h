@@ -32,8 +32,8 @@ inline void llama_bridge_log(ggml_log_level level, const char* text, void*) noex
         return;
     const bool keep = level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR ||
                       std::strstr(text, "buffer size") || std::strstr(text, "offload") ||
-                      std::strstr(text, "graph splits") || std::strstr(text, "D3D12") ||
-                      std::strstr(text, "expert cache (");
+                      std::strstr(text, "graph splits") || std::strstr(text, "splits = ") ||
+                      std::strstr(text, "D3D12") || std::strstr(text, "expert cache (");
     if (!keep)
         return;
     try {
