@@ -71,10 +71,10 @@ index 07b4c61..6557247 100644
              cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
 diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
 new file mode 100644
-index 0000000..dda33a1
+index 0000000..76862f9
 --- /dev/null
 +++ b/src/llama-expert-cache.cpp
-@@ -0,0 +1,1650 @@
+@@ -0,0 +1,1716 @@
 +#include "llama-expert-cache.h"
 +
 +#include "llama-impl.h"
@@ -115,6 +115,10 @@ index 0000000..dda33a1
 +#else
 +#    include <fcntl.h>
 +#    include <unistd.h>
++#endif
++
++#if !defined(GGML_BACKEND_DL) && (defined(__x86_64__) || defined(_M_X64))
++#    include <immintrin.h> // ec_copy_stream
 +#endif
 +
 +namespace {
@@ -318,7 +322,7 @@ index 0000000..dda33a1
 +    std::atomic<uint64_t> em_kept   {0}; // experts read into a slot (resident for what follows)
 +    std::atomic<uint64_t> em_bytes  {0};
 +    std::atomic<uint64_t> em_us     {0}; // wall time of the expert-major matmuls (reads and compute)
-+    std::vector<std::vector<uint8_t>> em_stage; // per compute thread: an expert read from the file
++    std::vector<std::vector<uint8_t>> em_stage; // per compute thread: an expert read from the file, or rows of a resident one
 +
 +    void log_stats(const char * when) const {
 +        const uint64_t h = hits.load();
@@ -1180,7 +1184,8 @@ index 0000000..dda33a1
 +// tokens from its slot if resident, else from one read of it: one read per expert, layer and tensor
 +// however many tokens use it. The missing experts with the most tokens are read into the least
 +// recently used slots (the resident ones pinned) and stay resident for the ubatches that follow, the
-+// others into the thread's staging buffer. The activations are quantized for the expert type's CPU
++// others only into the thread's staging buffer. The CPU computes from the stage, never from a slot
++// (ec_em_mm). The activations are quantized for the expert type's CPU
 +// dot product, as ggml's mul_mat_id does, so the result is the same up to the summation order.
 +// Prefetch is off for these ubatches
 +//
@@ -1189,6 +1194,54 @@ index 0000000..dda33a1
 +
 +// pairs per pass over an expert's rows: their activations stay in L1 while each row is reused
 +static constexpr int64_t EC_EM_CHUNK = 16;
++
++// bytes of a resident expert's rows copied to the stage at a time: they stay in L2 while every pair
++// of the expert reads them
++static constexpr size_t EC_EM_BLOCK = 64*1024;
++
++// memcpy, the source read with streaming loads (MOVNTDQA: a line per four loads on write-combined
++// memory, an ordinary load on write-back memory) and, with nt, the destination written with
++// streaming stores, fenced. Both 16-byte aligned, else a plain memcpy
++#if defined(__x86_64__) || defined(_M_X64)
++#    if defined(__GNUC__) || defined(__clang__)
++__attribute__((target("sse4.1")))
++#    endif
++static void ec_copy_stream(void * dst, const void * src, size_t n, bool nt) {
++    char       * d = (char *) dst;
++    const char * s = (const char *) src;
++    if ((((uintptr_t) d | (uintptr_t) s) & 15) == 0) {
++        const size_t n64 = n & ~(size_t) 63;
++        for (size_t i = 0; i < n64; i += 64) {
++            const __m128i x0 = _mm_stream_load_si128((__m128i *) (s + i));
++            const __m128i x1 = _mm_stream_load_si128((__m128i *) (s + i + 16));
++            const __m128i x2 = _mm_stream_load_si128((__m128i *) (s + i + 32));
++            const __m128i x3 = _mm_stream_load_si128((__m128i *) (s + i + 48));
++            if (nt) {
++                _mm_stream_si128((__m128i *) (d + i), x0);
++                _mm_stream_si128((__m128i *) (d + i + 16), x1);
++                _mm_stream_si128((__m128i *) (d + i + 32), x2);
++                _mm_stream_si128((__m128i *) (d + i + 48), x3);
++            } else {
++                _mm_store_si128((__m128i *) (d + i), x0);
++                _mm_store_si128((__m128i *) (d + i + 16), x1);
++                _mm_store_si128((__m128i *) (d + i + 32), x2);
++                _mm_store_si128((__m128i *) (d + i + 48), x3);
++            }
++        }
++        if (nt) {
++            _mm_sfence();
++        }
++        d += n64;
++        s += n64;
++        n -= n64;
++    }
++    memcpy(d, s, n);
++}
++#else
++static void ec_copy_stream(void * dst, const void * src, size_t n, bool) {
++    memcpy(dst, src, n);
++}
++#endif
 +
 +// the CPU traits of an expert type whose rows of k values the expert-major matmul can compute
 +static const ggml_type_traits_cpu * ec_em_traits(ggml_type type, int64_t k) {
@@ -1319,8 +1372,8 @@ index 0000000..dda33a1
 +}
 +
 +// all threads: dst [rows, n_used, n_tokens] (F32) = ggml_mul_mat_id(w, b, ids); the threads take the
-+// experts one at a time, reading a missing one into the slot of the round or their staging buffer.
-+// src = {the prep op}
++// experts one at a time, reading a missing one into their staging buffer (and from there into the
++// slot of the round). src = {the prep op}
 +static void ec_em_mm(ggml_tensor * dst, int ith, int nth, void * userdata) {
 +    const int64_t t0 = ggml_time_us();
 +
@@ -1344,47 +1397,60 @@ index 0000000..dda33a1
 +    uint64_t hits  = 0;
 +    const char * src[EC_EM_CHUNK];
 +    float      * out[EC_EM_CHUNK];
++    std::vector<uint8_t> & stage = C.em_stage[ith];
++    auto stage_buf = [&stage](size_t n) {
++        if (stage.size() < n + 64) {
++            stage.resize(n + 64);
++        }
++        return (char *) GGML_PAD((uintptr_t) stage.data(), 64);
++    };
++    const size_t  nb1 = w->nb[1];
++    const int64_t blk = std::max<int64_t>(1, (int64_t) (EC_EM_BLOCK/nb1)); // rows per copy of a resident expert
 +    for (int32_t i = E.next.fetch_add(1); i < n_list; i = E.next.fetch_add(1)) {
 +        const int32_t e = E.list[i];
 +        const int32_t v = L.em_slot[e];
 +        const int32_t s = L.slot_of[e];
-+        const char * wd = nullptr;
-+        if (v >= 0) {
-+            char * slot = (char *) w->data + (size_t) v*nb2;
-+            ec_read(*C.files[T.file], ith, slot, nb2, T.offs + (size_t) e*nb2);
-+            wd = slot;
-+            reads++;
-+        } else if (s >= 0) {
-+            wd = (const char *) w->data + (size_t) s*nb2;
-+            hits++;
-+        } else {
-+            std::vector<uint8_t> & stage = C.em_stage[ith];
-+            if (stage.size() < nb2 + 64) {
-+                stage.resize(nb2 + 64);
-+            }
-+            char * buf = (char *) GGML_PAD((uintptr_t) stage.data(), 64);
-+            ec_read(*C.files[T.file], ith, buf, nb2, T.offs + (size_t) e*nb2);
-+            wd = buf;
-+            reads++;
-+        }
-+
 +        const int32_t * pairs = E.pairs.data() + E.first[e];
 +        const int64_t   n_p   = E.count[e];
-+        for (int64_t c0 = 0; c0 < n_p; c0 += EC_EM_CHUNK) {
-+            const int64_t n_c = std::min(n_p - c0, EC_EM_CHUNK);
-+            for (int64_t j = 0; j < n_c; ++j) {
-+                const int64_t p  = pairs[c0 + j];
-+                const int64_t kk = p % n_used;
-+                const int64_t t  = p / n_used;
-+                src[j] = (const char *) q->data + (size_t) (kk % ne11 + ne11*t)*qrs;
-+                out[j] = (float *) ((char *) dst->data + kk*dst->nb[1] + t*dst->nb[2]);
-+            }
-+            for (int64_t r = 0; r < n_rows; ++r) {
-+                const char * row = wd + r*w->nb[1];
++        // rows [r0, r1) of the expert's outputs, wd holding those rows
++        auto mm_rows = [&](const char * wd, int64_t r0, int64_t r1) {
++            for (int64_t c0 = 0; c0 < n_p; c0 += EC_EM_CHUNK) {
++                const int64_t n_c = std::min(n_p - c0, EC_EM_CHUNK);
 +                for (int64_t j = 0; j < n_c; ++j) {
-+                    tr->vec_dot((int) k, out[j] + r, 0, row, 0, src[j], 0, 1);
++                    const int64_t p  = pairs[c0 + j];
++                    const int64_t kk = p % n_used;
++                    const int64_t t  = p / n_used;
++                    src[j] = (const char *) q->data + (size_t) (kk % ne11 + ne11*t)*qrs;
++                    out[j] = (float *) ((char *) dst->data + kk*dst->nb[1] + t*dst->nb[2]);
++                }
++                for (int64_t r = r0; r < r1; ++r) {
++                    const char * row = wd + (size_t) (r - r0)*nb1;
++                    for (int64_t j = 0; j < n_c; ++j) {
++                        tr->vec_dot((int) k, out[j] + r, 0, row, 0, src[j], 0, 1);
++                    }
 +                }
 +            }
++        };
++        // the CPU never computes from a slot: a write-combined slot (XLLAMA_D3D12_WC_MIB) is uncached,
++        // each load a bus read. A read goes to the stage, then to the round's slot with streaming
++        // stores; a resident expert comes to the stage a block of rows at a time with streaming loads
++        if (v < 0 && s >= 0) {
++            const char * slot = (const char *) w->data + (size_t) s*nb2;
++            char       * buf  = stage_buf(std::min<size_t>(nb2, (size_t) blk*nb1));
++            for (int64_t r0 = 0; r0 < n_rows; r0 += blk) {
++                const int64_t r1 = std::min(n_rows, r0 + blk);
++                ec_copy_stream(buf, slot + (size_t) r0*nb1, (size_t) (r1 - r0)*nb1, false);
++                mm_rows(buf, r0, r1);
++            }
++            hits++;
++        } else {
++            char * buf = stage_buf(nb2);
++            ec_read(*C.files[T.file], ith, buf, nb2, T.offs + (size_t) e*nb2);
++            if (v >= 0) {
++                ec_copy_stream((char *) w->data + (size_t) v*nb2, buf, nb2, true);
++            }
++            mm_rows(buf, 0, n_rows);
++            reads++;
 +        }
 +    }
 +
