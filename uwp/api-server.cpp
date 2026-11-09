@@ -1124,6 +1124,22 @@ std::vector<std::string> servable_model_ids() {
         if (::xllama::model_dir_files_ready(files))
             ids.push_back(entry.path().filename().string());
     }
+    // Catalogue entries named by a model directory outside LocalState (an Xbox's
+    // D:\DevelopmentFiles\xllama\models\<id>, uploaded over SMB): the id is that
+    // path, which POST "model" takes as is (model_servable_locked).
+    for (const auto& e : ::xllama::LoadModelManifest()) {
+        const std::string id = winrt::to_string(e.name);
+        if (id.find_first_of("\\/:") == std::string::npos ||
+            std::find(ids.begin(), ids.end(), id) != ids.end())
+            continue;
+        std::error_code dec;
+        std::vector<std::string> files;
+        for (const auto& f :
+             std::filesystem::directory_iterator(std::filesystem::path(e.name), dec))
+            files.push_back(f.path().filename().string());
+        if (!dec && ::xllama::model_dir_files_ready(files))
+            ids.push_back(id);
+    }
     std::sort(ids.begin(), ids.end());
     const std::string current = current_model_id();
     if (!current.empty() && std::find(ids.begin(), ids.end(), current) == ids.end())
