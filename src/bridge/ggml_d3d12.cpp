@@ -24,7 +24,7 @@ namespace xllama {
 
 bool d3d12_weight_type_supported(ggml_type t) {
     return t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q6_K ||
-           t == GGML_TYPE_IQ3_S;
+           t == GGML_TYPE_IQ3_S || t == GGML_TYPE_IQ4_XS || t == GGML_TYPE_Q5_K;
 }
 
 D3d12Dispatch d3d12_mm_dispatch(std::int64_t n, std::int64_t ncols) {
@@ -207,6 +207,53 @@ float thread_chunk(ggml_type t, const std::uint8_t* w, std::uint32_t row_off, st
         }
         return (d * dy) * static_cast<float>(sc1 * lo + sc2 * hi) -
                (dmin * dy) * static_cast<float>(m1 * sl + m2 * sh);
+    }
+    if (t == GGML_TYPE_Q5_K) {
+        const std::uint32_t il = itid >> 2, ir = itid & 3u;
+        const std::uint32_t e_lo = il * 64u + ir * 8u, e_hi = e_lo + 32u;
+        const std::uint32_t bb = row_off + blk * 176u;
+        const float d = h2f(ld16(w, bb)), dmin = h2f(ld16(w, bb + 2u));
+        std::int32_t sc1, m1, sc2, m2;
+        q4k_scale_min(2u * il, w + bb + 4u, &sc1, &m1);
+        q4k_scale_min(2u * il + 1u, w + bb + 4u, &sc2, &m2);
+        const std::uint32_t qa = ld32(w, bb + 48u + il * 32u + ir * 8u);
+        const std::uint32_t qb = ld32(w, bb + 52u + il * 32u + ir * 8u);
+        const std::uint32_t ha = ld32(w, bb + 16u + ir * 8u), hb = ld32(w, bb + 20u + ir * 8u);
+        auto q5 = [](std::uint32_t q, std::uint32_t qh, std::uint32_t i, std::uint32_t sh,
+                     std::uint32_t hs) {
+            return static_cast<std::int32_t>(((q >> (8u * i + sh)) & 0xFu) |
+                                             (((qh >> (8u * i + hs)) & 1u) << 4));
+        };
+        std::int32_t lo = 0, hi = 0, sl = 0, sh = 0;
+        for (std::uint32_t i = 0; i < 4; ++i) {
+            lo += q5(qa, ha, i, 0, 2u * il) * qx[e_lo + i] +
+                  q5(qb, hb, i, 0, 2u * il) * qx[e_lo + 4 + i];
+            hi += q5(qa, ha, i, 4, 2u * il + 1u) * qx[e_hi + i] +
+                  q5(qb, hb, i, 4, 2u * il + 1u) * qx[e_hi + 4 + i];
+            sl += qx[e_lo + i] + qx[e_lo + 4 + i];
+            sh += qx[e_hi + i] + qx[e_hi + 4 + i];
+        }
+        return (d * dy) * static_cast<float>(sc1 * lo + sc2 * hi) -
+               (dmin * dy) * static_cast<float>(m1 * sl + m2 * sh);
+    }
+    if (t == GGML_TYPE_IQ4_XS) {
+        static constexpr std::int32_t kv[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
+                                                1,    13,   25,  38,  53,  69,  89,  113};
+        const std::uint32_t ib = itid >> 1, h = itid & 1u, e_lo = 32u * ib + 8u * h;
+        const std::uint32_t bb = row_off + blk * 136u;
+        const std::uint32_t hdr0 = ld32(w, bb), hdr1 = ld32(w, bb + 4u);
+        const float d = h2f(hdr0 & 0xffffu);
+        const std::int32_t ls = static_cast<std::int32_t>(((hdr1 >> (4u * ib)) & 0xFu) |
+                                                          (((hdr0 >> (16u + 2u * ib)) & 3u) << 4)) -
+                                32;
+        const std::uint32_t qa = ld32(w, bb + 8u + 16u * ib + 8u * h);
+        const std::uint32_t qb = ld32(w, bb + 12u + 16u * ib + 8u * h);
+        std::int32_t sumi = 0;
+        for (std::uint32_t i = 0; i < 4; ++i) {
+            sumi += kv[nib(qa, i, 0)] * qx[e_lo + i] + kv[nib(qb, i, 0)] * qx[e_lo + 4 + i] +
+                    kv[nib(qa, i, 4)] * qx[e_lo + 16 + i] + kv[nib(qb, i, 4)] * qx[e_lo + 20 + i];
+        }
+        return (d * dy) * static_cast<float>(ls * sumi);
     }
     // Q6_K
     const std::uint32_t v = itid >> 3, l0 = 4u * (itid & 7u), is = l0 >> 4;
@@ -526,10 +573,14 @@ void run_d3d12_memprobe(const std::function<void(const std::string&)>& emit) {
         #include "ggml_d3d12_get_rows_q6_k_dxil.h"
         #include "ggml_d3d12_mmv_iq3_s_t128_dxil.h"
         #include "ggml_d3d12_mmv_iq3_s_t64_dxil.h"
+        #include "ggml_d3d12_mmv_iq4_xs_t128_dxil.h"
+        #include "ggml_d3d12_mmv_iq4_xs_t64_dxil.h"
         #include "ggml_d3d12_mmv_q4_0_t128_dxil.h"
         #include "ggml_d3d12_mmv_q4_0_t64_dxil.h"
         #include "ggml_d3d12_mmv_q4_k_t128_dxil.h"
         #include "ggml_d3d12_mmv_q4_k_t64_dxil.h"
+        #include "ggml_d3d12_mmv_q5_k_t128_dxil.h"
+        #include "ggml_d3d12_mmv_q5_k_t64_dxil.h"
         #include "ggml_d3d12_mmv_q6_k_t128_dxil.h"
         #include "ggml_d3d12_mmv_q6_k_t64_dxil.h"
         #include "xllama/d3d12_dyn.h"
@@ -540,7 +591,15 @@ namespace {
 
 using d3d12c::ComPtr;
 
-enum Pso { kPsoQ40 = 0, kPsoQ4K = 1, kPsoQ6K = 2, kPsoIq3S = 3, kPsoCount = 4 };
+enum Pso {
+    kPsoQ40 = 0,
+    kPsoQ4K = 1,
+    kPsoQ6K = 2,
+    kPsoIq3S = 3,
+    kPsoIq4Xs = 4,
+    kPsoQ5K = 5,
+    kPsoCount = 6
+};
 enum Elt { kEltBinary = 0, kEltRmsNorm = 1, kEltQuantQ8K = 2, kEltCount = 3 };
 
 int pso_for(ggml_type t) {
@@ -553,6 +612,10 @@ int pso_for(ggml_type t) {
         return kPsoQ6K;
     case GGML_TYPE_IQ3_S:
         return kPsoIq3S;
+    case GGML_TYPE_IQ4_XS:
+        return kPsoIq4Xs;
+    case GGML_TYPE_Q5_K:
+        return kPsoQ5K;
     default:
         return -1;
     }
@@ -679,12 +742,16 @@ bool init_gpu(Gpu& g) {
     const void* blobs[kPsoCount][2] = {{kGgmlD3d12MmvQ40T64Dxil, kGgmlD3d12MmvQ40T128Dxil},
                                        {kGgmlD3d12MmvQ4KT64Dxil, kGgmlD3d12MmvQ4KT128Dxil},
                                        {kGgmlD3d12MmvQ6KT64Dxil, kGgmlD3d12MmvQ6KT128Dxil},
-                                       {kGgmlD3d12MmvIq3ST64Dxil, kGgmlD3d12MmvIq3ST128Dxil}};
+                                       {kGgmlD3d12MmvIq3ST64Dxil, kGgmlD3d12MmvIq3ST128Dxil},
+                                       {kGgmlD3d12MmvIq4XsT64Dxil, kGgmlD3d12MmvIq4XsT128Dxil},
+                                       {kGgmlD3d12MmvQ5KT64Dxil, kGgmlD3d12MmvQ5KT128Dxil}};
     const size_t sizes[kPsoCount][2] = {
         {kGgmlD3d12MmvQ40T64DxilSize, kGgmlD3d12MmvQ40T128DxilSize},
         {kGgmlD3d12MmvQ4KT64DxilSize, kGgmlD3d12MmvQ4KT128DxilSize},
         {kGgmlD3d12MmvQ6KT64DxilSize, kGgmlD3d12MmvQ6KT128DxilSize},
-        {kGgmlD3d12MmvIq3ST64DxilSize, kGgmlD3d12MmvIq3ST128DxilSize}};
+        {kGgmlD3d12MmvIq3ST64DxilSize, kGgmlD3d12MmvIq3ST128DxilSize},
+        {kGgmlD3d12MmvIq4XsT64DxilSize, kGgmlD3d12MmvIq4XsT128DxilSize},
+        {kGgmlD3d12MmvQ5KT64DxilSize, kGgmlD3d12MmvQ5KT128DxilSize}};
     for (int i = 0; i < kPsoCount; ++i) {
         for (int wd = 0; wd < 2; ++wd) {
             D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
@@ -1647,7 +1714,7 @@ const char* dev_name(ggml_backend_dev_t) {
     return "D3D12";
 }
 const char* dev_description(ggml_backend_dev_t) {
-    return "xllama D3D12 compute (Q4_0/Q4_K/Q6_K/IQ3_S matmul, Q6_K get_rows, f32 "
+    return "xllama D3D12 compute (Q4_0/Q4_K/Q5_K/Q6_K/IQ3_S/IQ4_XS matmul, Q6_K get_rows, f32 "
            "add/mul/rms_norm/swiglu, q8_K quant)";
 }
 void dev_memory(ggml_backend_dev_t, size_t* free, size_t* total) {
@@ -2365,6 +2432,16 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
         {GGML_TYPE_IQ3_S, "iq3_s", 12288, 4096, 1},
         {GGML_TYPE_IQ3_S, "iq3_s", 4096, 12288, 1},
         {GGML_TYPE_IQ3_S, "iq3_s", 1024, 1024, 7},
+        // Qwen3.6-35B-A3B IQ4_XS: attn_gate 2048->4096, ssm_out 4096->2048,
+        // ffn_down_shexp 512->2048, ssm_alpha 2048->32; Q5_K attn_qkv and attn_v.
+        {GGML_TYPE_IQ4_XS, "iq4_xs", 4096, 2048, 1},
+        {GGML_TYPE_IQ4_XS, "iq4_xs", 2048, 4096, 1},
+        {GGML_TYPE_IQ4_XS, "iq4_xs", 2048, 512, 1},
+        {GGML_TYPE_IQ4_XS, "iq4_xs", 32, 2048, 1},
+        {GGML_TYPE_IQ4_XS, "iq4_xs", 1024, 1024, 7},
+        {GGML_TYPE_Q5_K, "q5_k", 8192, 2048, 1},
+        {GGML_TYPE_Q5_K, "q5_k", 512, 2048, 1},
+        {GGML_TYPE_Q5_K, "q5_k", 1024, 1024, 7},
     };
     for (const auto& sc : cases)
         out->push_back(run_case(backend, sc));

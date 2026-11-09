@@ -86,8 +86,12 @@ TEST_CASE("ggml_d3d12: weight types") {
     CHECK(d3d12_weight_type_supported(GGML_TYPE_Q6_K));
     CHECK(d3d12_weight_type_supported(GGML_TYPE_IQ3_S));
     CHECK(d3d12_activation_type(GGML_TYPE_IQ3_S) == GGML_TYPE_Q8_K);
+    CHECK(d3d12_weight_type_supported(GGML_TYPE_IQ4_XS));
+    CHECK(d3d12_activation_type(GGML_TYPE_IQ4_XS) == GGML_TYPE_Q8_K);
+    CHECK(d3d12_weight_type_supported(GGML_TYPE_Q5_K));
+    CHECK(d3d12_activation_type(GGML_TYPE_Q5_K) == GGML_TYPE_Q8_K);
     CHECK_FALSE(d3d12_weight_type_supported(GGML_TYPE_IQ3_XXS));
-    CHECK_FALSE(d3d12_weight_type_supported(GGML_TYPE_Q5_K));
+    CHECK_FALSE(d3d12_weight_type_supported(GGML_TYPE_IQ4_NL));
     CHECK_FALSE(d3d12_weight_type_supported(GGML_TYPE_Q8_0));
     CHECK_FALSE(d3d12_weight_type_supported(GGML_TYPE_F16));
     CHECK_FALSE(d3d12_weight_type_supported(GGML_TYPE_F32));
@@ -192,6 +196,14 @@ TEST_CASE("ggml_d3d12: kernel emulation matches the CPU backend (q8 activations)
         {GGML_TYPE_IQ3_S, 6, 2304},
         // Qwen3.5-9B ffn_down width: 48 super-blocks, 128 threads.
         {GGML_TYPE_IQ3_S, 3, 12288},
+        // Qwen3.6-35B-A3B dense projections: IQ4_XS (136-byte blocks) and
+        // Q5_K (176-byte blocks), both 4-byte aligned at every row.
+        {GGML_TYPE_IQ4_XS, 13, 1024},
+        {GGML_TYPE_IQ4_XS, 6, 2304},
+        {GGML_TYPE_IQ4_XS, 3, 4096},
+        {GGML_TYPE_Q5_K, 13, 1024},
+        {GGML_TYPE_Q5_K, 6, 2304},
+        {GGML_TYPE_Q5_K, 3, 4096},
     };
     for (const auto& c : cases) {
         CAPTURE(ggml_type_name(c.t));
