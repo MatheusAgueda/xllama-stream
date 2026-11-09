@@ -1,0 +1,776 @@
+diff --git a/include/llama.h b/include/llama.h
+index 9bca8ee..e6ae285 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -38,6 +38,9 @@
+ 
+ #define LLAMA_TOKEN_NULL -1
+ 
++// llama_model_params::n_expert_slots exists (xllama patch 0004-expert-cache)
++#define LLAMA_HAS_EXPERT_SLOTS 1
++
+ #define LLAMA_FILE_MAGIC_GGLA 0x67676c61u // 'ggla'
+ #define LLAMA_FILE_MAGIC_GGSN 0x6767736eu // 'ggsn'
+ #define LLAMA_FILE_MAGIC_GGSQ 0x67677371u // 'ggsq'
+@@ -346,6 +349,11 @@ extern "C" {
+         // override key-value pairs of the model meta data
+         const struct llama_model_kv_override * kv_overrides;
+ 
++        // MoE models larger than memory: keep only this many experts per layer resident and read the
++        // others from the model file when the router picks them (0 = off; CPU only, caps n_ubatch)
++        // (xllama patch 0004; LLAMA_HAS_EXPERT_SLOTS)
++        uint32_t n_expert_slots;
++
+         // Keep the booleans together to avoid misalignment during copy-by-value.
+         bool vocab_only;      // only load the vocabulary, no weights
+         bool check_tensors;   // validate model tensor data
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index afdaddc..58cc0c8 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -17,6 +17,7 @@ set(LLAMA_CORE_SOURCES
+     llama-context.cpp
+     llama-cparams.cpp
+     llama-grammar.cpp
++    llama-expert-cache.cpp
+     llama-graph.cpp
+     llama-hparams.cpp
+     llama-impl.cpp
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 07b4c61..8414093 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-context.h"
++#include "llama-expert-cache.h"
+ 
+ #include "ggml.h"
+ #include "llama-arch.h"
+@@ -249,6 +250,15 @@ llama_context::llama_context(
+ 
+     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+ 
++    // every expert a ubatch routes to must fit in the expert cache slots at once
++    if (model.expert_cache) {
++        const uint32_t n_ubatch_max = llama_expert_cache_max_ubatch(*model.expert_cache);
++        if (cparams.n_ubatch > n_ubatch_max) {
++            LLAMA_LOG_INFO("%s: expert cache: n_ubatch %u -> %u\n", __func__, cparams.n_ubatch, n_ubatch_max);
++            cparams.n_ubatch = n_ubatch_max;
++        }
++    }
++
+     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
+     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
+             cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
+diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
+new file mode 100644
+index 0000000..4891413
+--- /dev/null
++++ b/src/llama-expert-cache.cpp
+@@ -0,0 +1,423 @@
++#include "llama-expert-cache.h"
++
++#include "llama-impl.h"
++
++#include "../ggml/src/ggml-backend-impl.h"
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <cerrno>
++#include <cinttypes>
++#include <cstdio>
++#include <cstring>
++#include <stdexcept>
++#include <unordered_map>
++#include <utility>
++#include <vector>
++
++#if defined(_WIN32)
++#    ifndef WIN32_LEAN_AND_MEAN
++#        define WIN32_LEAN_AND_MEAN
++#    endif
++#    ifndef NOMINMAX
++#        define NOMINMAX
++#    endif
++#    include <windows.h>
++#    include <io.h>
++#else
++#    include <unistd.h>
++#endif
++
++namespace {
++
++struct ec_file {
++    std::string path;
++    // one handle per compute thread: positional reads on separate file objects run in parallel
++    std::array<FILE *, GGML_MAX_N_THREADS> fp {};
++
++    ~ec_file() {
++        for (FILE * f : fp) {
++            if (f) {
++                fclose(f);
++            }
++        }
++    }
++};
++
++struct ec_tensor {
++    ggml_tensor * t;
++    size_t  file;
++    size_t  offs;  // file offset of expert 0
++    int32_t layer;
++};
++
++struct ec_layer {
++    llama_expert_cache * cache = nullptr;
++    int32_t id = -1;
++    std::vector<size_t>   tensors;   // indices into llama_expert_cache::tensors
++    std::vector<int32_t>  slot_of;   // expert -> slot, -1 if not resident
++    std::vector<int32_t>  expert_of; // slot -> expert, -1 if empty
++    std::vector<uint64_t> used;      // slot -> tick of the last plan that used it
++    std::vector<std::pair<int32_t, int32_t>> pending; // (slot, expert) read by the load op of this ubatch
++    uint64_t tick = 0;
++};
++
++} // namespace
++
++struct llama_expert_cache {
++    uint32_t n_slots       = 0;
++    uint32_t n_expert_used = 1;
++
++    ggml_backend_buffer_type buft {};
++
++    std::vector<std::unique_ptr<ec_file>> files;
++    std::vector<ec_tensor> tensors;
++    std::unordered_map<const ggml_tensor *, size_t> tensor_idx;
++    std::unordered_map<int32_t, std::unique_ptr<ec_layer>> layers;
++    int32_t first_layer = INT32_MAX;
++
++    std::atomic<uint64_t> hits   {0};
++    std::atomic<uint64_t> misses {0};
++    std::atomic<uint64_t> bytes  {0};
++    uint64_t n_rounds = 0; // plans of first_layer, i.e. ubatches
++
++    void log_stats(const char * when) const {
++        const uint64_t h = hits.load();
++        const uint64_t m = misses.load();
++        LLAMA_LOG_INFO("expert cache (%s): %u slots x %zu layers, %" PRIu64 " ubatches, %" PRIu64 " hits, %" PRIu64 " misses (%.1f%% hit), %.1f MiB read\n",
++                when, n_slots, layers.size(), n_rounds, h, m, h + m ? 100.0*h/(h + m) : 0.0, bytes.load()/1024.0/1024.0);
++    }
++
++    ~llama_expert_cache() {
++        if (n_rounds > 0) {
++            log_stats("final");
++        }
++    }
++};
++
++//
++// buffer type: a CPU buffer whose expert tensors were shrunk to n_slots experts
++//
++
++static const char * ec_buft_get_name(ggml_backend_buffer_type_t buft) {
++    GGML_UNUSED(buft);
++    return "EXPERT_CACHE";
++}
++
++static ggml_backend_buffer_type_t ec_cpu_buft() {
++    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++    GGML_ASSERT(dev != nullptr && "expert cache needs the CPU backend");
++    return ggml_backend_dev_buffer_type(dev);
++}
++
++static ggml_backend_buffer_t ec_buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
++    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(ec_cpu_buft(), size);
++    if (buf) {
++        buf->buft = buft; // CPU buffer whose tensors are sized by this type
++    }
++    return buf;
++}
++
++static size_t ec_buft_get_alignment(ggml_backend_buffer_type_t buft) {
++    GGML_UNUSED(buft);
++    return ggml_backend_buft_get_alignment(ec_cpu_buft());
++}
++
++static bool ec_buft_is_host(ggml_backend_buffer_type_t buft) {
++    GGML_UNUSED(buft);
++    return true;
++}
++
++static llama_expert_cache * ec_of_buft(ggml_backend_buffer_type_t buft) {
++    if (buft == nullptr || buft->iface.get_name != ec_buft_get_name) {
++        return nullptr;
++    }
++    return (llama_expert_cache *) buft->context;
++}
++
++static llama_expert_cache * ec_of(const ggml_tensor * t) {
++    if (t == nullptr || t->buffer == nullptr) {
++        return nullptr;
++    }
++    return ec_of_buft(ggml_backend_buffer_get_type(t->buffer));
++}
++
++//
++// positional read, safe to run from every compute thread at once
++//
++
++static void ec_read(ec_file & f, int ith, void * dst, size_t n, size_t offs) {
++    FILE *& fp = f.fp[ith];
++    if (fp == nullptr) {
++        fp = ggml_fopen(f.path.c_str(), "rb");
++        if (fp == nullptr) {
++            GGML_ABORT("expert cache: cannot open %s: %s", f.path.c_str(), strerror(errno));
++        }
++    }
++
++    size_t done = 0;
++#if defined(_WIN32)
++    HANDLE h = (HANDLE) _get_osfhandle(_fileno(fp));
++    while (done < n) {
++        const uint64_t pos = (uint64_t) offs + done;
++        OVERLAPPED ov = {};
++        ov.Offset     = (DWORD) (pos & 0xFFFFFFFFu);
++        ov.OffsetHigh = (DWORD) (pos >> 32);
++        const DWORD want = (DWORD) std::min<size_t>(n - done, (size_t) 1 << 30);
++        DWORD got = 0;
++        if (!ReadFile(h, (char *) dst + done, want, &got, &ov) || got == 0) {
++            GGML_ABORT("expert cache: read of %zu bytes at %" PRIu64 " failed (error %lu)", (size_t) want, pos, (unsigned long) GetLastError());
++        }
++        done += got;
++    }
++#else
++    const int fd = fileno(fp);
++    while (done < n) {
++        const ssize_t got = pread(fd, (char *) dst + done, n - done, (off_t) (offs + done));
++        if (got < 0 && errno == EINTR) {
++            continue;
++        }
++        if (got <= 0) {
++            GGML_ABORT("expert cache: read of %zu bytes at %zu failed: %s", n - done, offs + done, got == 0 ? "end of file" : strerror(errno));
++        }
++        done += (size_t) got;
++    }
++#endif
++}
++
++//
++// graph ops
++//
++
++static int32_t ec_id_at(const ggml_tensor * ids, int64_t i0, int64_t i1) {
++    return *(const int32_t *) ((const char *) ids->data + i0*ids->nb[0] + i1*ids->nb[1]);
++}
++
++// 1 thread: LRU slot assignment for the experts of this ubatch; dst = slot ids
++static void ec_plan(ggml_tensor * dst, int ith, int nth, void * userdata) {
++    GGML_UNUSED(nth);
++    if (ith != 0) {
++        return;
++    }
++
++    ec_layer & L = *(ec_layer *) userdata;
++    llama_expert_cache & C = *L.cache;
++    const ggml_tensor * ids = dst->src[0];
++
++    const int64_t n_used   = ids->ne[0];
++    const int64_t n_tokens = ids->ne[1];
++    const int32_t n_expert = (int32_t) L.slot_of.size();
++    const int32_t n_slots  = (int32_t) L.expert_of.size();
++    const uint64_t tick    = ++L.tick;
++
++    L.pending.clear();
++
++    // resident experts: pin them for this ubatch
++    uint64_t hits = 0;
++    for (int64_t i1 = 0; i1 < n_tokens; ++i1) {
++        for (int64_t i0 = 0; i0 < n_used; ++i0) {
++            const int32_t e = ec_id_at(ids, i0, i1);
++            GGML_ASSERT(e >= 0 && e < n_expert);
++            const int32_t s = L.slot_of[e];
++            if (s >= 0 && L.used[s] != tick) {
++                L.used[s] = tick;
++                hits++;
++            }
++        }
++    }
++
++    // missing experts: take the least recently used slot that this ubatch does not need
++    for (int64_t i1 = 0; i1 < n_tokens; ++i1) {
++        for (int64_t i0 = 0; i0 < n_used; ++i0) {
++            const int32_t e = ec_id_at(ids, i0, i1);
++            if (L.slot_of[e] >= 0) {
++                continue;
++            }
++            int32_t victim = -1;
++            for (int32_t s = 0; s < n_slots; ++s) {
++                if (L.used[s] != tick && (victim < 0 || L.used[s] < L.used[victim])) {
++                    victim = s;
++                }
++            }
++            if (victim < 0) {
++                GGML_ABORT("expert cache: layer %d needs more than %d experts in one ubatch - lower n_ubatch", L.id, n_slots);
++            }
++            if (L.expert_of[victim] >= 0) {
++                L.slot_of[L.expert_of[victim]] = -1;
++            }
++            L.expert_of[victim] = e;
++            L.slot_of[e]        = victim;
++            L.used[victim]      = tick;
++            L.pending.emplace_back(victim, e);
++        }
++    }
++
++    int32_t * out = (int32_t *) dst->data;
++    for (int64_t i1 = 0; i1 < n_tokens; ++i1) {
++        for (int64_t i0 = 0; i0 < n_used; ++i0) {
++            out[i1*n_used + i0] = L.slot_of[ec_id_at(ids, i0, i1)];
++        }
++    }
++
++    C.hits   += hits;
++    C.misses += L.pending.size();
++    if (L.id == C.first_layer && ++C.n_rounds % 64 == 0) {
++        C.log_stats("running");
++    }
++}
++
++// all threads: read the pending experts of every tensor of the layer into their slots; dst = slot ids
++static void ec_load(ggml_tensor * dst, int ith, int nth, void * userdata) {
++    ec_layer & L = *(ec_layer *) userdata;
++    llama_expert_cache & C = *L.cache;
++
++    const size_t n_t    = L.tensors.size();
++    const size_t n_jobs = L.pending.size()*n_t;
++
++    size_t bytes = 0;
++    for (size_t j = ith; j < n_jobs; j += nth) {
++        const auto & job = L.pending[j / n_t];
++        const ec_tensor & T = C.tensors[L.tensors[j % n_t]];
++        const size_t nb2 = T.t->nb[2];
++        ec_read(*C.files[T.file], ith, (char *) T.t->data + (size_t) job.first*nb2, nb2, T.offs + (size_t) job.second*nb2);
++        bytes += nb2;
++    }
++    if (bytes > 0) {
++        C.bytes += bytes;
++    }
++
++    if (ith == 0) {
++        memcpy(dst->data, dst->src[0]->data, ggml_nbytes(dst));
++    }
++}
++
++//
++// API
++//
++
++std::shared_ptr<llama_expert_cache> llama_expert_cache_init(uint32_t n_slots, uint32_t n_expert_used) {
++    auto cache = std::make_shared<llama_expert_cache>();
++
++    cache->n_expert_used = std::max<uint32_t>(1, n_expert_used);
++    cache->n_slots       = std::max(n_slots, cache->n_expert_used);
++
++    cache->buft = {
++        /* .iface = */ {
++            /* .get_name         = */ ec_buft_get_name,
++            /* .alloc_buffer     = */ ec_buft_alloc_buffer,
++            /* .alloc_buffer_n   = */ nullptr,
++            /* .get_alignment    = */ ec_buft_get_alignment,
++            /* .get_max_size     = */ nullptr,
++            /* .get_alloc_size   = */ nullptr, // the tensors are shrunk, ggml_nbytes is their size
++            /* .get_alloc_size_n = */ nullptr,
++            /* .is_host          = */ ec_buft_is_host,
++        },
++        /* .device  = */ ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU),
++        /* .context = */ cache.get(),
++    };
++
++    return cache;
++}
++
++ggml_backend_buffer_type_t llama_expert_cache_buft(llama_expert_cache & cache) {
++    return &cache.buft;
++}
++
++uint32_t llama_expert_cache_n_slots(const llama_expert_cache & cache) {
++    return cache.n_slots;
++}
++
++uint32_t llama_expert_cache_max_ubatch(const llama_expert_cache & cache) {
++    return std::max<uint32_t>(1, cache.n_slots / cache.n_expert_used);
++}
++
++bool llama_expert_cache_wants(ggml_backend_buffer_type_t buft, const ggml_tensor * t) {
++    const llama_expert_cache * cache = ec_of_buft(buft);
++    return cache != nullptr && t->ne[3] == 1 && t->ne[2] > (int64_t) cache->n_slots &&
++           t->nb[2] == t->nb[1]*(size_t) t->ne[1];
++}
++
++void llama_expert_cache_shrink(ggml_backend_buffer_type_t buft, ggml_tensor * t) {
++    if (!llama_expert_cache_wants(buft, t)) {
++        return;
++    }
++    t->ne[2] = ec_of_buft(buft)->n_slots;
++    t->nb[3] = t->nb[2]*(size_t) t->ne[2];
++}
++
++bool llama_expert_cache_has(const ggml_tensor * t) {
++    return ec_of(t) != nullptr;
++}
++
++void llama_expert_cache_bind(ggml_tensor * t, const std::string & path, size_t offs, int64_t n_expert) {
++    llama_expert_cache * cache = ec_of(t);
++    GGML_ASSERT(cache != nullptr);
++
++    if (path.empty()) {
++        throw std::runtime_error("expert cache: the model must be loaded from a file path");
++    }
++
++    int32_t il = -1;
++    if (sscanf(ggml_get_name(t), "blk.%d.", &il) != 1 || il < 0) {
++        throw std::runtime_error(std::string("expert cache: no layer in tensor name ") + ggml_get_name(t));
++    }
++    if (t->ne[3] != 1 || t->ne[2] != (int64_t) cache->n_slots || n_expert <= t->ne[2] ||
++            t->nb[2] != t->nb[1]*(size_t) t->ne[1]) {
++        throw std::runtime_error(std::string("expert cache: unsupported layout for ") + ggml_get_name(t));
++    }
++
++    size_t file = 0;
++    while (file < cache->files.size() && cache->files[file]->path != path) {
++        file++;
++    }
++    if (file == cache->files.size()) {
++        cache->files.emplace_back(new ec_file());
++        cache->files.back()->path = path;
++    }
++
++    auto & slot = cache->layers[il];
++    if (!slot) {
++        slot.reset(new ec_layer());
++        slot->cache = cache;
++        slot->id    = il;
++        slot->slot_of.assign(n_expert, -1);
++        slot->expert_of.assign(cache->n_slots, -1);
++        slot->used.assign(cache->n_slots, 0);
++        cache->first_layer = std::min(cache->first_layer, il);
++    }
++    if ((int64_t) slot->slot_of.size() != n_expert) {
++        throw std::runtime_error(std::string("expert cache: expert count differs within the layer of ") + ggml_get_name(t));
++    }
++
++    cache->tensor_idx[t] = cache->tensors.size();
++    slot->tensors.push_back(cache->tensors.size());
++    cache->tensors.push_back({ t, file, offs, il });
++}
++
++ggml_tensor * llama_expert_cache_build_ids(ggml_context * ctx, ggml_tensor * w, ggml_tensor * selected_experts) {
++    llama_expert_cache * cache = ec_of(w);
++    if (cache == nullptr) {
++        return nullptr;
++    }
++
++    const auto it = cache->tensor_idx.find(w);
++    if (it == cache->tensor_idx.end()) {
++        // not bound: weights never loaded (memory-fit pass), nothing will be computed
++        return nullptr;
++    }
++
++    GGML_ASSERT(selected_experts->type == GGML_TYPE_I32);
++    ec_layer * layer = cache->layers.at(cache->tensors[it->second].layer).get();
++
++    const int64_t n_used   = selected_experts->ne[0];
++    const int64_t n_tokens = selected_experts->ne[1];
++
++    ggml_tensor * plan = ggml_custom_4d(ctx, GGML_TYPE_I32, n_used, n_tokens, 1, 1, &selected_experts, 1, ec_plan, 1, layer);
++    ggml_format_name(plan, "ffn_moe_slot_plan-%d", layer->id);
++
++    ggml_tensor * slots = ggml_custom_4d(ctx, GGML_TYPE_I32, n_used, n_tokens, 1, 1, &plan, 1, ec_load, GGML_N_TASKS_MAX, layer);
++    ggml_format_name(slots, "ffn_moe_slots-%d", layer->id);
++
++    return slots;
++}
+diff --git a/src/llama-expert-cache.h b/src/llama-expert-cache.h
+new file mode 100644
+index 0000000..02190d1
+--- /dev/null
++++ b/src/llama-expert-cache.h
+@@ -0,0 +1,47 @@
++#pragma once
++
++#include "ggml.h"
++#include "ggml-backend.h"
++
++#include <cstdint>
++#include <memory>
++#include <string>
++
++// Routed-expert cache for MoE models larger than memory (llama_model_params.n_expert_slots > 0).
++//
++// Every routed `*_exps.weight` tensor is created with n_slots experts instead of the n_expert of the
++// GGUF, so its buffer holds only the resident ones. The loader does not read these tensors; it
++// records where they live in the file. In build_moe_ffn two custom ops run before the expert matmuls
++// of each layer:
++//   plan (1 thread): map the router's expert ids to slots (LRU per layer) and list the misses
++//   load (all threads): read the missed experts with positional reads into their slots
++// The mul_mat_id ops take the slot ids; router weights, biases and scales keep the real ids.
++// CPU only, one context per model at a time, n_ubatch <= n_slots / n_expert_used.
++
++struct llama_expert_cache;
++
++std::shared_ptr<llama_expert_cache> llama_expert_cache_init(uint32_t n_slots, uint32_t n_expert_used);
++
++ggml_backend_buffer_type_t llama_expert_cache_buft(llama_expert_cache & cache);
++
++uint32_t llama_expert_cache_n_slots(const llama_expert_cache & cache);
++
++// largest ubatch whose experts always fit in the slots
++uint32_t llama_expert_cache_max_ubatch(const llama_expert_cache & cache);
++
++// loader: buft is an expert-cache type and t (as in the GGUF) a stack of more experts than it keeps
++bool llama_expert_cache_wants(ggml_backend_buffer_type_t buft, const ggml_tensor * t);
++
++// loader: resize a tensor just created for buft to the n_slots experts its buffer will hold
++void llama_expert_cache_shrink(ggml_backend_buffer_type_t buft, ggml_tensor * t);
++
++// true if t lives in an expert-cache buffer
++bool llama_expert_cache_has(const ggml_tensor * t);
++
++// loader: t is read on demand from `path` (expert e at offs + e*nb[2], n_expert of them in the file)
++// instead of at load time
++void llama_expert_cache_bind(ggml_tensor * t, const std::string & path, size_t offs, int64_t n_expert);
++
++// graph: slot ids replacing `selected_experts` for the mul_mat_id ops on the experts of w's layer,
++// or nullptr if w is not cached
++ggml_tensor * llama_expert_cache_build_ids(ggml_context * ctx, ggml_tensor * w, ggml_tensor * selected_experts);
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 1112ad8..8d3d8f9 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1,6 +1,7 @@
+ #include "llama-graph.h"
+ 
+ #include "llama-impl.h"
++#include "llama-expert-cache.h"
+ #include "llama-model.h"
+ #include "llama-batch.h"
+ #include "llama-cparams.h"
+@@ -1589,8 +1590,9 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
+           ggml_tensor * w,   // ggml_tensor * as
+           ggml_tensor * cur, // ggml_tensor * b
+           ggml_tensor * ids,
+-          ggml_tensor * w_s) const {
+-    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
++          ggml_tensor * w_s,
++          ggml_tensor * w_ids) const {
++    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, w_ids ? w_ids : ids);
+ 
+     if (prec_policy) {
+         prec_policy->apply(res);
+@@ -2205,6 +2207,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     //call early so that topk-moe can be used
+     ggml_build_forward_expand(gf, weights);
+ 
++    // expert cache: the routed expert tensors hold a few slots; the matmuls take slot ids, everything else the expert ids
++    ggml_tensor * slot_ids = llama_expert_cache_build_ids(ctx0, down_exps, selected_experts);
++
+     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+ 
+     if (weight_before_ffn) {
+@@ -2219,7 +2224,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+ 
+     if (gate_up_exps) {
+         // merged gate_up path: one mul_mat_id, then split into gate and up views
+-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
++        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s, slot_ids); // [n_ff*2, n_expert_used, n_tokens]
+         cb(gate_up, "ffn_moe_gate_up", il);
+ 
+         if (up_exps_s) {
+@@ -2238,7 +2243,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         cb(up, "ffn_moe_up", il);
+     } else {
+         // separate gate and up path
+-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
++        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s, slot_ids); // [n_ff, n_expert_used, n_tokens]
+         cb(up, "ffn_moe_up", il);
+ 
+         if (up_exps_s) {
+@@ -2251,7 +2256,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         }
+ 
+         if (gate_exps) {
+-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
++            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s, slot_ids); // [n_ff, n_expert_used, n_tokens]
+             cb(cur, "ffn_moe_gate", il);
+         } else {
+             cur = up;
+@@ -2352,7 +2357,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             GGML_ABORT("fatal error");
+     }
+ 
+-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
++    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s, slot_ids); // [n_embd, n_expert_used, n_tokens]
+     if (arch == LLM_ARCH_MISTRAL4) {
+         // src1 can exceed F16 range
+         ggml_prec_set_src(experts, GGML_PREC_F32, 1);
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 5cf74c9..35e0ce4 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1068,11 +1068,13 @@ struct llm_graph_context {
+               ggml_tensor * w_s = nullptr) const;
+ 
+     // do mat_mul_id, while optionally apply lora and per-expert scale
++    // w_ids: ids into w when they differ from the expert ids (expert cache slots)
+     ggml_tensor * build_lora_mm_id(
+               ggml_tensor * w,   // ggml_tensor * as
+               ggml_tensor * cur, // ggml_tensor * b
+               ggml_tensor * ids,
+-              ggml_tensor * w_s = nullptr) const;
++              ggml_tensor * w_s = nullptr,
++              ggml_tensor * w_ids = nullptr) const;
+ 
+     ggml_tensor * build_norm(
+              ggml_tensor * cur,
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index e795d40..251f0a9 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-model-loader.h"
++#include "llama-expert-cache.h"
+ 
+ #include "ggml-alloc.h"
+ #include "ggml.h"
+@@ -577,6 +578,7 @@ llama_model_loader::llama_model_loader(
+         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+ 
+         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
++        file_paths.emplace_back(fname);
+         contexts.emplace_back(ctx);
+ 
+         // Save tensors data offset of the main file.
+@@ -645,6 +647,7 @@ llama_model_loader::llama_model_loader(
+                 }
+ 
+                 files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
++                file_paths.emplace_back(fname_split);
+                 contexts.emplace_back(ctx);
+ 
+                 // Save tensors data offset info of the shard.
+@@ -696,6 +699,7 @@ llama_model_loader::llama_model_loader(
+         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+ 
+         files.emplace_back(new llama_file(file));
++        file_paths.emplace_back();
+         contexts.emplace_back(ctx);
+ 
+         // Save tensors data offset info of the main file.
+@@ -1212,6 +1216,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+             return lazy_read::buft();
+         }
+ 
++        // routed experts read on demand need a file to read them from
++        if (expert_cache_buft && !files.empty() && op == GGML_OP_MUL_MAT_ID && tn.suffix != nullptr &&
++                strcmp(tn.suffix, "weight") == 0 && llama_expert_cache_wants(expert_cache_buft, t_meta)) {
++            return expert_cache_buft;
++        }
++
+         // select the buffer type for this tensor
+         const buft_list_t * buft_list;
+         switch (info.layer) {
+@@ -1379,6 +1389,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+ 
+     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
+     ggml_set_name(tensor, ggml_get_name(&t_meta));
++    llama_expert_cache_shrink(buft, tensor);
+ 
+     if (duplicated) {
+         size_data += ggml_nbytes(&t_meta);
+@@ -1636,6 +1647,13 @@ bool llama_model_loader::load_all_data(
+ 
+         size_t n_size = ggml_nbytes(cur);
+ 
++        // routed experts: the buffer holds only the cache slots, the experts are read when the router picks them
++        if (llama_expert_cache_has(cur)) {
++            llama_expert_cache_bind(cur, file_paths.at(weight->idx), weight->offs, weight->tensor->ne[2]);
++            size_done += ggml_nbytes(weight->tensor); // size_data counts the whole stack
++            continue;
++        }
++
+         const bool from_mapping = use_mmap || lazy.has(cur);
+ 
+         if (from_mapping) {
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index 9e51d0c..f36bdc1 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -117,7 +117,12 @@ struct llama_model_loader {
+         std::set<std::string>                  tensors;
+     } lazy;
+ 
++    // set by the caller before the create_tensor() calls: routed expert weights go to this buffer type
++    // and are bound to the expert cache instead of being read (llama-expert-cache.h)
++    ggml_backend_buffer_type_t expert_cache_buft = nullptr;
++
+     llama_files files;
++    std::vector<std::string> file_paths; // parallel to files, empty when opened from a FILE *
+     llama_ftype ftype;
+     llama_fver  fver;
+ 
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 97e0cee..c9987ed 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -6,6 +6,7 @@
+ #include "llama-impl.h"
+ #include "llama-mmap.h"
+ #include "llama-cparams.h"
++#include "llama-expert-cache.h"
+ #include "llama-model-loader.h"
+ 
+ #include "llama-kv-cache.h"
+@@ -1550,6 +1551,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         pimpl->gpu_buft_list.emplace(dev.dev, std::move(buft_list));
+     }
+ 
++    // routed experts read on demand into a few resident slots per layer (llama-expert-cache.h)
++    expert_cache.reset();
++    ml.expert_cache_buft = nullptr;
++    if (params.n_expert_slots > 0 && hparams.n_expert > params.n_expert_slots) {
++        if (arch == LLM_ARCH_GRANITE_SWITCH) {
++            LLAMA_LOG_WARN("%s: expert cache not supported for %s, loading all experts\n", __func__, llm_arch_name(arch));
++        } else {
++            expert_cache = llama_expert_cache_init(params.n_expert_slots, hparams.n_expert_used_max());
++            ml.expert_cache_buft = llama_expert_cache_buft(*expert_cache);
++            LLAMA_LOG_INFO("%s: expert cache: %u of %u experts resident per layer, read from the model file on demand\n",
++                __func__, llama_expert_cache_n_slots(*expert_cache), hparams.n_expert);
++        }
++    }
++
+     ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+     if (cpu_dev == nullptr) {
+         throw std::runtime_error(format("%s: no CPU backend found", __func__));
+@@ -2935,6 +2950,7 @@ llama_model_params llama_model_default_params() {
+         /*.progress_callback           =*/ nullptr,
+         /*.progress_callback_user_data =*/ nullptr,
+         /*.kv_overrides                =*/ nullptr,
++        /*.n_expert_slots              =*/ 0,
+         /*.vocab_only                  =*/ false,
+         /*.check_tensors               =*/ false,
+         /*.use_extra_bufts             =*/ true,
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 2243377..92a9ae7 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -743,6 +743,9 @@ struct llama_model {
+     // which tensors can be prefetched - driven by TENSOR_READ_LAZY
+     std::unordered_set<const ggml_tensor *> can_prefetch;
+ 
++    // routed experts kept in a few slots per layer (n_expert_slots > 0); declared before pimpl so it outlives the buffers
++    std::shared_ptr<struct llama_expert_cache> expert_cache;
++
+     // statically allocated context for assigning
+     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
+ 

@@ -64,6 +64,13 @@ struct SessionParams {
     // the title's RAM budget loads and decodes reading only the experts each
     // token routes to. Forces the CPU (no d3d12 layers). apply_gguf_residency.
     bool stream_weights = false;
+
+    // GGUF only (llama.cpp patch 0004): keep this many experts per MoE layer in
+    // the heap and read the others from the model file when the router picks
+    // them, so a MoE larger than the title's memory runs from a fixed-size cache
+    // rather than a mapping the AppContainer caps. 0 = off. Forces the CPU (no
+    // d3d12 layers) and takes precedence over stream_weights. apply_gguf_residency.
+    int expert_slots = 0;
 };
 
 struct GenerateParams {
