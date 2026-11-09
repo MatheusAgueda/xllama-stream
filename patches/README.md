@@ -81,6 +81,12 @@ the missing ones, best first, to two background I/O threads, so their reads
 overlap the attention. The plan settles the round first: unstarted reads are
 cancelled (the slot gets its old expert back, its data was never overwritten),
 running ones are waited for. Routing is untouched, so the output stays exact.
+With a swap ratio the prediction is the swapped routing: the op ranks each
+token by softmax, runs the same swap as the routing op against the current
+residency (`ec_swap_missing`), pins the residents that would stand in and
+queues only the experts still missing among the first k ranks. Before that it
+queued every missing expert of the top k and evicted the stand-ins the routing
+op would have used.
 Offline on the 35B's routing trace (32 slots): 63.0% hits without, 90.4% with
 k = 8. Measured on the bench runner (run 42643773195, 32 slots, 2 threads,
 reads the bottleneck) k = 8 lifted the hits to 89.8% but read 25% more and
