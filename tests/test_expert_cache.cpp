@@ -436,6 +436,28 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
         CHECK(buffered.tokens == plain.tokens);
         CHECK(buffered.logits == plain.logits);
 
+        // Prefetch jobs read whole by one I/O thread (LLAMA_EXPERT_SPLIT=0), where
+        // the cached run above split each expert in parts over all of them: the
+        // reads change which experts are resident, never the routing.
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            log.final_line.clear();
+        }
+        set_prefetch(2);
+        set_env_k("LLAMA_EXPERT_SPLIT", 0);
+        const EcRun whole = run_greedy(path, c.slots, 512, c.used, 24);
+        set_env_k("LLAMA_EXPERT_SPLIT", -1);
+        set_prefetch(-1);
+        REQUIRE(whole.ok);
+        CHECK(whole.n_ubatch == cached.n_ubatch);
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            MESSAGE(log.final_line);
+            CHECK(prefetched_of(log.final_line) >= 0);
+            CHECK(swaps_of(log.final_line) == 0);
+        }
+        CHECK(whole.tokens == cached.tokens);
+
         // Cache-aware routing: a resident expert stands in for a missing one
         // with at least half its probability, so the same run reads less.
         {
@@ -483,6 +505,8 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
         REQUIRE(plain.logits.size() == full.logits.size());
         CHECK(max_abs_diff(cached.logits, full.logits) <= 1e-4f);
         CHECK(max_abs_diff(plain.logits, full.logits) <= 1e-4f);
+        REQUIRE(whole.logits.size() == full.logits.size());
+        CHECK(max_abs_diff(whole.logits, full.logits) <= 1e-4f);
     }
     // The predictions really read ahead somewhere (layers 1+ of each case).
     CHECK(prefetched > 0);

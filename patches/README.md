@@ -77,8 +77,14 @@ own router is applied to its input residual through the pre-FFN RMS norm right
 after the attention norm (`build_moe_pregate`, on the GPU split with the
 projections), and a fourth op after the attention projections
 (`build_moe_prefetch`) pins the predicted experts already resident and queues
-the missing ones, best first, to two background I/O threads, so their reads
-overlap the attention. The plan settles the round first: unstarted reads are
+the missing ones, best first, to four background I/O threads, so their reads
+overlap the attention. With split reads on (`LLAMA_EXPERT_SPLIT`, below) a job
+is cut into two 4 KiB-aligned parts per tensor, queued job-major: the threads
+read the most likely expert together before starting the next one, instead of
+one thread reading its three tensors one after the other; with split off each
+job is one thread's whole reads. Every queue entry carries its job's
+generation, so an entry left from a cancelled round never reads into the
+job's next use. The plan settles the round first: unstarted reads are
 cancelled (the slot gets its old expert back, its data was never overwritten),
 running ones are waited for. Routing is untouched, so the output stays exact.
 With a swap ratio the prediction is the swapped routing: the op ranks each
@@ -133,7 +139,9 @@ stats line ends with the direct, staged and buffered read counts, plus
 resident and checks the tokens and logits against the same model fully
 resident, with prefetch on (it must read ahead somewhere) and off, that
 buffered whole reads give the same tokens and logits bit for bit as the
-unbuffered split ones (which must happen on Linux), that a
+unbuffered split ones (which must happen on Linux), that prefetch with whole
+jobs gives the same tokens as with parts and logits within 1e-4 of the fully
+resident model, that a
 swap ratio of 0.5 reads less, and that expert-major prompts (with and without
 experts resident from earlier tokens, and with every slot free so the decode
 starts from the experts the prompt kept) give the same tokens and logits

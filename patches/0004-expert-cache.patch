@@ -71,10 +71,10 @@ index 07b4c61..6557247 100644
              cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
 diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
 new file mode 100644
-index 0000000..d821524
+index 0000000..384b875
 --- /dev/null
 +++ b/src/llama-expert-cache.cpp
-@@ -0,0 +1,1502 @@
+@@ -0,0 +1,1557 @@
 +#include "llama-expert-cache.h"
 +
 +#include "llama-impl.h"
@@ -194,13 +194,29 @@ index 0000000..d821524
 +
 +enum ec_pf_state : int { EC_PF_QUEUED, EC_PF_RUNNING, EC_PF_DONE, EC_PF_CANCELLED };
 +
-+// one read of a prefetch round: expert into slot, which held old_expert (last used at old_used)
++// one read of a prefetch round: expert into slot, which held old_expert (last used at old_used). Its
++// parts (every tensor whole, or each tensor's halves) are queued separately for the I/O threads; the
++// one that reads the last part marks the job done. gen tells this round's queue entries from those
++// an earlier round left behind for the same job
 +struct ec_pf {
 +    int32_t  slot       = -1;
 +    int32_t  expert     = -1;
 +    int32_t  old_expert = -1;
 +    uint64_t old_used   = 0;
-+    std::atomic<int> state {EC_PF_DONE};
++    int32_t  parts      = 1;
++    std::atomic<int>      state {EC_PF_DONE};
++    std::atomic<int32_t>  left  {0};
++    std::atomic<uint32_t> gen   {0};
++};
++
++struct ec_layer;
++
++// a prefetch queue entry: part of job i of layer L's round gen
++struct ec_pf_part {
++    ec_layer * L    = nullptr;
++    int32_t    i    = -1;
++    int32_t    part = 0;
++    uint32_t   gen  = 0;
 +};
 +
 +struct ec_layer {
@@ -267,7 +283,7 @@ index 0000000..d821524
 +    std::atomic<uint64_t> pf_wait_us   {0}; // plans waiting for reads in flight
 +    std::mutex pf_mtx;
 +    std::condition_variable pf_cv;
-+    std::deque<std::pair<ec_layer *, int32_t>> pf_queue;
++    std::deque<ec_pf_part> pf_queue;
 +    bool pf_stop = false;
 +    std::vector<std::thread> pf_threads;
 +
@@ -556,45 +572,79 @@ index 0000000..d821524
 +#endif
 +}
 +
++// a read split in n_parts: each part aligned and of at least EC_LOAD_MIN_PART, so that more reads
++// are in flight at once (LLAMA_EXPERT_SPLIT=0: whole reads). Part p covers [p*size, min((p+1)*size, nb2))
++static constexpr size_t EC_LOAD_MIN_PART = 128*1024;
++
++static size_t ec_part_size(size_t nb2, size_t n_parts) {
++    const size_t per = (nb2 + n_parts - 1)/n_parts;
++    return std::max(EC_LOAD_MIN_PART, (per + EC_DIRECT_ALIGN - 1)/EC_DIRECT_ALIGN*EC_DIRECT_ALIGN);
++}
++
 +//
 +// pre-gating prefetch: I/O threads read the experts a layer is predicted to route to while the
 +// graph computes the layer's attention; the layer's plan settles the round before it maps ids
 +//
 +
-+// the I/O threads take file handles from the top of ec_file::fp, the compute threads from the bottom
-+static constexpr int EC_PF_THREADS = 2;
++// the I/O threads take file handles from the top of ec_file::fp, the compute threads from the bottom.
++// With split reads a job is 2 parts per tensor, so the 3 tensors of an expert are read 6 at a time
++// instead of one after another by one thread
++static constexpr int    EC_PF_THREADS  = 4;
++static constexpr size_t EC_PF_SUBPARTS = 2;
 +
 +static void ec_pf_worker(llama_expert_cache * C, int ith) {
 +    for (;;) {
-+        ec_layer * L = nullptr;
-+        int32_t i = -1;
++        ec_pf_part e;
 +        {
 +            std::unique_lock<std::mutex> lock(C->pf_mtx);
 +            C->pf_cv.wait(lock, [C] { return C->pf_stop || !C->pf_queue.empty(); });
 +            if (C->pf_stop) {
 +                return;
 +            }
-+            L = C->pf_queue.front().first;
-+            i = C->pf_queue.front().second;
++            e = C->pf_queue.front();
 +            C->pf_queue.pop_front();
 +        }
-+        // an entry left from a settled round finds its job finished, dropped or already re-queued:
-+        // only the thread that moves it from queued to running reads, after the plan wrote it
-+        ec_pf & j = L->pf[i];
++        // an entry of an earlier round (its job dropped, the job then reused) has an older gen and
++        // reads nothing. This round has one entry per part, so while this part is unread the job can
++        // be neither done nor reused: past the second check, j holds the round the entry was made for.
++        // The first part taken moves the job from queued to running; a job the plan dropped first
++        // (cancelled) is skipped
++        ec_pf & j = e.L->pf[e.i];
++        if (j.gen.load(std::memory_order_acquire) != e.gen) {
++            continue;
++        }
 +        int st = EC_PF_QUEUED;
-+        if (!j.state.compare_exchange_strong(st, EC_PF_RUNNING, std::memory_order_acq_rel)) {
++        if (!j.state.compare_exchange_strong(st, EC_PF_RUNNING, std::memory_order_acq_rel) && st != EC_PF_RUNNING) {
++            continue;
++        }
++        if (j.gen.load(std::memory_order_acquire) != e.gen) {
 +            continue;
 +        }
 +        size_t bytes = 0;
-+        for (size_t ti : L->tensors) {
-+            const ec_tensor & T = C->tensors[ti];
-+            const size_t nb2 = T.t->nb[2];
-+            ec_read(*C->files[T.file], ith, (char *) T.t->data + (size_t) j.slot*nb2, nb2, T.offs + (size_t) j.expert*nb2);
-+            bytes += nb2;
++        if (j.parts == 1) {
++            for (size_t ti : e.L->tensors) {
++                const ec_tensor & T = C->tensors[ti];
++                const size_t nb2 = T.t->nb[2];
++                ec_read(*C->files[T.file], ith, (char *) T.t->data + (size_t) j.slot*nb2, nb2, T.offs + (size_t) j.expert*nb2);
++                bytes += nb2;
++            }
++        } else {
++            const ec_tensor & T = C->tensors[e.L->tensors[(size_t) e.part / EC_PF_SUBPARTS]];
++            const size_t nb2  = T.t->nb[2];
++            const size_t part = ec_part_size(nb2, EC_PF_SUBPARTS);
++            const size_t b    = ((size_t) e.part % EC_PF_SUBPARTS)*part;
++            if (b < nb2) {
++                const size_t n = std::min(part, nb2 - b);
++                ec_read(*C->files[T.file], ith, (char *) T.t->data + (size_t) j.slot*nb2 + b, n, T.offs + (size_t) j.expert*nb2 + b);
++                bytes = n;
++            }
 +        }
-+        C->bytes    += bytes;
-+        C->pf_reads += 1;
-+        j.state.store(EC_PF_DONE, std::memory_order_release);
++        C->bytes += bytes;
++        // the slot's data happens before the last part's release: the plan sees done, then the data
++        if (j.left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
++            C->pf_reads += 1;
++            j.state.store(EC_PF_DONE, std::memory_order_release);
++        }
 +    }
 +}
 +
@@ -606,8 +656,13 @@ index 0000000..d821524
 +                pf_threads.emplace_back(ec_pf_worker, this, GGML_MAX_N_THREADS - 1 - k);
 +            }
 +        }
++        // job-major, most likely expert first: it lands soonest, and the jobs no thread reached by
++        // the plan stay whole and can still be dropped
 +        for (int32_t i = 0; i < L.n_pf; ++i) {
-+            pf_queue.emplace_back(&L, i);
++            const ec_pf & j = L.pf[i];
++            for (int32_t p = 0; p < j.parts; ++p) {
++                pf_queue.push_back({&L, i, p, j.gen.load(std::memory_order_relaxed)});
++            }
 +        }
 +    }
 +    pf_cv.notify_all();
@@ -857,6 +912,9 @@ index 0000000..d821524
 +        L.expert_of[victim] = e;
 +        L.slot_of[e]        = victim;
 +        L.used[victim]      = tick;
++        j.parts = C.io_split ? (int32_t) (L.tensors.size()*EC_PF_SUBPARTS) : 1;
++        j.left.store(j.parts, std::memory_order_relaxed);
++        j.gen.store(j.gen.load(std::memory_order_relaxed) + 1, std::memory_order_release);
 +        j.state.store(EC_PF_QUEUED, std::memory_order_release);
 +    }
 +    if (L.n_pf > 0) {
@@ -991,9 +1049,7 @@ index 0000000..d821524
 +}
 +
 +// a decode ubatch misses about one expert per layer, one read per expert tensor: fewer reads than
-+// threads. Each read is then split in parts, aligned and of at least EC_LOAD_MIN_PART, so that every
-+// thread has one in flight (LLAMA_EXPERT_SPLIT=0: whole reads)
-+static constexpr size_t EC_LOAD_MIN_PART = 128*1024;
++// threads. Each read is then split in parts (ec_part_size), so that every thread has one in flight
 +
 +// all threads: read the pending experts of every tensor of the layer into their slots; dst = slot ids
 +static void ec_load(ggml_tensor * dst, int ith, int nth, void * userdata) {
@@ -1012,8 +1068,7 @@ index 0000000..d821524
 +        const auto & job = L.pending[r / n_t];
 +        const ec_tensor & T = C.tensors[L.tensors[r % n_t]];
 +        const size_t nb2  = T.t->nb[2];
-+        const size_t per  = (nb2 + n_parts - 1)/n_parts;
-+        const size_t part = std::max(EC_LOAD_MIN_PART, (per + EC_DIRECT_ALIGN - 1)/EC_DIRECT_ALIGN*EC_DIRECT_ALIGN);
++        const size_t part = ec_part_size(nb2, n_parts);
 +        const size_t b    = (j % n_parts)*part;
 +        if (b >= nb2) {
 +            continue;
