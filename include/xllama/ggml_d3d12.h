@@ -22,6 +22,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -154,5 +155,20 @@ std::string format_d3d12_selftest_row(const D3d12SelftestRow& r, const char* hos
 // Windows: run every type x shape through the backend and append rows.
 // Non-Windows: one row with d3d12_ran=false.
 void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out);
+
+// Largest single D3D12_Weights buffer llama.cpp may ask for (0 = no limit).
+// Above it ggml splits a context's weights into several buffers; a tensor
+// larger than the limit still gets one buffer of its own.
+void ggml_d3d12_set_weights_max_buffer(std::size_t bytes);
+
+// Keep output.weight in a CPU buffer when layers go to D3D12 (UWP knob
+// LocalState\gguf_output_cpu.txt). Read by apply_gguf_gpu_layers.
+void gguf_set_output_on_cpu(bool on);
+bool gguf_output_on_cpu();
+
+// GPU memory probe (gpumem.flag): single-allocation ceilings per heap kind,
+// cumulative ceilings with and without the heap filled first, and a reserved
+// (tiled) buffer backed by 64 MiB heaps. One line per result through emit.
+void run_d3d12_memprobe(const std::function<void(const std::string&)>& emit);
 
 } // namespace xllama

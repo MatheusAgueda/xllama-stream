@@ -71,6 +71,18 @@ bool d3d12_place_tied_embedding(ggml_type embd_type, bool has_output_weight) {
     return !has_output_weight && d3d12_get_rows_type_supported(embd_type);
 }
 
+namespace {
+bool g_output_on_cpu = false;
+} // namespace
+
+void gguf_set_output_on_cpu(bool on) {
+    g_output_on_cpu = on;
+}
+
+bool gguf_output_on_cpu() {
+    return g_output_on_cpu;
+}
+
 // --- Host emulation of shaders/ggml_d3d12_mmv_*.hlsl ---
 
 namespace {
@@ -317,12 +329,20 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
     out->push_back(std::move(r));
 }
 
+void ggml_d3d12_set_weights_max_buffer(std::size_t) {}
+
+void run_d3d12_memprobe(const std::function<void(const std::string&)>& emit) {
+    if (emit)
+        emit("d3d12 unavailable on this platform");
+}
+
 } // namespace xllama
 
     #else // _WIN32 — the backend itself
 
         #include <chrono>
         #include <cstdint>
+        #include <cstdlib>
         #include <mutex>
         #include <random>
 
@@ -557,11 +577,107 @@ template <typename F> bool run_now(Gpu& g, F&& record) {
 // --- Buffers ---
 
 struct BufCtx {
+    std::vector<ComPtr<ID3D12Heap>> heaps; // backing of a reserved weights buffer; outlives res
     ComPtr<ID3D12Resource> res;
     D3D12_GPU_VIRTUAL_ADDRESS va = 0;
     std::uint8_t* host = nullptr; // mapped pointer (D3D12_Host only)
     bool is_host = false;
 };
+
+// Series X Dev Mode (2026-11-09): a committed DEFAULT buffer of 834,355,456 B
+// (Qwen3.5-9B's Q6_K output.weight) fails with E_OUTOFMEMORY in a fresh
+// process while DXGI reports 4.1 GB of budget free; Series S placed a single
+// 1834 MiB buffer. A reserved buffer gives one contiguous GPU VA backed by
+// small heaps, so a size limit on one allocation stops mattering.
+constexpr UINT64 kTileBytes = 64ull << 10;
+constexpr UINT64 kTiledHeapBytes = 64ull << 20;
+
+D3D12_HEAP_PROPERTIES custom_l0_props() {
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_CUSTOM;
+    hp.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+    hp.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+    return hp;
+}
+
+ComPtr<ID3D12Heap> create_heap(ID3D12Device* device, UINT64 bytes, bool custom_l0, HRESULT* hr_out) {
+    D3D12_HEAP_DESC hd = {};
+    hd.SizeInBytes = bytes;
+    if (custom_l0)
+        hd.Properties = custom_l0_props();
+    else
+        hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+    ComPtr<ID3D12Heap> heap;
+    const HRESULT hr = device->CreateHeap(&hd, IID_PPV_ARGS(&heap));
+    if (hr_out)
+        *hr_out = hr;
+    if (FAILED(hr))
+        return {};
+    return heap;
+}
+
+// Reserved buffer of `bytes` (rounded up to 64 KiB) whose tiles are mapped,
+// in order, onto kTiledHeapBytes heaps (DEFAULT, else CUSTOM L0 per heap).
+ComPtr<ID3D12Resource> create_tiled_buffer(Gpu& g, UINT64 bytes, std::vector<ComPtr<ID3D12Heap>>* heaps,
+                                           std::string* err) {
+    D3D12_FEATURE_DATA_D3D12_OPTIONS o = {};
+    if (FAILED(g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof(o))) ||
+        o.TiledResourcesTier == D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED) {
+        *err = "tiled resources not supported";
+        return {};
+    }
+    bytes = (bytes + kTileBytes - 1) / kTileBytes * kTileBytes;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = bytes;
+    rd.Height = 1;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_UNKNOWN;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> res;
+    HRESULT hr = g.device->CreateReservedResource(&rd, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                  IID_PPV_ARGS(&res));
+    if (FAILED(hr)) {
+        *err = d3d12c::hr_message("CreateReservedResource", hr);
+        return {};
+    }
+    const UINT64 tiles = bytes / kTileBytes, per_heap = kTiledHeapBytes / kTileBytes;
+    std::lock_guard<std::mutex> lock(g.mu);
+    for (UINT64 t0 = 0; t0 < tiles; t0 += per_heap) {
+        const UINT64 n = std::min(per_heap, tiles - t0);
+        HRESULT hr_default = S_OK;
+        ComPtr<ID3D12Heap> heap = create_heap(g.device.Get(), n * kTileBytes, false, &hr_default);
+        if (!heap)
+            heap = create_heap(g.device.Get(), n * kTileBytes, true, &hr);
+        if (!heap) {
+            *err = d3d12c::hr_message("CreateHeap (tiled backing)", hr_default) + " after " +
+                   std::to_string(heaps->size()) + " heaps";
+            heaps->clear();
+            return {};
+        }
+        D3D12_TILED_RESOURCE_COORDINATE coord = {};
+        coord.X = static_cast<UINT>(t0);
+        D3D12_TILE_REGION_SIZE region = {};
+        region.NumTiles = static_cast<UINT>(n);
+        region.UseBox = FALSE;
+        const D3D12_TILE_RANGE_FLAGS range_flags = D3D12_TILE_RANGE_FLAG_NONE;
+        const UINT heap_start = 0, range_tiles = static_cast<UINT>(n);
+        g.queue->UpdateTileMappings(res.Get(), 1, &coord, &region, heap.Get(), 1, &range_flags,
+                                    &heap_start, &range_tiles, D3D12_TILE_MAPPING_FLAG_NONE);
+        heaps->push_back(heap);
+    }
+    if (!g.fence.signal_and_wait(g.queue.Get(), /*spin=*/false)) {
+        *err = "fence wait after UpdateTileMappings failed";
+        heaps->clear();
+        return {};
+    }
+    return res;
+}
+
+std::size_t g_weights_max_buffer = 0; // 0 = no limit (ggml_d3d12_set_weights_max_buffer)
 
 void* buf_base(ggml_backend_buffer_t b) {
     auto* c = static_cast<BufCtx*>(b->context);
@@ -721,6 +837,31 @@ ggml_backend_buffer_t alloc_buf(ggml_backend_buffer_type_t buft, size_t size, bo
         c->res = d3d12c::create_buffer(g.device.Get(), size, D3D12_HEAP_TYPE_DEFAULT,
                                        D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON,
                                        "D3D12_Weights", &err);
+        const char* fallback = nullptr;
+        if (!c->res) {
+            std::string err_l0;
+            c->res = d3d12c::create_buffer_props(g.device.Get(), size, custom_l0_props(),
+                                                 D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON,
+                                                 "D3D12_Weights_L0", &err_l0);
+            if (c->res)
+                fallback = "CUSTOM L0 committed";
+            else
+                err += "; " + err_l0;
+        }
+        if (!c->res) {
+            std::string err_tiled;
+            c->res = create_tiled_buffer(g, size, &c->heaps, &err_tiled);
+            if (c->res)
+                fallback = "reserved + 64 MiB heaps";
+            else
+                err += "; " + err_tiled;
+        }
+        if (fallback) {
+            char msg[256];
+            std::snprintf(msg, sizeof(msg), "[xllama] d3d12: weights %.1f MiB: DEFAULT committed failed, %s\n",
+                          static_cast<double>(size) / 1048576.0, fallback);
+            log_output(msg);
+        }
     }
     if (!c->res || (host && !c->host)) {
         char msg[256];
@@ -746,6 +887,9 @@ ggml_backend_buffer_t host_alloc(ggml_backend_buffer_type_t buft, size_t size) {
 ggml_backend_buffer_t weights_alloc(ggml_backend_buffer_type_t buft, size_t size) {
     return alloc_buf(buft, size, false);
 }
+size_t weights_max_size(ggml_backend_buffer_type_t) {
+    return g_weights_max_buffer ? g_weights_max_buffer : SIZE_MAX;
+}
 
 ggml_backend_buffer_type kHostBuft = {
     /* .iface = */
@@ -769,7 +913,7 @@ ggml_backend_buffer_type kWeightsBuft = {
         /* .alloc_buffer     = */ weights_alloc,
         /* .alloc_buffer_n   = */ nullptr,
         /* .get_alignment    = */ buft_alignment,
-        /* .get_max_size     = */ nullptr,
+        /* .get_max_size     = */ weights_max_size,
         /* .get_alloc_size   = */ weights_alloc_size,
         /* .get_alloc_size_n = */ nullptr,
         /* .is_host          = */ nullptr,
@@ -1262,6 +1406,213 @@ bool ggml_d3d12_register() {
 
 ggml_backend_buffer_type_t ggml_d3d12_weights_buft() {
     return ggml_d3d12_register() ? &kWeightsBuft : nullptr;
+}
+
+void ggml_d3d12_set_weights_max_buffer(std::size_t bytes) {
+    g_weights_max_buffer = bytes;
+}
+
+// --- Memory probe (gpumem.flag) ---
+
+namespace {
+
+constexpr std::size_t kProbeStep = 64ull << 20;
+constexpr std::size_t kProbeHeapFloorMb = 256; // same margin as ramceil: stop before the PLM kills us
+
+std::string probe_state(Gpu& g) {
+    char b[256];
+    std::size_t budget = 0, usage = 0, nl_budget = 0, nl_usage = 0;
+    ComPtr<IDXGIFactory4> factory;
+    ComPtr<IDXGIAdapter3> adapter;
+    if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) &&
+        SUCCEEDED(factory->EnumAdapterByLuid(g.luid, IID_PPV_ARGS(&adapter)))) {
+        DXGI_QUERY_VIDEO_MEMORY_INFO i = {};
+        if (SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &i))) {
+            budget = static_cast<std::size_t>(i.Budget >> 20);
+            usage = static_cast<std::size_t>(i.CurrentUsage >> 20);
+        }
+        if (SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &i))) {
+            nl_budget = static_cast<std::size_t>(i.Budget >> 20);
+            nl_usage = static_cast<std::size_t>(i.CurrentUsage >> 20);
+        }
+    }
+    std::snprintf(b, sizeof(b), "dxgi_local %zu/%zu MB, dxgi_nonlocal %zu/%zu MB, avail_phys %zu MB, ws %zu MB",
+                  usage, budget, nl_usage, nl_budget, avail_phys_mb(), working_set_mb());
+    return b;
+}
+
+struct ProbeHold {
+    std::vector<ComPtr<ID3D12Resource>> res;
+    std::vector<ComPtr<ID3D12Heap>> heaps;
+    std::vector<void*> heap_blocks;
+    ~ProbeHold() {
+        for (void* p : heap_blocks)
+            std::free(p);
+    }
+};
+
+volatile std::uint8_t g_probe_sink = 0;
+
+// Adds kProbeStep units of one kind until an allocation fails, the cap is hit
+// or (heap) avail_phys drops under the floor. Returns MiB added.
+std::size_t probe_fill(Gpu& g, const char* kind, std::size_t cap_mb, ProbeHold* hold,
+                       const std::function<void(const std::string&)>& emit) {
+    std::size_t mb = 0;
+    std::string stop = "cap";
+    while (mb + (kProbeStep >> 20) <= cap_mb) {
+        std::string err;
+        bool ok = false;
+        if (std::strcmp(kind, "heap") == 0) {
+            if (avail_phys_mb() < kProbeHeapFloorMb + (kProbeStep >> 20)) {
+                stop = "avail_floor";
+                break;
+            }
+            void* p = std::malloc(kProbeStep);
+            if (p) {
+                auto* bytes = static_cast<std::uint8_t*>(p);
+                for (std::size_t off = 0; off < kProbeStep; off += 4096)
+                    bytes[off] = static_cast<std::uint8_t>(off >> 12);
+                g_probe_sink = g_probe_sink + bytes[kProbeStep - 4096];
+                hold->heap_blocks.push_back(p);
+                ok = true;
+            } else {
+                err = "malloc null";
+            }
+        } else if (std::strcmp(kind, "default") == 0) {
+            auto r = d3d12c::create_buffer(g.device.Get(), kProbeStep, D3D12_HEAP_TYPE_DEFAULT,
+                                           D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON, "probe", &err);
+            if (r) {
+                hold->res.push_back(r);
+                ok = true;
+            }
+        } else if (std::strcmp(kind, "custom_l0") == 0) {
+            auto r = d3d12c::create_buffer_props(g.device.Get(), kProbeStep, custom_l0_props(),
+                                                 D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON, "probe",
+                                                 &err);
+            if (r) {
+                hold->res.push_back(r);
+                ok = true;
+            }
+        } else { // "heapobj": ID3D12Heap DEFAULT, buffers only
+            HRESULT hr = S_OK;
+            auto h = create_heap(g.device.Get(), kProbeStep, false, &hr);
+            if (h) {
+                hold->heaps.push_back(h);
+                ok = true;
+            } else {
+                err = d3d12c::hr_message("CreateHeap", hr);
+            }
+        }
+        if (!ok) {
+            stop = err;
+            break;
+        }
+        mb += kProbeStep >> 20;
+        if (mb % 1024 == 0)
+            emit(std::string("  fill ") + kind + " " + std::to_string(mb) + " MB: " + probe_state(g));
+    }
+    emit(std::string("fill ") + kind + " total " + std::to_string(mb) + " MB (stop: " + stop + "); " +
+         probe_state(g));
+    return mb;
+}
+
+// One reserved buffer of `mb`, every 64 MiB tile range on its own heap; then a
+// 1 MiB pattern written through the staging ring at its last MiB and read back.
+void probe_tiled(Gpu& g, std::size_t mb, const std::function<void(const std::string&)>& emit) {
+    std::vector<ComPtr<ID3D12Heap>> heaps;
+    std::string err;
+    const UINT64 bytes = static_cast<UINT64>(mb) << 20;
+    auto res = create_tiled_buffer(g, bytes, &heaps, &err);
+    if (!res) {
+        emit("tiled " + std::to_string(mb) + " MB: FAIL " + err + "; " + probe_state(g));
+        return;
+    }
+    const UINT64 off = bytes - (1ull << 20);
+    bool same = false;
+    {
+        std::lock_guard<std::mutex> lock(g.mu);
+        for (std::size_t i = 0; i < (1u << 20); ++i)
+            g.staging_ptr[i] = static_cast<std::uint8_t>(i * 7 + 3);
+        run_now(g, [&](ID3D12GraphicsCommandList* cl) {
+            cl->CopyBufferRegion(res.Get(), off, g.staging.Get(), 0, 1ull << 20);
+        });
+        run_now(g, [&](ID3D12GraphicsCommandList* cl) {
+            cl->CopyBufferRegion(g.readback.Get(), 0, res.Get(), off, 1ull << 20);
+        });
+        same = std::memcmp(g.staging_ptr, g.readback_ptr, 1u << 20) == 0;
+    }
+    emit("tiled " + std::to_string(mb) + " MB: ok, " + std::to_string(heaps.size()) + " heaps, readback " +
+         (same ? "MATCH" : "MISMATCH") + "; " + probe_state(g));
+}
+
+} // namespace
+
+void run_d3d12_memprobe(const std::function<void(const std::string&)>& emit) {
+    if (!emit)
+        return;
+    Gpu& g = gpu();
+    if (!g.ok) {
+        emit("d3d12 init failed: " + g.error);
+        return;
+    }
+    {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS o = {};
+        D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT va = {};
+        D3D12_FEATURE_DATA_ARCHITECTURE1 arch = {};
+        g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof(o));
+        g.device->CheckFeatureSupport(D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT, &va, sizeof(va));
+        g.device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE1, &arch, sizeof(arch));
+        char b[256];
+        std::snprintf(b, sizeof(b),
+                      "caps: uma=%d cc_uma=%d tiled_tier=%d heap_tier=%d va_bits_res=%u va_bits_proc=%u",
+                      arch.UMA ? 1 : 0, arch.CacheCoherentUMA ? 1 : 0, static_cast<int>(o.TiledResourcesTier),
+                      static_cast<int>(o.ResourceHeapTier), va.MaxGPUVirtualAddressBitsPerResource,
+                      va.MaxGPUVirtualAddressBitsPerProcess);
+        emit(b);
+        emit("start: " + probe_state(g));
+    }
+    // A: one allocation of each size, released at once.
+    static const std::size_t sizes_mb[] = {64, 128, 256, 384, 512, 640, 704, 768, 800, 832, 896, 1024, 1536, 2048};
+    for (const char* kind : {"default", "custom_l0", "heapobj"}) {
+        std::string line = std::string("single ") + kind + ":";
+        for (std::size_t mb : sizes_mb) {
+            std::string err;
+            bool ok = false;
+            const UINT64 bytes = static_cast<UINT64>(mb) << 20;
+            if (std::strcmp(kind, "default") == 0) {
+                ok = d3d12c::create_buffer(g.device.Get(), bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+                                           D3D12_RESOURCE_STATE_COMMON, "probe", &err) != nullptr;
+            } else if (std::strcmp(kind, "custom_l0") == 0) {
+                ok = d3d12c::create_buffer_props(g.device.Get(), bytes, custom_l0_props(), D3D12_RESOURCE_FLAG_NONE,
+                                                 D3D12_RESOURCE_STATE_COMMON, "probe", &err) != nullptr;
+            } else {
+                ok = create_heap(g.device.Get(), bytes, false, nullptr) != nullptr;
+            }
+            line += " " + std::to_string(mb) + (ok ? "=ok" : "=FAIL");
+        }
+        emit(line);
+    }
+    // B: GPU first, then heap on top.
+    {
+        ProbeHold hold;
+        probe_fill(g, "default", 12288, &hold, emit);
+        probe_fill(g, "custom_l0", 12288, &hold, emit);
+        probe_fill(g, "heapobj", 12288, &hold, emit);
+        probe_fill(g, "heap", 8192, &hold, emit);
+    }
+    emit("released: " + probe_state(g));
+    // C: heap first, then GPU on top: equal totals in B and C = one shared pool.
+    {
+        ProbeHold hold;
+        probe_fill(g, "heap", 8192, &hold, emit);
+        probe_fill(g, "default", 12288, &hold, emit);
+        probe_fill(g, "custom_l0", 12288, &hold, emit);
+    }
+    emit("released: " + probe_state(g));
+    // D: reserved buffers backed by 64 MiB heaps.
+    for (std::size_t mb : {1024, 2048, 3072})
+        probe_tiled(g, mb, emit);
+    emit("done: " + probe_state(g));
 }
 
 // --- Selftest ---

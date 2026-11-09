@@ -51,6 +51,11 @@ void run_gpustep(bool inproc);
 // Q4_K / Q6_K shape against ggml's dequantizers. llama builds only.
 void run_d3d12_selftest();
 
+// D3D12 allocation ceilings per heap kind, shared-pool test against the heap,
+// reserved buffers on 64 MiB heaps. Triggered by LocalFolder\gpumem.flag;
+// writes gpumem-result.txt (+ .done). llama builds only.
+void run_gpumem();
+
 // Operator override for GGUF GPU layers in interactive sessions (GUI and LAN
 // API): the value in LocalState\gguf_gpu_layers.txt, or
 // kGgufGpuLayersKnobAbsent when there is no file. Callers combine it with the

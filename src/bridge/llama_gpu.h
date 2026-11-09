@@ -125,14 +125,23 @@ inline int apply_gguf_gpu_layers(int requested, llama_model_params& mparams,
     // one copy: the duplicate finds the original in the same buffer context.
     ggml_type embd_type = GGML_TYPE_COUNT;
     bool has_output = true;
-    if (gguf_embedding_info(model_path, &embd_type, &has_output) &&
-        d3d12_place_tied_embedding(embd_type, has_output)) {
-        static llama_model_tensor_buft_override embd_on_gpu[] = {{"^token_embd\\.weight$", nullptr},
-                                                                 {nullptr, nullptr}};
-        embd_on_gpu[0].buft = ggml_d3d12_weights_buft();
-        mparams.tensor_buft_overrides = embd_on_gpu;
+    static llama_model_tensor_buft_override overrides[3] = {};
+    int n_overrides = 0;
+    const bool have_info = gguf_embedding_info(model_path, &embd_type, &has_output);
+    if (have_info && d3d12_place_tied_embedding(embd_type, has_output)) {
+        overrides[n_overrides++] = {"^token_embd\\.weight$", ggml_d3d12_weights_buft()};
         log_output("[xllama] gguf gpu layers: tied token_embd in D3D12_Weights\n");
     }
+    // n_gpu_layers >= 1 always offloads output.weight first, and on a large
+    // vocabulary it is the single biggest tensor (Qwen3.5: 248K x 4096 Q6_K =
+    // 796 MiB, over what one Series X allocation takes). Knob: keep it on the CPU.
+    if (have_info && has_output && gguf_output_on_cpu()) {
+        overrides[n_overrides++] = {"^output\\.weight$", ggml_backend_cpu_buffer_type()};
+        log_output("[xllama] gguf gpu layers: output.weight kept on the CPU\n");
+    }
+    overrides[n_overrides] = {nullptr, nullptr};
+    if (n_overrides > 0)
+        mparams.tensor_buft_overrides = overrides;
     log_gguf_ws("after d3d12 init");
     log_output("[xllama] gguf gpu layers: " + std::to_string(requested) + " on D3D12\n");
     return requested;
