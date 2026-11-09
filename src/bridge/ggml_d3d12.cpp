@@ -579,6 +579,7 @@ void run_d3d12_memprobe(const std::function<void(const std::string&)>& emit) {
         #include <map>
         #include <mutex>
         #include <random>
+        #include <tuple>
         #include <unordered_map>
         #include <unordered_set>
 
@@ -691,6 +692,11 @@ struct Gpu {
     bool ssm_ok = false;
     ComPtr<ID3D12QueryHeap> ts;
     ComPtr<ID3D12Resource> ts_rb;
+    // XLLAMA_D3D12_PROFILE (read when a backend is created): a timestamp after
+    // every dispatch, summed per kernel and grid in `kernels`.
+    ComPtr<ID3D12QueryHeap> prof;
+    ComPtr<ID3D12Resource> prof_rb;
+    bool prof_on = false;
     ComPtr<ID3D12Resource> staging;  // weight upload ring (kStagingBytes)
     ComPtr<ID3D12Resource> readback; // get_tensor on weights (kStagingBytes)
     std::uint8_t* staging_ptr = nullptr;
@@ -709,6 +715,7 @@ struct Gpu {
     std::uint64_t n_dispatches = 0;
     std::uint64_t n_submits = 0;
     std::uint64_t n_replays = 0; // submits that executed a kept command list again
+    std::uint64_t n_barriers = 0;
     double wall_ms = 0.0;
     double gpu_ms = 0.0;
     // Of wall_ms: recording + submitting the graph submissions, then waiting for
@@ -723,6 +730,8 @@ struct Gpu {
         double ms = 0.0;
     };
     std::map<std::string, SegStat> segs;
+    // XLLAMA_D3D12_PROFILE: dispatches by pipeline and grid.
+    std::map<std::tuple<const ID3D12PipelineState*, UINT, UINT, UINT>, SegStat> kernels;
     std::mutex mu;
     bool ok = false;
     std::string error;
@@ -1367,6 +1376,39 @@ bool in_expert_cache(const ggml_tensor* t) {
     return b && is_expert_cache(b->buft) && b->iface.get_base == kHostBufIface.get_base;
 }
 
+// A pipeline's kernel, for the profile.
+std::string pso_name(const Gpu& g, const ID3D12PipelineState* p) {
+    static const char* const kTypes[] = {"q4_0", "q4_K", "q6_K", "iq3_s", "iq4_xs", "q5_K", "f32"};
+    static const char* const kElts[] = {"elt binary", "elt rms_norm", "elt quant q8_K"};
+    static const char* const kMoes[] = {"moe combine", "moe tail"};
+    static const char* const kSsms[] = {"ssm unary", "ssm copy", "ssm get_rows", "ssm conv",
+                                        "ssm gated delta net"};
+    static_assert(static_cast<int>(std::size(kTypes)) == kPsoCount &&
+                      static_cast<int>(std::size(kElts)) == kEltCount &&
+                      static_cast<int>(std::size(kMoes)) == kMoeCount &&
+                      static_cast<int>(std::size(kSsms)) == kSsmCount,
+                  "a name per kernel");
+    for (int i = 0; i < kPsoCount; ++i)
+        for (int wd = 0; wd < 2; ++wd)
+            if (g.pso[i][wd].Get() == p)
+                return std::string("mmv ") + kTypes[i] + (wd ? " t128" : " t64");
+    if (g.pso_get_rows.Get() == p)
+        return "get_rows q6_K";
+    for (int wd = 0; wd < 2; ++wd)
+        if (g.pso_mmid[wd].Get() == p)
+            return wd ? "mmid iq4_xs t128" : "mmid iq4_xs t64";
+    for (int i = 0; i < kEltCount; ++i)
+        if (g.pso_elt[i].Get() == p)
+            return kElts[i];
+    for (int i = 0; i < kMoeCount; ++i)
+        if (g.pso_moe[i].Get() == p)
+            return kMoes[i];
+    for (int i = 0; i < kSsmCount; ++i)
+        if (g.pso_ssm[i].Get() == p)
+            return kSsms[i];
+    return "?";
+}
+
 // --- Backend ---
 
 const char* backend_name(ggml_backend_t) {
@@ -1380,13 +1422,29 @@ void backend_free(ggml_backend_t b) {
         std::snprintf(msg, sizeof(msg),
                       "[xllama] d3d12: %llu graph_compute calls, %llu submits, %llu dispatches, "
                       "%.1f ms wall (%.1f ms GPU; %.1f ms recording, %.1f ms waiting, %.1f ms "
-                      "host); %llu submits replayed a kept list\n",
+                      "host); %llu submits replayed a kept list; %llu barriers\n",
                       static_cast<unsigned long long>(g.n_calls),
                       static_cast<unsigned long long>(g.n_submits),
                       static_cast<unsigned long long>(g.n_dispatches), g.wall_ms, g.gpu_ms,
                       g.rec_ms, g.wait_ms, g.wall_ms - g.rec_ms - g.wait_ms,
-                      static_cast<unsigned long long>(g.n_replays));
+                      static_cast<unsigned long long>(g.n_replays),
+                      static_cast<unsigned long long>(g.n_barriers));
         log_output(msg);
+        std::vector<
+            std::pair<std::tuple<const ID3D12PipelineState*, UINT, UINT, UINT>, Gpu::SegStat>>
+            ks(g.kernels.begin(), g.kernels.end());
+        std::sort(ks.begin(), ks.end(),
+                  [](const auto& x, const auto& y) { return x.second.ms > y.second.ms; });
+        if (ks.size() > 40)
+            ks.resize(40);
+        for (const auto& [key, s] : ks) {
+            char line[256];
+            std::snprintf(
+                line, sizeof(line), "[xllama] d3d12 kernel: %9llu x %9.1f ms  %s grid %ux%ux%u\n",
+                static_cast<unsigned long long>(s.n), s.ms, pso_name(g, std::get<0>(key)).c_str(),
+                std::get<1>(key), std::get<2>(key), std::get<3>(key));
+            log_output(line);
+        }
         std::vector<std::pair<std::string, Gpu::SegStat>> top(g.segs.begin(), g.segs.end());
         std::sort(top.begin(), top.end(),
                   [](const auto& x, const auto& y) { return x.second.ms > y.second.ms; });
@@ -1398,9 +1456,10 @@ void backend_free(ggml_backend_t b) {
                           static_cast<unsigned long long>(s.n), s.ms, key.c_str());
             log_output(line);
         }
-        g.n_calls = g.n_submits = g.n_dispatches = g.n_replays = 0;
+        g.n_calls = g.n_submits = g.n_dispatches = g.n_replays = g.n_barriers = 0;
         g.wall_ms = g.gpu_ms = g.rec_ms = g.wait_ms = 0.0;
         g.segs.clear();
+        g.kernels.clear();
     }
     delete b;
 }
@@ -1683,15 +1742,22 @@ void set_c(Op& op, std::initializer_list<std::uint64_t> c) {
         op.c[i++] = static_cast<std::uint32_t>(v);
 }
 
+// XLLAMA_D3D12_PROFILE's timestamps per submission: one before the first
+// dispatch, then one after each; dispatches past the last go uncounted.
+constexpr UINT kProfStamps = 1024;
+
 // The commands of one submission; returns its dispatch count. A pure function
-// of ops and ts (with the process-lifetime root signature, PSOs and query
-// heap), which is what lets a kept list stand in for a fresh recording.
-std::uint64_t record_ops(Gpu& g, ID3D12GraphicsCommandList* cl, const std::vector<Op>& ops,
-                         bool ts) {
+// of ops, ts and prof (with the process-lifetime root signature, PSOs and
+// query heaps), which is what lets a kept list stand in for a fresh recording.
+std::uint64_t record_ops(Gpu& g, ID3D12GraphicsCommandList* cl, const std::vector<Op>& ops, bool ts,
+                         bool prof) {
     std::uint64_t n = 0;
+    UINT stamps = 0;
     cl->SetComputeRootSignature(g.root.Get());
     if (ts)
         cl->EndQuery(g.ts.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+    if (prof)
+        cl->EndQuery(g.prof.Get(), D3D12_QUERY_TYPE_TIMESTAMP, stamps++);
     ID3D12PipelineState* bound = nullptr;
     for (const Op& op : ops) {
         if (!op.pso) {
@@ -1713,12 +1779,39 @@ std::uint64_t record_ops(Gpu& g, ID3D12GraphicsCommandList* cl, const std::vecto
         cl->SetComputeRootUnorderedAccessView(7, op.u[4] ? op.u[4] : op.u[0]);
         cl->Dispatch(op.gx, op.gy, op.gz);
         ++n;
+        if (prof && stamps < kProfStamps)
+            cl->EndQuery(g.prof.Get(), D3D12_QUERY_TYPE_TIMESTAMP, stamps++);
     }
     if (ts) {
         cl->EndQuery(g.ts.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
         cl->ResolveQueryData(g.ts.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, g.ts_rb.Get(), 0);
     }
+    if (prof)
+        cl->ResolveQueryData(g.prof.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, stamps, g.prof_rb.Get(),
+                             0);
     return n;
+}
+
+// Each profiled dispatch's time, from the stamps record_ops resolved: the gap
+// from the previous stamp, so a barrier counts towards the dispatch after it.
+void add_profile(Gpu& g, const std::vector<Op>& ops) {
+    void* p = nullptr;
+    if (FAILED(g.prof_rb->Map(0, nullptr, &p)))
+        return;
+    const auto* t = static_cast<const std::uint64_t*>(p);
+    UINT k = 1;
+    for (const Op& op : ops) {
+        if (!op.pso)
+            continue;
+        if (k >= kProfStamps)
+            break;
+        Gpu::SegStat& s = g.kernels[std::make_tuple(op.pso, op.gx, op.gy, op.gz)];
+        ++s.n;
+        if (t[k] > t[k - 1])
+            s.ms += 1000.0 * static_cast<double>(t[k] - t[k - 1]) / static_cast<double>(g.ts_freq);
+        ++k;
+    }
+    g.prof_rb->Unmap(0, nullptr);
 }
 
 bool same_op(const Op& a, const Op& b) {
@@ -1728,8 +1821,8 @@ bool same_op(const Op& a, const Op& b) {
            a.gy == b.gy && a.gz == b.gz;
 }
 
-std::uint64_t ops_hash(const std::vector<Op>& ops, bool ts) {
-    std::uint64_t h = 1469598103934665603ull ^ (ts ? 1u : 0u);
+std::uint64_t ops_hash(const std::vector<Op>& ops, bool ts, bool prof) {
+    std::uint64_t h = 1469598103934665603ull ^ (ts ? 1u : 0u) ^ (prof ? 2u : 0u);
     auto mix = [&h](std::uint64_t v) {
         h = (h ^ v) * 1099511628211ull;
         h ^= h >> 29;
@@ -1776,8 +1869,9 @@ ListCache& list_cache() { // guarded by gpu().mu
 // Record and run one submission. Caller holds g.mu.
 bool submit_ops(Gpu& g, const std::vector<Op>& ops) {
     const bool ts = g.ts && g.ts_rb;
+    const bool prof = g.prof_on && g.prof && g.prof_rb && g.ts_freq > 0;
     ListCache& lc = list_cache();
-    const std::uint64_t h = ops_hash(ops, ts);
+    const std::uint64_t h = ops_hash(ops, ts, prof);
     const auto it = lc.kept.find(h);
     std::uint64_t n = 0;
     bool ran = false;
@@ -1802,7 +1896,7 @@ bool submit_ops(Gpu& g, const std::vector<Op>& ops) {
             hr = g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, k.alloc.Get(),
                                              nullptr, IID_PPV_ARGS(&k.cl));
         if (SUCCEEDED(hr)) {
-            k.n = record_ops(g, k.cl.Get(), ops, ts);
+            k.n = record_ops(g, k.cl.Get(), ops, ts, prof);
             hr = k.cl->Close();
         }
         if (SUCCEEDED(hr)) {
@@ -1817,10 +1911,14 @@ bool submit_ops(Gpu& g, const std::vector<Op>& ops) {
     }
     if (!done)
         ran = run_now(
-            g, [&](ID3D12GraphicsCommandList* cl) { n = record_ops(g, cl, ops, ts); }, &g.rec_ms,
-            &g.wait_ms);
+            g, [&](ID3D12GraphicsCommandList* cl) { n = record_ops(g, cl, ops, ts, prof); },
+            &g.rec_ms, &g.wait_ms);
     if (!ran)
         return false;
+    if (prof)
+        add_profile(g, ops);
+    g.n_barriers += static_cast<std::uint64_t>(
+        std::count_if(ops.begin(), ops.end(), [](const Op& op) { return !op.pso; }));
     if (ts) {
         void* p = nullptr;
         if (SUCCEEDED(g.ts_rb->Map(0, nullptr, &p))) {
@@ -2560,8 +2658,32 @@ void dev_props(ggml_backend_dev_t dev, ggml_backend_dev_props* props) {
                    /* events */ false, /* mmap_support */ false};
 }
 ggml_backend_t dev_init_backend(ggml_backend_dev_t dev, const char*) {
-    if (!gpu().ok)
+    Gpu& g = gpu();
+    if (!g.ok)
         return nullptr;
+    {
+        // Read per backend: a catalogue entry's "env" is applied before its load.
+        std::lock_guard<std::mutex> lock(g.mu);
+        const char* s = std::getenv("XLLAMA_D3D12_PROFILE");
+        g.prof_on = s && *s && *s != '0' && g.ts_freq > 0;
+        if (g.prof_on && !g.prof) {
+            D3D12_QUERY_HEAP_DESC qhd = {};
+            qhd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+            qhd.Count = kProfStamps;
+            std::string err;
+            if (SUCCEEDED(g.device->CreateQueryHeap(&qhd, IID_PPV_ARGS(&g.prof))))
+                g.prof_rb = d3d12c::create_buffer(
+                    g.device.Get(), kProfStamps * sizeof(std::uint64_t), D3D12_HEAP_TYPE_READBACK,
+                    D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, "prof_rb", &err);
+            if (!g.prof || !g.prof_rb) {
+                g.prof.Reset();
+                g.prof_rb.Reset();
+                g.prof_on = false;
+            }
+        }
+        if (g.prof_on)
+            log_output("[xllama] d3d12: profiling every dispatch (XLLAMA_D3D12_PROFILE)\n");
+    }
     return new ggml_backend{backend_guid(), kBackendIface, dev, nullptr};
 }
 ggml_backend_buffer_type_t dev_buffer_type(ggml_backend_dev_t) {
