@@ -6,14 +6,14 @@
 #   shaders/gpugemv_q4k_wave32.hlsl → gpugemv_q4k_wave32_dxil.h (H6.2 LDS-red)
 #   shaders/gpugemv_q4k_rows.hlsl   → gpugemv_q4k_rows_dxil.h   (H6.3 multi-row)
 #   shaders/gpugemv_q4k_dot4.hlsl   → gpugemv_q4k_dot4_dxil.h   (H6.3 int8 dot, cs_6_4)
-#   shaders/ggml_d3d12_mmv_{q4_0,q4_k,q5_k,q6_k,iq3_s,iq4_xs}.hlsl → ggml_d3d12_mmv_*_t{64,128}_dxil.h (cs_6_4)
+#   shaders/ggml_d3d12_mmv_{q4_0,q4_k,q5_k,q6_k,iq3_s,iq4_xs,f32}.hlsl → ggml_d3d12_mmv_*_t{64,128}_dxil.h (cs_6_4)
 #     (D2 backend; one blob per thread-group width, -D NUM_THREADS)
 #   shaders/ggml_d3d12_mmid_iq4_xs.hlsl → ggml_d3d12_mmid_iq4_xs_t{64,128}_dxil.h (cs_6_4, MUL_MAT_ID)
 #   shaders/ggml_d3d12_get_rows_q6_k.hlsl → ggml_d3d12_get_rows_q6_k_dxil.h (cs_6_4)
 #   shaders/ggml_d3d12_elt.hlsl → ggml_d3d12_elt_{binary,rms_norm,quant_q8_k}_dxil.h (cs_6_4, -D KERNEL)
 #   shaders/ggml_d3d12_moe.hlsl → ggml_d3d12_moe_{combine,tail}_dxil.h (cs_6_4, -D KERNEL)
 #
-# Usage: compile-gpugemv-shader.sh [naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q5_k|mmv_q6_k|mmv_iq3_s|mmv_iq4_xs|mmid_iq4_xs|get_rows_q6_k|elt|moe ...]
+# Usage: compile-gpugemv-shader.sh [naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q5_k|mmv_q6_k|mmv_iq3_s|mmv_iq4_xs|mmv_f32|mmid_iq4_xs|get_rows_q6_k|elt|moe ...]
 #        (default: all)
 # A different dxc release emits different bytes: regenerate only the targets
 # you changed so measured blobs stay the ones the CSVs were recorded with.
@@ -93,7 +93,7 @@ compile_target() {
 	dot4) compile_one "$ROOT/shaders/gpugemv_q4k_dot4.hlsl" \
 		"$ROOT/shaders/generated/gpugemv_q4k_dot4_dxil.h" \
 		"shaders/gpugemv_q4k_dot4.hlsl" "kGpugemvQ4kDot4Dxil" cs_6_4 ;;
-	mmv_q4_0 | mmv_q4_k | mmv_q5_k | mmv_q6_k | mmv_iq3_s | mmv_iq4_xs)
+	mmv_q4_0 | mmv_q4_k | mmv_q5_k | mmv_q6_k | mmv_iq3_s | mmv_iq4_xs | mmv_f32)
 		local t="${1#mmv_}" w sym
 		for w in 64 128; do
 			sym="kGgmlD3d12Mmv$(echo "$t" | sed -e 's/_\(.\)/\U\1/g' -e 's/^./\U&/')T${w}Dxil"
@@ -143,7 +143,7 @@ compile_target() {
 }
 
 if [[ $# -eq 0 ]]; then
-	set -- naive wave32 rows dot4 mmv_q4_0 mmv_q4_k mmv_q5_k mmv_q6_k mmv_iq3_s mmv_iq4_xs mmid_iq4_xs get_rows_q6_k elt moe
+	set -- naive wave32 rows dot4 mmv_q4_0 mmv_q4_k mmv_q5_k mmv_q6_k mmv_iq3_s mmv_iq4_xs mmv_f32 mmid_iq4_xs get_rows_q6_k elt moe
 fi
 for target in "$@"; do
 	compile_target "$target"
