@@ -1,0 +1,468 @@
+{
+  "_comment": "Model catalogue for xllama. Bundled at InstalledPath\\models\\manifest.json; a LocalState\\manifest.json (uploadable via Device Portal, no reinstall) is merged per entry: same-name entries replace the bundled one, new names are appended, unmentioned bundled entries stay. Entries without hf_base_url are USB/Device-Portal-provisioned only. approx_bytes drives the download progress bar; files[].sha256 is the lowercase SHA-256 integrity pin checked before promotion. kind: 'ort-genai' (default, chat picker, ORT backend), 'diffusion' (image dialog), or 'gguf' (chat picker, llama.cpp backend — CPU-only, KV-reuse enabled via a persistent llama_context, routing disabled). role: '' (general chat, default) or 'coding' (denser token estimate, coding system prompt on LAN API) or 'embedding' (hidden from chat picker, llama.cpp, not a chat model — LAN API only). files[].filename is the local path under models\\<name> (subdirs allowed); files[].remote is the flat asset name in the release (defaults to filename). files[].role marks a pin as weight/data (counts for installed-model verification) or licence/notice/sidecar (fetched independently; adding or changing it must not invalidate matching weights). files[].role is not the entry-level role (coding / embedding). Omitted files[].role uses the documented filename default in model_file_plan.h. TAESD VAE (optional, Image dialog toggle): models-v1 asset sd-turbo-fp16_taesd_vae_decoder_model.onnx plus sd-turbo-fp16_taesd_LICENSE (MIT) — export via diffusion/export_taesd.py.",
+  "models": [
+    {
+      "name": "smollm2-360m-cpu-int4",
+      "display": "SmolLM2 360M (CPU int4)",
+      "hf_base_url": "https://github.com/gianlucamazza/xllama/releases/download/models-v1",
+      "files": [
+        {
+          "filename": "LICENSE",
+          "role": "licence",
+          "remote": "smollm2-360m-cpu-int4_LICENSE",
+          "approx_bytes": 11357,
+          "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+        },
+        {
+          "filename": "NOTICE",
+          "role": "notice",
+          "remote": "smollm2-360m-cpu-int4_NOTICE",
+          "approx_bytes": 170,
+          "sha256": "fde264afb75fa1ba6c46c005f774952879a1848b80198128b2e75be5c6b1a8d0"
+        },
+        {
+          "filename": "genai_config.json",
+          "approx_bytes": 1500,
+          "sha256": "02b0e86449641989ab0bd9598a14f863d7c0281a9fcc3bf06767cb5b409e5a82"
+        },
+        {
+          "filename": "tokenizer.json",
+          "approx_bytes": 3522871,
+          "sha256": "bf346d64f6f0fbcefb4c1b6928a98241467dff36c6fbae5fe1785c4ff90667f4"
+        },
+        {
+          "filename": "tokenizer_config.json",
+          "approx_bytes": 453,
+          "sha256": "3e9c0d0aff40796f26a2986e6ed1b5e03646765272eb20bacd2492bd020e6c98"
+        },
+        {
+          "filename": "model.onnx",
+          "approx_bytes": 417404408,
+          "sha256": "22496ba7ca4a796be916055e1fe995d6c506d77db05e05d16857722e711a0eda"
+        }
+      ]
+    },
+    {
+      "name": "smollm2-360m-dml-fp16-v2",
+      "display": "SmolLM2 360M (GPU fp16)",
+      "hf_base_url": "https://github.com/gianlucamazza/xllama/releases/download/models-v1",
+      "files": [
+        {
+          "filename": "LICENSE",
+          "role": "licence",
+          "remote": "smollm2-360m-dml-fp16-v2_LICENSE",
+          "approx_bytes": 11357,
+          "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+        },
+        {
+          "filename": "NOTICE",
+          "role": "notice",
+          "remote": "smollm2-360m-dml-fp16-v2_NOTICE",
+          "approx_bytes": 232,
+          "sha256": "bfb504953441e7a7dc7e5e1b44ea0a192bb4fb12c296f9ce402b6d28ef7645e2"
+        },
+        {
+          "filename": "genai_config.json",
+          "remote": "smollm2-360m-dml-fp16-v2_genai_config.json",
+          "approx_bytes": 1599,
+          "sha256": "d4073f856c3e174f31523f5dcc1fbb68d47f01f534022b44451441d3449c5240"
+        },
+        {
+          "filename": "tokenizer.json",
+          "remote": "smollm2-360m-dml-fp16-v2_tokenizer.json",
+          "approx_bytes": 3522871,
+          "sha256": "bf346d64f6f0fbcefb4c1b6928a98241467dff36c6fbae5fe1785c4ff90667f4"
+        },
+        {
+          "filename": "tokenizer_config.json",
+          "remote": "smollm2-360m-dml-fp16-v2_tokenizer_config.json",
+          "approx_bytes": 452,
+          "sha256": "47b4a92de79d133d06b4cec56e9b8226d2be0b62936209577181d5a76444a08a"
+        },
+        {
+          "filename": "model.onnx",
+          "remote": "smollm2-360m-dml-fp16-v2_model.onnx",
+          "approx_bytes": 725021421,
+          "sha256": "c417dda34ebf9c0c4ab9f0057c0841121581296789f8fa156f2899195434133f"
+        }
+      ]
+    },
+    {
+      "name": "smollm2-1.7b-cpu-int4",
+      "display": "SmolLM2 1.7B (CPU int4)",
+      "hf_base_url": "https://github.com/gianlucamazza/xllama/releases/download/models-v1",
+      "files": [
+        {
+          "filename": "LICENSE",
+          "role": "licence",
+          "remote": "smollm2-1.7b-cpu-int4_LICENSE",
+          "approx_bytes": 11357,
+          "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+        },
+        {
+          "filename": "NOTICE",
+          "role": "notice",
+          "remote": "smollm2-1.7b-cpu-int4_NOTICE",
+          "approx_bytes": 170,
+          "sha256": "ce00add4201f10fb0db32193fc183fb5082ff96e2800319d51fbd6ba18388691"
+        },
+        {
+          "filename": "genai_config.json",
+          "remote": "smollm2-1.7b-cpu-int4_genai_config.json",
+          "approx_bytes": 1458,
+          "sha256": "c76e19ce57f3463f19588142c8266f805d18cb93a38288d8c5b9d35dae030753"
+        },
+        {
+          "filename": "tokenizer.json",
+          "remote": "smollm2-1.7b-cpu-int4_tokenizer.json",
+          "approx_bytes": 3522871,
+          "sha256": "bf346d64f6f0fbcefb4c1b6928a98241467dff36c6fbae5fe1785c4ff90667f4"
+        },
+        {
+          "filename": "tokenizer_config.json",
+          "remote": "smollm2-1.7b-cpu-int4_tokenizer_config.json",
+          "approx_bytes": 452,
+          "sha256": "47b4a92de79d133d06b4cec56e9b8226d2be0b62936209577181d5a76444a08a"
+        },
+        {
+          "filename": "model.onnx",
+          "remote": "smollm2-1.7b-cpu-int4_model.onnx",
+          "approx_bytes": 1474861442,
+          "sha256": "8b46fe437133f584ddab2443f92cf60e531d17318a81a3c99e5e0993f6e7020e"
+        }
+      ]
+    },
+    {
+      "_comment": "GGUF chat models (llama.cpp backend, unified builds). Qwen3.5 quant: unsloth/Qwen3.5-0.8B-GGUF (Apache-2.0 — LICENSE + NOTICE downloaded alongside from models-v1). LFM2.5 quant: LiquidAI/LFM2.5-350M-GGUF (LFM Open License v1.0 — LICENSE.txt downloaded alongside per §4a).",
+      "name": "qwen35-0.8b",
+      "display": "Qwen3.5 0.8B (GGUF · CPU)",
+      "kind": "gguf",
+      "hf_base_url": "https://github.com/gianlucamazza/xllama/releases/download/models-v1",
+      "files": [
+        {
+          "filename": "LICENSE",
+          "role": "licence",
+          "remote": "qwen35-0.8b_LICENSE",
+          "approx_bytes": 11544,
+          "sha256": "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"
+        },
+        {
+          "filename": "NOTICE",
+          "role": "notice",
+          "remote": "qwen35-0.8b_NOTICE",
+          "approx_bytes": 109,
+          "sha256": "df92d1a2b08ed9d0c161666ac3a3b749fa2709438cc7f697e6bfb372794b22c5"
+        },
+        {
+          "filename": "Qwen3.5-0.8B-Q4_K_M.gguf",
+          "approx_bytes": 532517120,
+          "sha256": "bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517"
+        }
+      ]
+    },
+    {
+      "_comment": "Gemma-3-270M GGUF (llama.cpp gemma3 arch, verified loads on the pinned submodule). Downloaded directly from the original Hugging Face repo (hf_base_url → resolve/main) rather than re-hosted on our release: Gemma Terms of Use govern redistribution — verify before ever mirroring the weights onto models-v1. Uses the <start_of_turn>/<end_of_turn> template via chat_format_for (kind:gguf, CPU-only, KV-reuse enabled, routing disabled).",
+      "name": "gemma3-270m",
+      "display": "Gemma 3 270M (GGUF · CPU)",
+      "kind": "gguf",
+      "hf_base_url": "https://huggingface.co/unsloth/gemma-3-270m-it-GGUF/resolve/main",
+      "files": [
+        {
+          "filename": "gemma-3-270m-it-Q4_K_M.gguf",
+          "approx_bytes": 253115424,
+          "sha256": "b1baabd6b729e4041822220d3e648e00d99cac5df86b10dffb77bcccf0688e39"
+        }
+      ]
+    },
+    {
+      "_comment": "Gemma-4-E2B (llama.cpp gemma4 arch). Console-validated 2026-07-14 with Q3_K_S (2.45 GB): peak RAM 2742 MB, decode ~15.3 tok/s, generates full responses on long prompts (266 tok). Upgraded from UD-IQ2_M (2.29 GB) — the 2-bit quant collapsed to an immediate EOG on ~512-token declarative prompts (0 decode tok); Q3_K_S fixes that and is faster. Heavy/advanced: >2GB (fine on GGUF — the ~2GB Dev Mode per-file limit does not apply). Direct from HF (>2GB exceeds the GitHub release 2GB asset limit; Gemma Terms apply — verify before mirroring).",
+      "name": "gemma4-e2b",
+      "display": "Gemma 4 E2B (GGUF · CPU · 2.45 GB, advanced)",
+      "kind": "gguf",
+      "hf_base_url": "https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main",
+      "files": [
+        {
+          "filename": "gemma-4-E2B-it-Q3_K_S.gguf",
+          "approx_bytes": 2445652064,
+          "sha256": "80d155f647d3a896669b1d1605b494b97ee9dbd1dcafd27957394134c280d270"
+        }
+      ]
+    },
+    {
+      "_comment": "Phase 16 H16.1c floor (2026-08-10) on Liquid Q4_K_M: 119.17 tok/s, 241 MB. 2026-09-30 QAD Q4_0 ripin (#270) after the #243 scorer fix: 132.4 tok/s decode, 236 MB peak, H9 1/8 = Q4_K_M 1/8 on the corrected scorer (bench/results/2026-09-30-catalogue-gates.csv, 2026-09-30-h9-rescore.jsonl). LiquidAI LFM2.5-230M-QAD-Q4_0 from HF; LICENSE travels with the weights. The unsloth Q4_K_M is a different artefact (bench/results/phase16-quantiser-ab.csv).",
+      "name": "lfm25-230m",
+      "display": "LFM2.5 230M (GGUF · CPU · floor · QAD)",
+      "kind": "gguf",
+      "hf_base_url": "https://huggingface.co/LiquidAI/LFM2.5-230M-GGUF/resolve/main",
+      "files": [
+        {
+          "filename": "LFM2.5-230M-QAD-Q4_0.gguf",
+          "approx_bytes": 149081056,
+          "sha256": "e75f83268de11b2a1bcfab5f3b5c5c0c97569ddbbc0990aad88437e45b8ba292"
+        },
+        {
+          "filename": "LICENSE",
+          "role": "licence",
+          "approx_bytes": 10574,
+          "sha256": "30adf9d6478191fb87f2424f63ba0728598335aaf99cd2848ef17e8e545fe94b"
+        }
+      ]
+    },
+    {
+      "_comment": "Default chat. 2026-09-30 QAD Q4_0 regression PASS on Series S (#270): 101.6 tok/s decode, 311 MB peak, H9 4/8 (Q4_K_M was 89.7 / 320 / 4/8; prefill 374 vs 441) — bench/results/2026-09-30-catalogue-gates.csv. LiquidAI LFM2.5-350M-QAD-Q4_0 from HF; LFM Open License accompanies the weights.",
+      "name": "lfm25-350m",
+      "display": "LFM2.5 350M (GGUF · CPU · QAD)",
+      "kind": "gguf",
+      "hf_base_url": "https://huggingface.co/LiquidAI/LFM2.5-350M-GGUF/resolve/main",
+      "files": [
+        {
+          "filename": "LFM2.5-350M-QAD-Q4_0.gguf",
+          "approx_bytes": 219312832,
+          "sha256": "3d10b6ab8fc91a919534b9558e266255aca0bbc7f6d015963599aa9e74e05b1d"
+        },
+        {
+          "filename": "LICENSE",
+          "role": "licence",
+          "approx_bytes": 10596,
+          "sha256": "5188f2b355da20647257a3156db5834c794e5fb5e6d8dc4d4cdbb3180e75b85b"
+        }
+      ]
+    },
+    {
+      "_comment": "D3 2026-10-02: GPU default (gpu_layers 99) after D2-r2 PASS — decode 1.64x, peak +163 MB vs CPU (docs/gguf-gpu-decode.md). Phase 7 H1 PASS (2026-07-17) on Q4_K_M. 2026-09-30 QAD Q4_0 regression PASS on Series S (#270): 40.0 tok/s decode, 783 MB peak, H9 6/8 (Q4_K_M was 37.9 / 811 / 6/8) — bench/results/2026-09-30-catalogue-gates.csv. Direct from LiquidAI so the LFM Open License accompanies the weights.",
+      "name": "lfm25-1.2b-instruct",
+      "display": "LFM2.5 1.2B Instruct (GGUF · GPU · balanced · QAD)",
+      "kind": "gguf",
+      "gpu_layers": 99,
+      "hf_base_url": "https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct-GGUF/resolve/main",
+      "files": [
+        {
+          "filename": "LFM2.5-1.2B-Instruct-QAD-Q4_0.gguf",
+          "approx_bytes": 695755488,
+          "sha256": "bb741ebb106d543e9de114b843a3d3d73d51c74b5801e69da2abde821a0cb3e1"
+        },
+        {
+          "filename": "LICENSE",
+          "role": "licence",
+          "approx_bytes": 10596,
+          "sha256": "5188f2b355da20647257a3156db5834c794e5fb5e6d8dc4d4cdbb3180e75b85b"
+        }
+      ]
+    },
+    {
+      "_comment": "Phase 7 H1 PASS (2026-07-17): 18.36 tok/s decode, 1623 MB peak, H9 7/8 (above Gemma-4-E2B) on Series S. Quality chat; direct from LiquidAI so the LFM Open License accompanies the weights.",
+      "name": "lfm2-2.6b",
+      "display": "LFM2 2.6B (GGUF · CPU · quality)",
+      "kind": "gguf",
+      "hf_base_url": "https://huggingface.co/LiquidAI/LFM2-2.6B-GGUF/resolve/main",
+      "files": [
+        {
+          "filename": "LFM2-2.6B-Q4_K_M.gguf",
+          "approx_bytes": 1563668704,
+          "sha256": "384bc877b6c37064982f96885bef69e4475919f5969218ed4e3b9399ae0340df"
+        },
+        {
+          "filename": "LICENSE",
+          "role": "licence",
+          "approx_bytes": 10644,
+          "sha256": "61d7e939a05911c765b7e98ffaa1ab5ca6c0174a65350766c25cb10197d19fc8"
+        }
+      ]
+    },
+    {
+      "_comment": "Llama-3.2-3B-Instruct Q3_K_S — Phase 7 H4 PASS (2026-07-16): decode 14.16 tok/s, peak 1824 MB on Series S (phase7-scale.csv). Optional heavy chat (not the shipping default — keep lfm25-350m). Direct from HF unsloth GGUF; Meta Llama Community License applies — do not mirror onto models-v1 without license review. Chat template: Llama-3 headers via chat_format_for (kind:gguf, CPU-only, KV-reuse, routing disabled).",
+      "name": "llama32-3b",
+      "display": "Llama 3.2 3B (GGUF · CPU · 1.54 GB, advanced)",
+      "kind": "gguf",
+      "hf_base_url": "https://huggingface.co/unsloth/Llama-3.2-3B-Instruct-GGUF/resolve/main",
+      "files": [
+        {
+          "filename": "Llama-3.2-3B-Instruct-Q3_K_S.gguf",
+          "approx_bytes": 1542848960,
+          "sha256": "81bd392ed38532d17f8be3942ec3237747ccc9d91365e6cc31e060be3f0edac8"
+        }
+      ]
+    },
+    {
+      "_comment": "Qwen2.5-Coder-0.5B-Instruct Q4_K_M — coding fast tier (role:coding, n_ctx 4096). ChatML; no Qwen3 <think>. Apache-2.0 unsloth GGUF. Console phase14: 148.2 prefill / 62.4 decode / 533 MB peak (phase14-console.csv); host Release quality PASS. H3 draft candidate.",
+      "name": "qwen25-coder-0.5b",
+      "display": "Qwen2.5 Coder 0.5B (GGUF · CPU · coding · fast)",
+      "kind": "gguf",
+      "role": "coding",
+      "n_ctx": 4096,
+      "hf_base_url": "https://huggingface.co/unsloth/Qwen2.5-Coder-0.5B-Instruct-GGUF/resolve/main",
+      "files": [
+        {
+          "filename": "Qwen2.5-Coder-0.5B-Instruct-Q4_K_M.gguf",
+          "approx_bytes": 397807456,
+          "sha256": "8c3d7a77d612727c35cc6f94ee9316e00ad53ba1cb41414e6b26b96be6a5338a"
+        }
+      ]
+    },
+    {
+      "_comment": "Qwen2.5-Coder-1.5B-Instruct Q4_K_M — the coding option (Apache-2.0), CPU. Console phase14 CPU: 96.6 prefill / 26.1 decode / 1179 MB peak; host Release quality PASS.",
+      "name": "qwen25-coder-1.5b",
+      "display": "Qwen2.5 Coder 1.5B (GGUF · CPU · coding)",
+      "kind": "gguf",
+      "role": "coding",
+      "n_ctx": 4096,
+      "hf_base_url": "https://huggingface.co/unsloth/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main",
+      "files": [
+        {
+          "filename": "Qwen2.5-Coder-1.5B-Instruct-Q4_K_M.gguf",
+          "approx_bytes": 986048032,
+          "sha256": "5ecd6f45e137154099741291848db7415b5effa1ae69228f20dacea31dbf5ce4"
+        }
+      ]
+    },
+    {
+      "_comment": "Phi-4-mini-instruct Q4_K_M (3.8B, MIT) — unsloth GGUF. Series S T3 PASS 2026-09-30 (#268): 11.2 tok/s decode, 33.1 prefill, 2765 MB peak, H9 6/8 vs llama32-3b 5/8 (bench/results/2026-09-30-catalogue-gates.csv). >2GB is fine on GGUF but must download straight from HF (GitHub release asset cap). Phi-3 template via chat_format_for (id must keep 'phi' and avoid 'gemma'/'llama'). kind:gguf, CPU-only, KV-reuse, routing disabled. n_ctx 4096 (console 1.6.0.1163, 2026-10-12): 3528-token prompt peak WorkingSetSize 3096 MB vs 2838 MB at 2048 (1515 tok), working set after context alloc 3038 MB; needle at 3547 tokens correct; agent-runtime 50-case eval 48/50 at both n_ctx. Prefill ~28 tok/s, so a full window costs ~2 min before the first token.",
+      "name": "phi4-mini",
+      "display": "Phi-4 mini (GGUF · CPU)",
+      "kind": "gguf",
+      "n_ctx": 4096,
+      "hf_base_url": "https://huggingface.co/unsloth/Phi-4-mini-instruct-GGUF/resolve/main",
+      "files": [
+        {
+          "filename": "Phi-4-mini-instruct-Q4_K_M.gguf",
+          "approx_bytes": 2491874272,
+          "sha256": "88c00229914083cd112853aab84ed51b87bdf6b9ce42f532d8c85c7c63b1730a"
+        }
+      ]
+    },
+    {
+      "_comment": "Qwen3-1.7B Q4_K_M — chat upgrade over qwen35-0.8b. ChatML + model_is_qwen3 no-think prefill. Console phase14: 89.5 prefill / 21.8 decode / 1398 MB peak; host Release quality PASS. Apache-2.0 unsloth. Context shift OK: arch qwen3 reports can_shift=1 (measured 2026-07-29 on host; the property is per-arch, not per-platform) — unlike qwen35, which is imrope and cannot shift.",
+      "name": "qwen3-1.7b",
+      "display": "Qwen3 1.7B (GGUF · CPU)",
+      "kind": "gguf",
+      "hf_base_url": "https://huggingface.co/unsloth/Qwen3-1.7B-GGUF/resolve/main",
+      "files": [
+        {
+          "filename": "Qwen3-1.7B-Q4_K_M.gguf",
+          "approx_bytes": 1107409472,
+          "sha256": "b139949c5bd74937ad8ed8c8cf3d9ffb1e99c866c823204dc42c0d91fa181897"
+        }
+      ]
+    },
+    {
+      "_comment": "LFM2.5-1.2B-Thinking Q4_K_M — hybrid CoT. ChatML; model_is_thinking strips <think>…</think> for display/persist. Catalogue n_predict=1024 (applied on model select, #223) so short CoT+answer fits more often than the UI default 512; hard multi-step prompts may still exhaust the budget (reasoning-only stand-in). Console phase14: 130.4 prefill / 36.7 decode / 811 MB. LFM Open License. No KV snapshot (#170b) — stripped history diverges from CoT tokens. Pinned to HF revision 9584426: LiquidAI reconverted this GGUF on 2026-10-29, so resolve/main no longer matches the SHA-256 or the console measurements above.",
+      "name": "lfm25-1.2b-thinking",
+      "display": "LFM2.5 1.2B Thinking (GGUF · CPU · reasoning · 1024 tok)",
+      "kind": "gguf",
+      "hf_base_url": "https://huggingface.co/LiquidAI/LFM2.5-1.2B-Thinking-GGUF/resolve/9584426effbfa44b677e925793a12188a36b44ce",
+      "files": [
+        {
+          "filename": "LFM2.5-1.2B-Thinking-Q4_K_M.gguf",
+          "approx_bytes": 730895360,
+          "sha256": "7223a2202405b02e8e1e6c5baa543c43dc98c1d9741a5c2a0ee1583212e1231b"
+        },
+        {
+          "filename": "LICENSE",
+          "role": "licence",
+          "approx_bytes": 10596,
+          "sha256": "5188f2b355da20647257a3156db5834c794e5fb5e6d8dc4d4cdbb3180e75b85b"
+        }
+      ],
+      "n_predict": 1024
+    },
+    {
+      "_comment": "BGE-M3 Q8_0 GGUF from gpustack/bge-m3-GGUF (MIT). Release embedding smoke 2026-09-23: bert/CLS, 1024 dimensions, 8192 context, unit norm, peak RSS 746 MiB. Passed the 3584 MiB host gate; Series S API validation passed 2026-09-28; see bench/results/2026-09-28-console-api-validation.json. Dedicated throughput/retrieval-quality benchmarks remain open.",
+      "name": "embed-bge-m3",
+      "display": "BGE-M3 (GGUF · embedding)",
+      "kind": "gguf",
+      "role": "embedding",
+      "n_ctx": 8192,
+      "hf_base_url": "https://huggingface.co/gpustack/bge-m3-GGUF/resolve/main",
+      "files": [
+        {
+          "filename": "bge-m3-Q8_0.gguf",
+          "approx_bytes": 634553760,
+          "sha256": "950f4a8e5e19477a6d3c26d2f162233c20002c601f75e4b002e3239997821167"
+        }
+      ]
+    },
+    {
+      "_comment": "Nomic Embed Text v2 MoE Q8_0 GGUF from ggml-org/Nomic-Embed-Text-V2-GGUF (Apache-2.0). Release embedding smoke 2026-09-23: nomic-bert-moe/mean, 768 dimensions, opened at 512 context, unit norm, peak RSS 632 MiB. Passed the 3584 MiB host gate; Series S API validation passed 2026-09-28; see bench/results/2026-09-28-console-api-validation.json. Dedicated throughput/retrieval-quality benchmarks remain open. Inputs require search_query: or search_document:.",
+      "name": "embed-nomic-v2-moe",
+      "display": "Nomic Embed Text v2 MoE (GGUF · embedding)",
+      "kind": "gguf",
+      "role": "embedding",
+      "n_ctx": 512,
+      "hf_base_url": "https://huggingface.co/ggml-org/Nomic-Embed-Text-V2-GGUF/resolve/main",
+      "files": [
+        {
+          "filename": "nomic-embed-text-v2-moe-q8_0.gguf",
+          "approx_bytes": 512225120,
+          "sha256": "36c5817bc25f379e62021f49efde05b10ed3b0c93ab8059c43173a7a5de73565"
+        }
+      ]
+    },
+    {
+      "_comment": "SD-Turbo fp16 ONNX. Stability AI Community License — LICENSE + NOTICE downloaded alongside from models-v1 (§IV.a). TAESD overlay is not a catalogue entry: Image dialog downloads sd-turbo-fp16_taesd_vae_decoder_model.onnx and sd-turbo-fp16_taesd_LICENSE (MIT) into this tree.",
+      "name": "sd-turbo-fp16",
+      "display": "SD-Turbo (image, GPU fp16)",
+      "kind": "diffusion",
+      "hf_base_url": "https://github.com/gianlucamazza/xllama/releases/download/models-v1",
+      "files": [
+        {
+          "filename": "LICENSE",
+          "role": "licence",
+          "remote": "sd-turbo-fp16_LICENSE",
+          "approx_bytes": 11852,
+          "sha256": "d6f6b1a4dce5c852bd6d7d9482d002baf0ccdb71e662250b73be9eec8764ee8d"
+        },
+        {
+          "filename": "NOTICE",
+          "role": "notice",
+          "remote": "sd-turbo-fp16_NOTICE",
+          "approx_bytes": 355,
+          "sha256": "bc2fd877fa2d3e3c157e479ebda62575a84d4ec70223a934bb951853e6cd3557"
+        },
+        {
+          "filename": "text_encoder/model.onnx",
+          "remote": "sd-turbo-fp16_text_encoder_model.onnx",
+          "approx_bytes": 681657392,
+          "sha256": "19eafca6146cb5a939464307bdaec18a2831a3b4558069435b4bd48c2b2fed7e"
+        },
+        {
+          "filename": "unet/model.onnx",
+          "remote": "sd-turbo-fp16_unet_model.onnx",
+          "approx_bytes": 1733278769,
+          "sha256": "3026a99cf01786e7d4524a8e535112fff98c8958916daaad815333dd929bab37"
+        },
+        {
+          "filename": "vae_decoder/model.onnx",
+          "remote": "sd-turbo-fp16_vae_decoder_model.onnx",
+          "approx_bytes": 99125634,
+          "sha256": "b12f26698d6ac9ee6aac0482a86cf0194231d0a3304da78a98796eb6d6ddbc35"
+        },
+        {
+          "filename": "tokenizer/vocab.json",
+          "remote": "sd-turbo-fp16_tokenizer_vocab.json",
+          "approx_bytes": 1059962,
+          "sha256": "e089ad92ba36837a0d31433e555c8f45fe601ab5c221d4f607ded32d9f7a4349"
+        },
+        {
+          "filename": "tokenizer/merges.txt",
+          "remote": "sd-turbo-fp16_tokenizer_merges.txt",
+          "approx_bytes": 524619,
+          "sha256": "9fd691f7c8039210e0fced15865466c65820d09b63988b0174bfe25de299051a"
+        }
+      ]
+    },
+    {
+      "_comment": "LFM2.5-8B-A1B UD-IQ3_S — Phase 15 H2 candidate (MoE): 32 experts, 4 active per token (1/8), 24 blocks. Host gate 2026-07-29: loads on pin b10093 (lfm2moe), coherent at IQ3_S, peak 3502 MB — weights+2.8%, well under the 4 GB H2 gate and the 4864 MB measured console heap ceiling (phase15-ramceil.csv). THINKING MODEL: emits <think> every turn (template's preserve_thinking governs history replay only), so chat_format_for strips it and KV snapshots stay off — model_is_thinking() detects it by family, not by name. Direct from HF unsloth GGUF (>2 GB, not mirrored to models-v1); LFM Open License applies. kind:gguf, CPU-only, KV-reuse, routing disabled.",
+      "name": "lfm25-8b-a1b",
+      "display": "LFM2.5 8B-A1B MoE (GGUF · CPU · 3.57 GB, experimental)",
+      "kind": "gguf",
+      "hf_base_url": "https://huggingface.co/unsloth/LFM2.5-8B-A1B-GGUF/resolve/main",
+      "files": [
+        {
+          "filename": "LFM2.5-8B-A1B-UD-IQ3_S.gguf",
+          "approx_bytes": 3570921056,
+          "sha256": "4a3c682957fa64e4361f651d6a157caaf8f2447bff64167eee0d258c0c937ef4"
+        }
+      ]
+    }
+  ]
+}

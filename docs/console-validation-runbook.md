@@ -1,0 +1,488 @@
+# Console validation runbook
+
+Current on-device release gates for Xbox Series S Developer Mode. Tested and measured
+on Series S. Not yet tested on Series X. Historical experiment
+procedures and measured results live in `CHANGELOG.md` and `bench/results/`.
+
+## Prerequisites
+
+- Install the latest `xllama-appx` unified artifact.
+- Set Device Portal credentials in `~/.config/xllama/xbox-env`.
+- Confirm the package is designated **Game** in Dev Home.
+- Provision models after any uninstall, because uninstall removes `LocalState`.
+
+```bash
+source ~/.config/xllama/xbox-env
+./scripts/provision-models.sh --all-test
+```
+
+**After installing a NEW package identity** (first install, or an identity
+rename like the 1.5.0.0 VenereLabs → GianlucaMazza migration): launch the app
+once (`./scripts/deploy.sh start-app`) before provisioning. The `LocalState`
+folder does not exist until first launch, and every WDP file upload fails with
+`"File move failed" / "The system cannot find the path specified"` until it
+does (hit during the 2026-07-25 migration).
+
+For a controlled trial, set `XLLAMA_EXPECTED_PFN` to the installed package full
+name verified against the selected CI run and commit. Console/API suites reject
+a different installed package before writing test files; the benchmark runner
+also checks it before every run. Keep the expected value fixed until the next
+intentional deployment.
+
+## Run-scoped log evidence
+
+The UI and training harnesses share `scripts/console-run-log.sh`. Each attempt
+invalidates the preceding run's snapshot, including attempts that fail to stop
+the app. Stops use the checked, package-encoding helper in `deploy.sh`. Before
+launch they snapshot `xllama.log` after stopping the app. The harnesses **never
+delete this log**: a delayed unlink can race the new process (#347). Only a
+successful download or HTTP 404 establishes the baseline. Verdicts read only
+new bytes beginning at one complete, exact `App::App()` entry for UI gates.
+The device-training gate explicitly selects the exact `train.flag detected ->
+headless device training (Lane B)` entry, because headless dispatch precedes
+the XAML constructor. Neither mode accepts the other mode as a fallback. An old partial
+line may precede that append boundary; historical bytes never complete a new
+marker or enter the extracted output.
+
+A missing or ambiguous new launch, failed download, or truncated/replaced
+baseline fails closed. WDP file sizes, timestamps and successful DELETEs are
+not atomic file-generation identities and cannot prove recreation after launch.
+Even a legitimate recreation with a nonempty baseline is therefore rejected;
+there is no fallback to the whole log or to a historical startup marker.
+`validate-api.sh` currently checks HTTP responses, not `xllama.log`, and does
+not need this helper.
+
+Because the log is kept, it grows across harness runs. Truncate it only while
+the app is stopped, using the existing `deploy.sh` operations:
+
+```bash
+source ~/.config/xllama/xbox-env
+./scripts/deploy.sh stop-app
+./scripts/deploy.sh delete-file "$(./scripts/deploy.sh pfn)" xllama.log
+```
+
+Device Portal can report a successful DELETE without removing the file (#347).
+Confirm with `./scripts/deploy.sh get-log` or `list-localstate` while the app
+is still stopped. If the file is still there, replace it by uploading an empty
+file with `deploy.sh upload-file`.
+
+### Temporary fixture cleanup
+
+`console-temp-chats.sh` journals unique injected chat IDs **before** upload.
+The gate epilogue and the common EXIT handler both attempt cleanup, including
+on early return and caught HUP/INT/TERM. The TAESD VAE restore uses that same
+handler rather than replacing it. Cleanup stops the app, validates the index,
+removes only journaled IDs, checks file absence after DELETE and checks index
+contents after POST. HTTP/transport errors and malformed JSON are never treated
+as an empty index. Initial fixture injection uses the same checked index read.
+
+**Exclusive console access is required throughout validation and cleanup.** Do
+not run another harness or manually launch/edit chats at the same time. A second
+index read detects an intervening write, but WDP has no atomic compare-and-swap:
+that check cannot exclude a writer racing the final upload. Timestamps and
+repeated identical reads are not substitutes for exclusive access.
+
+If cleanup cannot be verified, the gate exits nonzero and retains its journal
+and recovery files. Once connectivity is restored, retry without running a gate:
+
+```bash
+source ~/.config/xllama/xbox-env
+XLLAMA_CHAT_JOURNAL=/path/printed/by/the/failure/chat-cleanup.pending ./scripts/validate-console.sh cleanup
+```
+
+Recovery must use the original private journal from that run on the same console
+and package. The journal is trusted local recovery input; do not substitute an
+unrelated or edited list of chat IDs.
+
+Physical deletion cannot be guaranteed while WDP is unavailable or holds a file
+open; failure is explicit, not a false success. SIGKILL/power loss cannot run
+shell traps. Recovery requires the retained journal; no unrelated chat is deleted.
+The journal owns injected fixtures only, not arbitrary conversations created by
+other users or unrelated clients.
+
+Host-only regression tests (no console or credentials):
+
+```bash
+python3 -m unittest tests/test_console_run_log.py tests/test_console_temp_chats.py \
+  tests/test_console_taesd_result.py
+```
+
+## Official automated suite
+
+```bash
+./scripts/validate-console.sh all
+```
+
+The suite drives the live UI through autopilot and fails unless all current
+hardware gates pass:
+
+- **routing** — auto A/B with the parity-validated `-v2` DML asset: the long
+  (>1550 tok) turn routes to GPU, short turns to CPU (#91 lifted for that asset);
+- **settings** — the `set_routing` / `set_sampling` / `set_kv_reuse` /
+  `set_taesd` / `set_system_prompt` autopilot ops are dispatched and every
+  resulting value is asserted against the persisted `settings.json`. The
+  baseline is seeded with the opposite of each target, so an op that silently
+  does nothing fails rather than inheriting a value that already matched (needs
+  `smollm2-360m-cpu-int4` in LocalState; `set_taesd` / `set_system_prompt` need
+  an app build >= 1.4.0.632, the rest >= 1.4.0.606);
+- **GGUF chat** — the default LFM model loads through llama.cpp and generates,
+  **and the conversation is read back from `chats/index.json` with a non-empty
+  title**. That second half was added after the gate passed for months over a
+  real defect: `NewChat()` assigns the id, so the branch that also derived the
+  title could never run, and every saved conversation had `"title":""` (14 of 14
+  on the console). The turn generated correctly and the log said so — what was
+  wrong was the record on disk, which no gate had ever looked at;
+- **longchat** (#169) — a chat whose history exceeds the trimmer ceiling is
+  injected, then run with KV reuse. Trimmed rounds must stay in the reuse regime
+  (prefill = the delta, not the ~1800 tokens of the whole history), and when the
+  resident KV overflows `n_ctx` the session must front-drop-evict and carry on.
+  Three log assertions, and two of them are negative: a `context shift — evicted`
+  line must appear, and neither `retrying with full prefill` nor `context full`
+  may. A continuation that silently falls back to a full re-prefill still answers
+  correctly, which is why the gate reads the log rather than the reply;
+- **kvsnap** (#170b) — leave a conversation, come back, and the history must not
+  be re-read: the snapshot written on the way out is restored on the way back and
+  the #170a prefix diff turns it into a delta. Beyond the two log lines
+  (`KV state saved`, `KV snapshot restored`) the gate compares **prompt-token
+  counts**: the returning turn must prefill under a quarter of the cold turn. A
+  snapshot that is written, restored and then ignored passes both log checks and
+  fails this one. Seed replies are one-token greedy replies to keep the saved
+  prefix append-only. This measures the supported optimization, not hybrid tail
+  rewind: completed/re-rendered replies can diverge inside the saved tail, where
+  LFM must safely full-prefill. `validate-kv-fallback.py` forces that divergence
+  and compares its output and token count with a cold session. The injected history is deliberately kept **under** the trimmer
+  budget, so a trim cannot muddy the signal with #169's shift;
+- **coderpaste** (#193) — a long paste on a coding session (`n_ctx` 4096), in two
+  regimes and two runs, on `qwen25-coder-0.5b`. **A**: past the 2048 logical
+  batch but inside `n_ctx` → the prefill must chunk and answer normally.
+  **B**: past `n_ctx` → the app must refuse with `prompt too long` and stay
+  alive. What this pins is an abort, not an error: `llama_decode` asserts
+  `n_tokens <= n_batch` with `GGML_ABORT` in Release too, so the old failure
+  killed the process. A dead app never writes `autopilot-done.txt`, so the
+  missing marker is itself the assertion;
+- **thinkdone** (#223) — a short prompt on `lfm25-1.2b-thinking` at **n_predict
+  1024** (catalogue default) completes with a non-empty answer after strip —
+  the happy path that `thinkcut` deliberately does not cover.
+- **thinkcut** (#193) — a thinking model (`lfm25-1.2b-thinking`) that spends its
+  whole budget reasoning postprocesses to an empty answer, and the turn used to
+  vanish: nothing saved, the streamed chain of thought orphaned on screen, status
+  `Done`. The gate asserts both halves — `postprocess left no answer` in the log,
+  **and** the conversation on disk still ending in an assistant turn carrying the
+  explicit `reasoning only` stand-in. If the reasoning block is never truncated
+  the gate fails on purpose: either `n_predict` is too generous or the model
+  emits no `<think>` at all, which would make the whole strip a no-op. Investigate
+  it; do not relax it;
+- **genroom** (#193) — a full context must still leave room for the whole reply.
+  The trimmer ceiling used to reserve a flat 250 tokens while the UI default
+  `n_predict` is 512, and the generation loop clamps `n_predict` to what the
+  context has left, so a prompt on the old ceiling got a reply cut at ~248 tokens
+  in silence. The gate asserts the **arithmetic** — `prefill + n_predict <=
+n_ctx` — rather than the answer's length, which keeps the verdict independent
+  of whether a small model feels talkative. Two preconditions guard against a
+  vacuous pass: the `prompt budget:` line must be present (or the exact fit never
+  ran) and something must actually have been dropped (or the payload never filled
+  the context);
+- **TAESD** — image generation completes through DirectML with the fast VAE.
+  This gate swaps `vae_decoder/model.onnx` from a local cache rather than
+  flipping the in-app toggle: the toggle makes the console download the asset
+  from the models-v1 release, which would make the gate slower and dependent on
+  console-side network. The toggle's own writer is covered by the `settings`
+  gate instead. `wait_idle` (default 120 s, `XLLAMA_TAESD_READY_TIMEOUT_S`,
+  250 ms poll, three consecutive idle reads of the UI/preload atomics) parks
+  until session preload is done, so `generate_image` is not rejected busy at
+  launch. A `diffuse-result.csv` row must identify the taesd job
+  (`sd-turbo-fp16`, steps 1, seed 42) and contain a finite nonnegative VAE
+  duration. Its `date` must be at or after the recorded UTC start, or a valid
+  pre-run snapshot must exist and the file must have changed; a stale last
+  row is a FAIL, never an `ok` number. `ok` is printed only
+  when the autopilot marker is `ok`. `max_sampled_private_ws_mb` is the max of
+  PrivateWorkingSet sampled every `XLLAMA_TAESD_WS_SAMPLE_S` seconds (default
+  5), matched by package family from the installed PFN (or
+  `XLLAMA_PACKAGE_FAMILY`); it is not a peak;
+- **API** — separate LAN gate (`scripts/validate-api.sh`):
+  `spike|chat|stream|admission|budget|tools|framing|embed|pull|prefs|train|all` (chat, context budget,
+  client-side tool proposals per [ADR 0004](adr/0004-tool-proposals.md),
+  embeddings, pull, #118 preference/training-status probes). `admission` waits
+  for the first SSE data chunk of a long streamed reply, then requires 503 on
+  a concurrent chat. Not wired into `validate-console.sh all` today — run it
+  from another host on the LAN.
+
+### When a gate fails, look at the screen
+
+Verdicts come from grepping `xllama.log`, which cannot describe a failure that
+never reached the log — the app dying at launch behind a system dialog being the
+case that cost the most time (`dml-metacommands-runbook.md`). So every run keeps
+the last two Device Portal screenshots, and a failing gate writes them out:
+
+```text
+  Screenshots of the failing run: /tmp/xllama-gate-shots/longchat-*.png
+```
+
+`-1.png` is the later frame. What they are worth depends on how the gate failed,
+and the first console run of this feature corrected the original claim:
+
+- **autopilot `error:`** — `ApRun` writes its marker _without_ exiting, so the
+  app is still on screen showing the broken state. This is what the frames are
+  for, and they deliver it.
+- **timeout** — the app is alive and most likely stuck. Same.
+- **marker `ok`, log grep rejects** — every gate script ends with `quit`, and
+  that path does exit. Keeping two frames was meant to cover this; measured, it
+  often does not. Polling is every 10 s and a gate can finish in ~20 s, so both
+  frames can land after the app is gone — observed, both showing Dev Home. **A
+  Dev Home frame is not a UI fault**; for this class the log is the evidence.
+
+Frames are taken at every poll, except during `taesd` — the one gate that
+asserts a duration (VAE decode under 1000 ms), and a screenshot is GPU work on
+the same SoC. That is a list, not a sampling rate, because sampling less often
+everywhere would only make the collision rarer while halving the evidence for
+the nine gates that time nothing. `taesd` still gets its end-of-run frame, and
+loses nothing it needed: its image-generation failure takes the autopilot
+`error:` path where that frame is the right one, and its `vae_ms` failure is a
+number already in the log that no screenshot improves.
+
+`XLLAMA_GATE_SHOTS=0` disables capture entirely; `XLLAMA_GATE_SHOTS_DIR` chooses
+where the frames land.
+
+Run an individual gate while debugging:
+
+```bash
+./scripts/validate-console.sh routing
+./scripts/validate-console.sh settings
+./scripts/validate-console.sh gguf
+./scripts/validate-console.sh longchat
+./scripts/validate-console.sh kvsnap
+./scripts/validate-console.sh coderpaste
+./scripts/validate-console.sh thinkcut
+./scripts/validate-console.sh thinkdone
+./scripts/validate-console.sh genroom
+./scripts/validate-console.sh taesd
+./scripts/validate-api.sh all          # spike + chat + stream + admission + embed + budget + tools + framing + prefs + train + pull
+./scripts/validate-console-training.sh rate   # preference UI path
+./scripts/validate-console-training.sh rate-stale   # negative control (F04)
+```
+
+Training gates count only what the current run created: new chat ids for
+`serve`, exactly one new `like` carrying the run id for `rate`, and a fresh
+`result.json` for `device-train`. Each chat gate pins its starting settings
+(system prompt, greedy sampling) and restores `settings.json` afterwards; a
+failed upload (the portal answers a full disk with 500) stops the gate. `serve`
+removes the model and manifest override it uploaded and puts back any
+LocalState `manifest.json` the user had, on success and failure alike. The
+`serve-stale` and `rate-stale` modes make the current run fail while history
+holds successes, and pass only when the gate reports that failure. Set
+`XLLAMA_EXPECTED_PFN` to refuse a different installed package before any
+upload.
+
+## Reduced-SKU smoke (not in `all`)
+
+Research-stripped package: no LAN, no USB, no headless flags. Autopilot remains.
+Procedure and restore: `docs/release-readiness.md` §10.
+
+```bash
+./scripts/validate-console.sh store
+```
+
+Asserts (1) first-run catalogue download of `lfm25-350m` or an already-provisioned
+line after `install-latest-build.sh --store`, (2) GGUF chat saved with a title,
+(3) `set_api` is rejected with `LAN API not available in Store SKU`.
+
+## Benchmark evidence
+
+Use `scripts/bench-xbox-ort.sh` and the fixed prompts described in
+[`bench/README.md`](../bench/README.md). A comparison row must come from one
+atomic CSV record; never combine the best prefill, decode and RAM values from
+different runs.
+
+**Preflight — verify the on-device config is pristine.** `--threads` swaps
+`models\<name>\genai_config.json` on the device and restores it on exit, but a
+crashed or pre-restore-era sweep can leave the swap in place (observed twice: a
+t8 residue, and a t4 residue found 2026-07-25 — the shipped CPU asset sets no
+`intra_op_num_threads` at all). Before any measurement session:
+
+```bash
+./scripts/deploy.sh fetch-file "$(./scripts/deploy.sh pfn)" genai_config.json \
+    /tmp/cfg.json 'models\smollm2-360m-cpu-int4'
+grep intra_op_num_threads /tmp/cfg.json && echo "DRIFT: restore the pristine config first"
+```
+
+After adding or changing committed evidence:
+
+```bash
+python3 scripts/generate-benchmark-summary.py
+python3 scripts/generate-benchmark-summary.py --check
+```
+
+Record raw CSV/JSONL output under `bench/results/`, update the appropriate
+research verdict or changelog entry, and let the generated summary own the
+comparison table.
+
+## Campaign T3 — new GGUF catalogue candidate
+
+A candidate enters the manifest with status `catalogue` after host T1, then a
+Series S session decides it. Use the CI MSVC unified package (`xllama-appx`) and
+`xbox-env`. Do not treat host tok/s as a Series S result. Fix the PASS bar in
+[model-matrix.md](model-matrix.md) before the run.
+
+```bash
+source ~/.config/xllama/xbox-env
+./scripts/install-latest-build.sh --provision   # clean LocalState, no stale GGUFs
+./scripts/provision-models.sh <candidate> <peer>
+export XLLAMA_EXPECTED_PFN="$(./scripts/deploy.sh pfn)"
+for m in <candidate> <peer>; do
+  ./scripts/bench-xbox-ort.sh "$m" --runs 4 --out bench/results/<date>-catalogue-gates.csv
+done
+# H9 goes through the LAN API: bench mode never binds the port.
+./scripts/validate-api.sh spike
+./scripts/eval-xbox-models.sh --models <candidate>,<peer> \
+  --out bench/results/<date>-catalogue-gates-h9.jsonl
+```
+
+- `eval-xbox-models.sh` truncates `--out` before writing, so never point it at
+  the canonical H9 file (`quality.source` in `bench/benchmark-summary.json`,
+  currently `2026-09-30-h9-rescore.jsonl`). Only that file feeds the published
+  H9 column. Append a
+  shipped candidate's rows to it and add the score to `check-coherence.py`.
+- Record the package next to the CSV as a JSON sidecar with `run_id`,
+  `head_sha`, `sha256` and `expected_pfn` (see
+  `bench/results/2026-09-30-catalogue-gates.json`).
+- PASS moves the row to §A1 and adds a `bench/benchmark-summary.json` row.
+  FAIL becomes `reject — measured` in §F and removes the manifest entry.
+- Candidates that use a reasoning template also fail on any visible
+  `<think>` / `</think>` in H9 output.
+
+Closed 2026-09-30: `phi4-mini` PASS (#268); MiniCPM5-1B (#267) and
+Gemma-3-1B (#269) rejected — measured.
+
+## Quant ripin regression (same catalogue id)
+
+Changing the GGUF behind an existing id (for example the LFM2.5 QAD Q4_0 ripin,
+#270) needs a no-regression run against the recorded rows in
+[model-matrix.md](model-matrix.md) §A1. Fix the bar first. #270 used H9 ≥ the
+old score, median decode ≥ 0.9×, and `peak_ws_mb` ≤ +10%. A FAIL reverts that
+id's pin.
+
+`provision-models.sh --force` uploads the new file but leaves the old one in
+place, and the app loads the first `.gguf` in directory order. Start from a
+clean install (as above), or delete the old file with
+`./scripts/deploy.sh delete-file <pfn> <old>.gguf 'models\<id>'`. Every bench
+row must report the new `quant`, and the default prompt (`n_prompt_tok` 298)
+keeps runs comparable.
+
+Closed 2026-09-30: all three LFM2.5 ids PASS on QAD Q4_0. `lfm25-230m` passed
+only after the #243 scorer fix, which moved its Q4_K_M baseline from 2/8 to 1/8.
+
+## Troubleshooting
+
+- `./scripts/deploy.sh diagnose-startup` — process state, log and crash dumps.
+- `./scripts/deploy.sh get-log` — current `xllama.log`.
+- Remove a stale `bench.flag` before UI/autopilot runs. It is uploaded only when
+  `install-latest-build.sh --bench` is used.
+- Reinstall with a higher package revision for an in-place update; a same-version
+  package with different contents is rejected.
+- Detailed Device Portal behavior: [device-portal.md](device-portal.md).
+
+## Release acceptance
+
+A hardware-sensitive change is complete only when the relevant automated gate
+passes on the target console and the package version, raw evidence and outcome
+are recorded. Do not revive closed historical experiments unless new evidence
+changes a documented constraint.
+
+## Recorded 2026-09-28 validation
+
+The [source/package-bound record](../bench/results/2026-09-28-console-api-validation.json)
+separates the controlled candidate console/LAN campaign from the exact main
+shipping-package smoke. Full console gates ran against production-identical
+candidate sources; the main package additionally passed health/chat/pull, both
+embedding contract suites and maximum BGE input. It records failed/inconclusive
+trials and avoids assigning cumulative process high-water marks to one model.
+Automated doc/coherence checks do not replace those runtime observations.
+
+## Controlled model-writer and KV fallback probes
+
+Run these against the expected CI MSVC package, with the console credentials
+loaded and `XLLAMA_EXPECTED_PFN` set to its full package identity. Use a private
+output directory: the harness backs up settings, conversations and KV metadata
+and restores every tracked original byte before restarting the normal app.
+
+```bash
+python scripts/validate-model-writer.py --out /private/writer-proof \
+  --model-backup /private/LFM2.5-350M-QAD-Q4_0.gguf \
+  --embedding-backup /private/bge-m3-Q8_0.gguf
+python scripts/validate-kv-fallback.py --out /private/kv-proof
+```
+
+The writer probe verifies independently pinned weight backups before deleting
+console weights to force real remote transfers. Both GUI/API ownership directions
+must reject the competing writer without changing its files, preserve adapters,
+verify downloaded hashes and recover after completion. The reverse trial releases
+the GUI selection when streamed API download progress arrives; a transfer that
+finishes before admission is inconclusive, not a concurrency PASS. API/API requests
+may serialize and both succeed; that result alone does not prove overlap.
+
+The KV probe forces a divergent saved assistant reply and requires the hybrid
+fallback's complete prompt count and greedy output to match a fresh cold session.
+It also sends native and OpenAI embedding requests while the GUI is generating
+and requires their respective 503 error envelopes. A missing overlap fails the
+probe; do not reinterpret a sequential 200 response as a busy-path validation.
+
+## Independent Series X acceptance (#374)
+
+This is a tester protocol, not a statement that Series X has passed. Keep
+"Tested and measured on Series S. Not yet tested on Series X." until accepted
+upstream inference receipts exist. Resource-only measurements from a fork do
+not satisfy this protocol.
+
+1. Select an immutable upstream candidate SHA and its CI **MSVC unified**
+   `xllama-appx`. Record CI run, package SHA-256, package full name and revision,
+   submodule pin and a Device Portal OS/device-info receipt. Record the device
+   family separately from any operator-declared benchmark profile. Redact
+   credentials, serial numbers and network addresses; omit tester names unless
+   credit was requested.
+2. Follow [install-release.md](install-release.md) for Developer Mode setup and
+   the prerequisites above. Back up required LocalState data before any uninstall.
+   Set `XLLAMA_EXPECTED_PFN` to the verified installed package; never use a
+   floating "latest" package for an acceptance receipt.
+3. Run the existing console and API suites against that fixed package, capturing
+   stdout/stderr and exit codes independently:
+
+   ```bash
+   source ~/.config/xllama/xbox-env
+   ./scripts/validate-console.sh all
+   ./scripts/validate-api.sh all
+   ```
+
+   Follow the affected training gates above if training is in the candidate's
+   scope. Test default chat, model switching, CPU and supported GPU routing,
+   load/reload, generated output, cancellation and GUI/API compute overlap.
+   A failed or unavailable gate is FAIL/BLOCKED, never a successful partial suite.
+
+4. Record model-file hashes, fixed prompt hashes, context/sampling settings,
+   individual cold-load and warm repeats, prefill, decode, measured TTFT,
+   memory scope and any crashes/hangs. Use the methodology in `bench/README.md`.
+   The current Series S-only XAB profile and hard-coded historical host labels
+   must not silently label Series X results: require the hardware-identity
+   follow-up [#402](https://github.com/gianlucamazza/xllama/issues/402) before
+   using XAB text capture on Series X. Preserve old CSVs and labels with an
+   explicit caveat; do not relabel historical rows.
+5. Submit a new campaign directory with raw results, logs, source/package/model/
+   prompt hashes, observed device identity, invocation/exit records and a manifest
+   of file SHA-256s. Run applicable CSV and sidecar admission checks and the
+   generated claim checks. A valid schema alone does not prove a run occurred.
+6. Review under #374: compare against existing gates on the same device and
+   package, investigate failures and record limitations. Only then update the
+   canonical model/hardware status and public wording. Do not pool Series X,
+   Series S, Linux or WARP results.
+
+No console is configured in the execution environment for the 2026-11-07
+program. This protocol is ready for review; its live steps have not been run.
+
+## Diffusion peak-memory receipt
+
+For new packages exposing `process_peak_ws_mb` in `diffuse-result.csv`, retain
+the fresh result and run-scoped launch log together with the exact package hash.
+A positive value is the Windows process-lifetime peak working set, including
+launch preload, measured after image encoding. Start a new process for each
+trial; do not subtract a baseline or label the result as GPU memory. Zero or
+a missing column does not prove a peak-memory gate. The TAESD sampler remains
+separate evidence of sampled current private working set.

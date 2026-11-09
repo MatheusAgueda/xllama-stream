@@ -1,0 +1,390 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <!-- =====================================================================
+       Configurations: Debug|x64 and Release|x64 only.
+       Xbox Series S is x64 (Zen 2). No ARM64, no Win32.
+       ===================================================================== -->
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <!-- =====================================================================
+       Global properties — UWP app targeting Xbox Series S
+       ===================================================================== -->
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}</ProjectGuid>
+    <RootNamespace>xllama</RootNamespace>
+    <DefaultLanguage>en-US</DefaultLanguage>
+    <MinimumVisualStudioVersion>17.0</MinimumVisualStudioVersion>
+    <AppContainerApplication>true</AppContainerApplication>
+    <AppxPackage>true</AppxPackage>
+    <ApplicationType>Windows Store</ApplicationType>
+    <ApplicationTypeRevision>10.0</ApplicationTypeRevision>
+    <!-- Pin to 22621 (22H2): the 26100 XAML compiler has a NullReferenceException
+         (WMC9999) at MarkupCompilePass2 for C++/WinRT projects (no C++/CX metadata).
+         SDK 22621 is installed on the windows-2022 CI runner. -->
+    <WindowsTargetPlatformVersion>10.0.22621.0</WindowsTargetPlatformVersion>
+    <WindowsTargetPlatformMinVersion>10.0.19041.0</WindowsTargetPlatformMinVersion>
+  </PropertyGroup>
+
+  <!-- Backend selection: 'ort' (default, ORT GenAI text inference) or 'llamacpp'
+       (ggml/llama CPU backend from the submodule, XLLAMA_USE_ORT=0 — the CPU A/B
+       lane; requires the submodule checked out + scripts/apply-uwp-patches.sh).
+       Plain ORT (image spike, diffusion) stays linked in both. -->
+  <PropertyGroup>
+    <XllamaBackend Condition="'$(XllamaBackend)' == ''">ort</XllamaBackend>
+    <!-- The sources gate on `#ifdef XLLAMA_USE_ORT` / `#ifdef XLLAMA_USE_LLAMA`
+         (not #if), so each macro must be ABSENT — not 0 — when its backend is off.
+         ort: ORT only. llamacpp: llama only. unified: BOTH (runtime dispatch). -->
+    <XllamaOrtDefine Condition="'$(XllamaBackend)' != 'llamacpp'">XLLAMA_USE_ORT=1;</XllamaOrtDefine>
+    <XllamaLlamaDefine Condition="'$(XllamaBackend)' == 'llamacpp' or '$(XllamaBackend)' == 'unified'">XLLAMA_USE_LLAMA=1;</XllamaLlamaDefine>
+    <!-- Lane B in-process training rides on the llama.cpp backend (ggml-opt). -->
+    <XllamaDeviceTrainDefine Condition="'$(XllamaBackend)' == 'llamacpp' or '$(XllamaBackend)' == 'unified'">XLLAMA_DEVICE_TRAIN=1;</XllamaDeviceTrainDefine>
+    <!-- Store SKU: strip research surfaces (LAN API, USB models, headless flags).
+         Default false keeps the Dev Mode package. See docs/release-readiness.md. -->
+    <XllamaStoreSku Condition="'$(XllamaStoreSku)' == ''">false</XllamaStoreSku>
+    <XllamaStoreSkuDefine Condition="'$(XllamaStoreSku)' == 'true'">XLLAMA_STORE_SKU=1;</XllamaStoreSkuDefine>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <!-- =====================================================================
+       Per-configuration base properties
+       ===================================================================== -->
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>false</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <!-- NuGet props — imported AFTER Microsoft.Cpp.props so $(IntDir) and
+       $(GeneratedFilesDir) are already resolved when CppWinRT.props runs. -->
+  <Import Project="packages\Microsoft.Windows.CppWinRT.2.0.240405.15\build\native\Microsoft.Windows.CppWinRT.props"
+          Condition="Exists('packages\Microsoft.Windows.CppWinRT.2.0.240405.15\build\native\Microsoft.Windows.CppWinRT.props')" />
+  <Import Project="packages\Microsoft.AI.DirectML.1.15.4\build\native\Microsoft.AI.DirectML.props"
+          Condition="Exists('packages\Microsoft.AI.DirectML.1.15.4\build\native\Microsoft.AI.DirectML.props')" />
+  <Import Project="packages\Microsoft.ML.OnnxRuntime.DirectML.1.24.4\build\native\Microsoft.ML.OnnxRuntime.DirectML.props"
+          Condition="Exists('packages\Microsoft.ML.OnnxRuntime.DirectML.1.24.4\build\native\Microsoft.ML.OnnxRuntime.DirectML.props')" />
+  <Import Project="packages\Microsoft.ML.OnnxRuntimeGenAI.DirectML.0.14.1\build\native\Microsoft.ML.OnnxRuntimeGenAI.DirectML.props"
+          Condition="Exists('packages\Microsoft.ML.OnnxRuntimeGenAI.DirectML.0.14.1\build\native\Microsoft.ML.OnnxRuntimeGenAI.DirectML.props')" />
+
+  <!-- =====================================================================
+       Package / signing
+       ===================================================================== -->
+  <PropertyGroup>
+    <AppxPackageSigningEnabled>false</AppxPackageSigningEnabled>
+    <AppxBundle>Never</AppxBundle>
+  </PropertyGroup>
+
+  <!-- C++/WinRT XAML integration (via Microsoft.Windows.CppWinRT NuGet).
+       Only Windows SDK XAML controls are used (Windows.UI.Xaml.Controls.*);
+       WinUI 2 (Microsoft.UI.Xaml) was removed because CppWinRT 2.0 fails to
+       generate projection headers from the WinUI 2.7 WinMD silently. -->
+  <PropertyGroup>
+    <CppWinRTGenerateWindowsMetadata>true</CppWinRTGenerateWindowsMetadata>
+  </PropertyGroup>
+
+  <!-- =====================================================================
+       Include paths (both configurations)
+       ===================================================================== -->
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <AdditionalIncludeDirectories>
+        $(ProjectDir);
+        $(ProjectDir)Generated Files;
+        $(IntDir)Generated Files;
+        $(ProjectDir)..\include;
+        $(ProjectDir)..\shaders\generated;
+        $(ProjectDir)..\llama.cpp\include;
+        $(ProjectDir)..\llama.cpp\common;
+        $(ProjectDir)..\llama.cpp\ggml\include;
+        $(ProjectDir)..\llama.cpp\vendor;
+        $(ProjectDir)packages\Microsoft.ML.OnnxRuntimeGenAI.DirectML.0.14.1\build\native\include;
+        $(ProjectDir)packages\Microsoft.ML.OnnxRuntime.DirectML.1.24.4\build\native\include;
+        %(AdditionalIncludeDirectories)
+      </AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>
+        NOMINMAX;
+        WIN32_LEAN_AND_MEAN;
+        _CRT_SECURE_NO_WARNINGS;
+        XLLAMA_UWP=1;
+        $(XllamaOrtDefine)
+        $(XllamaLlamaDefine)
+        $(XllamaDeviceTrainDefine)
+        $(XllamaStoreSkuDefine)
+        %(PreprocessorDefinitions)
+      </PreprocessorDefinitions>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <LanguageStandard_C>stdc11</LanguageStandard_C>
+      <ConformanceMode>true</ConformanceMode>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <!-- C++/WinRT does NOT use /ZW (C++/CX). Disable it globally so .c files
+           can compile. /ZW is for the legacy C++/CX ABI, incompatible with
+           pure-C files and with the winrt:: header-only library we use. -->
+      <CompileAsWinRT>false</CompileAsWinRT>
+      <!-- Preserve directory structure in .obj paths to avoid collision when
+           two files share the same basename (e.g. repack.cpp, quants.c, llama.cpp). -->
+      <ObjectFileName>$(IntDir)%(RelativeDir)</ObjectFileName>
+      <!-- Disable precompiled headers globally. We don't have pch.cpp to create
+           the PCH; pch.h is included as a regular header via App.h. -->
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <!-- /EHa: enable SEH → C++ exception translation so _set_se_translator fires. -->
+      <ExceptionHandling>Async</ExceptionHandling>
+      <!-- Sources are UTF-8 without BOM; without /utf-8 MSVC assumes the system
+           codepage (Windows-1252) and non-ASCII literals (▶ ■ · — ●) reach the
+           UI as mojibake ("â–¶ Run"). -->
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <!-- WindowsApp.lib is the UWP umbrella library.
+           onnxruntime.lib / onnxruntime-genai.lib are import libs from the NuGet packages.
+           The NuGet .targets files don't inject AdditionalLibraryDirectories for native C++
+           projects, so we add the paths explicitly. Both packages use runtimes/win-x64/native/
+           (not win10-x64) for their native binaries. -->
+      <AdditionalLibraryDirectories>
+        $(ProjectDir)packages\Microsoft.ML.OnnxRuntime.DirectML.1.24.4\runtimes\win-x64\native;
+        $(ProjectDir)packages\Microsoft.ML.OnnxRuntimeGenAI.DirectML.0.14.1\runtimes\win-x64\native;
+        %(AdditionalLibraryDirectories)
+      </AdditionalLibraryDirectories>
+      <!-- d3d12.dll is LoadLibrary'd at first GPU path use (d3d12_dyn.h); no hard import. -->
+      <AdditionalDependencies>WindowsApp.lib;Bcrypt.lib;onnxruntime.lib;onnxruntime-genai.lib;dxgi.lib;d3d11.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <!-- Debug-specific compile flags -->
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <Optimization>Disabled</Optimization>
+      <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
+      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
+    </ClCompile>
+  </ItemDefinitionGroup>
+
+  <!-- Release-specific compile flags: AVX2 for Zen 2 (Xbox CPU), LTCG -->
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <Optimization>MaxSpeed</Optimization>
+      <InlineFunctionExpansion>AnySuitable</InlineFunctionExpansion>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <AdditionalOptions>/arch:AVX2 /Oi /Ot %(AdditionalOptions)</AdditionalOptions>
+      <WholeProgramOptimization>true</WholeProgramOptimization>
+    </ClCompile>
+    <Link>
+      <LinkTimeCodeGeneration>UseLinkTimeCodeGeneration</LinkTimeCodeGeneration>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <!-- =====================================================================
+       IDL (MIDL 3 format) — processed by cppwinrt.exe via CppWinRT NuGet.
+       Declares App and MainPage runtimeclasses; cppwinrt.exe emits
+       xllama.winmd (needed by AppxPackage.Targets for EntryPoint="xllama.App")
+       and generates App.g.h / MainPage.g.h used by the C++ source.
+       ===================================================================== -->
+  <ItemGroup>
+    <Midl Include="xllama.idl" />
+  </ItemGroup>
+
+  <!-- No Desktop Extension SDK reference, and this is a measured decision.
+       One was added on 2026-07-30 to read AppRecordingManager.GetStatus(), then
+       removed the same day: the [caprec] probe reports the type as ABSENT on the
+       console (Xbox 1.5.2.x, Dev Mode), so the reference bought a projection for
+       code that can never run there. AppxManifest.xml declaring the
+       Windows.Desktop device family does not make the Desktop contract present —
+       that is the whole reason ApiInformation::IsTypePresent is the guard.
+       Do not re-add it without a probe line saying the contract has appeared. -->
+
+
+  <!-- =====================================================================
+       Manifest
+       ===================================================================== -->
+  <ItemGroup>
+    <!-- Dev Mode / research package (LAN API + USB model path). -->
+    <AppxManifest Include="AppxManifest.xml" Condition="'$(XllamaStoreSku)' != 'true'">
+      <SubType>Designer</SubType>
+    </AppxManifest>
+    <!-- Store SKU: internetClient only (docs/release-readiness.md). -->
+    <AppxManifest Include="AppxManifest.store.xml" Condition="'$(XllamaStoreSku)' == 'true'">
+      <SubType>Designer</SubType>
+    </AppxManifest>
+  </ItemGroup>
+
+  <!-- =====================================================================
+       Assets (placeholder PNGs required by AppxManifest)
+       ===================================================================== -->
+  <ItemGroup>
+    <Image Include="Assets\StoreLogo.png" />
+    <Image Include="Assets\Square150x150Logo.png" />
+    <Image Include="Assets\Square44x44Logo.png" />
+    <Image Include="Assets\Wide310x150Logo.png" />
+    <Image Include="Assets\SplashScreen.png" />
+  </ItemGroup>
+
+  <!-- =====================================================================
+       Source files — ORT GenAI + DirectML engine (llama.cpp removed from UWP)
+       ===================================================================== -->
+
+  <!-- Native DLLs from NuGet: must be app-local for UWP container.
+       NuGet targets copy these automatically if DeploymentContent=true. -->
+  <ItemGroup>
+    <!-- TargetPath flattens each DLL to the package root so the Windows loader
+         finds them on startup (UWP only searches the package root, not subdirs). -->
+    <None Include="packages\Microsoft.AI.DirectML.1.15.4\bin\x64-win\DirectML.dll"
+          Condition="Exists('packages\Microsoft.AI.DirectML.1.15.4\bin\x64-win\DirectML.dll')">
+      <DeploymentContent>true</DeploymentContent>
+      <TargetPath>DirectML.dll</TargetPath>
+    </None>
+    <None Include="packages\Microsoft.ML.OnnxRuntime.DirectML.1.24.4\runtimes\win-x64\native\onnxruntime.dll"
+          Condition="Exists('packages\Microsoft.ML.OnnxRuntime.DirectML.1.24.4\runtimes\win-x64\native\onnxruntime.dll')">
+      <DeploymentContent>true</DeploymentContent>
+      <TargetPath>onnxruntime.dll</TargetPath>
+    </None>
+    <None Include="packages\Microsoft.ML.OnnxRuntimeGenAI.DirectML.0.14.1\runtimes\win-x64\native\onnxruntime-genai.dll"
+          Condition="Exists('packages\Microsoft.ML.OnnxRuntimeGenAI.DirectML.0.14.1\runtimes\win-x64\native\onnxruntime-genai.dll')">
+      <DeploymentContent>true</DeploymentContent>
+      <TargetPath>onnxruntime-genai.dll</TargetPath>
+    </None>
+    <!-- VC++ runtime DLLs required by onnxruntime.dll and onnxruntime-genai.dll.
+         These packages are built with the desktop runtime (/MD, linking MSVCP140.dll
+         not MSVCP140_APP.dll), so they cannot find it from System32 in AppContainer.
+         Bundling them in the package root makes them app-local and loader-accessible.
+         build-uwp.ps1 copies these from the VS2022 CRT redist to uwp/ before MSBuild. -->
+    <None Include="MSVCP140.dll" Condition="Exists('MSVCP140.dll')">
+      <DeploymentContent>true</DeploymentContent>
+      <TargetPath>MSVCP140.dll</TargetPath>
+    </None>
+    <None Include="MSVCP140_1.dll" Condition="Exists('MSVCP140_1.dll')">
+      <DeploymentContent>true</DeploymentContent>
+      <TargetPath>MSVCP140_1.dll</TargetPath>
+    </None>
+    <None Include="VCRUNTIME140.dll" Condition="Exists('VCRUNTIME140.dll')">
+      <DeploymentContent>true</DeploymentContent>
+      <TargetPath>VCRUNTIME140.dll</TargetPath>
+    </None>
+    <None Include="VCRUNTIME140_1.dll" Condition="Exists('VCRUNTIME140_1.dll')">
+      <DeploymentContent>true</DeploymentContent>
+      <TargetPath>VCRUNTIME140_1.dll</TargetPath>
+    </None>
+  </ItemGroup>
+
+  <!-- No model is bundled in the MSIX (Exp 2 validated 2026-07-08): the app
+       downloads models on first launch from the catalogue (models/manifest.json,
+       GitHub Release assets) or accepts USB/Device-Portal provisioning. -->
+
+  <!-- Model catalogue: always bundled (both variants) at InstalledPath\models\manifest.json.
+       A LocalState\manifest.json uploaded via Device Portal overrides it (see
+       LoadModelManifest in model-downloader.cpp). -->
+  <ItemGroup>
+    <None Include="models\manifest.json">
+      <DeploymentContent>true</DeploymentContent>
+      <TargetPath>models\manifest.json</TargetPath>
+    </None>
+  </ItemGroup>
+
+  <!-- llama.cpp CPU backend (llamacpp variant only). ggml-uwp.vcxproj is not a
+       solution member, so the solution's project-configuration mapping does not
+       cover it — without SetConfiguration/SetPlatform the reference builds as
+       the MSBuild default Debug|Win32 (MSB8013). -->
+  <ItemGroup Condition="'$(XllamaBackend)' == 'llamacpp' or '$(XllamaBackend)' == 'unified'">
+    <ProjectReference Include="ggml-uwp.vcxproj">
+      <Project>{B7E11D2A-4C63-4A0E-9D1F-2A6C58F0AA31}</Project>
+      <SetConfiguration>Configuration=$(Configuration)</SetConfiguration>
+      <SetPlatform>Platform=$(Platform)</SetPlatform>
+    </ProjectReference>
+    <ProjectReference Include="llama-common-uwp.vcxproj">
+      <Project>{C8F22E3B-5D74-4B1F-8E20-3B7D69A1BB42}</Project>
+      <SetConfiguration>Configuration=$(Configuration)</SetConfiguration>
+      <SetPlatform>Platform=$(Platform)</SetPlatform>
+    </ProjectReference>
+  </ItemGroup>
+
+  <!-- xllama shared bridge -->
+  <ItemGroup>
+    <ClCompile Include="..\src\bridge\inference.cpp" />
+    <ClCompile Include="..\src\bridge\session.cpp" />
+    <ClCompile Include="..\src\bridge\embedding.cpp" />
+    <ClCompile Include="..\src\bridge\kv_store.cpp" />
+    <ClCompile Include="..\src\bridge\bench.cpp" />
+    <ClCompile Include="..\src\bridge\diskbw.cpp" />
+    <ClCompile Include="..\src\bridge\membw.cpp" />
+    <ClCompile Include="..\src\bridge\gpubw.cpp" />
+    <ClCompile Include="..\src\bridge\gpugemv.cpp" />
+    <ClCompile Include="..\src\bridge\gpustep.cpp" />
+    <ClCompile Include="..\src\bridge\d3d12_compute.cpp" />
+    <!-- d3d12 ggml backend: implements ggml-backend-impl.h, internal to ggml. -->
+    <ClCompile Include="..\src\bridge\ggml_d3d12.cpp">
+      <AdditionalIncludeDirectories>$(ProjectDir)..\llama.cpp\ggml\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <ClCompile Include="..\src\bridge\ramceil.cpp" />
+    <ClCompile Include="..\src\bridge\platform.cpp" />
+    <ClCompile Include="..\src\bridge\path_utils.cpp" />
+    <ClCompile Include="..\src\bridge\utf8_utils.cpp" />
+    <ClCompile Include="..\src\bridge\chat_prompt.cpp" />
+    <ClCompile Include="..\src\bridge\prompt_budget.cpp" />
+    <ClCompile Include="..\src\bridge\http_framing.cpp" />
+    <ClCompile Include="..\src\bridge\sse.cpp" />
+    <ClCompile Include="..\src\bridge\stop_sequence_filter.cpp" />
+    <ClCompile Include="..\src\bridge\tool_request.cpp" />
+    <ClCompile Include="..\src\bridge\tool_template.cpp" />
+    <ClCompile Include="..\src\bridge\tool_transcript.cpp" />
+    <ClCompile Include="..\src\bridge\training.cpp" />
+    <ClCompile Include="..\src\bridge\device_train.cpp" />
+    <ClCompile Include="..\src\bridge\preference_capture.cpp" />
+    <ClCompile Include="..\src\bridge\capture_probe.cpp" />
+    <ClCompile Include="..\src\bridge\personalize.cpp" />
+    <ClCompile Include="..\src\bridge\autopilot.cpp" />
+    <!-- cli.cpp uses POSIX getopt — Linux only, excluded from UWP target -->
+    <ClCompile Include="inference-bridge.cpp" />
+    <ClCompile Include="native_capture.cpp" />
+    <ClCompile Include="diffuse.cpp" />
+    <ClCompile Include="op-repro.cpp" />
+  </ItemGroup>
+
+  <!-- xllama UWP app -->
+  <ItemGroup>
+    <ClCompile Include="App.cpp" />
+    <!-- LAN API is Dev Mode only; omit from Store SKU link (docs/release-readiness.md). -->
+    <ClCompile Include="api-server.cpp" Condition="'$(XllamaStoreSku)' != 'true'" />
+    <ClCompile Include="chat-history.cpp" />
+    <ClCompile Include="MainPage.cpp" />
+    <ClCompile Include="model-downloader.cpp" />
+    <!-- module.cpp includes Generated Files\module.g.cpp (cppwinrt 2.0 factory
+         aggregator). In cppwinrt 2.x, per-class App.g.cpp are
+         replaced by a single module.g.cpp; this is the TU that compiles it. -->
+    <ClCompile Include="module.cpp" />
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+
+  <!-- NuGet package targets (restored to packages\ relative to this vcxproj) -->
+  <Import Project="packages\Microsoft.Windows.CppWinRT.2.0.240405.15\build\native\Microsoft.Windows.CppWinRT.targets"
+          Condition="Exists('packages\Microsoft.Windows.CppWinRT.2.0.240405.15\build\native\Microsoft.Windows.CppWinRT.targets')" />
+  <Import Project="packages\Microsoft.AI.DirectML.1.15.4\build\native\Microsoft.AI.DirectML.targets"
+          Condition="Exists('packages\Microsoft.AI.DirectML.1.15.4\build\native\Microsoft.AI.DirectML.targets')" />
+  <Import Project="packages\Microsoft.ML.OnnxRuntime.DirectML.1.24.4\build\native\Microsoft.ML.OnnxRuntime.DirectML.targets"
+          Condition="Exists('packages\Microsoft.ML.OnnxRuntime.DirectML.1.24.4\build\native\Microsoft.ML.OnnxRuntime.DirectML.targets')" />
+  <Import Project="packages\Microsoft.ML.OnnxRuntimeGenAI.DirectML.0.14.1\build\native\Microsoft.ML.OnnxRuntimeGenAI.DirectML.targets"
+          Condition="Exists('packages\Microsoft.ML.OnnxRuntimeGenAI.DirectML.0.14.1\build\native\Microsoft.ML.OnnxRuntimeGenAI.DirectML.targets')" />
+
+</Project>

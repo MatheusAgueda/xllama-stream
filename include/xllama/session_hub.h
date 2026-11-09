@@ -1,0 +1,103 @@
+// Copyright (c) 2024 Gianluca Mazza
+// SPDX-License-Identifier: MIT
+// Single process-wide owner of the loaded model Session.
+//
+// Before this existed the GUI (MainPageController::m_session) and the LAN API
+// (api-server.cpp g_session) each owned an independent Session: both could
+// hold a model at the same time, silently breaking the "never 2x model in
+// RAM" invariant EnsureSession enforced only within the GUI. The hub is the
+// one owner; both surfaces lock it for the duration of a turn.
+//
+// SDK usage:
+//   xllama::SessionHub hub;           // explicit instance (SDK)
+//   auto* s = hub.ensure_locked(...); // same API as session_hub().ensure_locked()
+//
+// The global session_hub() function remains for backward compatibility;
+// it returns a reference to a static SessionHub instance.
+//
+// Locking contract:
+//   - Take `mtx` before touching `session` / `model`, and HOLD it across
+//     ensure_locked() + generate() so a concurrent surface cannot swap the
+//     resident model mid-turn. The GUI blocks on the lock (its turns are
+//     serialized anyway); the API uses try_lock and reports busy.
+//   - `generation` increments every time the resident session changes. A
+//     surface that keeps per-conversation state tied to the live session
+//     (the GUI's KV-reuse flag) must record it and drop that state when it
+//     no longer matches — the other surface may have swapped models between
+//     turns.
+#pragma once
+
+#include "xllama/session.h"
+#include "xllama/session_spec.h" // same_load
+
+#include <atomic>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <string>
+
+namespace xllama {
+
+// SessionHub owns one resident Session at a time.
+// It is a plain, constructible struct — no singleton pattern.
+// The global session_hub() function provides a static instance for
+// backward compatibility; SDK users may create their own instance.
+struct SessionHub {
+    std::mutex mtx;
+    std::unique_ptr<Session> session; // guarded by mtx
+    std::string model;                // model id loaded into `session`; guarded by mtx
+    SessionParams params;             // what `session` was loaded with; guarded by mtx
+    uint64_t generation = 0;          // bumps on every resident-session change; guarded by mtx
+
+    // True while a background pre-load owns compute admission and is loading
+    // the session. Lets the LAN API and the first GUI send distinguish
+    // "warming up, wait briefly" from "another job is active, report busy"
+    // before they attempt mtx (observed on-console during Phase C validation).
+    std::atomic<bool> preloading{false};
+
+    // Under mtx: return the resident session for |model_id|, creating it (and
+    // destroying any other model's session FIRST — never 2x model in RAM) if
+    // needed. On creation failure the hub is left empty and nullptr returns.
+    Session* ensure_locked(const std::string& model_id, const SessionParams& sp,
+                           std::string* err = nullptr) {
+        // Reuse only the same load (ADR 0007): another adapter, context or
+        // GPU-layer split is a different model in RAM, so it reloads like a
+        // model switch. Matching the id alone let the first surface's load
+        // win (audit F03: the API reused or skipped the GUI's LoRA).
+        if (session && model == model_id && same_load(params, sp))
+            return session.get();
+        session.reset(); // release the old model before loading the new one
+        model.clear();
+        ++generation;
+        auto s = Session::create(sp, err);
+        if (!s)
+            return nullptr;
+        session = std::move(s);
+        model = model_id;
+        params = sp;
+        ++generation;
+        return session.get();
+    }
+
+    // Under mtx: the files behind |model_id| changed (pull, import, promotion),
+    // so a resident session of it is stale even with the same parameters.
+    void invalidate_locked(const std::string& model_id) {
+        if (session && model == model_id)
+            reset_locked();
+    }
+
+    // Under mtx: drop the resident session (e.g. to free RAM on demand).
+    void reset_locked() {
+        if (session) {
+            session.reset();
+            model.clear();
+            ++generation;
+        }
+    }
+};
+
+// The process-wide hub (defined in session.cpp).
+// SDK users may create their own SessionHub instance instead.
+SessionHub& session_hub();
+
+} // namespace xllama

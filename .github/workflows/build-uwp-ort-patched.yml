@@ -1,0 +1,101 @@
+name: build-uwp-ort-patched
+
+# Manual lane: REBUILD the patched onnxruntime.dll from source (DirectML) with
+# the AppContainer external-data fixes
+# (patches/onnxruntime-extdata-appcontainer.patch). Full ORT build is 1–3 h —
+# too slow for the per-PR shipping lane.
+#
+# Shipping CI (build-uwp.yml) downloads the pinned console-validated DLL from
+# the vendor-dlls-v1 release (hash in vendor/onnxruntime-patched/SHA256SUMS).
+# After rebuilding here and re-validating on console, update that release asset
+# + SHA256SUMS. See docs/fp16-extdata-runbook.md.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # windows-2022: VS2022 (v143) + UWP workload (same rationale as build-uwp.yml).
+    runs-on: windows-2022
+    # A full ORT DirectML build can take 1-3 h; keep headroom under the 6 h cap.
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+          fetch-depth: 1
+
+      - name: Checkout llama.cpp submodule + apply AppContainer guards
+        shell: bash
+        run: |
+          git submodule update --init --depth 1 llama.cpp
+          bash scripts/apply-uwp-patches.sh
+          bash scripts/check-uwp-sources.sh
+
+      - name: Setup Python (ORT build.py)
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Restore NuGet packages
+        shell: pwsh
+        working-directory: uwp
+        run: nuget restore packages.config -PackagesDirectory packages -NonInteractive
+
+      - name: Build patched onnxruntime-genai.dll (#2280) from source
+        shell: pwsh
+        run: ./scripts/vendor-genai-dml-patch.ps1 -Build
+
+      - name: Build patched onnxruntime.dll (extdata AppContainer guard) from source
+        shell: pwsh
+        run: ./scripts/vendor-ort-extdata-patch.ps1 -Build
+
+      - name: Verify both patched DLLs replaced the NuGet copies
+        shell: pwsh
+        run: |
+          $pkgs = ([xml](Get-Content uwp/packages.config)).packages.package
+          $genaiVer = ($pkgs | Where-Object { $_.id -eq "Microsoft.ML.OnnxRuntimeGenAI.DirectML" }).version
+          $ortVer   = ($pkgs | Where-Object { $_.id -eq "Microsoft.ML.OnnxRuntime.DirectML" }).version
+          $checks = @(
+            @{ vendor = "vendor/onnxruntime-genai-patched/win-x64/onnxruntime-genai.dll";
+               nuget  = "uwp/packages/Microsoft.ML.OnnxRuntimeGenAI.DirectML.$genaiVer/runtimes/win-x64/native/onnxruntime-genai.dll" },
+            @{ vendor = "vendor/onnxruntime-patched/win-x64/onnxruntime.dll";
+               nuget  = "uwp/packages/Microsoft.ML.OnnxRuntime.DirectML.$ortVer/runtimes/win-x64/native/onnxruntime.dll" }
+          )
+          foreach ($c in $checks) {
+            if (-not (Test-Path $c.vendor)) { Write-Error "patched DLL missing: $($c.vendor)"; exit 1 }
+            if ((Get-FileHash $c.vendor).Hash -ne (Get-FileHash $c.nuget).Hash) {
+              Write-Error "NuGet DLL is not the patched build: $($c.nuget)"; exit 1
+            }
+          }
+
+      - name: Build UWP package (unified, -PatchedGenAI -PatchedOrt)
+        shell: pwsh
+        run: >-
+          ./scripts/build-uwp.ps1 -Configuration Release -Platform x64
+          -Backend unified -PatchedGenAI -PatchedOrt
+          -BuildRevision ${{ github.run_number }}
+
+      - uses: actions/upload-artifact@v7
+        if: success()
+        with:
+          name: xllama-appx-ort-patched
+          path: |
+            uwp/AppPackages/**/*.msix
+            uwp/AppPackages/**/*.appx
+            uwp/xllama-test.cer
+          retention-days: 14
+
+      # The patched ORT DLL itself, so a console-validated build can be dropped
+      # into vendor/onnxruntime-patched/win-x64/ (gitignored) or attached to a
+      # release; build-uwp.yml can then install it without a source rebuild.
+      - name: Upload patched onnxruntime.dll
+        uses: actions/upload-artifact@v7
+        if: success()
+        with:
+          name: onnxruntime-patched-dll
+          path: vendor/onnxruntime-patched/win-x64/onnxruntime.dll
+          retention-days: 90

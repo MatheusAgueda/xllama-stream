@@ -1,0 +1,415 @@
+# Model Selection Checklist
+
+> **SSOT for the model catalogue and backend selection.** The catalogue data
+> lives in [`uwp/models/manifest.json`](../uwp/models/manifest.json); this file
+> is the narrative source of truth for limits, licensing, backend routing, and
+> "add your own model". Performance numbers live in [`benchmarks.md`](benchmarks.md).
+
+Models are made by their authors and used under their own licences. Most download
+directly from the author's or a community quantizer's Hugging Face repository; a
+few converted builds download from this repository's `models-v1` release, and
+their upstream licences apply (see each model's source card). xllama doesn't
+sell models or apps. Design limits for what the catalogue may contain are in
+[CONTRIBUTING.md](../CONTRIBUTING.md#model-catalogue-design-limits).
+
+Operational criteria for choosing or evaluating a model for the xllama UWP build
+(Xbox Series S Developer Mode; not yet tested on Series X). Covers both backends — ONNX Runtime GenAI (CPU/DirectML)
+and llama.cpp (GGUF, CPU).
+
+## Hard limits (must pass)
+
+| Constraint                              | Limit                                                                       | Source                       |
+| --------------------------------------- | --------------------------------------------------------------------------- | ---------------------------- |
+| Format                                  | ONNX GenAI directory (`genai_config.json` + `model.onnx` + tokenizer files) | ORT GenAI 0.14.1 requirement |
+| External data files                     | Must be merged into a self-contained `model.onnx` before distribution       | `uwp-constraints.md §8`      |
+| On-disk size (merged ONNX)              | ~2.2–2.5 GB free by default (**expandable to 90 GB**, so rarely binding)    | `uwp-constraints.md §9`      |
+| GPU EP weights (if attempting DirectML) | < ~300 MB                                                                   | `uwp-constraints.md §5`, §7  |
+
+## Selection sequence
+
+1. Identify a candidate (Hugging Face, ONNX zoo, etc.). Confirm format is ONNX GenAI
+   (directory with `genai_config.json`), not a plain `.onnx` or a GGUF file.
+
+2. Download locally:
+
+   ```bash
+   huggingface-cli download <repo-id> --local-dir models/<name>
+   ```
+
+3. Merge external data if present:
+
+   ```bash
+   python3 scripts/merge_onnx_external_data.py models/<name>
+   ```
+
+   The script prints a `NOTE` or `WARNING` if the merged size exceeds budget thresholds.
+
+4. Check on-disk size against the Developer Mode disk budget (~2.2–2.5 GB free by
+   default, expandable to 90 GB — `uwp-constraints.md §9`):
+
+   ```bash
+   du -sm models/<name>
+   ```
+
+5. Provision it on the console — either add a catalogue entry (see
+   "Add your own model" below) and let the app download it, or upload directly:
+
+   ```bash
+   source ~/.config/xllama/xbox-env
+   PFN=$(./scripts/deploy.sh pfn)
+   ./scripts/deploy.sh upload-dir models/<name>/ "$PFN" "models\\<name>"
+   ```
+
+   If the upload fails for space (`0x80070070` ERROR_DISK_FULL), the model
+   exceeds the available Developer Mode partition space.
+
+6. Launch and check the log:
+
+   ```bash
+   ./scripts/deploy.sh get-log
+   ```
+
+   If model creation fails, use `deploy.sh diagnose-startup` and the current
+   troubleshooting guidance in `device-portal.md`.
+
+7. Benchmark and compare against the current baseline:
+   ```bash
+   ./scripts/bench-xbox-ort.sh <model-name> --runs 3 --out bench/results/phase1-cpu.csv
+   ```
+   Store results in a campaign-specific CSV under `bench/results/`; do not append
+   unrelated models to the historical Phase 1 file.
+
+## Reference: tested models
+
+| Model                          | On-disk (merged) | CPU EP                                                                      | DirectML EP                                      | Notes                                                                                                                                 |
+| ------------------------------ | ---------------- | --------------------------------------------------------------------------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
+| SmolLM2-360M-Instruct INT4 CPU | ~421 MB          | ✅ ORT baseline (**74.8** tok/s with the shipped t6 asset, `benchmarks.md`) | ❌ `80070057` (CPU-int4 graph in DML fused node) | ORT-only default; size from `manifest.json` `approx_bytes`                                                                            |
+| SmolLM2-360M-Instruct INT4 DML | 285 MB           | —                                                                           | ⚠️ **8.8 tok/s** but wrong logits (#91)          | Built with ORT GenAI model builder (`-p int4 -e dml`); CPU ~8× faster — and DML text output is numerically wrong on this device (#91) |
+| SmolLM2-1.7B-Instruct INT4 CPU | 1.4 GB           | ✅ in-app (`models-v1` catalogue)                                           | —                                                | Console: 20.6 tok/s decode, peak 2423 MiB (`phase35-1b-cpu.csv`); also USB/LocalState                                                 |
+| Phi-3.5-mini Q3_K_S (GGUF)     | 1.68 GB          | ✅ H4 A/B (11.3 tok/s, 2453 MiB)                                            | —                                                | Loses speed+RAM vs Llama-3.2-3B Q3; **not** catalogue (`phase7-scale.csv`)                                                            |
+
+## Historical ONNX candidate survey
+
+The July 2 candidate survey used an early disk estimate that was later
+superseded by the measured 90 GB Developer Mode allocation and the patched external-
+data path. Its individual size-based rejections are not current selection
+policy. Historical details remain in Git history and `CHANGELOG.md`; evaluate
+new candidates against the measured limits in `uwp-constraints.md` and the
+sequence above.
+
+**External data >2 GB (un-mergeable) — unblocked for loading, but not for fp16-GPU
+(2026-07-15).** The 2 GB protobuf merge ceiling no longer blocks _loading_: the
+patched ORT DLL (`uwp-constraints.md §8` Fix B) loads external-`.onnx.data` models
+directly, console-validated with a 1.86 GB int4 model. **But this does not make big
+fp16 models viable on the GPU**: a native-DML 1B fp16 (2.49 GB) loads yet OOMs
+inference within the 3801 MB budget (`uwp-constraints.md §7`). Practical takeaway:
+the >2 GB path is a **CPU/int4** enabler; DML-fp16 stays ≤~360-500 M
+(`smollm2-360m-dml-fp16-v2` — the RMSNorm-decomposed graph that passes the
+parity gate, `#91`/`dml-rmsnorm-fix-runbook.md`). Build DML models
+natively (`builder … -p fp16 -e dml`) — a cuda-fp16 re-host loads but fails DML
+inference.
+
+**Future — BitNet / INT2 models**: Microsoft BitNet b1.58 (1-bit/1.58-bit quantization)
+could bring a 1.7B–3B model under 400 MB, fitting both the disk and GPU budgets.
+ORT GenAI does not natively support INT2 as of 0.14.1. Re-evaluate when
+`microsoft/onnxruntime-genai` adds a stable INT2/BitNet execution path.
+
+## Why these limits
+
+The disk and GPU limits derive from the UWP sandbox on Xbox Series S in Developer Mode.
+This document records only observed behavior at the application boundary. See
+`uwp-constraints.md §7` (GPU pool) and `uwp-constraints.md §9` (disk budget) for
+what we measure. Do not treat any claim about the internal Xbox OS partition layout
+as authoritative unless backed by a Microsoft source.
+
+## Add your own model (manifest override, no reinstall)
+
+Downloaded catalogue files may declare a lowercase `sha256` value alongside
+`filename`, `remote`, and `approx_bytes`. xllama verifies that digest against
+the staged file before replacing an existing model and before writing the
+`.complete` marker. Missing hashes remain supported only for legacy/custom
+Developer Mode provisioning. The signed-catalogue build (`XLLAMA_STORE_SKU`) rejects a
+catalogue without a valid signature envelope and any download entry without a
+SHA-256 pin; the Developer Mode release build accepts an unsigned catalogue (a
+signature, if present, is still verified).
+
+The Settings ComboBox is populated from the model catalogue. A
+`LocalState\manifest.json` uploaded via Device Portal is **merged per entry**
+into the bundled catalogue (`uwp/model-downloader.cpp`, `LoadModelManifest`):
+a same-name entry replaces the bundled one, new names are appended, and
+bundled entries you don't mention stay available — so a minimal override file
+with just your model is enough, and it keeps working when the bundled
+catalogue grows:
+
+1. Write a manifest with just your entry (or copy `uwp/models/manifest.json`):
+
+   ```json
+   {
+     "models": [
+       {
+         "name": "my-model-dir",
+         "display": "My Model (CPU int4)",
+         "kind": "ort-genai",
+         "hf_base_url": "https://example.com/base/url",
+         "files": [{ "filename": "model.onnx", "approx_bytes": 123456789 }]
+       }
+     ]
+   }
+   ```
+
+   With `hf_base_url` set, the app downloads `<hf_base_url>/<remote or filename>`
+   for each file on selection. Without it, the entry expects the directory at
+   `LocalState\models\<name>` (Device Portal upload) or USB `E:\xllama\models\<name>`.
+   Optional fields: `kind` (`"ort-genai"` default; `"diffusion"` entries feed the
+   Image dialog and are hidden from the chat picker); `n_ctx` (session context size,
+   `0`/omit = shipping default 2048; coding models use `4096`); `role`
+   (`""` or `"coding"` — denser prompt-token estimate + coding system default on
+   the LAN API); and per-file `remote` (the flat asset name in the release when
+   `filename` carries a subpath, e.g. `"filename": "unet/model.onnx"` +
+   `"remote": "sd-turbo-fp16_unet_model.onnx"`). Per-file `role` marks a pin as
+   `weight` / `data` (counts for installed-model verification) or `licence` /
+   `notice` / `sidecar` (fetched on their own). When `role` is omitted, the
+   documented filename default in `model_file_plan.h` applies: a basename stem
+   of license / licence / notice / readme / copying / authors / copyright is a
+   sidecar; everything else is a weight. `files[].role` is not the entry-level
+   `role` (`coding` / `embedding`). Adding or changing a licence or notice
+   row must not invalidate already-verified weights.
+
+2. Upload the override and (if needed) the model files:
+
+   ```bash
+   source ~/.config/xllama/xbox-env
+   PFN=$(./scripts/deploy.sh pfn)
+   ./scripts/deploy.sh upload-file my-manifest.json "$PFN" ""   # rename to manifest.json first
+   ./scripts/deploy.sh upload-dir ./my-model-dir/ "$PFN" "models\\my-model-dir"
+   ```
+
+3. Restart the app: the ComboBox now shows the new entry.
+
+Constraints: `model.onnx` must be **self-contained** (< 2 GB, external data merged —
+`uwp-constraints.md §8`) and fit the Developer Mode disk budget. For diffusion models the
+contract is different (three components + CLIP assets): see `diffusion/README.md`.
+
+### Coding model entry (GGUF)
+
+**Design (SSOT structure):** [architecture.md](./architecture.md) — catalogue
+session policy + “inference surfaces”. **No third backend.** Coding is chat on
+the existing GGUF/`Session`/`ChatFormat` path with optional catalogue knobs.
+
+```json
+{
+  "models": [
+    {
+      "name": "qwen25-coder-1.5b",
+      "display": "Qwen2.5 Coder 1.5B (GGUF · CPU · coding)",
+      "kind": "gguf",
+      "role": "coding",
+      "n_ctx": 4096,
+      "hf_base_url": "https://huggingface.co/unsloth/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main",
+      "files": [
+        {
+          "filename": "Qwen2.5-Coder-1.5B-Instruct-Q4_K_M.gguf",
+          "approx_bytes": 986048032
+        }
+      ]
+    }
+  ]
+}
+```
+
+| Field            | Effect                                                                                  | Non-effect                                                                  |
+| ---------------- | --------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| `role: "coding"` | Trimmer 3.5 chars/token; LAN empty `system` → `kCodingSystemPrompt`                     | Does **not** rewrite Settings system prompt; does not pick backend/template |
+| `n_ctx: 4096`    | Session + trimmer ceiling (`resolve_n_ctx` / `max_prompt_tokens_for_n_ctx`)             | Does not change sampling or routing (GGUF has no EP routing)                |
+| Chat template    | `chat_format_for` by family — Qwen2.5-Coder = ChatML **without** Qwen3 no-think prefill | Qwen3 only gets empty-`<think>` via `model_is_qwen3`                        |
+
+**Best practices before shipping a new GGUF (any role):**
+
+1. Host **Release** smoke (`xllama-cli --chat --greedy`) — coherent output, peak RSS.
+2. Console headless (`bench-xbox-ort.sh`, set `--ctx` if non-default) → `bench/results/`.
+3. Only then: `manifest.json` entry + inventory line in [model-matrix.md](./model-matrix.md).
+4. Numbers go only through `benchmark-summary.json` → `generate-benchmark-summary.py`.
+5. Prefer 0.5–3B Q3/Q4 on Series S; reject 7B+ interactive for BW reasons (Phase 7).
+
+**Shipped (console phase14):** coding `qwen25-coder-1.5b` (the coding option)
+and `qwen25-coder-0.5b` (fast);
+chat `qwen3-1.7b`; reasoning `lfm25-1.2b-thinking` (CoT stripped for display via
+`model_is_thinking`). **Not catalogue:** FIM, tools/agents, and
+`qwen25-coder-3b` (non-commercial research licence; benchmark only).
+Metrics: [benchmarks.md](./benchmarks.md), status:
+[model-matrix.md](./model-matrix.md).
+
+### Runtime LoRA entry (GGUF only)
+
+A `kind: "gguf"` entry can load a llama.cpp LoRA adapter without merging it
+into the base model. Put both files in the same catalogue directory and declare
+the adapter with `lora`; `lora_scale` is optional and defaults to `1.0`:
+
+```json
+{
+  "models": [
+    {
+      "name": "my-model-lora",
+      "display": "My Model + LoRA",
+      "kind": "gguf",
+      "lora": "adapter.gguf",
+      "lora_scale": 1.0,
+      "files": [
+        { "filename": "model.gguf", "approx_bytes": 123456789 },
+        { "filename": "adapter.gguf", "approx_bytes": 1234567 }
+      ]
+    }
+  ]
+}
+```
+
+The runtime resolves `lora` relative to `LocalState\models\<name>`. The base
+file should be named `model.gguf`: when a directory contains both base and
+adapter GGUFs, backend discovery deliberately prefers `model.gguf` over
+`adapter.gguf`. Runtime LoRA is supported only by the llama.cpp/GGUF backend;
+ORT GenAI ignores `SessionParams::lora_path`. For training and generated
+overrides, see [`training/README.md`](../training/README.md).
+
+## Publishing ORT model assets (models-v1) — logit-parity gate
+
+**No ORT text-model asset reaches the `models-v1` release without passing a
+logit-parity check.** Institutionalized after #91: the DML fp16/int4 assets
+shipped for weeks producing numerically wrong logits — only tok/s was ever
+measured. Healthy cross-quant parity looks like NMSE ≈ 0.09 / top-10 overlap
+≈ 0.9; broken looks like NMSE ≈ 0.98 / top-10 ≈ 0.3 — the rank metrics
+(top-1 + top-10) are the decisive gate, not the raw diff.
+
+Runbook, in order:
+
+1. **Golden** (once per model family): dump the llama.cpp reference from the
+   equivalent GGUF on the host —
+   `xllama-cli -m <model>.gguf -p "The capital of France is" -n 1 --greedy
+--dump-logits tests/golden/logits-<model>-short.bin` — and commit
+   `.bin` + `.json` sidecar (see `tests/golden/logits-smol-short.bin`).
+   Templated prompts must tokenize with `parse_special` (the CLI does this
+   when a chat template is active).
+2. **Host CPU-EP check** (every asset, minimum bar): run the ORT asset through
+   the bridge CLI with `--greedy --dump-logits`, then
+   `scripts/compare-logits.py <golden.bin> <ort.bin>` — PASS requires top-1
+   agreement and top-10 overlap within thresholds (defaults in the script;
+   cross-quant gate used on-device: `MAX_ABS_DIFF=8.0`, `NMSE=0.2`).
+3. **On-device check** (every DML asset): provision with
+   `scripts/provision-models.sh`, then
+   `MODEL=<catalogue-name> ./scripts/validate-logit-parity.sh [golden.bin]`.
+   A DML text asset that fails here must not ship — and must not join the
+   `routing_policy.h dml_text_model_ok` allowlist until it passes.
+4. **Upload**: `gh release upload models-v1 <files>` — publish fixed graphs
+   under a **new catalogue name** (e.g. the `-v2` suffix) instead of
+   `--clobber`: stale local copies of the old name survive in LocalState and
+   the routing allowlist is keyed on the name. Then update `approx_bytes` in
+   `uwp/models/manifest.json` with the **exact** byte sizes (a mismatch
+   re-triggers the download loop fixed in #90).
+
+`tests/test_logit_parity.cpp` runs the golden regression in CI when
+`XLLAMA_TEST_MODEL` is set (skips cleanly otherwise).
+
+## Modern models (2026 survey, runtime-backend era)
+
+The ORT GenAI model builder is frozen at the Qwen3 / Gemma3 architectures.
+Newer small models (Qwen3.5, LFM2, Gemma-4) ship as GGUF and run **only via
+llama.cpp** — reachable via the shipping `unified` backend build with
+`kind: gguf` catalogue entries. All are console-measured — **decode/prefill/RAM
+numbers live in [`benchmarks.md`](benchmarks.md)** (the perf SSOT); this table is
+the catalogue status only.
+
+| Model            | Path      | Disk size        | Status                                                                     |
+| ---------------- | --------- | ---------------- | -------------------------------------------------------------------------- |
+| Qwen3.5-0.8B     | llama.cpp | ~533 MB          | ✅ `qwen35-0.8b` — optional modern GGUF                                    |
+| LFM2.5-230M      | llama.cpp | ~149 MB          | ✅ `lfm25-230m` — floor; QAD Q4_0, 132.4 tok/s, 236 MiB, H9 1/8            |
+| LFM2.5-350M      | llama.cpp | ~219 MB          | ✅ `lfm25-350m` — default chat; QAD Q4_0, 101.6 tok/s, 311 MiB, H9 4/8     |
+| LFM2.5-1.2B      | llama.cpp | ~696 MB          | ✅ `lfm25-1.2b-instruct` — balanced; QAD Q4_0, 40.0 tok/s, 783 MiB, H9 6/8 |
+| LFM2-2.6B        | llama.cpp | ~1.56 GB         | ✅ `lfm2-2.6b` — quality; 17.9 tok/s, H9 7/8                               |
+| Phi-4-mini       | llama.cpp | ~2.49 GB         | ✅ `phi4-mini` — T3 PASS: H9 6/8, 11.2 tok/s, 2765 MiB (#268)              |
+| MiniCPM5-1B      | llama.cpp | ~688 MB          | ⛔ rejected — measured: Series S H9 3/8 (#267)                             |
+| Qwen3-0.6B       | ORT GenAI | 969 MB merged    | ✅ builds; heavy (151k-vocab embedding dominates)                          |
+| Gemma-3-270M     | llama.cpp | 253 MB           | ✅ `gemma3-270m` — fast, tiny, fits easily                                 |
+| Gemma-3-1B       | llama.cpp | ~806 MB          | ⛔ rejected — measured: dominated by LFM2.5-1.2B on Series S (#269)        |
+| Gemma-4-E2B      | llama.cpp | 2.45 GB (Q3_K_S) | ✅ **console-validated** `gemma4-e2b` (see verdict below)                  |
+| Gemma-4 E4B/12B+ | llama.cpp | ≥4.5 GB          | ⛔ too big / too slow for the console                                      |
+
+**Gemma chat template**: the ORT GenAI _builder_ is frozen at Gemma3, but the
+vendored `llama.cpp` (current pin `08659901c`, see `patches/README.md`) already carries `LLM_ARCH_GEMMA3` **and**
+`LLM_ARCH_GEMMA4` — both load and generate (verified via `xllama-cli`,
+`general.architecture = gemma3`/`gemma4`). What was missing was the prompt
+format: the app hard-coded ChatML. `chat_format_for()` (`src/bridge/chat_prompt.cpp`)
+now selects the Gemma template (`<start_of_turn>…<end_of_turn>`, no system role,
+stop `<end_of_turn>`, `<bos>` via `add_bos`) by model id, so any `gemma*` GGUF
+gets the right template with zero per-model code.
+
+**Gemma-4-E2B verdict** (console-validated 2026-07-14): the "too big" call is
+**overturned**. E2B is ~5B raw params (2B effective, MatFormer). Key findings
+(full numbers in [`benchmarks.md`](benchmarks.md)):
+
+- ✅ **The ~2 GB Developer Mode per-file limit does not apply to GGUF** — a >2 GB single
+  `.gguf` loads with no OOM under the Game budget.
+- ✅ **Generates coherently** and stops on `<end_of_turn>`.
+- ⚠️ **Load is slow** (a few seconds). ⚠️ The old "load is repack-bound"
+  attribution predates PR #155: the repack path was dead code on Series S when it
+  was measured, and enabling it made loads _faster_ (lfm25: 1645→1284 ms,
+  `phase13-repack-{before,after}.csv`) — the mmap conclusion (no benefit)
+  still stands, the mechanism story does not.
+- The catalogue default is **Q3_K_S (2.45 GB)**, not the smaller 2-bit UD-IQ2_M:
+  IQ2_M collapsed to an immediate EOG on long declarative prompts, which Q3_K_S
+  fixes (and it decodes faster). Details in `benchmarks.md` root-cause notes.
+
+Disk was never the real constraint (Developer Mode is now 90 GB, `uwp-constraints.md §9`).
+Catalogue entry `gemma4-e2b` downloads from HF (2.45 GB > the GitHub release 2 GB
+asset limit). See `docs/benchmarks.md` for the full comparison.
+
+Backend selection is by `SessionParams::backend` (explicit values take
+precedence in dual-backend builds). `Auto` (default) uses either a `.gguf`
+suffix or on-disk layout inspection via the public helper
+`model_uses_llama_backend()` (bare catalogue names or directories containing a
+`.gguf` file → llama.cpp; otherwise ORT GenAI). Catalogue entries `qwen35-0.8b`
+and `lfm25-350m` download in-app from `models-v1`. The larger LFM entries
+download directly from LiquidAI so their upstream `LICENSE` file accompanies
+each GGUF.
+
+Redistribution licensing (verified 2026-07-10): the Qwen quant
+(`unsloth/Qwen3.5-0.8B-GGUF`) is Apache-2.0 ✅. Qwen2.5-Coder-0.5B-Instruct
+and 1.5B-Instruct are also Apache-2.0.
+
+Qwen2.5-Coder-3B-Instruct is under the
+[Qwen Research License (non-commercial)](https://huggingface.co/Qwen/Qwen2.5-Coder-3B-Instruct/blob/main/LICENSE)
+(release date September 19, 2024), so it is **not in the catalogue**. Its
+benchmark rows stay, labelled.
+LFM Open License v1.0 §4
+permits redistribution provided recipients get a copy of the license —
+`LFM2.5-350M_LICENSE.txt` is published on the release and listed in the
+catalogue entry so it lands next to the model on-device. Note §5: commercial
+use is licensed only while the licensee (with its affiliates) has annual
+revenue below US$10M. xllama is free, open-source software by an independent
+consultant and may bring indirect commercial advantage (e.g. GitHub Sponsors,
+professional visibility), so we treat our use as Commercial Use and rely on
+the revenue threshold, not on a non-commercial exemption. SD-Turbo is under
+the Stability AI Community License: commercial use requires registration with
+Stability AI and annual revenue below US$1M. We are registered with Stability
+AI under the Community License. The distribution includes a copy of the
+licence, a NOTICE file
+with the text "This Stability AI Model is licensed under the Stability AI
+Community License, Copyright © Stability AI Ltd. All Rights Reserved", and a
+prominent "Powered by Stability AI" credit (§IV.a). **Gemma** is under the
+Gemma Terms of Use (not Apache/MIT): the
+`gemma3-270m` catalogue entry therefore downloads straight from the original
+Hugging Face repo (`hf_base_url` → `unsloth/gemma-3-270m-it-GGUF/resolve/main`)
+rather than re-hosting the weights on `models-v1` — verify the Terms permit
+redistribution before ever mirroring them onto our release.
+
+SD-Turbo: This Stability AI Model is licensed under the Stability AI Community
+License, Copyright © Stability AI Ltd. All Rights Reserved. Powered by Stability
+AI.
+
+### TAESD — a faster diffusion VAE decoder
+
+`madebyollin/taesd` (MIT) is a **4.9 MB** tiny autoencoder that drop-in replaces
+SD-Turbo's 94 MB VAE decoder (same `latent_sample [1,4,64,64] → sample
+[1,3,512,512]` contract). On console the VAE stage is 2.6 s of the 6.9 s total,
+so TAESD targets **~4.5 s/image** and frees ~90 MB of GPU. Export with
+`diffusion/export_taesd.py` (the diffusers `AutoencoderTiny` decoder already
+emits SD `[-1,1]` — the [0,1]→remap assumption was falsified); validate the swap
+with `validate_pipeline.py <sd_dir> out.png "<prompt>" 1 42 <taesd_dir>`.

@@ -1,0 +1,230 @@
+name: build-linux
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Feature branches build once via pull_request (not also via push); superseded
+# runs on the same branch cancel so only the latest commit is tested.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # Explicit check name: dispatch-only UWP workflows also have a `build` job.
+    name: build (linux)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential libcurl4-openssl-dev ccache \
+            python3-pip
+          # Pinned like the other two linters. apt on ubuntu-22.04 carries 0.8.0,
+          # which does not report findings 0.11 does — so an image bump could turn
+          # this red on files nobody touched, and a contributor's newer local
+          # local ShellCheck disagreed with CI. Pin both to the same version instead.
+          SC_VER=v0.11.0
+          SC_WORKDIR=$(mktemp -d)
+          for attempt in 1 2 3; do
+            if gh release download "$SC_VER" --repo koalaman/shellcheck \
+              --pattern "shellcheck-${SC_VER}.linux.x86_64.tar.xz" \
+              --dir "$SC_WORKDIR" --clobber; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "Could not download pinned ShellCheck"
+              exit 1
+            fi
+          done
+          tar -xJf "$SC_WORKDIR/shellcheck-${SC_VER}.linux.x86_64.tar.xz" -C /tmp
+          rm "$SC_WORKDIR/shellcheck-${SC_VER}.linux.x86_64.tar.xz"
+          rmdir "$SC_WORKDIR"
+          sudo install -m0755 "/tmp/shellcheck-${SC_VER}/shellcheck" /usr/local/bin/shellcheck
+          shellcheck --version | grep -E '^version:'
+          # Pinned: an unpinned clang-format broke CI when 22.x changed rules
+          # (2026-07-10). Bump deliberately and reformat the tree in one PR.
+          pip3 install --user 'clang-format==22.1.5'
+          echo "$(python3 -m site --user-base)/bin" >> "$GITHUB_PATH"
+          # Pinned for the same reason as clang-format: prettier changes
+          # Markdown output between minors, and an unpinned formatter turns an
+          # unrelated PR red. Bump deliberately and reformat the tree in one PR.
+          npm install -g 'prettier@3.9.6'
+
+      - name: Verify C++ formatting
+        run: |
+          find . \
+            -path ./llama.cpp -prune -o \
+            -path ./build -prune -o \
+            -path ./build-uwp-test -prune -o \
+            \( -name '*.cpp' -o -name '*.h' -o -name '*.c' \) -type f -print |
+            xargs clang-format --dry-run --Werror
+
+      - name: Verify Markdown formatting
+        # Scope and exclusions come from .prettierignore; settings from
+        # .prettierrc (proseWrap preserve, so prose line breaks are the
+        # author's and only structure is normalised).
+        run: |
+          git ls-files '*.md' '*.markdown' | xargs prettier --check
+
+      - name: Verify shell script quality
+        run: |
+          shellcheck scripts/*.sh
+
+      - name: Smoke test debug tooling (profile analyzer + GPU sampler parser)
+        run: |
+          python3 scripts/analyze_ort_profile.py tests/fixtures/ort_profile_sample.json |
+            grep -q "VERDICT: MIXED"
+          python3 scripts/analyze_ort_profile.py tests/fixtures/ort_profile_truncated.json |
+            grep -q "VERDICT:"
+          ./scripts/xbox-gpu-sample.sh --parse-stdin < tests/fixtures/systemperf_sample.json |
+            grep -q "^[0-9]*,42,404,0.720"
+
+      - name: Verify generated benchmark summaries
+        run: python3 scripts/generate-benchmark-summary.py --check
+
+      - name: Verify research package provenance
+        run: python3 scripts/build-research-package.py --check
+
+      - name: Validate benchmark CSV schemas
+        run: |
+          shopt -s nullglob
+          for file in bench/results/*.csv; do
+            if head -1 "$file" | grep -q 'prompt_tok_s'; then
+              python3 scripts/validate-benchmark.py "$file"
+            fi
+          done
+
+      - name: Validate benchmark provenance sidecars
+        run: |
+          shopt -s nullglob
+          for file in bench/results/*.sidecar.json; do
+            python3 scripts/validate-benchmark-sidecar.py "$file"
+          done
+
+      - name: Compile benchmark and catalogue tooling
+        run: |
+          python3 -m py_compile scripts/hash-model-artifacts.py \
+            scripts/sign-model-manifest.py scripts/validate-benchmark.py \
+            scripts/validate-benchmark-sidecar.py scripts/write-benchmark-sidecar.py \
+            scripts/benchmark_sidecar.py \
+            scripts/build-research-package.py scripts/build-release-bundle.py \
+            scripts/check-release-metadata.py scripts/release-research.py \
+            scripts/sync-release-metadata.py scripts/zenodo-deposit.py \
+            scripts/bench_run_status.py scripts/redact_recorded_path.py \
+            scripts/console_taesd_result.py
+          bash -n scripts/run-xab.sh
+
+      - name: Test research package tooling
+        run: python3 -m unittest tests/test_benchmark_sidecar.py tests/test_research_package.py tests/test_xab_contract.py tests/test_release_metadata.py tests/test_release_bundle.py tests/test_make_shape_gguf.py tests/test_bench_run_status.py tests/test_validate_benchmark.py tests/test_console_run_log.py tests/test_console_temp_chats.py tests/test_console_taesd_result.py tests/test_api_framing_status.py tests/test_catalog_licenses.py tests/test_diffusion_export.py tests/test_redact_recorded_path.py
+
+      - name: Verify release metadata synchronization
+        run: python3 scripts/check-release-metadata.py
+
+      - name: Verify host training model trust policy
+        run: python3 -m unittest tests/test_host_model_trust.py tests/test_host_training_env.py
+
+      - name: Verify Python dependency monitoring coverage
+        run: python3 -m unittest tests/test_dependency_monitoring.py
+
+      - name: Verify code/project/doc coherence (SSOT audit)
+        run: python3 scripts/check-coherence.py
+
+      - name: Configure (with tests)
+        run: cmake --preset linux-test
+
+      - name: Build
+        run: cmake --build build/linux-test -j$(nproc)
+
+      # check-coherence.py runs before the build so docs-only PRs fail fast, and
+      # correctly *warns* when xllama-cli is missing. That meant train-job JSON
+      # validation never ran on CI (#222). Keep the early SSOT audit; gate jobs
+      # here once the binary exists (fail closed).
+      - name: Validate training job JSON (requires built CLI)
+        run: |
+          cli=./build/linux-test/bin/xllama-cli
+          shopt -s nullglob
+          jobs=(training/jobs/*.json)
+          if ((${#jobs[@]} == 0)); then
+            echo "no training/jobs/*.json — nothing to validate"
+            exit 0
+          fi
+          for job in "${jobs[@]}"; do
+            echo "validate $job"
+            "$cli" --validate-train-job "$job"
+          done
+          echo "OK ${#jobs[@]} train job(s)"
+
+      - name: Run unit tests
+        run: ctest --test-dir build/linux-test --output-on-failure
+
+      - name: Verify the test-suite size
+        run: |
+          out=$(./build/linux-test/tests/xllama-tests | tail -3)
+          cases=$(sed -n 's/.*test cases: *\([0-9]*\) .*/\1/p' <<<"$out")
+          asserts=$(sed -n 's/.*assertions: *\([0-9]*\) .*/\1/p' <<<"$out")
+          [ -n "$cases" ] && [ -n "$asserts" ] || {
+            echo "could not parse doctest output:"; echo "$out"; exit 1; }
+          echo "Suite: ${cases} cases / ${asserts} assertions"
+          # The suite size is a citable fact (cited in CHANGELOG, ROADMAP, etc.).
+          # If it changes, update the docs that cite it.
+
+      - name: Smoke test
+        run: ./build/linux-test/bin/xllama-cli --help
+
+      - name: Verify UWP gate
+        run: |
+          output=$(cmake -B build-uwp-test -DXLLAMA_TARGET=uwp 2>&1 || true)
+          if echo "$output" | grep -qi "build-uwp.ps1"; then
+            echo "UWP gate OK"
+          else
+            echo "UWP gate missing"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v7
+        if: success()
+        with:
+          name: xllama-cli-linux
+          path: build/linux-test/bin/xllama-cli
+          retention-days: 14
+
+  # ASan build — optional, triggered manually (workflow_dispatch). Catches memory
+  # errors that normal builds miss. Uses the linux-asan preset (Debug + ASan +
+  # tests; UBSan is the separate XLLAMA_ENABLE_UBSAN option).
+  asan:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential libcurl4-openssl-dev
+
+      - name: Configure (ASan + tests)
+        run: cmake --preset linux-asan
+
+      - name: Build
+        run: cmake --build build/linux-asan -j$(nproc)
+
+      - name: Run unit tests under ASan
+        run: ctest --test-dir build/linux-asan --output-on-failure

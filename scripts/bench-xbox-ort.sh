@@ -1,0 +1,793 @@
+#!/usr/bin/env bash
+# bench-xbox-ort.sh — ORT GenAI benchmark orchestrator for declared Xbox hardware
+#
+# Usage:
+#   source ~/.config/xllama/xbox-env
+#   ./scripts/bench-xbox-ort.sh <model-dir-name> [--threads N] [--runs N] [--prompt file]
+#                                [--out FILE] [--gpu-sample] [--ctx N] [--n-predict N]
+#                                [--max-length N] [--keep-config] [--prompt-lookup]
+#
+# Arguments:
+#   model-dir-name   Model directory name in LocalState/models/ (e.g. smollm2-360m-cpu-int4)
+#   --threads N      Upload genai_config-threads-N.json and tag CSV row with t<N>.
+#                    The device config is backed up and RESTORED on exit (a swap
+#                    left in place would silently affect every later run).
+#   --keep-config    Leave the --threads config on the device (skip the restore)
+#   --runs N         Number of bench runs (default: 4, warmup run 1 is dropped;
+#                    runs 2..N are each appended individually with their run_index
+#                    so the summary can report a spread instead of a pre-averaged
+#                    point — W1.1). Default 4 yields 3 recorded measurement runs.
+#   --prompt file    Path to prompt file (default: bench/prompts/standard-512.txt)
+#   --out FILE       Results CSV to append the per-run rows to
+#                    (default: bench/results/phase1-cpu.csv; DML runs → phase2-dml.csv)
+#   --gpu-sample     Sample Device Portal GPU telemetry (xbox-gpu-sample.sh)
+#                    across the runs and print a per-engine summary at the end
+#   --ctx N          Override n_ctx via bench_ctx.txt (0 = engine default 2048)
+#   --n-predict N    Override n_predict via bench_npredict.txt (0 = default 512)
+#   --max-length N   Override max_length via bench_maxlen.txt. 0 = derive as
+#                    min(n_ctx, prompt+n_predict); -1 = saturate to n_ctx (what
+#                    the shipping app does since #135); >0 = explicit value.
+#                    On DirectML this is THE variable governing prefill (#130).
+#   --ubatch N       Override llama.cpp n_ubatch (physical prefill chunk) via
+#                    bench_ubatch.txt (#172). 0 = llama default (512). GGUF
+#                    models only; the ORT path ignores it. The device tags the
+#                    CSV host column with -uN so the row carries the variable.
+#   --kv-q8          q8_0 KV cache + flash attention via bench_kvq8.txt (#171).
+#                    GGUF models only. Host column tagged -kvq8 (same rationale
+#                    as -uN); the guard fails if the MSIX ignores the knob.
+#   --gpu-layers N   GGUF GPU decode D2b: layers on the d3d12 backend via
+#                    bench_gpu_layers.txt (0 = CPU, default). GGUF models only.
+#                    Host column tagged -gN; the guard fails if the MSIX ignores it.
+#   --ignore-eog     Decode exactly n_predict tokens via bench_ignore_eog.txt
+#                    (no EOG / stop-sequence end). Host column tagged -noeog.
+#                    Use for A/Bs whose arms reach EOG at different points.
+#   --prompt-lookup  Phase 15 W2 (#210): draft-free n-gram speculative decoding
+#                    via bench_prompt_lookup.txt=1. Host column tagged -plookup.
+#                    Off (file deleted) when the flag is absent so a prior on
+#                    run cannot leak into the next.
+#   --timeout S      Harness wait for bench-result.csv.done (default: 300, or
+#                    XLLAMA_BENCH_TIMEOUT_S). A timeout or in-app stall is
+#                    recorded as a CSV row (host suffix -timeout/-stall/-hung)
+#                    and the campaign exits non-zero — a missing run cannot
+#                    look like a clean OK (2026-10-11 LFM2-2.6B run 4).
+#   --stall-timeout S
+#                    In-app watchdog, uploaded as bench_stall_timeout.txt
+#                    (seconds; 0 disables; default is the in-app 180 s).
+#   --decode-progress-every N
+#                    Decode progress log every N tokens (0 disables).
+#   --decode-progress-ms MS
+#                    Decode progress log every T milliseconds (0 disables).
+#
+# Required hardware: --hardware xbox-series-s|xbox-series-x (or XLLAMA_BENCH_HARDWARE).
+# This records an operator declaration, not automatic model detection.
+# Required env: XBOX_IP, XBOX_USER, XBOX_PASS
+#
+# Output: one row per recorded run appended to the --out CSV (run_index column);
+#         the summary generator computes the median and min-max spread from them.
+#
+# Notes:
+#   - The model must already be in LocalState\models\<name>\ on the console
+#     (copied from MSIX on first launch, or uploaded via deploy.sh upload-dir).
+#   - bench.flag is consumed by the app and deleted; this script re-uploads it
+#     for each run.
+#   - Thread variants require bench-xbox-ort.sh from a v0.3.1+ MSIX that reads
+#     bench_threads.txt. With v0.3.0 the n_threads CSV column shows detect_threads().
+
+set -euo pipefail
+
+MODEL_NAME="${1:-smollm2-360m-cpu-int4}"
+HARDWARE="${XLLAMA_BENCH_HARDWARE:-}"
+N_THREADS=0
+N_CTX=0         # 0 = engine default (2048)
+N_PREDICT=0     # 0 = engine default (512)
+MAX_LEN=0       # 0 = derive min(n_ctx, prompt+n_predict); -1 = saturate to n_ctx; >0 = explicit
+UBATCH=0        # 0 = llama default (512); #172 sweep knob, GGUF only
+KVQ8=0          # 1 = q8_0 KV + flash attention; #171 A/B knob, GGUF only
+GPU_LAYERS=0    # D2b: GGUF layers on the d3d12 backend; 0 = CPU
+IGNORE_EOG=0    # D2b: 1 = decode exactly n_predict tokens
+PROMPT_LOOKUP=0 # 1 = W2 prompt-lookup; #210 A/B knob, GGUF only
+N_RUNS=4        # warmup run 1 dropped; runs 2..N recorded individually (W1.1) → 3 by default
+BENCH_TIMEOUT_S="${XLLAMA_BENCH_TIMEOUT_S:-300}"
+STALL_TIMEOUT_S=""          # empty = in-app default (180); 0 = disable
+DECODE_PROGRESS_EVERY=""    # empty = in-app default (64); 0 = disable
+DECODE_PROGRESS_MS=""       # empty = in-app default (15000); 0 = disable
+PROMPT_FILE=""
+OUT_CSV=""
+GPU_SAMPLE=false
+KEEP_CONFIG=false # --keep-config: leave a --threads genai_config.json on the device
+
+shift || true
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	--hardware)
+		HARDWARE="${2:?--hardware requires a value}"
+		shift 2
+		;;
+	--threads)
+		N_THREADS="${2:?--threads requires a value}"
+		shift 2
+		;;
+	--ctx)
+		N_CTX="${2:?--ctx requires a value}"
+		shift 2
+		;;
+	--n-predict)
+		N_PREDICT="${2:?--n-predict requires a value}"
+		shift 2
+		;;
+	--max-length)
+		MAX_LEN="${2:?--max-length requires a value}"
+		shift 2
+		;;
+	--ubatch)
+		UBATCH="${2:?--ubatch requires a value}"
+		shift 2
+		;;
+	--kv-q8)
+		KVQ8=1
+		shift
+		;;
+	--gpu-layers)
+		GPU_LAYERS="${2:?--gpu-layers requires a value}"
+		shift 2
+		;;
+	--ignore-eog)
+		IGNORE_EOG=1
+		shift
+		;;
+	--prompt-lookup)
+		PROMPT_LOOKUP=1
+		shift
+		;;
+	--timeout)
+		BENCH_TIMEOUT_S="${2:?--timeout requires a value}"
+		shift 2
+		;;
+	--stall-timeout)
+		STALL_TIMEOUT_S="${2:?--stall-timeout requires a value}"
+		shift 2
+		;;
+	--decode-progress-every)
+		DECODE_PROGRESS_EVERY="${2:?--decode-progress-every requires a value}"
+		shift 2
+		;;
+	--decode-progress-ms)
+		DECODE_PROGRESS_MS="${2:?--decode-progress-ms requires a value}"
+		shift 2
+		;;
+	--runs)
+		N_RUNS="${2:?--runs requires a value}"
+		shift 2
+		;;
+	--prompt)
+		PROMPT_FILE="${2:?--prompt requires a file}"
+		shift 2
+		;;
+	--out)
+		OUT_CSV="${2:?--out requires a file}"
+		shift 2
+		;;
+	--gpu-sample)
+		GPU_SAMPLE=true
+		shift
+		;;
+	--keep-config)
+		KEEP_CONFIG=true
+		shift
+		;;
+	*)
+		echo "Unknown argument: $1" >&2
+		exit 1
+		;;
+	esac
+done
+
+# Explicit declaration is mandatory. It does not establish observed hardware.
+case "$HARDWARE" in
+xbox-series-s|xbox-series-x) ;;
+*) echo "unsupported benchmark hardware: '${HARDWARE}' (use --hardware xbox-series-s|xbox-series-x or XLLAMA_BENCH_HARDWARE)" >&2; exit 2 ;;
+esac
+
+: "${XBOX_IP:?XBOX_IP not set — run: source ~/.config/xllama/xbox-env}"
+: "${XBOX_USER:?XBOX_USER not set}"
+: "${XBOX_PASS:?XBOX_PASS not set}"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck disable=SC1090,SC1091
+source "${SCRIPT_DIR}/wdp-file-upload.sh"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+DEPLOY="${SCRIPT_DIR}/deploy.sh"
+STATUS_PY="${SCRIPT_DIR}/bench_run_status.py"
+BASE_URL="https://${XBOX_IP}:11443"
+CURL_AUTH=(--basic -u "${XBOX_USER}:${XBOX_PASS}" -k -sS)
+
+echo "=== xllama bench-xbox-ort ==="
+echo "  Model:   $MODEL_NAME"
+echo "  Hardware: $HARDWARE (operator-declared, not detected)"
+echo "  Threads: ${N_THREADS:-auto}"
+echo "  n_ctx:   $([[ $N_CTX -gt 0 ]] && echo "$N_CTX" || echo "default")"
+echo "  n_predict: $([[ $N_PREDICT -gt 0 ]] && echo "$N_PREDICT" || echo "default")"
+if ((MAX_LEN == 0)); then
+	MAX_LEN_LABEL="derived"
+elif ((MAX_LEN < 0)); then
+	MAX_LEN_LABEL="saturated (n_ctx)"
+else
+	MAX_LEN_LABEL="$MAX_LEN"
+fi
+echo "  max_length: $MAX_LEN_LABEL"
+echo "  Runs:    $N_RUNS (run 1 warmup, dropped from median)"
+echo "  timeout: ${BENCH_TIMEOUT_S}s (harness wait)"
+if [[ -n "$STALL_TIMEOUT_S" ]]; then
+	echo "  stall-timeout: ${STALL_TIMEOUT_S}s (in-app watchdog)"
+fi
+echo "  Xbox:    $XBOX_IP"
+
+# ---------------------------------------------------------------------------
+# CSRF token (required for POST/DELETE)
+# ---------------------------------------------------------------------------
+CSRF_TOKEN=$(curl "${CURL_AUTH[@]}" "${BASE_URL}/" -o /dev/null -D - 2>/dev/null |
+	sed -n 's/.*[Cc][Ss][Rr][Ff]-[Tt]oken=\([^;[:space:]]*\).*/\1/p' |
+	tr -d '\r' | head -n1)
+[[ -z "$CSRF_TOKEN" ]] && echo "Warning: no CSRF token — POST/DELETE may fail" >&2
+
+# ---------------------------------------------------------------------------
+# Package full name
+# ---------------------------------------------------------------------------
+PFN=$("${DEPLOY}" pfn 2>/dev/null)
+
+verify_expected_package() {
+	[[ -z "${XLLAMA_EXPECTED_PFN:-}" ]] && return 0
+	if [[ "$PFN" != "$XLLAMA_EXPECTED_PFN" ]]; then
+		echo "Error: initial package $PFN differs from trial package $XLLAMA_EXPECTED_PFN" >&2
+		return 1
+	fi
+	local current_pfn
+	current_pfn=$("${DEPLOY}" pfn)
+	if [[ "$current_pfn" != "$XLLAMA_EXPECTED_PFN" ]]; then
+		echo "Error: installed package $current_pfn differs from trial package $XLLAMA_EXPECTED_PFN" >&2
+		return 1
+	fi
+}
+verify_expected_package
+[[ -z "$PFN" ]] && {
+	echo "Error: xllama not found — deploy it first" >&2
+	exit 1
+}
+echo "  PFN: $PFN"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+TMPDIR_LOCAL=$(mktemp -d)
+CONFIG_SWAPPED="" # set when --threads overwrites the device genai_config.json
+MODEL_TXT_ORIG="" # "saved" or "absent" once the device model.txt was backed up
+
+# One cleanup path for the whole script. --threads overwrites genai_config.json
+# on the device (models\<name>\); without a restore, the last thread variant
+# stays in force for every later run of the app and every bench that does not
+# pass --threads (observed: a t8 sweep left the console on t8). Mirror the
+# backup/restore that profile-dml-run.sh already does, and run it on ANY exit,
+# so a mid-run failure still restores. --keep-config opts out.
+cleanup() {
+	if [[ -n "$CONFIG_SWAPPED" && "$KEEP_CONFIG" != "true" ]]; then
+		echo "  Restoring original genai_config.json on the device..." >&2
+		upload_as "${TMPDIR_LOCAL}/genai_config_orig.json" "models\\${MODEL_NAME}" "genai_config.json" >/dev/null 2>&1 || true
+	elif [[ -n "$CONFIG_SWAPPED" ]]; then
+		echo "  --keep-config: t${N_THREADS} genai_config.json left on the device" >&2
+	fi
+	# model.txt also selects the model for the LAN API and the next app launch.
+	# Left pointing at the benched dir, it breaks both once that dir is removed
+	# (observed after the shape gate: model.txt = a deleted shape-* dir).
+	if [[ "$MODEL_TXT_ORIG" == "saved" ]]; then
+		echo "  Restoring original model.txt on the device..." >&2
+		upload_as "${TMPDIR_LOCAL}/model_orig.txt" "" "model.txt" >/dev/null 2>&1 || true
+	elif [[ "$MODEL_TXT_ORIG" == "absent" ]]; then
+		delete_from_localstate "model.txt"
+	fi
+	# A declaration belongs to this invocation, not to a later manual bench.
+	delete_from_localstate "bench_hardware.txt"
+	rm -rf "$TMPDIR_LOCAL"
+}
+trap cleanup EXIT
+
+_curl_post_file() {
+	local local_path="$1" path_param="$2" filename="${3:-}"
+	wdp_upload_file_request \
+		"${BASE_URL}/api/filesystem/apps/file?knownfolderid=LocalAppData&packagefullname=${PFN}&path=${path_param}" \
+		"$local_path" "$filename"
+}
+
+# Upload file to LocalState root (or subdir via remote_dir like "models\\<name>")
+upload_to_localstate() {
+	local local_path="$1" remote_dir="${2:-}"
+	local path_param="%5CLocalState"
+	[[ -n "$remote_dir" ]] && path_param="%5CLocalState%5C${remote_dir//\\/%5C}"
+	echo "  Uploading $(basename "$local_path") → LocalState\\${remote_dir} ..."
+	_curl_post_file "$local_path" "$path_param"
+}
+
+# Upload file to LocalState with an explicit remote filename
+upload_as() {
+	local local_path="$1" remote_dir="${2:-}" remote_name="$3"
+	local path_param="%5CLocalState"
+	[[ -n "$remote_dir" ]] && path_param="%5CLocalState%5C${remote_dir//\\/%5C}"
+	printf '  Uploading %s → LocalState\\%s\\%s ...\n' "$(basename "$local_path")" "$remote_dir" "$remote_name"
+	_curl_post_file "$local_path" "$path_param" "$remote_name"
+}
+
+# Download file from LocalState root
+download_from_localstate() {
+	local remote_name="$1" dest="$2"
+	curl "${CURL_AUTH[@]}" -o "$dest" \
+		"${BASE_URL}/api/filesystem/apps/file?knownfolderid=LocalAppData&packagefullname=${PFN}&path=%5CLocalState&filename=${remote_name}" \
+		2>/dev/null || true
+}
+
+# Delete file from LocalState root
+delete_from_localstate() {
+	local remote_name="$1"
+	curl "${CURL_AUTH[@]}" -H "X-CSRF-Token:${CSRF_TOKEN}" -X DELETE \
+		"${BASE_URL}/api/filesystem/apps/file?knownfolderid=LocalAppData&packagefullname=${PFN}&path=%5CLocalState&filename=${remote_name}" \
+		>/dev/null 2>&1 || true
+}
+
+# Poll until a LocalState file is confirmed absent (GET returns 404 / error body).
+# delete_from_localstate is fire-and-forget; without this confirmation a stale
+# marker still present when wait_for_done first polls makes it return 0 instantly
+# off the PREVIOUS run's bench-result.csv.done — a silent wrong row, not a timeout.
+verify_deleted() {
+	local remote_name="$1" tries="${2:-15}" resp
+	while ((tries-- > 0)); do
+		resp=$(curl "${CURL_AUTH[@]}" \
+			"${BASE_URL}/api/filesystem/apps/file?knownfolderid=LocalAppData&packagefullname=${PFN}&path=%5CLocalState&filename=${remote_name}" \
+			2>/dev/null) || true
+		if [[ -z "$resp" || "$resp" == *"404"* || "$resp" == *"error"* ]]; then
+			return 0
+		fi
+		delete_from_localstate "$remote_name" # retry the delete, then re-check
+		sleep 1
+	done
+	echo "  Warning: could not confirm ${remote_name} was deleted — result may be stale" >&2
+	return 1
+}
+
+# Stop the app via Device Portal (hung inference cannot exit itself).
+stop_app() {
+	curl "${CURL_AUTH[@]}" -H "X-CSRF-Token:${CSRF_TOKEN}" -X DELETE \
+		"${BASE_URL}/api/taskmanager/app?package=${PFN}" >/dev/null 2>&1 || true
+}
+
+# Restart app via Device Portal
+restart_app() {
+	stop_app
+	sleep 2
+	local pfamily
+	# shellcheck disable=SC2001
+	pfamily=$(echo "$PFN" | sed 's/_[0-9][0-9.]*_[^_]*__/_/')
+	local aumid
+	aumid=$(printf '%s!xllama' "$pfamily" | base64 -w0)
+	curl "${CURL_AUTH[@]}" -H "X-CSRF-Token:${CSRF_TOKEN}" -X POST -d "" \
+		"${BASE_URL}/api/taskmanager/app?appid=${aumid}" >/dev/null 2>&1 || true
+}
+
+# Host label the device would have written, used for harness-authored fail rows.
+bench_host_base() {
+	local host="${HARDWARE}-declared"
+	((N_THREADS > 0)) && host+="-t${N_THREADS}"
+	((UBATCH > 0)) && host+="-u${UBATCH}"
+	((KVQ8 != 0)) && host+="-kvq8"
+	((GPU_LAYERS > 0)) && host+="-g${GPU_LAYERS}"
+	((IGNORE_EOG != 0)) && host+="-noeog"
+	((PROMPT_LOOKUP != 0)) && host+="-plookup"
+	printf '%s' "$host"
+}
+
+record_failed_run() {
+	local run="$1" reason="$2"
+	local n_ctx="$N_CTX"
+	((n_ctx > 0)) || n_ctx=2048
+	local row
+	row=$(python3 "${STATUS_PY}" format-row \
+		--model "$MODEL_NAME" \
+		--host "$(bench_host_base)" \
+		--run-index "$run" \
+		--reason "$reason" \
+		--n-ctx "$n_ctx" \
+		--n-threads "$N_THREADS")
+	CSV_ROWS+=("$row")
+	FAILED_RUNS+=("${run}:${reason}")
+	echo "  Recorded ${reason} for run ${run}: ${row}" >&2
+}
+
+# Wait for bench-result.csv.done or inference-stall.txt (polling).
+# Returns 0 on .done, 2 on stall marker, 1 on harness timeout.
+wait_for_done() {
+	local timeout_s="${1:-300}" elapsed=0
+	echo "  Waiting for bench-result.csv.done (timeout ${timeout_s}s)..."
+	while ((elapsed < timeout_s)); do
+		local resp stall
+		resp=$(curl "${CURL_AUTH[@]}" \
+			"${BASE_URL}/api/filesystem/apps/file?knownfolderid=LocalAppData&packagefullname=${PFN}&path=%5CLocalState&filename=bench-result.csv.done" \
+			2>/dev/null) || true
+		if [[ -n "$resp" && "$resp" != *"404"* && "$resp" != *"error"* ]]; then
+			echo "  Done after ${elapsed}s."
+			return 0
+		fi
+		stall=$(curl "${CURL_AUTH[@]}" \
+			"${BASE_URL}/api/filesystem/apps/file?knownfolderid=LocalAppData&packagefullname=${PFN}&path=%5CLocalState&filename=inference-stall.txt" \
+			2>/dev/null) || true
+		if [[ -n "$stall" && "$stall" != *"404"* && "$stall" != *"error"* ]]; then
+			echo "  In-app stall after ${elapsed}s: ${stall}" >&2
+			return 2
+		fi
+		sleep 10
+		((elapsed += 10))
+	done
+	echo "  Timeout waiting for bench-result.csv.done" >&2
+	return 1
+}
+
+# ---------------------------------------------------------------------------
+# Upload genai_config variant for thread tuning (if --threads N specified)
+# ORT GenAI only — skip when the model dir is GGUF (llama.cpp uses
+# bench_threads.txt / params.n_threads; a genai_config.json next to a .gguf
+# is noise and confused earlier campaigns).
+# ---------------------------------------------------------------------------
+model_dir_has_gguf() {
+	local listing
+	listing=$(curl "${CURL_AUTH[@]}" \
+		"${BASE_URL}/api/filesystem/apps/files?knownfolderid=LocalAppData&packagefullname=${PFN}&path=%5CLocalState%5Cmodels%5C${MODEL_NAME}" \
+		2>/dev/null) || true
+	[[ "$listing" == *".gguf"* ]]
+}
+
+if [[ "$N_THREADS" -gt 0 ]] 2>/dev/null; then
+	if model_dir_has_gguf; then
+		echo ""
+		echo "--- Skipping genai_config (GGUF model; threads via bench_threads.txt) ---"
+	else
+		THREADS_CONFIG="${REPO_ROOT}/bench/configs/genai_config-threads-${N_THREADS}.json"
+		if [[ -f "$THREADS_CONFIG" ]]; then
+			echo ""
+			echo "--- Uploading genai_config (intra_op_num_threads=${N_THREADS}) ---"
+			# Back up the device's current config FIRST, so the EXIT trap can put
+			# it back. Without this the swap is permanent (see cleanup()).
+			curl "${CURL_AUTH[@]}" -o "${TMPDIR_LOCAL}/genai_config_orig.json" \
+				"${BASE_URL}/api/filesystem/apps/file?knownfolderid=LocalAppData&packagefullname=${PFN}&path=%5CLocalState%5Cmodels%5C${MODEL_NAME}&filename=genai_config.json" \
+				2>/dev/null || true
+			if [[ -s "${TMPDIR_LOCAL}/genai_config_orig.json" ]]; then
+				CONFIG_SWAPPED=1
+			else
+				echo "Warning: could not back up the device genai_config.json — it will NOT be restored" >&2
+			fi
+			upload_as "$THREADS_CONFIG" "models\\${MODEL_NAME}" "genai_config.json"
+		else
+			echo "Warning: $THREADS_CONFIG not found — using existing genai_config.json on device" >&2
+		fi
+	fi
+fi
+
+# ---------------------------------------------------------------------------
+# Prepare local bench files
+# ---------------------------------------------------------------------------
+PROMPT_SRC="${PROMPT_FILE:-${REPO_ROOT}/bench/prompts/standard-512.txt}"
+[[ ! -f "$PROMPT_SRC" ]] && {
+	echo "Error: prompt file not found: $PROMPT_SRC" >&2
+	exit 1
+}
+cp "$PROMPT_SRC" "${TMPDIR_LOCAL}/prompt.txt"
+
+# model.txt — tells inference-bridge which model dir to use
+printf '%s' "$MODEL_NAME" >"${TMPDIR_LOCAL}/model.txt"
+printf '%s' "$HARDWARE" >"${TMPDIR_LOCAL}/bench_hardware.txt"
+# Back it up before the first overwrite so cleanup() can put it back.
+if curl "${CURL_AUTH[@]}" --fail -o "${TMPDIR_LOCAL}/model_orig.txt" \
+	"${BASE_URL}/api/filesystem/apps/file?knownfolderid=LocalAppData&packagefullname=${PFN}&path=%5CLocalState&filename=model.txt" \
+	2>/dev/null; then
+	MODEL_TXT_ORIG="saved"
+else
+	MODEL_TXT_ORIG="absent"
+fi
+
+# bench_threads.txt — tells inference-bridge what n_threads to write in CSV (v0.3.1+)
+printf '%d' "$N_THREADS" >"${TMPDIR_LOCAL}/bench_threads.txt"
+# 0 = leave the engine default; #130 varies these to test the band hypothesis.
+printf '%d' "$N_CTX" >"${TMPDIR_LOCAL}/bench_ctx.txt"
+printf '%d' "$N_PREDICT" >"${TMPDIR_LOCAL}/bench_npredict.txt"
+# Always written, even when 0 — main_loop only ever overwrites these files, so a
+# value left by a previous run would otherwise stay in force.
+printf '%d' "$MAX_LEN" >"${TMPDIR_LOCAL}/bench_maxlen.txt"
+printf '%d' "$UBATCH" >"${TMPDIR_LOCAL}/bench_ubatch.txt"
+printf '%d' "$KVQ8" >"${TMPDIR_LOCAL}/bench_kvq8.txt"
+printf '%d' "$GPU_LAYERS" >"${TMPDIR_LOCAL}/bench_gpu_layers.txt"
+printf '%d' "$IGNORE_EOG" >"${TMPDIR_LOCAL}/bench_ignore_eog.txt"
+printf '%d' "$PROMPT_LOOKUP" >"${TMPDIR_LOCAL}/bench_prompt_lookup.txt"
+if [[ -n "$STALL_TIMEOUT_S" ]]; then
+	printf '%d' "$STALL_TIMEOUT_S" >"${TMPDIR_LOCAL}/bench_stall_timeout.txt"
+fi
+if [[ -n "$DECODE_PROGRESS_EVERY" ]]; then
+	printf '%d' "$DECODE_PROGRESS_EVERY" >"${TMPDIR_LOCAL}/bench_decode_progress_every.txt"
+fi
+if [[ -n "$DECODE_PROGRESS_MS" ]]; then
+	printf '%d' "$DECODE_PROGRESS_MS" >"${TMPDIR_LOCAL}/bench_decode_progress_ms.txt"
+fi
+
+# bench.flag — consumed by app on each start; must be re-uploaded per run
+printf 'bench' >"${TMPDIR_LOCAL}/bench.flag"
+
+# ---------------------------------------------------------------------------
+# Run N_RUNS iterations
+# ---------------------------------------------------------------------------
+declare -a CSV_ROWS=()
+declare -a FAILED_RUNS=()
+
+# Defined before the run loop, not just before the median: each downloaded row is
+# checked against this schema's field count as it arrives (see below).
+CSV_HEADER="model,quant,backend,n_ctx,n_threads,prompt_tok_s,decode_tok_s,peak_ws_mb,load_ms,gpu_mem_mb,gpu_budget_mb,n_prompt_tok,n_gen_tok,max_length,host,date,run_index,prefill_ms,ttft_ms"
+
+SAMPLER_PID=""
+if [[ "$GPU_SAMPLE" == "true" ]]; then
+	echo "  Starting GPU sampler (systemperf)..."
+	"${SCRIPT_DIR}/xbox-gpu-sample.sh" --out "${TMPDIR_LOCAL}/gpu-sample.csv" \
+		>"${TMPDIR_LOCAL}/gpu-summary.txt" 2>&1 &
+	SAMPLER_PID=$!
+fi
+
+for ((run = 1; run <= N_RUNS; run++)); do
+	verify_expected_package
+	echo ""
+	echo "--- Run $run / $N_RUNS ---"
+
+	delete_from_localstate "bench-result.csv"
+	delete_from_localstate "bench-result.csv.done"
+	delete_from_localstate "inference-stall.txt"
+	# Confirm the marker is actually gone before starting the app, so wait_for_done
+	# can't return off a stale bench-result.csv.done from the previous run.
+	verify_deleted "bench-result.csv.done"
+	verify_deleted "inference-stall.txt" 5 || true
+	# Remove any leftover bench_turns.txt: main_loop treats its presence as the
+	# KV-reuse bench trigger, which would hijack this standard bench into kv-bench
+	# mode (writes bench-kv-result.csv, never bench-result.csv → this run times out).
+	delete_from_localstate "bench_turns.txt"
+	sleep 1
+
+	# run_index changes per iteration (unlike the other bench_*.txt knobs), so it
+	# is written inside the loop: the device echoes it into the CSV row so repeats
+	# are individually recoverable rather than pre-averaged here (W1.1).
+	printf '%d' "$run" >"${TMPDIR_LOCAL}/bench_run_index.txt"
+
+	echo "  Uploading bench artifacts..."
+	upload_to_localstate "${TMPDIR_LOCAL}/bench.flag"
+	upload_to_localstate "${TMPDIR_LOCAL}/prompt.txt"
+	upload_to_localstate "${TMPDIR_LOCAL}/model.txt"
+	upload_to_localstate "${TMPDIR_LOCAL}/bench_hardware.txt"
+	upload_to_localstate "${TMPDIR_LOCAL}/bench_threads.txt"
+	upload_to_localstate "${TMPDIR_LOCAL}/bench_ctx.txt"
+	upload_to_localstate "${TMPDIR_LOCAL}/bench_npredict.txt"
+	upload_to_localstate "${TMPDIR_LOCAL}/bench_maxlen.txt"
+	upload_to_localstate "${TMPDIR_LOCAL}/bench_ubatch.txt"
+	upload_to_localstate "${TMPDIR_LOCAL}/bench_kvq8.txt"
+	upload_to_localstate "${TMPDIR_LOCAL}/bench_gpu_layers.txt"
+	upload_to_localstate "${TMPDIR_LOCAL}/bench_ignore_eog.txt"
+	if ((PROMPT_LOOKUP != 0)); then
+		upload_to_localstate "${TMPDIR_LOCAL}/bench_prompt_lookup.txt"
+	else
+		# A prior --prompt-lookup run must not leave the knob on.
+		delete_from_localstate "bench_prompt_lookup.txt"
+		verify_deleted "bench_prompt_lookup.txt" 5 || true
+	fi
+	if [[ -n "$STALL_TIMEOUT_S" ]]; then
+		upload_to_localstate "${TMPDIR_LOCAL}/bench_stall_timeout.txt"
+	else
+		delete_from_localstate "bench_stall_timeout.txt"
+	fi
+	if [[ -n "$DECODE_PROGRESS_EVERY" ]]; then
+		upload_to_localstate "${TMPDIR_LOCAL}/bench_decode_progress_every.txt"
+	else
+		delete_from_localstate "bench_decode_progress_every.txt"
+	fi
+	if [[ -n "$DECODE_PROGRESS_MS" ]]; then
+		upload_to_localstate "${TMPDIR_LOCAL}/bench_decode_progress_ms.txt"
+	else
+		delete_from_localstate "bench_decode_progress_ms.txt"
+	fi
+	upload_to_localstate "${TMPDIR_LOCAL}/bench_run_index.txt"
+
+	echo "  Starting app..."
+	restart_app
+
+	wait_rc=0
+	wait_for_done "$BENCH_TIMEOUT_S" || wait_rc=$?
+	if ((wait_rc != 0)); then
+		reason=timeout
+		((wait_rc == 2)) && reason=stall
+		echo "  Run $run ${reason} — recording failed row and stopping the app." >&2
+		stop_app
+		record_failed_run "$run" "$reason"
+		continue
+	fi
+
+	local_csv="${TMPDIR_LOCAL}/run${run}.csv"
+	download_from_localstate "bench-result.csv" "$local_csv"
+	data_row=$(tail -n +2 "$local_csv" 2>/dev/null | head -1)
+	if [[ -n "$data_row" ]]; then
+		# The device writes the row; this script owns the header. A build older
+		# than the current schema emits fewer fields and they get appended under
+		# our header anyway, shifting every column silently (a 14-field row from a
+		# pre-n_gen_tok build puts `host` under n_gen_tok and `date` under host).
+		# assert_header_matches only guards the local file, so nothing else here
+		# would notice. Observed 2026-07-21 with MSIX 1.4.0.615.
+		n_fields=$(awk -F, '{print NF}' <<<"$data_row")
+		want_fields=$(awk -F, '{print NF}' <<<"$CSV_HEADER")
+		if ((n_fields != want_fields)); then
+			echo "Error: the console wrote a ${n_fields}-field row; this script expects ${want_fields}." >&2
+			echo "  row:    $data_row" >&2
+			echo "  header: $CSV_HEADER" >&2
+			echo "The installed MSIX is older than the CSV schema — redeploy before benchmarking." >&2
+			exit 1
+		fi
+		# Before anything else: did the device measure the model we ASKED for?
+		# model.txt reaches the console over WDP, and a WDP POST can report
+		# success while writing nothing (the missing-X-CSRF-Token failure mode
+		# documented in uwp-constraints). A build older than 1.5.2 answered a
+		# missing model.txt by silently benching smollm2-360m-cpu-int4, so a lost
+		# upload produced a genuine row for the wrong model, appended to the
+		# results file of the run that was requested. Current builds refuse and
+		# write no CSV; this check also covers the older ones, and any future way
+		# the two can drift apart.
+		got_model=$(awk -F, '{print $1}' <<<"$data_row")
+		if [[ "$got_model" != "$MODEL_NAME" ]]; then
+			echo "Error: the console benched '${got_model}', not the requested '${MODEL_NAME}'." >&2
+			echo "  model.txt likely never reached the device (WDP writes can fail silently)." >&2
+			echo "  Nothing was appended — re-run rather than trusting this row." >&2
+			exit 1
+		fi
+		# Refuse old packages and failed/ignored identity uploads before admission.
+		got_host=$(awk -F, '{print $15}' <<<"$data_row")
+		if [[ "$got_host" != "${HARDWARE}-declared" && "$got_host" != "${HARDWARE}-declared-"* ]]; then
+			echo "Error: benchmark hardware declaration not echoed: '${got_host}', expected '${HARDWARE}-declared'. Redeploy and retry." >&2
+			exit 1
+		fi
+		# The CSV schema does NOT change with --max-length, so the arity check
+		# above cannot catch an MSIX that ignores bench_maxlen.txt — it would
+		# record DERIVED max_lengths under a "saturated" label and the whole
+		# experiment would be quietly wrong. Compare what we asked for against
+		# what the device reports in the max_length column.
+		if ((MAX_LEN != 0)); then
+			got=$(awk -F, '{print $14}' <<<"$data_row")
+			if ((MAX_LEN < 0)); then
+				want=$((N_CTX > 0 ? N_CTX : 2048))
+			else
+				want=$MAX_LEN
+			fi
+			if ((got != want)); then
+				echo "Error: the console ignored --max-length: row says ${got}, asked ${want}." >&2
+				echo "  The installed MSIX predates bench_maxlen.txt — redeploy before measuring." >&2
+				exit 1
+			fi
+		fi
+		# Same hazard for --ubatch: the schema has no ubatch column, so an MSIX
+		# that ignores bench_ubatch.txt would record default-512 rows under a
+		# sweep label. The device tags the host column with -uN; require it.
+		if ((UBATCH != 0)); then
+			got_host=$(awk -F, '{print $15}' <<<"$data_row")
+			if [[ "$got_host" != *"-u${UBATCH}"* ]]; then
+				echo "Error: the console ignored --ubatch: host column says '${got_host}', asked -u${UBATCH}." >&2
+				echo "  The installed MSIX predates bench_ubatch.txt — redeploy before measuring." >&2
+				exit 1
+			fi
+		fi
+		# And for --kv-q8 (#171): require the -kvq8 host tag.
+		if ((KVQ8 != 0)); then
+			got_host=$(awk -F, '{print $15}' <<<"$data_row")
+			if [[ "$got_host" != *"-kvq8"* ]]; then
+				echo "Error: the console ignored --kv-q8: host column says '${got_host}'." >&2
+				echo "  The installed MSIX predates bench_kvq8.txt — redeploy before measuring." >&2
+				exit 1
+			fi
+		fi
+		if ((IGNORE_EOG != 0)); then
+			got_host=$(awk -F, '{print $15}' <<<"$data_row")
+			if [[ "$got_host" != *"-noeog"* ]]; then
+				echo "Error: the console ignored --ignore-eog: host column says '${got_host}'." >&2
+				exit 1
+			fi
+		fi
+		# And for --gpu-layers (D2b): require the -gN tag and the d3d12 backend
+		# column — a CPU fallback (device unavailable) must not pass as a GPU row.
+		if ((GPU_LAYERS > 0)); then
+			got_host=$(awk -F, '{print $15}' <<<"$data_row")
+			got_backend=$(awk -F, '{print $3}' <<<"$data_row")
+			if [[ "$got_host" != *"-g${GPU_LAYERS}"* || "$got_backend" != "d3d12" ]]; then
+				echo "Error: --gpu-layers ${GPU_LAYERS} not honoured: host '${got_host}', backend '${got_backend}'." >&2
+				echo "  Old MSIX (no bench_gpu_layers.txt) or the d3d12 device failed — see get-log." >&2
+				exit 1
+			fi
+		fi
+		CSV_ROWS+=("$data_row")
+		echo "  Row: $data_row"
+		got_host=$(awk -F, '{print $15}' <<<"$data_row")
+		if [[ "$got_host" == *"-stall"* || "$got_host" == *"-timeout"* || "$got_host" == *"-hung"* ]]; then
+			FAILED_RUNS+=("${run}:stall")
+			echo "  Device reported a stalled run." >&2
+		fi
+	else
+		echo "  bench-result.csv empty or missing after .done — recording hung run." >&2
+		record_failed_run "$run" "hung"
+	fi
+done
+
+if [[ -n "$SAMPLER_PID" ]]; then
+	kill -TERM "$SAMPLER_PID" 2>/dev/null || true
+	wait "$SAMPLER_PID" 2>/dev/null || true
+	if [[ -s "${TMPDIR_LOCAL}/gpu-summary.txt" ]]; then
+		echo ""
+		cat "${TMPDIR_LOCAL}/gpu-summary.txt"
+	fi
+fi
+
+# ---------------------------------------------------------------------------
+# Append each recorded run to the results CSV
+# ---------------------------------------------------------------------------
+# W1.1: the driver no longer pre-averages. Every recorded run is appended with the
+# run_index the device wrote, so the spread is recoverable from the committed CSV;
+# scripts/generate-benchmark-summary.py computes the median and min-max from them.
+echo ""
+echo "--- Appending recorded runs ---"
+RESULT_CSV="${OUT_CSV:-${REPO_ROOT}/bench/results/phase1-cpu.csv}"
+
+# Warmup drop matches the previous median's warmup exclusion: run 1 (CSV_ROWS[0])
+# is a cold cache and is not recorded, UNLESS it is the only run collected.
+if ((${#CSV_ROWS[@]} == 0)); then
+	echo "Error: no successful runs collected." >&2
+	exit 1
+elif ((${#CSV_ROWS[@]} < 2)); then
+	echo "Warning: only 1 run collected (warmup not dropped)." >&2
+	ROWS_TO_APPEND=("${CSV_ROWS[0]}")
+else
+	ROWS_TO_APPEND=("${CSV_ROWS[@]:1}") # skip warmup (run 1 = index 0)
+fi
+
+# Route DML rows to phase2-dml.csv when --out was not given. All rows in one
+# campaign share a backend, so decide from the first row to append.
+if [[ -z "$OUT_CSV" && "$(cut -d, -f3 <<<"${ROWS_TO_APPEND[0]}")" == *dml* ]]; then
+	RESULT_CSV="${REPO_ROOT}/bench/results/phase2-dml.csv"
+fi
+[[ ! -f "$RESULT_CSV" ]] && printf '%s\n' "$CSV_HEADER" >"$RESULT_CSV"
+
+# Refuse to append to a file written under an older schema: the row arity would
+# not match its header, and csv.DictReader would silently misalign every field
+# after the mismatch (host/date landing under the wrong keys). Pick a new --out.
+assert_header_matches() {
+	local csv="$1" existing
+	existing=$(head -1 "$csv")
+	if [[ "$existing" != "$CSV_HEADER" ]]; then
+		echo "Error: $csv uses a different CSV schema." >&2
+		echo "  file:     $existing" >&2
+		echo "  expected: $CSV_HEADER" >&2
+		echo "Append to a new file with --out, or migrate the old one first." >&2
+		exit 1
+	fi
+}
+assert_header_matches "$RESULT_CSV"
+
+for row in "${ROWS_TO_APPEND[@]}"; do
+	printf '%s\n' "$row" >>"$RESULT_CSV"
+	echo "  appended: $row"
+done
+echo "Appended ${#ROWS_TO_APPEND[@]} run(s) to $RESULT_CSV"
+
+check_args=(--n-runs "$N_RUNS" --failed-runs "${#FAILED_RUNS[@]}")
+for row in "${ROWS_TO_APPEND[@]}"; do
+	check_args+=(--row "$row")
+done
+if ! python3 "${STATUS_PY}" check "${check_args[@]}"; then
+	echo "Error: campaign incomplete — hung/timeout/stall runs were recorded and this is not OK." >&2
+	if ((${#FAILED_RUNS[@]} > 0)); then
+		echo "  failed: ${FAILED_RUNS[*]}" >&2
+	fi
+	exit 1
+fi
+
+echo ""
+echo "Done. ${RESULT_CSV} updated."

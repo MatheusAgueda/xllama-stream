@@ -1,0 +1,317 @@
+// Copyright (c) 2024 Gianluca Mazza
+// SPDX-License-Identifier: MIT
+
+#pragma once
+
+#ifdef XLLAMA_UWP
+
+    #include "chat-history.h"
+    #include "inference-bridge.h"
+    #include "model-downloader.h"
+    #include "pch.h"
+    #include "xllama/autopilot.h"
+    #include "xllama/chat_prompt.h"
+    #include "xllama/compute_admission.h"
+    #include "xllama/session.h"
+    #include "xllama/session_hub.h"
+
+    #include <atomic>
+    #include <chrono>
+    #include <cstdint>
+    #include <functional>
+    #include <future>
+    #include <memory>
+    #include <mutex>
+    #include <string>
+    #include <vector>
+
+namespace xllama {
+
+enum class StatusKind { Info, Working, Success, Error };
+
+// Plain C++ class that owns the UI tree.
+// Not a WinRT runtimeclass — avoids the XAML metadata provider (IXamlMetadataProvider)
+// and MarkupCompilePass2 entirely. The UI is built programmatically in BuildUI().
+class MainPageController : public std::enable_shared_from_this<MainPageController> {
+  public:
+    MainPageController();
+    void Init(); // must be called once after make_shared — wires handlers, loads model
+
+    winrt::Windows::UI::Xaml::Controls::Page Root() const {
+        return m_root;
+    }
+
+    // Autopilot: scripted validation of the real XAML UI (console has no human
+    // input path in Dev Mode). No-op unless LocalState\autopilot.flag exists;
+    // the flag is consumed, actions come from LocalState\autopilot.json, the
+    // outcome lands in LocalState\autopilot-done.txt ("ok" | "error: ...").
+    void StartAutopilotIfRequested(); // called from App::OnLaunched
+
+  private:
+    // First-run generative-AI disclosure (LocalState\disclaimer.accepted).
+    winrt::fire_and_forget ShowDisclaimerIfNeeded();
+    // One parsed autopilot action and the rules a script must satisfy live in
+    // include/xllama/autopilot.h: WinRT-free, so tests/test_autopilot.cpp can
+    // cover the contract every console gate is written in without a console.
+    using ApAction = ::xllama::AutopilotAction;
+    static bool ApParseScript(const std::string& json_utf8, std::vector<ApAction>& out,
+                              std::chrono::seconds& total_cap, std::string& err);
+    void ApRun(std::vector<ApAction> actions, std::chrono::seconds total_cap);
+    void ApDispatchSync(std::function<void()> fn); // sync hop to the UI thread (MTA-only)
+    // Record the ContentDialog going on screen so the autopilot can screenshot a
+    // pane and close it again, and so a second one cannot be opened underneath.
+    // Called by every Show* coroutine right before ShowAsync().
+    void ApTrackDialog(winrt::Windows::UI::Xaml::Controls::ContentDialog const& dlg);
+    bool ApWaitAtomic(std::atomic<bool>& flag, bool want, std::chrono::seconds timeout);
+    void BuildUI();
+    void LoadModelName();
+    bool SelectModel(const std::wstring& name);
+    winrt::fire_and_forget EnsureModelAsync();
+    // Provision one catalogue/USB/bundled model dir. When |set_app_ready| is true
+    // (chat model), enables Run on success and may queue gpu_model download.
+    winrt::fire_and_forget EnsureModelNamedAsync(std::wstring model_name,
+                                                 bool set_app_ready = false);
+    void EnsureGpuModelIfNeeded();
+    // Load (and, for DML models, warm up — #130 §5e) the resident session
+    // ahead of the first turn, so the first send pays prefill+decode only.
+    // Call on the UI thread right after the model becomes Ready; the load
+    // claims hub.preloading and the process-wide compute permit. A concurrent
+    // first send waits (bounded, same window as the LAN API) instead of
+    // failing busy, then takes the permit when preload releases it.
+    void PreloadSessionAsync();
+    bool StartInference(std::wstring const& prompt);
+    void OnRunClick(winrt::Windows::Foundation::IInspectable const&,
+                    winrt::Windows::UI::Xaml::RoutedEventArgs const&);
+    void OnCancelClick(winrt::Windows::Foundation::IInspectable const&,
+                       winrt::Windows::UI::Xaml::RoutedEventArgs const&);
+    void AppendOutput(std::wstring const& text);
+    void SetStatus(std::wstring const& msg, StatusKind kind = StatusKind::Info);
+    void SetRunning(bool running);
+    void FlushTokenBuffer(); // flush m_token_buffer to RichTextBlock on UI thread
+
+    // Multi-turn chat
+    void NewChat();
+    winrt::fire_and_forget ShowHistory();
+    void LoadConversation(const std::string& id);
+    void RenderConversation();
+    // Post-turn finalize of the streamed paragraph (postprocessed text +
+    // feedback controls) — no full conversation rebuild. RenderConversation
+    // stays for history load and feedback-driven edits.
+    void FinalizeStreamedTurn(const std::string& output_text);
+    void AddUserParagraph(std::wstring const& text);
+    void AppendFeedbackControls(winrt::Windows::UI::Xaml::Documents::Paragraph const& paragraph,
+                                size_t assistant_index);
+    bool SubmitFeedback(size_t assistant_index, const std::string& label,
+                        const std::string& preferred_assistant = {}, std::string* err = nullptr);
+    winrt::fire_and_forget ShowCorrectionDialog(size_t assistant_index);
+    // Everything a turn needs to build its prompt. `prompt` is trimmed by the
+    // chars-per-token ESTIMATE and exists so routing can count something before a
+    // model is chosen; the real budget is enforced once, in the worker, with the
+    // tokenizer of the model that will generate (xllama::fit_prompt) — which is
+    // why the surviving turns travel with it.
+    struct PromptPlan {
+        std::string prompt;
+        std::vector<xllama::ChatTurn> turns;
+        int dropped = 0;
+        int n_ctx = 0;
+    };
+    PromptPlan BuildPromptPlan(const std::string& user_text) const;
+    // Only the new turn's tokens, appended to the reused KV cache.
+    std::string BuildDeltaPrompt(const std::string& user_text) const;
+    // Per-architecture chat template for the current model (ChatML default, Gemma, ...).
+    // Built on demand (reads m_model_filename); do not call from the worker thread.
+    xllama::ChatFormat chat_format() const;
+    void LoadSettings();
+    void SaveSettings();
+    void ApplyDebugDashboard(bool enabled, bool persist_flag = true);
+    void RefreshDebugDashboard();
+    void StartDebugDashboardTimer();
+    void StopDebugDashboardTimer();
+    winrt::fire_and_forget ShowSettings();
+    #ifndef XLLAMA_STORE_SKU
+    void ApplyApiSettings(bool enabled, int port);
+    // LAN API panel (header, right): resolves the console IP once, then polls
+    // xllama::api::server_status() and api::activity() every second.
+    void StartApiPanel();
+    void RefreshApiPanel();
+    #endif
+    // Phase 11 (#116): in-app personalization — train on samples.jsonl, publish
+    // merged.gguf as catalogue entry "personalized".
+    void StartPersonalizeTrain();
+    bool PublishPersonalizedModel(const std::string& merged_gguf_path, std::string* err = nullptr);
+    std::string ResolvePersonalizeBase() const; // LocalState-relative path or empty
+    // Image generation UX: shows the last diffuse-out.png and runs SD-Turbo
+    // in-process (plain ORT DML coexists with the XAML compositor).
+    winrt::fire_and_forget ShowImageDialog();
+    void StartDiffusion(::xllama::ComputeJobAdmission::Handle permit);
+    void PollDiffuseProgress();
+    void FinishDiffusion();
+    void SaveCurrentConversation(bool partial = false);
+    // #170b: hand the KV of the conversation we are leaving to disk, off the UI
+    // thread. Call BEFORE the switch clears m_kv_valid / m_active_model.
+    // The next generate must wait (WaitKvSnapshotSave) so a follow-up turn cannot
+    // mutate the resident session before the save has copied it — that race was
+    // #216 (restored log line + full re-prefill under suite timing).
+    void SaveKvSnapshotAsync();
+    void WaitKvSnapshotSave();
+    // Apply catalogue knobs for the selected model (n_predict default, …).
+    // Call when the user or autopilot changes m_model_filename.
+    void ApplyCatalogueModelKnobs(const std::wstring& model);
+    // Must be called from background thread; builds/rebuilds m_session if needed.
+    bool EnsureSession(const std::string& model, std::string* err_out = nullptr);
+
+    // UI controls (populated by BuildUI)
+    winrt::Windows::UI::Xaml::Controls::Page m_root{nullptr};
+    winrt::Windows::UI::Xaml::Controls::TextBlock m_modelText{nullptr};
+    winrt::Windows::UI::Xaml::Controls::TextBlock m_statusText{nullptr};
+    winrt::Windows::UI::Xaml::Controls::ProgressBar m_loadingBar{nullptr};
+    winrt::Windows::UI::Xaml::Controls::ScrollViewer m_outputScroll{nullptr};
+    winrt::Windows::UI::Xaml::Controls::TextBox m_promptInput{nullptr};
+    winrt::Windows::UI::Xaml::Controls::RichTextBlock m_outputBody{nullptr};
+    winrt::Windows::UI::Xaml::Documents::Paragraph m_currentParagraph{nullptr};
+    winrt::Windows::UI::Xaml::Controls::TextBlock m_metricsText{nullptr};
+    winrt::Windows::UI::Xaml::Controls::Border m_debugDashboardPanel{nullptr};
+    winrt::Windows::UI::Xaml::Controls::TextBlock m_debugDashboardText{nullptr};
+    winrt::Windows::UI::Xaml::DispatcherTimer m_debug_timer{nullptr};
+    winrt::event_token m_debug_tick_token{};
+    winrt::Windows::UI::Xaml::Controls::StackPanel m_apiPanel{nullptr};
+    winrt::Windows::UI::Xaml::Controls::TextBlock m_apiEndpointText{nullptr};
+    winrt::Windows::UI::Xaml::Controls::TextBlock m_apiNowText{nullptr};
+    winrt::Windows::UI::Xaml::Controls::TextBlock m_apiCountsText{nullptr};
+    winrt::Windows::UI::Xaml::Controls::TextBlock m_apiErrorText{nullptr};
+    winrt::Windows::UI::Xaml::DispatcherTimer m_api_timer{nullptr};
+    winrt::event_token m_api_tick_token{};
+    std::wstring m_lan_ip; // cached console IPv4, resolved off the UI thread
+    winrt::Windows::UI::Xaml::Controls::Button m_runButton{nullptr};
+    winrt::Windows::UI::Xaml::Controls::Button m_cancelButton{nullptr};
+    winrt::Windows::UI::Xaml::Controls::Button m_newChatButton{nullptr};
+    winrt::Windows::UI::Xaml::Controls::Button m_historyButton{nullptr};
+    winrt::Windows::UI::Xaml::Controls::Button m_settingsButton{nullptr};
+    winrt::Windows::UI::Xaml::Controls::Button m_imageButton{nullptr};
+    winrt::Windows::UI::Xaml::DispatcherTimer m_flush_timer{nullptr};
+    winrt::event_token m_flush_tick_token{};
+
+    // The persistent inference session lives in xllama::session_hub() — one
+    // process-wide owner shared with the LAN API ("never 2× model in RAM").
+    // m_turn_session is a non-owning view set by EnsureSession, valid ONLY
+    // while the current worker turn holds hub.mtx. m_hub_generation records
+    // the resident-session generation the KV-reuse state was built on; a
+    // mismatch at the next turn means the API swapped models in between and
+    // the persistent generator is gone (worker-thread only).
+    ::xllama::Session* m_turn_session{nullptr};
+    uint64_t m_hub_generation{0};
+
+    // KV-cache reuse (continuous decoding) state.
+    //   m_kv_reuse: feature toggle (settings.json "kv_reuse", default true).
+    //   m_kv_valid: the session's persistent generator currently holds the KV for
+    //               m_current through the last completed turn — the next turn can
+    //               append only its delta. Cleared on new/loaded chat, settings
+    //               change, abort, context eviction, or any generator failure.
+    //   m_kv_last_ended_with_stop: whether the last turn stopped on <|im_end|>
+    //               (already in KV) vs the n_predict cap (not) — drives the delta.
+    bool m_kv_reuse{true};
+    bool m_kv_valid{false};
+    bool m_kv_last_ended_with_stop{false};
+    // Outstanding #170b save: generate waits so the snapshot path is not
+    // overwritten with a different conversation's KV (see SaveKvSnapshotAsync).
+    std::mutex m_kv_save_mutex;
+    std::future<void> m_kv_save_future;
+
+    // Per-conversation CPU/GPU routing (Stage 3). The GPU (DML fp16) EP wins the
+    // prefill of long prompts; the CPU EP wins decode. Routing is decided at a
+    // conversation's first turn and sticky for its lifetime (the KV cache is
+    // per-EP). m_routing: 0 = CPU only (default = current behaviour), 1 = GPU
+    // only, 2 = auto (route by first-prompt length). m_active_model holds the
+    // routed model dir for the current conversation.
+    int m_routing{0};
+    std::string m_gpu_model{"smollm2-360m-dml-fp16-v2"};
+    std::wstring m_active_model;
+
+    // Model-catalogue cache: LoadModelManifest re-reads and parses JSON from
+    // disk, and StartInference needed it on the UI thread for every turn.
+    // Invalidated on catalogue mutation (personalized-model publish); slow
+    // paths that mutate keep calling LoadModelManifest directly.
+    const std::vector<::xllama::ManifestEntry>& CachedManifest() const;
+    void InvalidateManifestCache() {
+        m_manifest_cached = false;
+    }
+    mutable std::vector<::xllama::ManifestEntry> m_manifest_cache;
+    mutable bool m_manifest_cached{false};
+
+    // Image generation: TAESD tiny VAE replaces the full VAE decoder in-place
+    // under models\sd-turbo-fp16\vae_decoder\ (same UNet/text_encoder).
+    bool m_diffuse_taesd{false};
+    uint32_t m_diffuse_seed{0};      // persisted UI value; 0 = choose a random seed
+    uint32_t m_last_diffuse_seed{0}; // concrete seed used by the active/last run
+
+    // Serialize detached API lifecycle workers and discard stale requests so
+    // rapid Settings changes cannot apply out of order.
+    std::mutex m_api_settings_mutex;
+    std::atomic<uint64_t> m_api_settings_generation{0};
+
+    // Token streaming state (written from bg thread, flushed on UI thread via timer)
+    std::mutex m_token_mutex;
+    std::string m_token_buffer;
+    std::atomic<int> m_tokens_received{0};
+    // Turn start, i.e. the moment the user's message was submitted. Includes
+    // model load and prefill, so it is NOT a decode-rate denominator (#130).
+    std::chrono::steady_clock::time_point m_gen_start;
+    // First token out. Prefill ends here, decode begins. The app streams, so
+    // this is the latency the user actually feels — everything after it arrives
+    // faster than anyone reads (33-59 tok/s against ~10 tok/s of reading).
+    // Measured but never surfaced before #130; the live counter divided by
+    // m_gen_start and so reported a decode rate diluted by prefill.
+    std::chrono::steady_clock::time_point m_first_token_at;
+    std::atomic<bool> m_first_token_seen{false};
+    // UI-thread latch: the status line is flipped from "reading prompt" to
+    // "generating" once, on the first flushed batch. Separate from
+    // m_first_token_seen, which is written by the inference thread.
+    bool m_status_flipped_to_generating{false};
+
+    // Multi-turn chat state
+    xllama::ui::ChatHistory m_history;
+    xllama::ui::Conversation m_current;
+    std::string m_system_prompt{::xllama::kDefaultSystemPrompt};
+
+    // Autoscroll state: true while the user has not scrolled up during streaming
+    bool m_at_bottom{true};
+
+    // Sampling parameters (persisted in settings.json, exposed in Settings dialog).
+    // Seeded from the single source in sampling.h (#125) so the GUI defaults
+    // cannot drift from the CLI/API defaults.
+    float m_temperature{::xllama::sampling_defaults::kTemperature};
+    float m_top_p{::xllama::sampling_defaults::kTopP};
+    int m_top_k{::xllama::sampling_defaults::kTopK};
+    float m_repetition_penalty{::xllama::sampling_defaults::kRepetitionPenalty};
+    int m_n_predict{512};
+
+    // Optional debug dashboard (Settings + LocalState\debug-dashboard.flag).
+    // Off by default; the chat layout is unchanged while the panel is collapsed.
+    bool m_debug_dashboard{false};
+    std::optional<::xllama::InferenceResult> m_last_inference;
+    std::optional<double> m_live_decode_tok_s;
+    std::optional<int> m_live_tokens;
+
+    std::atomic<bool> m_abort{false};
+    std::atomic<bool> m_is_running{false};
+    std::atomic<bool> m_diffuse_running{false};
+    std::atomic<bool> m_train_running{false};
+    // A ContentDialog is on screen. XAML allows exactly one, and opening a
+    // second throws inside a fire_and_forget — whose unhandled_exception()
+    // calls std::terminate(). That is a silent process death with no
+    // autopilot-done.txt, which from the host looks like a mute timeout, so the
+    // autopilot checks this and refuses with a readable error instead.
+    std::atomic<bool> m_pane_open{false};
+    winrt::Windows::UI::Xaml::Controls::ContentDialog m_ap_dialog{nullptr};
+    std::atomic<bool> m_train_abort{false};
+    // Set once EnsureModelAsync lands a usable chat model (any source); the
+    // autopilot driver gates its first action on this.
+    std::atomic<bool> m_model_ready{false};
+    winrt::Windows::UI::Xaml::DispatcherTimer m_diffuse_timer{nullptr};
+    winrt::event_token m_diffuse_tick_token{};
+    std::wstring m_model_filename;
+};
+
+} // namespace xllama
+
+#endif // XLLAMA_UWP

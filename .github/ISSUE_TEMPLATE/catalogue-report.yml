@@ -1,0 +1,34 @@
+name: Model list report
+description: "Report inappropriate generated text or images, or a problem with a model from the built-in model list"
+title: "[catalogue-report] "
+labels: ["catalogue-report"]
+body:
+  - type: markdown
+    attributes:
+      value: "Use this form for **inappropriate generated text or images**, or a problem with a model from the built-in model list. Do not paste illegal content (including sexual content involving minors). Pick a category and name the model."
+  - type: dropdown
+    id: category
+    attributes:
+      label: Category
+      options:
+        - Sexual / pornographic
+        - Violence / gore
+        - Hate / harassment
+        - Self-harm
+        - Other (describe)
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model id (from the model list)
+      placeholder: lfm25-350m, sd-turbo-fp16, …
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: Short description. Do not attach illegal material.
+    validations:
+      required: true

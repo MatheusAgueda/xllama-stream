@@ -1,0 +1,484 @@
+// Copyright (c) 2024 Gianluca Mazza
+// SPDX-License-Identifier: MIT
+// Diffusion image generation: plain ONNX Runtime DirectML, three sessions
+// (text_encoder + UNet + VAE decoder) driven by the host-validated CLIP tokenizer
+// and Euler scheduler. Callable headless (diffuse.flag) or in-process from the
+// Image dialog. The 887A0036 compositor conflict applies to ORT GenAI chat DML
+// only — plain ORT DML coexists with XAML (docs/uwp-constraints.md §7).
+//
+// The correctness-critical logic (tokenizer, scheduler, fp16 conversion, PNG) is
+// unit-tested on the host against the diffusers/transformers reference
+// (tests/test_diffusion.cpp). This file is the ORT DirectML orchestration around
+// it — CI-compile-validated; runtime-validated on console per
+// docs/console-validation-runbook.md §7.
+//
+// MODEL CONTRACT: an SD-Turbo-class ONNX model (epsilon prediction, Euler trailing
+// schedule, guidance-free) under LocalState\models\<dir>\{text_encoder,unet,
+// vae_decoder}\model.onnx, each self-contained (< 2 GB, external data merged —
+// docs/uwp-constraints.md §8), plus the CLIP tokenizer's vocab.json + merges.txt
+// in LocalState\clip\. Tensor dtypes are ADAPTIVE: float inputs are fed as fp16 or
+// fp32 and input_ids as int32 or int64, matching what each session declares
+// (covers both a pure-fp16 export and a keep_io_types fp32-boundary one); outputs
+// are read as fp16 or fp32. Classifier-free guidance is NOT implemented — SD-Turbo
+// runs guidance-free (scale 0); SD1.x/LCM-class models would need CFG (two text
+// embeddings + guidance blend), out of scope for the console demo.
+//
+// Inputs (LocalState): prompt.txt, diffuse-model.txt (model dir name),
+// diffuse-steps.txt (default 1), diffuse-seed.txt (default 42);
+// diffuse-cancel.flag aborts between UNet steps (consumed).
+// Outputs: diffuse-out.png (+ .done), diffuse-result.csv with per-stage ms,
+// diffuse-progress.txt with the live stage (start/text_encoder/unet s/N/vae/
+// done/cancelled/error).
+//
+// Entry points: headless via diffuse.flag (bench/WDP), in-process from the
+// Image dialog (MainPageController::StartDiffusion), or diffuse-inproc.flag at
+// launch (App.cpp smoke test).
+
+#include "inference-bridge.h"
+
+#ifdef XLLAMA_UWP
+
+// clang-format off
+    #include <windows.h>
+    #include <eh.h>
+    #include <onnxruntime_cxx_api.h>
+    #include <dml_provider_factory.h>
+// clang-format on
+
+    #include "xllama/diffusion/clip_tokenizer.h"
+    #include "xllama/diffusion/euler_scheduler.h"
+    #include "xllama/diffusion/half.h"
+    #include "xllama/diffusion/png_writer.h"
+    #include "xllama/path_utils.h"
+    #include "xllama/platform.h"
+    #include "xllama/utf8_utils.h"
+
+    #include <algorithm>
+    #include <array>
+    #include <chrono>
+    #include <cstdint>
+    #include <cstdio>
+    #include <cstring>
+    #include <ctime>
+    #include <fstream>
+    #include <iterator>
+    #include <random>
+    #include <string>
+    #include <vector>
+
+namespace xllama::bridge {
+
+namespace {
+
+using xllama::diffusion::from_half;
+using xllama::diffusion::to_half;
+
+constexpr int kLatentC = 4;
+constexpr int kLatentHW = 64; // 64x64 latent -> 512x512 image (VAE upsamples x8)
+constexpr int kImageHW = 512;
+constexpr int kSeq = 77; // CLIP context length
+constexpr double kVaeScale = 0.18215;
+
+// A DML session with sequential execution + no mem pattern (DML requirements).
+// Graph optimization is capped at EXTENDED: ORT_ENABLE_ALL's layout transforms
+// crash session init (graph_utils GetIndexFromName) on the fp16 SD graphs
+// produced by onnxruntime.transformers' converter — verified 2026-07-08 on the
+// deployable sd-turbo fp16 artifacts; EXTENDED loads and runs them cleanly.
+Ort::Session make_session(Ort::Env& env, const std::string& path) {
+    Ort::SessionOptions so;
+    so.SetExecutionMode(ORT_SEQUENTIAL);
+    so.DisableMemPattern();
+    so.SetGraphOptimizationLevel(ORT_ENABLE_EXTENDED);
+    Ort::ThrowOnError(OrtSessionOptionsAppendExecutionProvider_DML(so, /*device_id=*/0));
+    return Ort::Session(env, utf8_to_wstring(path).c_str(), so);
+}
+
+Ort::MemoryInfo cpu_mem() {
+    return Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeCPU);
+}
+
+// Read a run output into the caller's float buffer (reused across UNet steps),
+// converting from fp16 or fp32.
+void read_output_f32_into(Ort::Value& v, std::vector<float>& out) {
+    auto info = v.GetTensorTypeAndShapeInfo();
+    const size_t n = info.GetElementCount();
+    out.resize(n);
+    if (info.GetElementType() == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
+        const auto* p = reinterpret_cast<const uint16_t*>(v.GetTensorData<Ort::Float16_t>());
+        for (size_t i = 0; i < n; ++i)
+            out[i] = diffusion::half_to_float(p[i]);
+    } else {
+        const float* p = v.GetTensorData<float>();
+        std::copy(p, p + n, out.begin());
+    }
+}
+
+// Read a run output (index 0) into a float vector, converting from fp16 or fp32.
+std::vector<float> read_output_f32(Ort::Value& v) {
+    std::vector<float> out;
+    read_output_f32_into(v, out);
+    return out;
+}
+
+// Declared element type of a session input, looked up by name (input order is not
+// guaranteed). UNDEFINED if the name is absent.
+ONNXTensorElementDataType input_type_by_name(Ort::Session& s, const char* name) {
+    Ort::AllocatorWithDefaultOptions alloc;
+    const size_t n = s.GetInputCount();
+    for (size_t i = 0; i < n; ++i) {
+        auto nm = s.GetInputNameAllocated(i, alloc);
+        if (std::strcmp(nm.get(), name) == 0)
+            return s.GetInputTypeInfo(i).GetTensorTypeAndShapeInfo().GetElementType();
+    }
+    return ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+}
+
+// Declared rank of a session input (export-dependent: timestep is [1] on
+// optimum <= 1.23, [] scalar on optimum-onnx 0.1.0+). 1 if the name is absent.
+size_t input_rank_by_name(Ort::Session& s, const char* name) {
+    Ort::AllocatorWithDefaultOptions alloc;
+    const size_t n = s.GetInputCount();
+    for (size_t i = 0; i < n; ++i) {
+        auto nm = s.GetInputNameAllocated(i, alloc);
+        if (std::strcmp(nm.get(), name) == 0)
+            return s.GetInputTypeInfo(i).GetTensorTypeAndShapeInfo().GetShape().size();
+    }
+    return 1;
+}
+
+// A float tensor fed as fp16 or fp32 depending on what the session declares.
+// Owns the backing storage; keep alive until after Run. (Moving is safe: vector
+// moves preserve the heap buffer the Ort::Value points into.)
+struct FloatInput {
+    std::vector<float> f32;
+    std::vector<uint16_t> f16;
+    Ort::Value value{nullptr};
+};
+
+FloatInput make_float_input(Ort::MemoryInfo& mem, std::vector<float> data, const int64_t* shape,
+                            size_t rank, bool as_fp16) {
+    FloatInput t;
+    if (as_fp16) {
+        t.f16 = to_half(data);
+        t.value = Ort::Value::CreateTensor(mem, t.f16.data(), t.f16.size() * sizeof(uint16_t),
+                                           shape, rank, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16);
+    } else {
+        t.f32 = std::move(data);
+        t.value = Ort::Value::CreateTensor<float>(mem, t.f32.data(), t.f32.size(), shape, rank);
+    }
+    return t;
+}
+
+std::string read_text_file(const char* name, const std::string& fallback) {
+    std::ifstream f(utf8_to_wstring(resolve_local_path(name)).c_str());
+    if (!f.good())
+        return fallback;
+    std::string s((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' '))
+        s.pop_back();
+    return s.empty() ? fallback : s;
+}
+
+int read_int_file(const char* name, int fallback, int lo, int hi) {
+    const std::string s = read_text_file(name, "");
+    if (s.empty())
+        return fallback;
+    const int v = std::atoi(s.c_str());
+    return (v >= lo && v <= hi) ? v : fallback;
+}
+
+double ms_since(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// Progress/cancel plumbing for UI or Device-Portal pollers.
+// diffuse-progress.txt holds the current stage: "start", "text_encoder",
+// "unet <s>/<N>", "vae", then "done" / "cancelled" / "error".
+void write_progress(const std::string& stage) {
+    FILE* fp = _wfopen(utf8_to_wstring(resolve_local_path("diffuse-progress.txt")).c_str(), L"w");
+    if (fp) {
+        fputs(stage.c_str(), fp);
+        fputc('\n', fp);
+        fclose(fp);
+    }
+}
+
+// diffuse-cancel.flag (written by the UI/WDP, consumed here) aborts the run
+// between UNet steps — the only boundary where a multi-second run can stop
+// cleanly without tearing down a session mid-Run.
+bool cancel_requested() {
+    const std::wstring flag = utf8_to_wstring(resolve_local_path("diffuse-cancel.flag"));
+    if (GetFileAttributesW(flag.c_str()) == INVALID_FILE_ATTRIBUTES)
+        return false;
+    _wremove(flag.c_str());
+    return true;
+}
+
+} // namespace
+
+void run_diffuse() {
+    _set_se_translator([](unsigned int code, EXCEPTION_POINTERS*) {
+        char b[48];
+        snprintf(b, sizeof(b), "SEH 0x%08X", code);
+        throw std::runtime_error(b);
+    });
+
+    const std::string dir = read_text_file("diffuse-model.txt", "sd-turbo-fp16");
+    const std::string prompt =
+        read_text_file("prompt.txt", "a red sports car on a mountain road at sunset");
+    const int steps = read_int_file("diffuse-steps.txt", 1, 1, 50);
+    const int seed = read_int_file("diffuse-seed.txt", 42, 0, 1'000'000'000);
+    log_output("[xllama] diffuse: model='" + dir + "' steps=" + std::to_string(steps) +
+               " seed=" + std::to_string(seed) + " prompt='" + prompt + "'\n");
+
+    // Fresh run: stale completion marker and a leftover cancel flag from a
+    // previous run must not leak into this one.
+    _wremove(utf8_to_wstring(resolve_local_path("diffuse-out.png.done")).c_str());
+    (void)cancel_requested();
+    write_progress("start");
+
+    try {
+        auto model = [&](const char* comp) {
+            return resolve_local_path("models\\" + dir + "\\" + comp + "\\model.onnx");
+        };
+        Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "diffuse");
+        Ort::MemoryInfo mem = cpu_mem();
+
+        // ---- Tokenize (host-validated CLIP BPE) -----------------------------
+        // Tokenizer assets: prefer the model's own tokenizer/ dir (what the
+        // catalogue download provides), falling back to the legacy standalone
+        // LocalState\clip\ upload. Same CLIP BPE files either way.
+        auto exists = [](const std::string& p) {
+            return GetFileAttributesW(utf8_to_wstring(p).c_str()) != INVALID_FILE_ATTRIBUTES;
+        };
+        std::string vocab = resolve_local_path("models\\" + dir + "\\tokenizer\\vocab.json");
+        std::string merges = resolve_local_path("models\\" + dir + "\\tokenizer\\merges.txt");
+        if (!exists(vocab) || !exists(merges)) {
+            vocab = resolve_local_path("clip\\vocab.json");
+            merges = resolve_local_path("clip\\merges.txt");
+        }
+        auto tok = diffusion::ClipTokenizer::from_files(vocab, merges);
+        const std::vector<int> ids = tok.encode(prompt); // length 77
+
+        // Sessions are created and DESTROYED per stage: the 3801 MB GPU budget
+        // does not fit all three sets of weights (~2.4 GB) plus the VAE's
+        // 512x512 activations — keeping them all alive OOM'd the VAE decode on
+        // console (8007000E at /decoder/up_blocks.3 InstanceNormalization,
+        // 2026-07-08). Sequential lifetime frees ~2.3 GB before the VAE runs.
+
+        // ---- Text encoder: input_ids[1,77] -> last_hidden_state[1,77,H] -----
+        write_progress("text_encoder");
+        auto t_load0 = std::chrono::steady_clock::now();
+        std::vector<float> hidden; // [1,77,H]
+        double te_ms = 0.0;
+        {
+            Ort::Session te = make_session(env, model("text_encoder"));
+            std::array<int64_t, 2> te_shape{1, kSeq};
+            // input_ids dtype is export-dependent (optimum: int32; others: int64).
+            const auto ids_type = input_type_by_name(te, "input_ids");
+            std::vector<int32_t> ids32(ids.begin(), ids.end());
+            std::vector<int64_t> ids64(ids.begin(), ids.end());
+            Ort::Value te_in =
+                (ids_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64)
+                    ? Ort::Value::CreateTensor<int64_t>(mem, ids64.data(), ids64.size(),
+                                                        te_shape.data(), te_shape.size())
+                    : Ort::Value::CreateTensor<int32_t>(mem, ids32.data(), ids32.size(),
+                                                        te_shape.data(), te_shape.size());
+            const char* te_in_names[] = {"input_ids"};
+            const char* te_out_names[] = {"last_hidden_state"};
+            auto t_te0 = std::chrono::steady_clock::now();
+            auto te_out = te.Run(Ort::RunOptions{nullptr}, te_in_names, &te_in, 1, te_out_names, 1);
+            te_ms = ms_since(t_te0);
+            hidden = read_output_f32(te_out[0]);
+        } // release text_encoder weights before loading the UNet
+        const int64_t hidden_dim = (int64_t)hidden.size() / kSeq; // 1024 (SD2-class) or 768 (SD1.x)
+
+        // ---- Scheduler + init latent ---------------------------------------
+        diffusion::EulerDiscreteScheduler sched;
+        sched.set_timesteps(steps);
+        const size_t latent_n = (size_t)kLatentC * kLatentHW * kLatentHW;
+        std::vector<float> latent(latent_n);
+        std::mt19937 rng((unsigned)seed);
+        std::normal_distribution<float> gauss(0.0f, 1.0f);
+        for (auto& v : latent)
+            v = gauss(rng) * (float)sched.init_noise_sigma();
+
+        std::array<int64_t, 4> s_shape{1, kLatentC, kLatentHW, kLatentHW};
+        std::array<int64_t, 1> t_shape{1};
+        std::array<int64_t, 3> h_shape{1, kSeq, hidden_dim};
+        double unet_ms = 0.0;
+        {
+            Ort::Session unet = make_session(env, model("unet"));
+            const bool unet_fp16 =
+                input_type_by_name(unet, "sample") == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16;
+            // timestep dtype is export-dependent too: int64 (optimum default) or
+            // float16/float32 (the ORT-team fp16 export declares timestep:f16 — the
+            // values used here, e.g. 999, are integers < 2048, exact in fp16).
+            const auto ts_type = input_type_by_name(unet, "timestep");
+            // timestep shape is export-dependent as well: [1] (optimum <= 1.23) or
+            // [] scalar (optimum-onnx 0.1.0+). Same 1-element buffer either way;
+            // only the declared rank changes.
+            const size_t ts_rank = input_rank_by_name(unet, "timestep");
+            log_output(std::string("[xllama] diffuse: unet input ") +
+                       (unet_fp16 ? "fp16" : "fp32") + ", hidden_dim " +
+                       std::to_string(hidden_dim) + ", ts rank " + std::to_string(ts_rank) +
+                       ", te+unet load " + std::to_string((int)ms_since(t_load0)) + " ms\n");
+
+            // encoder_hidden_states is constant across steps: convert to fp16
+            // once; each step only wraps these buffers in a zero-copy tensor.
+            std::vector<uint16_t> hs_f16;
+            if (unet_fp16)
+                hs_f16 = to_half(hidden);
+            std::vector<float> scaled;        // reused across steps
+            std::vector<uint16_t> scaled_f16; // reused when unet_fp16
+            std::vector<float> noise;         // reused across steps
+
+            for (size_t s = 0; s < sched.timesteps().size(); ++s) {
+                const std::string step_label =
+                    std::to_string(s + 1) + "/" + std::to_string(sched.timesteps().size());
+                if (cancel_requested()) {
+                    log_output("[xllama] diffuse: cancelled at unet step " + step_label + "\n");
+                    write_progress("cancelled");
+                    return;
+                }
+                write_progress("unet " + step_label);
+                // scale_model_input on a copy (UNet sees the scaled latent).
+                scaled = latent;
+                sched.scale_model_input(scaled);
+                Ort::Value u_sample{nullptr};
+                if (unet_fp16) {
+                    scaled_f16.resize(scaled.size());
+                    for (size_t i = 0; i < scaled.size(); ++i)
+                        scaled_f16[i] = diffusion::float_to_half(scaled[i]);
+                    u_sample = Ort::Value::CreateTensor(
+                        mem, scaled_f16.data(), scaled_f16.size() * sizeof(uint16_t),
+                        s_shape.data(), s_shape.size(), ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16);
+                } else {
+                    u_sample = Ort::Value::CreateTensor<float>(mem, scaled.data(), scaled.size(),
+                                                               s_shape.data(), s_shape.size());
+                }
+                Ort::Value u_hs =
+                    unet_fp16 ? Ort::Value::CreateTensor(mem, hs_f16.data(),
+                                                         hs_f16.size() * sizeof(uint16_t),
+                                                         h_shape.data(), h_shape.size(),
+                                                         ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16)
+                              : Ort::Value::CreateTensor<float>(mem, hidden.data(), hidden.size(),
+                                                                h_shape.data(), h_shape.size());
+                const double ts_val = sched.timesteps()[s];
+                int64_t ts_i64 = (int64_t)ts_val;
+                float ts_f32 = (float)ts_val;
+                uint16_t ts_f16 = diffusion::float_to_half(ts_f32);
+                Ort::Value u_ts{nullptr};
+                if (ts_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
+                    u_ts = Ort::Value::CreateTensor(mem, &ts_f16, sizeof(ts_f16), t_shape.data(),
+                                                    ts_rank, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16);
+                } else if (ts_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+                    u_ts =
+                        Ort::Value::CreateTensor<float>(mem, &ts_f32, 1, t_shape.data(), ts_rank);
+                } else {
+                    u_ts =
+                        Ort::Value::CreateTensor<int64_t>(mem, &ts_i64, 1, t_shape.data(), ts_rank);
+                }
+
+                Ort::Value u_ins[] = {std::move(u_sample), std::move(u_ts), std::move(u_hs)};
+                const char* u_in_names[] = {"sample", "timestep", "encoder_hidden_states"};
+                const char* u_out_names[] = {"out_sample"};
+                auto t_u0 = std::chrono::steady_clock::now();
+                auto u_out =
+                    unet.Run(Ort::RunOptions{nullptr}, u_in_names, u_ins, 3, u_out_names, 1);
+                unet_ms += ms_since(t_u0);
+                read_output_f32_into(u_out[0], noise); // epsilon [1,4,64,64]
+
+                sched.step(noise, latent); // latent <- previous sample
+            }
+        } // release UNet weights (~1.65 GB) before the VAE's 512x512 activations
+
+        // ---- VAE decode: latent/scale [1,4,64,64] -> sample[1,3,512,512] -----
+        write_progress("vae");
+        for (auto& v : latent)
+            v = v / (float)kVaeScale;
+        std::vector<float> img; // [1,3,512,512] in [-1,1]
+        double vae_ms = 0.0;
+        {
+            Ort::Session vae = make_session(env, model("vae_decoder"));
+            const bool vae_fp16 =
+                input_type_by_name(vae, "latent_sample") == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16;
+            FloatInput v_in =
+                make_float_input(mem, std::move(latent), s_shape.data(), s_shape.size(), vae_fp16);
+            const char* v_in_names[] = {"latent_sample"};
+            const char* v_out_names[] = {"sample"};
+            auto t_v0 = std::chrono::steady_clock::now();
+            auto v_out =
+                vae.Run(Ort::RunOptions{nullptr}, v_in_names, &v_in.value, 1, v_out_names, 1);
+            vae_ms = ms_since(t_v0);
+            img = read_output_f32(v_out[0]);
+        }
+
+        // ---- CHW [-1,1] -> HWC uint8 RGB -> PNG -----------------------------
+        const int HW = kImageHW * kImageHW;
+        std::vector<uint8_t> rgb((size_t)3 * HW);
+        for (int c = 0; c < 3; ++c)
+            for (int i = 0; i < HW; ++i) {
+                float x = img[(size_t)c * HW + i] * 0.5f + 0.5f; // [-1,1] -> [0,1]
+                x = std::max(0.0f, std::min(1.0f, x));
+                rgb[(size_t)i * 3 + c] = (uint8_t)(x * 255.0f + 0.5f);
+            }
+        // Encode with the host-tested writer, then write via the wide-path API
+        // used throughout the UWP code (LocalState paths are wide).
+        const std::vector<uint8_t> png = diffusion::encode_png_rgb(kImageHW, kImageHW, rgb);
+        FILE* pf = _wfopen(utf8_to_wstring(resolve_local_path("diffuse-out.png")).c_str(), L"wb");
+        if (pf) {
+            fwrite(png.data(), 1, png.size(), pf);
+            fclose(pf);
+        }
+
+        const double total_ms = te_ms + unet_ms + vae_ms;
+        const size_t process_peak_ws_mb = peak_working_set_mb();
+        char lb[256];
+        snprintf(lb, sizeof(lb),
+                 "[xllama] diffuse: te %.0f ms | unet %.0f ms (%zu step, %.0f ms/step) | vae "
+                 "%.0f ms | total %.0f ms | process_peak_ws_mb=%zu\n",
+                 te_ms, unet_ms, sched.timesteps().size(),
+                 unet_ms / (double)sched.timesteps().size(), vae_ms, total_ms, process_peak_ws_mb);
+        log_output(lb);
+
+        // Result CSV (+ .done marker), fetchable via Device Portal.
+        FILE* fp = _wfopen(utf8_to_wstring(resolve_local_path("diffuse-result.csv")).c_str(), L"w");
+        if (fp) {
+            time_t now = time(nullptr);
+            char date_buf[32];
+            strftime(date_buf, sizeof(date_buf), "%Y-%m-%dT%H:%M:%SZ", gmtime(&now));
+            fputs("model,steps,seed,te_ms,unet_ms,unet_ms_per_step,vae_ms,total_ms,resolution,"
+                  "date,process_peak_ws_mb\n",
+                  fp);
+            fprintf(fp, "%s,%d,%d,%.1f,%.1f,%.1f,%.1f,%.1f,%dx%d,%s,%zu\n", dir.c_str(), steps,
+                    seed, te_ms, unet_ms, unet_ms / (double)sched.timesteps().size(), vae_ms,
+                    total_ms, kImageHW, kImageHW, date_buf, process_peak_ws_mb);
+            fclose(fp);
+        }
+        if (pf) {
+            FILE* done =
+                _wfopen(utf8_to_wstring(resolve_local_path("diffuse-out.png.done")).c_str(), L"w");
+            if (done) {
+                fputs("done\n", done);
+                fclose(done);
+            }
+            log_output("[xllama] diffuse: wrote diffuse-out.png (" + std::to_string(kImageHW) +
+                       "x" + std::to_string(kImageHW) + ")\n");
+            write_progress("done");
+        } else {
+            log_output("[xllama] diffuse: PNG write failed\n");
+            write_progress("error");
+        }
+    } catch (const Ort::Exception& e) {
+        log_output(std::string("[xllama] diffuse: ORT error: ") + e.what() + "\n");
+        write_progress("error");
+    } catch (const std::exception& e) {
+        log_output(std::string("[xllama] diffuse: error: ") + e.what() + "\n");
+        write_progress("error");
+    }
+}
+
+} // namespace xllama::bridge
+
+#endif // XLLAMA_UWP

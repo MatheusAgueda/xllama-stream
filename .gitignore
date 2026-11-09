@@ -1,0 +1,97 @@
+# Build artifacts
+build/
+out/
+
+# UWP packages & certificates
+# uwp/packages/ is the NuGet restore tree the crossbuild creates; it is vendored
+# output, not source, and it carries third-party Markdown that trips doc checks.
+uwp/packages/
+*.appx
+*.appxbundle
+*.appxsym
+*.pfx
+*.cer
+
+# Models (large GGUF files)
+*.gguf
+models/
+# ...but the model catalogue is source, not a model artifact
+!uwp/models/
+uwp/models/*
+!uwp/models/manifest.json
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+AppPackages/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Training pillar artefacts (adapters, merged GGUF, venv)
+training/out/
+training/host/.venv/
+# Legacy spike paths (shim only)
+scripts/lora-spike/out/
+scripts/lora-spike/.venv/
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+*.swp
+*.swo
+
+# Local credentials (never commit)
+.env
+.release_state.json
+release-bundle/
+.release-upload/
+
+# Generated signing artifacts (per-build, not committed)
+uwp/xllama-test.pfx
+uwp/xllama-test.cer
+
+# Build artefacts (not tracked)
+build-uwp-test/
+build/vendor-onnxruntime-genai/
+build/vendor-onnxruntime/
+out/
+
+# Patched GenAI DLL binary (README in vendor/onnxruntime-genai-patched/ is tracked)
+vendor/onnxruntime-genai-patched/win-x64/
+
+# Patched ORT DLL binary (README in vendor/onnxruntime-patched/ is tracked)
+vendor/onnxruntime-patched/win-x64/
+
+# IDE / tool caches
+.cache/
+.vscode/
+.claude/
+
+# HuggingFace model cache and local test artifacts
+cache_dir/
+testdir/
+ollama-models-before-vm.txt
+
+# validate-console.sh VAE cache (full_vae.onnx / taesd_vae.onnx)
+.cache-validate/
+
+# Downloaded ORT profiling runs (can be tens of MB each)
+bench/results/profiles/*
+!bench/results/profiles/.gitkeep

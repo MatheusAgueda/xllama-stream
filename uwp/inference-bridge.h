@@ -1,0 +1,112 @@
+// Copyright (c) 2024 Gianluca Mazza
+// SPDX-License-Identifier: MIT
+
+#pragma once
+
+#include "xllama/device_train.h"
+#include "xllama/inference.h"
+#include "xllama/inference_params.h"
+#include "xllama/training_params.h"
+
+namespace xllama::bridge {
+
+// Thin wrappers kept for backward compatibility with existing UWP code.
+using InferenceParams = xllama::InferenceParams;
+using InferenceResult = xllama::InferenceResult;
+
+inline InferenceResult run_inference(const InferenceParams& params) {
+    return xllama::run_inference(params);
+}
+
+// Called from UWP App on a background thread (bench mode).
+void main_loop();
+
+// CPU memory-bandwidth micro-bench. Triggered by LocalFolder\membw.flag; writes
+// membw-result.csv (+ .done marker) to LocalState. Pins the DRAM-bandwidth
+// ceiling behind the bandwidth-bound decode number (see docs/benchmarks.md).
+void run_membw();
+
+// Disk (NVMe) read-bandwidth micro-bench (SSD-inference assessment). Triggered
+// by LocalFolder\diskbw.flag; writes diskbw-result.csv (+ .done) to LocalState.
+// Pins the sandboxed file-read rate any weight-streaming scheme would divide by.
+void run_diskbw();
+
+// Phase 15 W3 (#211): own D3D12 compute STREAM read (~1 GB VRAM) + checksum.
+// Triggered by LocalFolder\gpubw.flag; writes gpubw-result.csv (+ .done).
+// Kill criterion 100 GB/s is documented in docs/phase15-re-opt.md — not invented here.
+void run_gpubw();
+
+// Phase 15 H6.2 (#228): Q4_K GEMV density probe (wave32 + naive A/B).
+// Triggered by LocalFolder\gpugemv.flag; writes gpugemv-result.csv (+ .done even
+// on partial PSO failure). Soft G2 40 GB/s packed, K1=8; not a product backend.
+void run_gpugemv();
+
+// GGUF GPU decode probe D1 (docs/gguf-gpu-decode.md). inproc=false: headless
+// gpustep.flag → gpustep-result.csv. inproc=true: gpustep-inproc.flag, run after
+// the XAML window is up → gpustep-inproc-result.csv. Both write a .done marker.
+void run_gpustep(bool inproc);
+
+// d3d12 ggml backend selftest (docs/gguf-gpu-decode.md, D2a). Triggered by
+// LocalFolder\d3d12be.flag; writes d3d12be-result.csv (+ .done). Every Q4_0 /
+// Q4_K / Q6_K shape against ggml's dequantizers. llama builds only.
+void run_d3d12_selftest();
+
+// Operator override for GGUF GPU layers in interactive sessions (GUI and LAN
+// API): the value in LocalState\gguf_gpu_layers.txt, or
+// kGgufGpuLayersKnobAbsent when there is no file. Callers combine it with the
+// catalogue entry through resolve_gguf_gpu_layers (routing_policy.h, D3).
+int gguf_gpu_layers_knob();
+
+// Heap-ceiling probe. Triggered by LocalFolder\ramceil.flag; writes
+// ramceil-result.csv (+ .done marker holding the stop reason) to LocalState.
+// Measures how much heap the process can actually commit under GameOS — the
+// number that decides which model quants are admissible, since GGUF weights
+// are read into the heap and not mapped (see include/xllama/ramceil.h).
+void run_ramceil();
+
+// Phase 16 WS-F (card H16.6): can an AppContainer app on GameOS capture audio?
+// Triggered by LocalFolder\mic.flag; writes mic-result.json (+ .done) holding
+// the WinRT status enums BY NAME, not a boolean — AccessDenied (sandbox says
+// no) and DeviceNotAvailable (no headset plugged in) are different answers, and
+// only the first is a verdict on WS-F. See docs/uwp-constraints.md.
+void run_mic_probe();
+
+// Diffusion pipeline (SD-Turbo on plain ORT DirectML). Triggered by
+// LocalFolder\diffuse.flag (headless) or diffuse-inproc.flag (in-process
+// experiment) — see diffuse.cpp for the model contract.
+void run_diffuse();
+
+// Logit-parity dump: greedy 1-token forward pass on the ORT backend, writing the
+// last prefill-token logits to LocalState\logits.bin (+ .json sidecar, + a
+// logits.done marker). Triggered by LocalFolder\logits.flag. Reads the raw prompt
+// from prompt.txt and the model from model.txt (same config files as bench).
+// scripts/validate-logit-parity.sh pulls the dump and diffs it against the
+// llama.cpp golden via scripts/compare-logits.py.
+void run_logits();
+
+// Single-op CPU-vs-DML repro (#111): loads LocalState\repro.onnx with a plain
+// ORT CPU session and a DML session, feeds repro-input.bin and writes
+// repro-out-cpu.bin / repro-out-dml.bin (+ repro.done marker). Triggered by
+// LocalFolder\oprepro.flag; driven by scripts/validate-op-repro.sh. Used to
+// isolate broken DML kernels (first target: (Skip)SimplifiedLayerNormalization
+// -> MVN2 UseMean=false, the #91 root cause).
+void run_oprepro();
+
+// Lane B on-device training (ggml-opt partial FT). Triggered by
+// LocalFolder\train.flag; reads the job from LocalState\training\job.json
+// (paths inside the job are resolved relative to LocalState), runs
+// prepare → train → export → evaluate in-process on the CPU, and writes
+// <out_dir>\result.json plus a training\result.done marker. See
+// docs/training-architecture.md Lane B and scripts/validate-console-training.sh
+// device-train.
+void run_train();
+
+// Shared runner used by headless train.flag and the in-app personalize path
+// (#116). Localizes relative job paths to LocalState, writes
+// training/progress.json on each progress tick, and returns the engine result.
+// Does NOT exit the process — safe to call while XAML is up.
+// XLLAMA_DEVICE_TRAIN builds only; otherwise returns success=false.
+xllama::TrainingResult run_train_job_localized(const xllama::TrainingJob& job,
+                                               const xllama::DeviceTrainCallbacks& cb = {});
+
+} // namespace xllama::bridge

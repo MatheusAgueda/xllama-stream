@@ -1,0 +1,356 @@
+# bench/
+
+Benchmark suite for xllama. Results are stored as CSV files in `results/`.
+Tested and measured on Series S. Not yet tested on Series X.
+
+## Single source of truth
+
+- `results/*.csv` and `results/*.jsonl` are the immutable measured evidence.
+  A selector `source` may be a top-level file or a campaign path such as
+  `2026-10-11-remeasure-1163/gemma3-270m-q4km-cpu-t6.csv`.
+- `benchmark-summary.json` declares which atomic run represents each comparison
+  row; it contains metadata and selectors, never copied metric values.
+- `docs/benchmarks.md` and `docs/benchmarks-charts.html` contain generated blocks.
+  Refresh them with `python3 scripts/generate-benchmark-summary.py`.
+- CI runs the same command with `--check`; a result or selection-policy change
+  cannot merge while either published surface is stale.
+
+Never combine the best prefill, decode, or RAM values from different CSV rows.
+Add a row to `benchmark-summary.json` when a newly measured configuration should
+appear in the consolidated comparison.
+
+The CSV validator rejects duplicate headers, short or long rows, non-finite
+metrics (including NaN and infinity), negative metrics, and invalid integer
+settings. Historical schemas, single-field comment lines and empty optional cells
+remain supported. Passing
+this structural check does not verify provenance or reproduce a measurement.
+
+## Methodology
+
+- **Prompts**: fixed prompts in `bench/prompts/` (same across all runs for comparability).
+- **Runs**: warmup run 1 (cold start) is discarded; runs 2..N are each recorded **individually** with a `run_index` column, not pre-averaged in the driver (W1.1). `bench-xbox-ort.sh --runs` defaults to 4 → 3 recorded measurement runs. `scripts/generate-benchmark-summary.py` derives the median and the decode min–max spread from the recorded runs; the previous behaviour appended a single median row, which destroyed the spread needed to tell a real change from run-to-run noise. A selector that resolves to only one row (every row written before this change) is reported as-is and marked _single run_ in the generated table.
+- **Metrics**:
+  - `prompt_tok_s`: tokens/second during prompt processing
+  - `decode_tok_s`: tokens/second during generation (excluding prompt)
+  - `peak_ws_mb`: peak working set / RSS in MiB
+  - `load_ms`: model load time in milliseconds
+  - `gpu_mem_mb` / `gpu_budget_mb`: per-process GPU memory CurrentUsage/Budget after model load (`QueryVideoMemoryInfo`, LOCAL segment); 0 on CPU-only runs and Linux builds
+  - `n_prompt_tok`: prefill token count actually measured. Without it a row cannot be compared with one taken at another prompt length — the reason the pre-2026-07 DirectML rows are not re-readable.
+  - ⚠️ **GGUF pre/post-repack boundary (2026-07-25)**: every llama.cpp row written before build 675 predates `GGML_USE_CPU_REPACK` (PR #155 — it was dead code on Series S), so its `prompt_tok_s` is **not comparable** with post-675 rows: the identical model+prompt measures 241.9 pre vs 393.2 post (`phase13-repack-{before,after}.csv`). Decode columns are unaffected.
+  - ⚠️ **GGUF prefill-thread boundary (2026-07-26)**: every llama.cpp row written before build 711 predates the `n_threads_batch` fix (#168, PR #177), so its `prompt_tok_s` was measured on llama.cpp's default **4 prefill threads** regardless of the row's `n_threads` column (which describes decode): 390.7 pre vs 438.1 post at P=298 (`phase13b-threadsbatch-{before,after}.csv`). Decode columns are unaffected.
+  - `n_gen_tok`: tokens actually generated. **Not** the requested `n_predict`: generation is capped by the context window (`prompt + new <= n_ctx`) and can stop early on EOG. A 1574-token prompt at `n_ctx` 2048 caps new tokens at 474 and generated 277.
+  - `run_index`: which recorded repetition of a configuration this row is (W1.1). Written by the device from `bench_run_index.txt`. `0` = a single-run / legacy measurement; a non-zero value marks one of several repeats the summary aggregates into a median + spread.
+- **CSV schema**: `model,quant,backend,n_ctx,n_threads,prompt_tok_s,decode_tok_s,peak_ws_mb,load_ms,gpu_mem_mb,gpu_budget_mb,n_prompt_tok,n_gen_tok,max_length,host,date,run_index,prefill_ms,ttft_ms`
+
+  `backend` is `cpu` or `d3d12` for llama.cpp rows (`d3d12` = GGUF layers on
+  the d3d12 backend, host tag `-gN`) and `ort-genai-cpu` /
+  `ort-genai-dml` for ORT rows. `-noeog` in `host` means the run decoded
+  exactly `n_predict` tokens (`--ignore-eog`).
+
+  `prefill_ms` is prompt-processing duration. `ttft_ms` is measured from
+  prefill start until the first generated token is ready; zero means that no
+  token was produced. The fields are appended after `run_index` to preserve
+  positional compatibility with older bench scripts. They do not establish
+  thermal equilibrium by themselves.
+
+  A hung or timed-out run is recorded explicitly. `bench-xbox-ort.sh` no longer
+  skips a timeout and exits 0 with fewer rows than requested (the 2026-10-11
+  LFM2-2.6B run 4 failure: 2 of 3 measurement rows, `rc=0`). The harness writes
+  a row whose `host` carries `-timeout`, `-stall`, or `-hung`, then exits
+  non-zero. `scripts/generate-benchmark-summary.py` ignores those hosts so a
+  hang cannot enter a median. The in-app watchdog (default 180 s of no prefill
+  or decode progress; 0 disables) logs the phase and position and writes
+  `inference-stall.txt` so the last log line identifies where the run stuck.
+  Cadence and timeout are portable: CLI flags, env vars
+  (`XLLAMA_DECODE_PROGRESS_EVERY`, `XLLAMA_DECODE_PROGRESS_MS`,
+  `XLLAMA_INFER_STALL_TIMEOUT_S`, `XLLAMA_BENCH_TIMEOUT_S`), and optional
+  `bench_stall_timeout.txt` / `bench_decode_progress_every.txt` /
+  `bench_decode_progress_ms.txt`. See `include/xllama/inference_progress.h`.
+
+  A headline throughput claim also requires the exact model file size and
+  quantization, fixed context/prompt/sampling settings, one discarded warm-up,
+  and at least three recorded runs after a stable thermal state. Report the
+  median and min–max spread, never the best row. Measure power externally at
+  the console/UPS outlet and record idle, prefill, sustained decode watts,
+  wattmeter model/firmware, sampling interval, ambient temperature, and the
+  thermal-equilibrium rule in a sidecar report.
+  Generate and validate the sidecar with `scripts/write-benchmark-sidecar.py`;
+  validate raw CSVs with `scripts/validate-benchmark.py`.
+  The schema-1 sidecar writer and validator share one validation policy:
+  model, quantization, build, hardware, thermal rule and wattmeter identifiers
+  must be non-empty; both hashes must be lowercase SHA-256; byte size,
+  context and power sampling interval must be positive integers. Run counts
+  must be integers meeting the warm-up/repetition minimum above. Sampling
+  must be a JSON object without non-finite values; ambient temperature and
+  power readings must be finite numbers, and power readings non-negative.
+  Booleans do not qualify as numeric measurements or counts. Validation
+  checks metadata, not whether a run actually happened or reached thermal
+  equilibrium; retain the underlying raw evidence for review.
+  Both tools preserve
+  v1 historical files and identify v2 explicitly.
+  Rows written before 2026-07-21 have 13 columns and no prompt/generated counts; rows in `phase12-dml-crossover.csv` carry `n_prompt_tok` but leave `n_gen_tok` empty (the console build that produced them predates that column). Rows written before the W1.1 change have no `run_index` and are read as single measurements. The new fields are appended after `run_index` so no earlier positional column shifts: `bench-xbox-ort.sh` parses `backend` ($3), `decode_tok_s` ($7) and `max_length` ($14) positionally. The script refuses to append to a file whose header does not match, and rejects rows whose field count disagrees with the schema.
+
+  `max_length` (added 2026-07-21) is `min(n_ctx, n_prompt_tok + n_predict)`, the value actually requested of the engine. On DirectML it is the variable that governs prefill throughput — see #130 and `docs/uwp-constraints.md` §5c — so a row without it cannot be interpreted, and `n_ctx` does not substitute for it.
+
+**Backend field values**:
+
+- `ort-genai-cpu`: UWP build (`XLLAMA_USE_ORT` defined). Compile-time label; the runtime execution provider on Xbox Series S is CPU EP (see `docs/uwp-constraints.md §5`).
+- `ort-genai-dml`: UWP run whose model directory is a DML asset, or which reported non-zero `gpu_mem_mb` (`src/bridge/bench.cpp`). Rows written before 2026-07-19 mislabel DML runs as `ort-genai-cpu` (older binary).
+- `cpu`: Linux build (llama.cpp path).
+
+## App settings (console validation)
+
+Modern Xbox settings for routing + TAESD: [`configs/settings-modern.json`](configs/settings-modern.json).
+Upload via Device Portal or see [`docs/recommended-config.md`](../docs/recommended-config.md).
+
+## Running benchmarks
+
+### Xbox AI Benchmark (XAB)
+
+Use the XAB wrapper to run the standard Series S Developer Mode profile across one or
+more provisioned models. It composes the existing console harness and keeps
+one raw CSV per model; it does not publish a headline without a valid sidecar.
+
+```bash
+source ~/.config/xllama/xbox-env
+./scripts/run-xab.sh --models lfm25-230m,lfm25-350m --include text,kv,h9 --out bench/results/xab-2026-08-26
+```
+
+Use `--dry-run` to inspect the exact commands without contacting the console.
+The output manifest records the profile, prompt and requested repetitions.
+
+### Hardware identity for new text campaigns
+
+The text harness requires `--hardware xbox-series-s` or
+`--hardware xbox-series-x` (or `XLLAMA_BENCH_HARDWARE`). This is an explicit
+operator declaration, not hardware detection. New text rows carry
+`xbox-series-s-declared` or `xbox-series-x-declared`, followed by the existing
+configuration tags. The package reads `bench_hardware.txt`; absent or invalid
+values produce `xbox-unknown`. The harness rejects a missing/mismatched echo,
+including old packages that still hardcode Series S. It removes the declaration
+on normal exit. This knob is disposable invocation state: every invocation
+replaces any preexisting value and deletes the file on exit. After a killed
+harness, remove the knob before a manual run.
+
+XAB's default `series-s-devmode` profile declares Series S. For a Series X
+text-only campaign:
+
+```bash
+./scripts/run-xab.sh --profile series-x-devmode --include text --models lfm25-350m --out bench/results/series-x-campaign
+```
+
+The manifest records `hardware_identity_source: operator-declared` and
+`hardware_observed: false`. Retain a separate Device Portal/OS receipt of the
+actual device model and exact installed package before interpreting any result
+as Series X evidence. This change does not establish hardware validation.
+Other XAB workloads are blocked under the Series X profile until their identity
+paths are instrumented. Existing probe and KV scripts are outside this text
+identity contract and must not be used as Series X evidence without review.
+
+Direct text-harness callers must now pass the hardware declaration. The
+Series S prompt sweep, speculative-decoding campaign and fp16 external-data
+spike wrappers declare Series S by default and allow
+`XLLAMA_BENCH_HARDWARE` to override that declaration. This does not validate
+the wrappers on Series X. Historical CSVs and published selectors stay frozen;
+new declared labels require deliberate claim selection after review.
+
+### Xbox Series S (automated)
+
+```bash
+source ~/.config/xllama/xbox-env
+./scripts/bench-xbox-ort.sh smollm2-360m-cpu-int4 --hardware xbox-series-s --runs 3 --out bench/results/phase1-cpu.csv
+```
+
+`--threads N` swaps in `bench/configs/genai_config-threads-N.json`; `--gpu-sample`
+records GPU engine/memory telemetry on DML rows. `--ctx N` and `--n-predict N`
+override the engine defaults (2048 / 512) via `bench_ctx.txt` / `bench_npredict.txt`;
+0 keeps the default. `--prompt FILE` and `--out FILE` select the prompt and the
+results CSV. `--timeout S` (or `XLLAMA_BENCH_TIMEOUT_S`, default 300) is the
+harness wait for `bench-result.csv.done`. `--stall-timeout S`,
+`--decode-progress-every N`, and `--decode-progress-ms MS` upload the in-app
+watchdog / progress knobs.
+
+### Xbox Series S — prompt-length sweep
+
+`scripts/bench-prompt-sweep.sh` drives `bench-xbox-ort.sh` across a set of
+synthetic prompt lengths and both backends, one CSV row per point:
+
+```bash
+source ~/.config/xllama/xbox-env
+./scripts/bench-prompt-sweep.sh --tokens "150 300 550 800 1100 1600" --runs 4 \
+  --out bench/results/phase12-dml-crossover.csv
+```
+
+This produced the sweep behind the 1550-token routing threshold and the
+pathological DirectML band documented in `docs/uwp-constraints.md` §5b.
+
+### Xbox Series S — multi-turn TTFT (KV-cache reuse, Stage 2b)
+
+Measures the KV-reuse win: turn-2 prefill **with reuse** (append only the new
+turn) vs the **cold** baseline (full re-prefill of the 2-turn context), on one
+persistent session. Triggered when `bench_turns.txt` is present in LocalState
+(its content = the turn-2 user prompt; `prompt.txt` = turn 1). Upload both plus
+`model.txt` and `bench.flag`, then fetch `bench-kv-result.csv`:
+
+`scripts/bench-xbox-kv.sh` drives this end-to-end (upload, restart, poll, fetch);
+the manual `curl` recipe it replaced is no longer needed:
+
+```bash
+source ~/.config/xllama/xbox-env
+./scripts/bench-xbox-kv.sh smollm2-360m-cpu-int4 \
+  --prompt bench/prompts/standard-512.txt --runs 2 --out bench/results/my-kv.csv
+```
+
+Note `bench-xbox-ort.sh` deletes `bench_turns.txt` before every run, so a stale
+one cannot hijack a single-turn bench into this mode.
+
+Schema: `model,prefill1_ms,n_p1,prefill2_reuse_ms,n_p2_reuse,prefill2_cold_ms,n_p2_cold,speedup,decode_tok_s,n_ctx,host,date`.
+`speedup = prefill2_cold_ms / prefill2_reuse_ms` is the headline number.
+
+### Xbox Series S — deterministic capability suite (H9)
+
+`scripts/eval-xbox-models.sh` sends the fixed tasks in
+`bench/eval/phase7-h9.json` through the app's OpenAI-compatible LAN endpoint.
+It pins temperature 0 / seed 42 and records output, usage, latency and the
+machine-checkable verdict for every task:
+
+```bash
+source ~/.config/xllama/xbox-env
+./scripts/validate-api.sh spike   # H9 needs the LAN API; bench mode never binds it
+./scripts/eval-xbox-models.sh \
+  --models lfm25-350m,lfm25-1.2b-instruct,phi4-mini \
+  --out bench/results/<date>-h9.jsonl
+```
+
+The script truncates `--out` before writing, so always write a new dated file.
+The published H9 column reads only the canonical file named by `quality.source`
+in `bench/benchmark-summary.json` (since 2026-09-30:
+`results/2026-09-30-h9-rescore.jsonl`), and `scripts/check-coherence.py` pins
+its scores. `results/phase7-h9.jsonl` is raw history.
+
+The suite covers Italian, arithmetic, JSON extraction, grounded QA, constrained
+summarisation, translation, multi-turn memory and abstention. It is a compact
+promotion gate, not a general-purpose model benchmark; preserve the task corpus
+unchanged when comparing new candidates to the committed Phase 7 baseline.
+
+**Scorer limits.** Scoring is regex over the response text, so a semantically
+wrong answer that contains the required tokens can pass. Review found one case
+(`lfm25-230m`: "4 core CPU, **ciascuno** occupa 730 MB"). #243 closed it on
+2026-09-30 with forbidden patterns for distributive readings in `grounded_qa`,
+followed by a full re-run (`results/2026-09-30-h9-rescore.jsonl`). Any further
+tightening changes the task definition in `eval/phase7-h9.json` and lands with a
+full re-measurement. Recorded JSONL rows are never edited.
+
+### Linux (manual)
+
+```bash
+cmake --preset linux-release
+cmake --build build/linux-release -j
+
+./build/linux-release/bin/xllama-cli \
+    -m models/smollm2-360m.gguf \
+    -p "$(cat bench/prompts/standard-512.txt)" \
+    -n 128
+```
+
+Timing is printed by the bridge's `write_bench_csv()` in `src/bridge/bench.cpp`.
+Capture output and append a CSV row to `results/phase1-cpu.csv`.
+
+## Prompts
+
+| File                       | Tokens (approx) | Purpose                                                       |
+| -------------------------- | --------------- | ------------------------------------------------------------- |
+| `prompts/standard-512.txt` | ~272            | General-purpose decode benchmark — the name is historical     |
+| `prompts/short-32.txt`     | ~32             | Prompt-processing throughput                                  |
+| `prompts/long-1k.txt`      | ~1000           | Long-prompt prefill; carries a literal ChatML wrapper (below) |
+
+`standard-512.txt` measures **~272 tokens**, not 512 — the filename predates any
+measurement of it. Confirmed by the `n_prompt_tok` column now written by
+`write_bench_csv`, and by `docs/benchmarks.md`, which calls it "the 272-token
+declarative prompt".
+
+`long-1k.txt` embeds `<|im_start|>`/`<|im_end|>` markup. The bench path re-applies
+the model's chat template (`uwp/inference-bridge.cpp`), so feeding it verbatim
+double-templates the prompt. `scripts/bench-prompt-sweep.sh` and
+`scripts/validate-console.sh` both strip the wrapper and use only the prose.
+
+## Results files
+
+Qwen2.5-Coder-3B figures here are earlier measurements of a model under a
+non-commercial research licence; it is not in the catalogue.
+
+**This table is not the index of every file in `results/`** — it currently
+annotates 13 of ~38, and a file's absence from it is not a sign that the file is
+orphaned. The rule: a row exists where the _provenance_ needs explaining (an A/B
+whose two halves are only comparable under a stated condition, a measurement
+whose units are easy to misread, a negative result). Everything else is reachable
+through `benchmark-summary.json`, which declares which run backs which published
+row, and through the phase document that owns the campaign — `phase7-*` in
+`docs/phase7-hypotheses.md`, `phase12-*` in `docs/uwp-constraints.md §5`,
+`phase14-*` in `docs/model-matrix.md`. Before quoting any CSV, check whether one
+of those explains what it means.
+
+| File                                                 | Phase | Backend                                  | Status                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| ---------------------------------------------------- | ----- | ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `results/2026-09-30-excellence-default.csv`          | Audit | Unified MSVC, Series S                   | Exact-package audit trial on `1.6.0.1102` / `879c9d1`, with current LFM QAD weights. Protocol and interpretation: [excellence audit](../docs/audit/excellence/README.md). One warm-up plus three timing rows; retain the short-EOS row and do not claim homogeneous sustained throughput. H9 uses the current task rubric. No power/thermal sidecar and no change to published headline selectors.                                                                                                                                                                                                                                                                                                                                                               |
+| `results/2026-09-30-excellence-h9.jsonl`             | Audit | Unified MSVC, Series S                   | H9 responses and scores for the same exact-package trial; interpretation and limitations are in the [excellence audit](../docs/audit/excellence/README.md).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `results/2026-09-30-catalogue-gates.csv`             | 16+   | llama.cpp CPU (Series S, t6)             | CI package 1.6.0.1072 (sidecar `2026-09-30-catalogue-gates.json`): QAD Q4_0 headline sources for `lfm25-230m` / `lfm25-350m` / `lfm25-1.2b-instruct`, `phi4-mini` T3 PASS, MiniCPM5-1B and Gemma-3-1B T3 (rejected — measured). #267–#270.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `results/2026-09-30-catalogue-gates-h9.jsonl`        | 16+   | LAN API (Series S)                       | H9 of the same session, old scorer. Raw evidence for the #267/#269 rejections; superseded as the H9 source by the rescore file.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `results/2026-09-30-h9-rescore.jsonl`                | 16+   | LAN API (Series S)                       | **Canonical H9 source** (#243): full re-run on the corrected `grounded_qa` scorer, including a temporary `lfm25-230m-qad` entry. Only `lfm25-230m` Q4_K_M moved (2/8 → 1/8).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `results/2026-09-30-qad-prefill-ab.csv`              | 16+   | llama.cpp CPU (Series S, t6)             | Same-build interleaved A/B, Liquid Q4_K_M (`*-q4km` temporary dirs) against QAD Q4_0: about −15% prefill and +8–13% decode on all three LFM2.5 ids.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `results/2026-09-30-mic.json`                        | 16    | AudioGraph (Series S)                    | WS-F microphone probe **PASS** with an Xbox Wireless headset: 3 s, 48 kHz stereo, RMS 0.0191 (#241). `phase16-mic.json` is the room-empty run.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `results/phase1-cpu.csv`                             | 1     | CPU EP (Xbox Series S, Zen 2)            | populated — 4 runs (2026-05-23); best `n_threads=4` at 71.4 tok/s, regression at `n_threads=8` (28.2 tok/s)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `results/phase2-dml.csv`                             | 2     | DML EP (Xbox Series S, RDNA 2)           | ✅ populated (2026-07-07) — utilization matrix (v0.3.6): prefill GPU 354 vs CPU 198 tok/s @1k tok; decode CPU 68 vs GPU fp16 46.8 vs GPU int4 8.8; see `docs/uwp-constraints.md §5`. Note: the committed CSV's `backend` column mislabels DML runs as `ort-genai-cpu` (written by an older binary; `bench.cpp` now emits `ort-genai-dml`)                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `results/profiles/<ts>/`                             | 2     | —                                        | gitignored — downloaded ORT profiling JSON + log tail per run (`profile-dml-run.sh`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `results/phase12-*.csv`                              | 12    | CPU + DML                                | DirectML routing calibration campaign (crossover sweep, max_length band, KV reuse, threads) — see `uwp-constraints.md §5b–§5f`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `results/phase12b-threads-sweep.csv`                 | 12    | CPU EP                                   | the threads-6 ship-condition sweep (3 lengths × {unset,t4,t6} × 3 runs + closing control, build 675, pristine config verified first)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `results/phase13-repack-{before,after}.csv`          | 13    | llama.cpp CPU                            | `GGML_USE_CPU_REPACK` A/B (builds 674/675): prefill +62% on `lfm25-350m` Q4_K_M, decode/RAM unchanged — the post-repack GGUF baseline                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `results/phase13b-threadsbatch-{before,after}.csv`   | 13    | llama.cpp CPU                            | `n_threads_batch` A/B (#168, builds 698/711): prefill +12.1% (P=298) / +10.5% (P=1000) on `lfm25-350m` Q4_K_M, decode/RAM unchanged — the current GGUF prefill headline source                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `results/phase13c-ubatch-sweep.csv`                  | 13    | llama.cpp CPU                            | `n_ubatch` sweep post-repack+#168 (#172, `--ubatch` u128/u256/u512/u1024, P=1000, 3 runs each): **default 512 is the optimum** — u256 −0.7%, u128 −2.4%, u1024 −2.8% and +34 MiB peak. The 2026-07-14 host sweep's "inconclusive" verdict resolves to "keep the default"; peak RAM scales with ubatch (305 → 364 MiB)                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `results/phase15-ramceil.csv`                        | 15    | none (no model loaded)                   | heap-ceiling probe (`ramceil.flag`, MSIX 1.5.1.762): **4864 MB committed / 4893 MiB peak WS** over 38 × 128 MB faulted-in steps, process overhead a flat 29 MB, `avail_phys` ~5113 → 240 MiB. A **lower bound** — it stopped on its own 256 MB floor, not on a failed allocation — and a **headless** one: no model, no XAML, no compositor, so the in-app ceiling is lower. Decides MoE admissibility in H2                                                                                                                                                                                                                                                                                                                                                     |
+| `results/phase15-spec-vocab.csv`                     | 15    | none (vocab-only model load)             | H3 precondition: `common_speculative_are_compatible` (`common/speculative.cpp:64`, which **throws** on failure) replicated over 5 catalogue pairs on host. **`qwen25-coder-3b` ← `qwen25-coder-0.5b` PASSES**, so W2 proceeds. Two negatives kept: Qwen3-1.7B vs Coder share a vocab **size** but differ in 4 token texts, and LFM2.5-8B-A1B carries a 128000-token vocab against LFM2.5-350M's 65536 — H2 and H3 do not compose on the MoE                                                                                                                                                                                                                                                                                                                      |
+| `results/phase15-spec-pregate.csv`                   | 15    | llama.cpp CPU (host, throttled)          | H3 pre-gate: acceptance rate and drafting frequency for both speculative variants, two prompt regimes (`spec-code-edit`, `spec-chat-open`), k=2/4. Host timings in the file are **throttled and unusable** — only `accept_pct` and `n_drafted` transfer, being properties of the pair and the prompt. Combined with the console cost model by `scripts/analyze-spec-pregate.py`: **draft model 1.43x on code but 0.81x on chat** (0.67x at k=4), **prompt lookup 1.53x on code and 1.00x on chat** — it drafts 10 tokens where the draft model drafts 140. Verdict: draft model rejected, draft-free variant proceeds. Companion `…-pregate-batched.txt` is the `llama-batched-bench` curve showing T(n) linear over n=1..8, i.e. no free plateau at small batch |
+| `results/phase15-moe-console.csv`                    | 15    | llama.cpp CPU (Series S)                 | **H2 FAIL**, measured on MSIX 1.5.2.798: `lfm25-8b-a1b` UD-IQ3_S decodes **14.50 tok/s** against the dense `qwen25-coder-3b`'s 14.0, at **3553 MiB** peak (+1437). The sparse-activation premise held — ~631 MB read/token against 645 predicted — but the cost moves off bandwidth, and the model reasons every turn (102 completion tokens to answer "Roma", 401 for two sentences), so perceived latency is ~4× worse. H9 was not run: its tasks cap generation at 16-80 tokens, which a reasoning model cannot clear. Verdict and the two unseparated causes (i-quant dequant vs expert gather) in `docs/phase7-hypotheses.md` §H2                                                                                                                           |
+| `results/phase15-spec-w2-console.csv`                | 15    | llama.cpp CPU (Series S)                 | W2 prompt-lookup A/B (`qwen25-coder-3b`, CI 1.5.2.920): code **1.04× FAIL** ≥1.4×; chat ~0.99×. Opt-in only. SSOT `docs/phase15-re-opt.md`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `results/phase15-gpubw.csv`                          | 15    | D3D12 STREAM (Series S)                  | W3 M6 **PASS**: **119.07 GB/s** read, 1 GiB, checksum_ok (CI 1.5.2.853) ≥100 kill → H6 eng motivated then parked after H6.1                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `results/phase16-gguf.csv`                           | 16    | llama.cpp CPU (Series S, t6)             | Phase 16 model-scouting T3 (2026-08-10, MSIX 1.5.4.887, `n_ctx` 2048, `n_predict` 96, 3 recorded `run_index` each): `lfm25-230m` **PASS** 119.17 tok/s @ 241 MiB (the shipped LiquidAI build; the `unsloth` build's 119.77 is in `phase16-quantiser-ab.csv`); `qwen35-2b` FAIL 19.25 @ 1421 MiB; `maincoder-1b` FAIL 33.49 @ 843 MiB. Also the evidence that the `weights × 1.12` peak factor **under-predicts** (−4% to −47%) — overhead is a ~95 MB floor plus an arch-dependent KV term. Cards and verdicts: `docs/phase16-model-scouting.md`                                                                                                                                                                                                                 |
+| `results/phase16-quantiser-ab.csv`                   | 16    | llama.cpp CPU (Series S, t6)             | Phase 16 quantiser A/B on the same model and quant: `unsloth` LFM2.5-230M-Q4_K_M (153,406,656 B) vs the shipped LiquidAI build (153,406,304 B). **Identical** `peak_ws_mb` 241 and H9 2/8; decode 119.77 vs 119.17 (0.5%). The two artefacts are not byte-identical and their greedy output differs, so the shipping figure is the LiquidAI row in `phase16-gguf.csv`; this file is why that distinction was measured rather than assumed                                                                                                                                                                                                                                                                                                                        |
+| `results/phase16-mic.json`                           | 16    | AudioGraph probe (Series S)              | Phase 16 WS-F S-gate, not a benchmark: `mic.flag` → `run_mic_probe` on MSIX 1.5.4.897. Carries the WinRT status enums by name, because `AccessDenied` (the sandbox refuses) and `DeviceNotAvailable` (no headset attached) are different answers and only the first closes the workstream. Measured: graph `Success` at 48 kHz stereo, node `DeviceNotAvailable`, 0 samples — **inconclusive by design, not FAIL**. Reasoning: `docs/uwp-constraints.md` §10d                                                                                                                                                                                                                                                                                                    |
+| `results/phase16-h9.jsonl`                           | 16    | LAN API (Series S)                       | Phase 16 T4 **harness control only**: `lfm25-350m` re-measured at **4/8**, reproducing its recorded §A1 value before the campaign's own H9 numbers were read. The candidate and incumbent rows (`lfm25-230m` 2/8, `gemma3-270m` 3/8) moved into `phase7-h9.jsonl` when H16.1c shipped, so CI checks them                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `results/phase15-gpugemv.csv`                        | 15    | D3D12 Q4_K GEMV (Series S)               | H6.1: G1 PASS / G2 FAIL (`packed_gbs=2.15` vs soft 40). Measure only; eng parked (#228)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `results/phase15-gpugemv-h62.csv`                    | 15    | D3D12 Q4_K GEMV (Series S)               | H6.2 **K2** (CI `1.5.5.922`): `wave32` G1 PASS, median **25.4** GB/s packed (24.89–26.02); retimed `naive` median 1.96. G2 stays 40. Not a product tok/s table                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `results/phase15-gpugemv-h63.csv`                    | 15    | D3D12 Q4_K GEMV (Series S)               | H6.3 **K3** (CI `1.6.0.1113`): `rows` median **143.06** GB/s packed, `dot4` 136.94, `wave32` 25.12, `naive` 2.10; G1 PASS 3/3. Measure only                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `results/phase15-gpustep-d1.csv`                     | 15    | D3D12 GPU decode probe D1 (Series S)     | **D1 = `D2-matmul-only`** (CI `1.6.0.1117`, headless + in-XAML): round trip 49.7 µs, simulated Coder-3B token 21.16 ms with sync / 14.74 no sync. Schema: `gpustep_csv_header()`; verdict `xllama-cli --gpustep-verdict`. No tok/s                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `results/d2a-d3d12-selftest.csv`                     | 15    | ggml backend `d3d12` selftest (Series S) | D2a run 1 (CI `1.6.0.1123`, 64 threads): 12/12 correct; **FAIL** speed — q4_0 2048×8192 90.6, q6_k 2048×11008 94.3 GB/s                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `results/d2a-d3d12-selftest-t128.csv`                | 15    | ggml backend `d3d12` selftest (Series S) | D2a run 2 (CI `1.6.0.1124`, 128 threads): 12/12 correct; **FAIL** speed — q6_k 65536×1024 64.1 GB/s                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `results/d2a-d3d12-selftest-adaptive.csv`            | 15    | ggml backend `d3d12` selftest (Series S) | **D2a PASS** (CI `1.6.0.1125`, width by K): 12/12 correct, every decode shape ≥ 102 GB/s                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `results/2026-10-02-d2-gguf-gpu-hostbuft.csv`        | 15    | GGUF CPU vs d3d12 (Series S)             | **D2 verdict rows** (CI `1.6.0.1138`): Coder-3B decode 1.59× / prefill 1.32×, LFM2.5-1.2B 1.58× / 1.74×, LFM2.5-350M 0.95×; peak RAM above CPU on all. Host tags `-g99` `-noeog`; 256 tokens per decode run                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `results/2026-10-02-d2-gguf-gpu-final.csv`           | 15    | GGUF CPU vs d3d12 (Series S)             | CI `1.6.0.1137` decode A/B incl. the dropped tied-lm_head-on-CPU arm (`-ocpu`): Coder-3B peak −510 MiB, LFM2.5-1.2B decode 1.37×                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `results/2026-10-02-d2-gguf-gpu.csv`                 | 15    | GGUF CPU vs d3d12 (Series S)             | First D2b runs (CI `1.6.0.113x`); some decode runs stopped before 256 tokens (stop-sequence knob order, fixed) — superseded by `-hostbuft`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `results/2026-10-02-d2-diag.csv`                     | 15    | d3d12 diagnostics (Series S)             | Thread count, partial layers (`-g36`) and ubatch 256 on Coder-3B; diagnostic only                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `results/2026-10-02-d2-h9-{cpu,gpu}.jsonl`           | 15    | H9 via LAN API (XAML process)            | D2 H9 (CI `1.6.0.1138`): LFM2.5-1.2B 6/8 = 6/8, Coder-3B **6/8 → 5/8** (`constrained_summary`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `results/2026-10-02-d2r2-gatea-selftest.csv`         | 15    | ggml backend `d3d12` selftest (Series S) | **Gate A PASS** (CI `1.6.0.1144`, q8 activations): 12/12 within ≤ 2.9e-7 of the CPU backend's q8 vec_dot, decode 109–164 GB/s                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `results/2026-10-02-d2r2-gatea-h9-{cpu,gpu}.jsonl`   | 15    | H9 via LAN API (XAML process)            | Gate A H9 (CI `1.6.0.1144`): Coder-3B 6/8 = 6/8, LFM2.5-1.2B 6/8 = 6/8                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `results/2026-10-02-d2r2-gguf-gpu.csv`               | 15    | GGUF CPU vs d3d12 (Series S)             | First D2-r2 run (CI `1.6.0.1148`, superseded by `-final`): LFM2.5-1.2B decode 1.62× / prefill 1.81×, peak +163/+156 MiB → PASS; Coder-3B 1.55× / 1.27×, peak +159/+220 MiB → FAIL (RAM at P≈1000); 350M 0.97×                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `results/2026-10-02-d2r2-h9-{cpu,gpu}.jsonl`         | 15    | H9 via LAN API (XAML process)            | D2-r2 H9 (CI `1.6.0.1148`): Coder-3B 6/8 = 6/8, LFM2.5-1.2B 6/8 = 6/8                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `results/2026-10-02-d2r2-gguf-gpu-final.csv`         | 15    | GGUF CPU vs d3d12 (Series S)             | **D2-r2 verdict rows** (CI `1.6.0.1156`): Coder-3B decode 1.60× / prefill 1.27×, peak +159/+125 MiB; LFM2.5-1.2B 1.64× / 1.82×, +163/+156 MiB → both PASS; 350M 0.99×                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `results/2026-10-02-d2r2-final-h9-{cpu,gpu}.jsonl`   | 15    | H9 via LAN API (XAML process)            | D2-r2 final H9 (CI `1.6.0.1156`): Coder-3B 6/8 = 6/8, LFM2.5-1.2B 6/8 = 6/8                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `results/2026-10-02-d2r2-selftest.csv`               | 15    | ggml backend `d3d12` selftest (Series S) | Final head (CI `1.6.0.1155`, median of 5): 14/14 — MUL_MAT ≤ 2.9e-7 vs CPU q8 vec_dot, GET_ROWS Q6_K bit-exact; decode 108.7–163.8 GB/s                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `results/2026-10-02-d2r2-selftest-single-sample.csv` | 15    | ggml backend `d3d12` selftest (Series S) | Three single-sample selftests on CI `1.6.0.1154`, same blob: q4_0 2048×8192 at 78.2 / 108.8 / 102.9 GB/s — why the selftest now takes a median                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `results/2026-10-02-d3-coder-ctx4096.csv`            | 15    | GGUF CPU vs d3d12 (Series S)             | D3 (CI `1.6.0.1159`): Coder-3B at catalogue `n_ctx` 4096 — decode 1.60×, prefill 1.28–1.35×, peak +150 / +126 MiB                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `results/2026-10-02-d3-default-h9.jsonl`             | 15    | H9 via LAN API (XAML process)            | D3 default configuration (CI `1.6.0.1159`): Coder-3B 6/8, LFM2.5-1.2B 6/8, LFM2.5-350M 4/8                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `results/2026-10-02-fa-gguf-gpu.csv`                 | 15    | GGUF CPU vs d3d12 (Series S)             | **FA gate rows** (CI `1.6.0.1163`, Flash Attention kept on the GPU path): Coder-3B (ctx 4096) decode 1.90× / prefill 1.65×, peak +88 MiB; LFM2.5-1.2B 1.88× / 2.35×, +77 MiB                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `results/2026-10-02-fa-default-h9.jsonl`             | 15    | H9 via LAN API (XAML process)            | FA gate, default configuration (CI `1.6.0.1163`): Coder-3B 6/8, LFM2.5-1.2B 6/8                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `results/store-app-vs-game-2026-08-21.csv`           | store | llama.cpp CPU (Series S, t6)             | Store D1 App vs Game (`lfm25-350m`, CI `1.5.5.922`, `standard-512`): GPU budget **691 vs 3801 MB**. Long-gen decode App **86.6–87.0** vs Game **94.7**. Peak 320 both. Verdict: request Game metadata. SSOT `docs/release-readiness.md` §6                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `results/phase15-thinking-complete.csv`              | 15    | quality / gates (Series S)               | **#223 closed:** short prompts complete at catalogue `n_predict` 1024 (`thinkdone`); train-style multi-step can fail CoT @768. Not a tok/s table                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `results/t6-shipped-confirm.csv`                     | 12    | ORT CPU EP                               | on-device confirmation of the shipped t6 asset (1.5.0.0 migration, 3 runs): 262.4 prefill / 74.8 decode — feeds the generated ORT CPU headline                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+
+## Diffusion process peak working set
+
+New `diffuse-result.csv` rows append `process_peak_ws_mb`, read from Windows
+`PeakWorkingSetSize` after image encoding and before the result is written.
+The value is the process-lifetime peak working set in MiB, including model
+preload and other work since launch; zero means the reading is unavailable.
+It is neither GPU allocation nor sampled private working set. Use a fresh
+process and record its launch/workload when admitting peak-memory evidence.
+Historical CSV files are unchanged and may omit this column.

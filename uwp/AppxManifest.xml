@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:mp="http://schemas.microsoft.com/appx/2014/phone/manifest"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3"
+  xmlns:xbox="http://schemas.microsoft.com/appx/manifest/xbox/windows10"
+  IgnorableNamespaces="mp uap uap3 xbox">
+
+  <!-- Version: Major.Minor.Build is the semantic version (bump manually per
+       release, alongside CHANGELOG). The Revision (the trailing .0) is stamped
+       automatically in CI to the workflow run number (build-uwp.ps1
+       -BuildRevision) so every build is uniquely, monotonically versioned and
+       the console always accepts an in-place update. Local builds keep .0. -->
+  <Identity
+    Name="GianlucaMazza.xllama"
+    Publisher="CN=xllama-dev"
+    Version="1.7.0.0"
+    ProcessorArchitecture="x64" />
+
+  <mp:PhoneIdentity
+    PhoneProductId="00000000-0000-0000-0000-000000000000"
+    PhonePublisherId="00000000-0000-0000-0000-000000000000" />
+
+  <Properties>
+    <DisplayName>xllama</DisplayName>
+    <PublisherDisplayName>Gianluca Mazza</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Xbox"    MinVersion="10.0.19041.0" MaxVersionTested="10.0.22621.0" />
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.22621.0" />
+    <!-- Required by the Linux uwp-crossbuild /MD store-CRT path (VCRUNTIME140_APP).
+         Device Portal installs without it and then fails launch as 0x80070002. -->
+    <PackageDependency Name="Microsoft.VCLibs.140.00" MinVersion="14.0.0.0"
+        Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-US" />
+  </Resources>
+
+  <Applications>
+    <!-- EntryPoint="xllama.App": activatable class declared in App.idl, compiled by
+         MIDL to xllama.winmd. AppxPackage.Targets picks up $(OutDir)xllama.winmd
+         and includes it in the package payload. At runtime the OS starts xllama.exe
+         whose wWinMain calls CoreApplication::Run(winrt::make<App>()). -->
+    <Application Id="xllama" Executable="xllama.exe" EntryPoint="xllama.App">
+      <uap:VisualElements
+        DisplayName="xllama"
+        Description="Local LLM inference for Xbox Series S"
+        BackgroundColor="#0E1116"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png">
+        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" ShortName="xllama" />
+        <uap:SplashScreen Image="Assets\SplashScreen.png" BackgroundColor="#0E1116" />
+        <uap:InitialRotationPreference>
+          <uap:Rotation Preference="landscape" />
+        </uap:InitialRotationPreference>
+      </uap:VisualElements>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <Capability Name="internetClient" />
+    <!-- privateNetworkClientServer is a base Capability, not a uap:Capability -->
+    <Capability Name="privateNetworkClientServer" />
+    <!-- removableStorage: required to enumerate KnownFolders.RemovableDevices
+         for USB model loading (Exp 3 fallback path). -->
+    <uap:Capability Name="removableStorage" />
+    <!-- microphone: Phase 16 WS-F (card H16.6). Declared so run_mic_probe can
+         find out whether GameOS grants audio capture at all — a console with no
+         text input is the strongest case in the repo for speech, and the answer
+         is unrecorded. Without the capability CreateDeviceInputNodeAsync
+         returns AccessDenied for the manifest, which would be indistinguishable
+         from the sandbox refusing, i.e. the probe would answer its own question
+         wrong.
+
+         DEV MANIFEST ONLY, deliberately. AppxManifest.store.xml declares
+         internetClient and nothing else (docs/release-readiness.md), and it stays
+         that way: shipping speech is a separate decision that has not been
+         taken. If WS-F never ships, this line is removed with the probe. -->
+    <DeviceCapability Name="microphone" />
+  </Capabilities>
+
+</Package>

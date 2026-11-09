@@ -1,0 +1,68 @@
+diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
+index b1ca81a..3cb3d8d 100644
+--- a/src/llama-mmap.cpp
++++ b/src/llama-mmap.cpp
+@@ -593,6 +593,54 @@ struct llama_mmap::impl {
+             }
+         }
+     }
++#elif defined(_WIN32) && defined(LLAMA_WIN32_APP_PARTITION)
++    // AppContainer (UWP, Xbox Developer Mode): CreateFileMappingA / MapViewOfFile are
++    // desktop-only, the *FromApp variants are their app-partition equivalents. The
++    // view is never prefetched: a mapping exists on this path so that a model larger
++    // than the title's RAM budget stays file-backed and its pages (MoE experts) are
++    // read from storage on first touch and dropped by the memory manager under
++    // pressure, which a whole-file PrefetchVirtualMemory would defeat.
++    HANDLE hMapping = nullptr;
++
++    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
++        GGML_UNUSED(prefetch);
++        GGML_UNUSED(numa);
++        GGML_UNUSED(lazy_ranges);
++
++        size = file->size();
++
++        HANDLE hFile = (HANDLE) _get_osfhandle(file->file_id());
++
++        hMapping = CreateFileMappingFromApp(hFile, NULL, PAGE_READONLY, 0, NULL);
++        if (hMapping == NULL) {
++            DWORD error = GetLastError();
++            throw std::runtime_error(format("CreateFileMappingFromApp failed: %s", llama_format_win_err(error).c_str()));
++        }
++
++        addr = MapViewOfFileFromApp(hMapping, FILE_MAP_READ, 0, 0);
++        if (addr == NULL) {
++            DWORD error = GetLastError();
++            CloseHandle(hMapping);
++            hMapping = nullptr;
++            throw std::runtime_error(format("MapViewOfFileFromApp failed: %s", llama_format_win_err(error).c_str()));
++        }
++    }
++
++    void unmap_fragment(size_t first, size_t last) {
++        GGML_UNUSED(first);
++        GGML_UNUSED(last);
++    }
++
++    ~impl() {
++        if (addr && !UnmapViewOfFile(addr)) {
++            LLAMA_LOG_WARN("warning: UnmapViewOfFile failed: %s\n",
++                    llama_format_win_err(GetLastError()).c_str());
++        }
++        if (hMapping && !CloseHandle(hMapping)) {
++            LLAMA_LOG_WARN("warning: CloseHandle failed: %s\n",
++                    llama_format_win_err(GetLastError()).c_str());
++        }
++    }
+ #elif defined(_WIN32) && !defined(LLAMA_WIN32_APP_PARTITION)
+     HANDLE hMapping = nullptr;
+ 
+@@ -695,7 +743,7 @@ void * llama_mmap::addr() const { return pimpl->addr; }
+ 
+ void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
+ 
+-#if defined(_POSIX_MEMLOCK_RANGE) || (defined(_WIN32) && !defined(LLAMA_WIN32_APP_PARTITION))
++#if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
+ const bool llama_mmap::SUPPORTED  = true;
+ #else
+ const bool llama_mmap::SUPPORTED  = false;

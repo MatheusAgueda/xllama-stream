@@ -1,0 +1,9 @@
+{
+  "success": true,
+  "stages": ["prepare", "train", "export_adapter", "merge", "evaluate"],
+  "merged_gguf": "<console-app-data>/training/out/device-marker/merged.gguf",
+  "last_loss": 0.46798,
+  "wall_seconds": 446.069,
+  "peak_ws_mb": 1195,
+  "error": ""
+}
