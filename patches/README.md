@@ -243,6 +243,17 @@ delta-net kernels (`shaders/ggml_d3d12_ssm.hlsl`) read and write in place and
 the CPU reads as host memory, so a linear-attention layer's chain runs in one
 GPU split instead of one per state access. Unset, the placement is upstream's.
 
+`0011-sched-split-profile.patch` (independent of the others): with
+`GGML_SCHED_PROFILE` set (and not `0`), `ggml_backend_sched_compute_splits`
+times each split: its input copies, then its compute until the backend is idle
+(`ggml_backend_synchronize`). The totals are keyed by backend and the split's
+first and last node names, with the layer suffix dropped, so the same split of
+every layer adds up to one line. `ggml_backend_sched_free` logs the 40 most
+expensive kinds (`sched split: <count> x <ms> (copy <ms>) <backend> <first> ..
+<last>`). It is for finding where the CPU time of a decoded token goes. The
+synchronization costs async backends their overlap, so leave it unset for
+timing runs. Unset, the scheduler is unchanged.
+
 ## Applying
 
 ```bash
