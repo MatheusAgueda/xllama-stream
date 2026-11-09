@@ -1751,7 +1751,13 @@ void handle_pull(StreamSocket const& socket, const std::string& body, uint64_t g
         (void)output->write_line(pull_event_json("pulling model"));
     }
 
-    const std::string model_dir = ::xllama::resolve_local_path("models/" + model_name);
+    // A catalogue entry named by an absolute path (a drive or UNC path) downloads
+    // straight into that directory, so big models can live on another volume.
+    const bool absolute_dir =
+        model_name.size() > 2 && ((model_name[1] == ':' && (model_name[2] == '\\' || model_name[2] == '/')) ||
+                                  (model_name[0] == '\\' && model_name[1] == '\\'));
+    const std::string model_dir =
+        absolute_dir ? model_name : ::xllama::resolve_local_path("models/" + model_name);
     bool download_ok = false;
     std::wstring download_error;
     {
