@@ -71,10 +71,10 @@ index 07b4c61..6557247 100644
              cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
 diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
 new file mode 100644
-index 0000000..76862f9
+index 0000000..b93f475
 --- /dev/null
 +++ b/src/llama-expert-cache.cpp
-@@ -0,0 +1,1716 @@
+@@ -0,0 +1,1933 @@
 +#include "llama-expert-cache.h"
 +
 +#include "llama-impl.h"
@@ -129,9 +129,18 @@ index 0000000..76862f9
 +// thread's staging buffer. A thread whose handle cannot read this way reads buffered.
 +static constexpr size_t EC_DIRECT_ALIGN = 4096;
 +
++// LLAMA_EXPERT_IO_QD > 1 (Windows): an unbuffered read goes to the disk as up to that many requests
++// at once, of at least EC_IO_MIN_REQ each, on an overlapped handle; the thread waits for all of them.
++// A thread's synchronous read keeps one request in flight, and the NVMe queue then holds as many as
++// there are threads reading
++static constexpr int    EC_IO_QD_MAX  = 64;
++static constexpr size_t EC_IO_MIN_REQ = 32*1024;
++
 +struct ec_direct {
 +#if defined(_WIN32)
 +    HANDLE h = INVALID_HANDLE_VALUE;
++    std::vector<HANDLE>     ev; // an event per request in flight (the handle is overlapped), else empty
++    std::vector<OVERLAPPED> ov;
 +#else
 +    int fd = -1;
 +#endif
@@ -143,6 +152,7 @@ index 0000000..76862f9
 +struct ec_file {
 +    std::string path;
 +    bool direct = true; // try unbuffered reads first (LLAMA_EXPERT_DIRECT)
++    int  qd     = 1;    // requests in flight per unbuffered read (LLAMA_EXPERT_IO_QD, Windows)
 +    // one handle per compute thread: positional reads on separate file objects run in parallel
 +    std::array<FILE *, GGML_MAX_N_THREADS> fp {};
 +    std::array<ec_direct, GGML_MAX_N_THREADS> dio {};
@@ -158,6 +168,11 @@ index 0000000..76862f9
 +        }
 +        for (ec_direct & d : dio) {
 +#if defined(_WIN32)
++            for (HANDLE e : d.ev) {
++                if (e != nullptr) {
++                    CloseHandle(e);
++                }
++            }
 +            if (d.h != INVALID_HANDLE_VALUE) {
 +                CloseHandle(d.h);
 +            }
@@ -281,6 +296,7 @@ index 0000000..76862f9
 +
 +    bool io_direct = true; // unbuffered reads (LLAMA_EXPERT_DIRECT)
 +    bool io_split  = true; // a load op's reads split over all its threads (LLAMA_EXPERT_SPLIT)
++    int  io_qd     = 1;    // requests in flight per unbuffered read (LLAMA_EXPERT_IO_QD, Windows)
 +
 +    // pre-gating prefetch: pf_k predicted experts per token, read by I/O threads ahead of the plan.
 +    // pf_ahead: layer il+1 is predicted from layer il's post-attention residual and queued right
@@ -324,6 +340,17 @@ index 0000000..76862f9
 +    std::atomic<uint64_t> em_us     {0}; // wall time of the expert-major matmuls (reads and compute)
 +    std::vector<std::vector<uint8_t>> em_stage; // per compute thread: an expert read from the file, or rows of a resident one
 +
++    // where a resident expert comes to the stage from (LLAMA_EXPERT_EM_RESIDENT): its slot, the file
++    // as a missing one does, or auto: whichever filled the stage faster so far. A write-combined slot
++    // (XLLAMA_D3D12_WC_MIB) reads slower than the disk; a write-back one never does. The file's rate
++    // is halved every ubatch, so it follows the disk's load; the slot's is the memory's own
++    int em_resident = 2; // 0 slot, 1 file, 2 auto
++    std::atomic<uint64_t> em_from_file {0}; // resident expert tensors read from the file
++    std::atomic<uint64_t> em_slot_b    {0}; // bytes copied from slots to the stages
++    std::atomic<uint64_t> em_slot_us   {0}; //   and the time the copies took, summed over the threads
++    std::atomic<uint64_t> em_file_b    {0}; // bytes read from the files to the stages (halved every ubatch)
++    std::atomic<uint64_t> em_file_us   {0};
++
 +    void log_stats(const char * when) const {
 +        const uint64_t h = hits.load();
 +        const uint64_t m = misses.load();
@@ -349,10 +376,14 @@ index 0000000..76862f9
 +                    n ? pf_lag_us.load()/1000.0/n : 0.0, n ? pf_run_us.load()/1000.0/n : 0.0,
 +                    pf_ahead ? ", ahead" : "", pf_help ? ", help" : "", prio);
 +        }
-+        char em[192] = "";
++        char em[320] = "";
 +        if (em_rounds.load() > 0) {
-+            snprintf(em, sizeof(em), "; expert-major %" PRIu64 " ubatches, %" PRIu64 " read (%.1f MiB), %" PRIu64 " resident, %" PRIu64 " kept, %.0f ms",
-+                    em_rounds.load(), em_reads.load(), em_bytes.load()/1024.0/1024.0, em_hits.load(), em_kept.load(), em_wall/1000.0);
++            static const char * const res_name[] = { "slot", "file", "auto" };
++            const uint64_t sus = em_slot_us.load();
++            const uint64_t fus = em_file_us.load();
++            snprintf(em, sizeof(em), "; expert-major %" PRIu64 " ubatches, %" PRIu64 " read (%.1f MiB), %" PRIu64 " resident, %" PRIu64 " kept, %.0f ms, %" PRIu64 " resident read from the file (%s; stage from slots %.0f MB/s, from the file %.0f MB/s per thread)",
++                    em_rounds.load(), em_reads.load(), em_bytes.load()/1024.0/1024.0, em_hits.load(), em_kept.load(), em_wall/1000.0,
++                    em_from_file.load(), res_name[em_resident], sus ? (double) em_slot_b.load()/sus : 0.0, fus ? (double) em_file_b.load()/fus : 0.0);
 +        }
 +        uint64_t n_direct = 0;
 +        uint64_t n_staged = 0;
@@ -362,9 +393,15 @@ index 0000000..76862f9
 +            n_staged   += f->n_staged.load();
 +            n_buffered += f->n_buffered.load();
 +        }
-+        char io[128] = "";
-+        snprintf(io, sizeof(io), "; reads %" PRIu64 " direct, %" PRIu64 " staged, %" PRIu64 " buffered%s",
-+                n_direct, n_staged, n_buffered, io_split ? ", split" : "");
++        char qd[16] = "";
++#if defined(_WIN32)
++        if (io_qd > 1) {
++            snprintf(qd, sizeof(qd), ", qd %d", io_qd);
++        }
++#endif
++        char io[160] = "";
++        snprintf(io, sizeof(io), "; reads %" PRIu64 " direct, %" PRIu64 " staged, %" PRIu64 " buffered%s%s",
++                n_direct, n_staged, n_buffered, io_split ? ", split" : "", qd);
 +        LLAMA_LOG_INFO("expert cache (%s): %u slots x %zu layers, %" PRIu64 " ubatches, %" PRIu64 " hits, %" PRIu64 " misses (%.1f%% hit), %" PRIu64 " swaps, %.1f MiB read in %.0f ms%s%s%s\n",
 +                when, n_slots, layers.size(), n_rounds, h, m, h + m ? 100.0*h/(h + m) : 0.0, swaps.load(), bytes.load()/1024.0/1024.0, us/1000.0, pf, em, io);
 +    }
@@ -445,7 +482,10 @@ index 0000000..76862f9
 +// positional read, safe to run from every compute thread at once
 +//
 +
-+static bool ec_direct_open(const std::string & path, ec_direct & d) {
++static void ec_direct_close(ec_direct & d);
++
++// qd > 1: an overlapped handle with qd requests' events (Windows; elsewhere qd is not used)
++static bool ec_direct_open(const std::string & path, ec_direct & d, int qd) {
 +#if defined(_WIN32) && defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x0602
 +    // CreateFile2: the opener an AppContainer (UWP) may call, on the desktop too
 +    const int nw = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
@@ -457,21 +497,44 @@ index 0000000..76862f9
 +    CREATEFILE2_EXTENDED_PARAMETERS p = {};
 +    p.dwSize           = sizeof(p);
 +    p.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
-+    p.dwFileFlags      = FILE_FLAG_NO_BUFFERING | FILE_FLAG_RANDOM_ACCESS;
++    p.dwFileFlags      = FILE_FLAG_NO_BUFFERING | FILE_FLAG_RANDOM_ACCESS | (qd > 1 ? FILE_FLAG_OVERLAPPED : 0);
 +    d.h = CreateFile2(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING, &p);
-+    return d.h != INVALID_HANDLE_VALUE;
++    if (d.h == INVALID_HANDLE_VALUE) {
++        return false;
++    }
++    if (qd > 1) {
++        d.ov.assign((size_t) qd, OVERLAPPED {});
++        d.ev.assign((size_t) qd, nullptr);
++        for (HANDLE & e : d.ev) {
++            e = CreateEventExW(nullptr, nullptr, CREATE_EVENT_MANUAL_RESET, EVENT_ALL_ACCESS);
++            if (e == nullptr) {
++                ec_direct_close(d);
++                return false;
++            }
++        }
++    }
++    return true;
 +#elif !defined(_WIN32) && defined(O_DIRECT)
++    GGML_UNUSED(qd);
 +    d.fd = open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
 +    return d.fd >= 0;
 +#else
 +    GGML_UNUSED(path);
 +    GGML_UNUSED(d);
++    GGML_UNUSED(qd);
 +    return false;
 +#endif
 +}
 +
 +static void ec_direct_close(ec_direct & d) {
 +#if defined(_WIN32)
++    for (HANDLE e : d.ev) {
++        if (e != nullptr) {
++            CloseHandle(e);
++        }
++    }
++    d.ev = std::vector<HANDLE>();
++    d.ov = std::vector<OVERLAPPED>();
 +    if (d.h != INVALID_HANDLE_VALUE) {
 +        CloseHandle(d.h);
 +        d.h = INVALID_HANDLE_VALUE;
@@ -486,9 +549,107 @@ index 0000000..76862f9
 +    d.stage = std::vector<char>();
 +}
 +
++#if defined(_WIN32) && defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x0602
++// the requests an aligned span of len bytes is read in with qd in flight: *n of the returned size
++// (a multiple of EC_DIRECT_ALIGN, at most 1 GiB), the last one shorter. As many as qd, unless that
++// makes them smaller than EC_IO_MIN_REQ; more than qd only for a span over qd GiB
++static size_t ec_io_req_size(size_t len, int qd, size_t * n) {
++    const size_t A = EC_DIRECT_ALIGN;
++    if (len == 0) {
++        *n = 0;
++        return 0;
++    }
++    const size_t k  = std::min<size_t>((size_t) std::max(qd, 1), std::max<size_t>(1, len/EC_IO_MIN_REQ));
++    const size_t rs = std::min<size_t>(((len + k - 1)/k + A - 1)/A*A, (size_t) 1 << 30);
++    *n = (len + rs - 1)/rs;
++    return rs;
++}
++
++// one overlapped read of want bytes at pos into buf with request r's event, waited for: the bytes
++// read, 0 on error (also at the end of the file)
++static DWORD ec_direct_read1(ec_direct & d, size_t r, char * buf, uint64_t pos, DWORD want) {
++    OVERLAPPED & o = d.ov[r];
++    o            = OVERLAPPED {};
++    o.Offset     = (DWORD) (pos & 0xFFFFFFFFu);
++    o.OffsetHigh = (DWORD) (pos >> 32);
++    o.hEvent     = d.ev[r];
++    DWORD got = 0;
++    if (!ReadFile(d.h, buf, want, nullptr, &o) && GetLastError() != ERROR_IO_PENDING) {
++        return 0;
++    }
++    return GetOverlappedResult(d.h, &o, &got, TRUE) ? got : 0;
++}
++
++// ec_direct_span on an overlapped handle (LLAMA_EXPERT_IO_QD > 1): the requests of the span that
++// [lo, end) needs, up to qd in flight at once, every one issued waited for before returning (the
++// buffer is the caller's). A request that stops short before end (it should not, unbuffered) is
++// read on from there once its wave is done
++static bool ec_direct_span_qd(ec_direct & d, char * buf, size_t lo, size_t len, size_t end) {
++    const size_t qd = std::min<size_t>(d.ev.size(), EC_IO_QD_MAX);
++    size_t n = 0;
++    const size_t rs = ec_io_req_size(len, (int) qd, &n);
++    std::array<DWORD, EC_IO_QD_MAX> got_of {};
++    for (size_t b = 0; b < n && lo + b*rs < end; b += qd) {
++        bool   ok     = true;
++        size_t issued = 0;
++        for (; issued < qd && b + issued < n && lo + (b + issued)*rs < end; ++issued) {
++            const size_t   at  = (b + issued)*rs;
++            const uint64_t pos = (uint64_t) (lo + at);
++            OVERLAPPED & o = d.ov[issued];
++            o            = OVERLAPPED {};
++            o.Offset     = (DWORD) (pos & 0xFFFFFFFFu);
++            o.OffsetHigh = (DWORD) (pos >> 32);
++            o.hEvent     = d.ev[issued];
++            if (!ReadFile(d.h, buf + at, (DWORD) std::min(rs, len - at), nullptr, &o) && GetLastError() != ERROR_IO_PENDING) {
++                ok = false;
++                break;
++            }
++        }
++        // every request issued is waited for, cancelled first once one has failed
++        for (size_t i = 0; i < issued; ++i) {
++            if (!ok) {
++                CancelIoEx(d.h, &d.ov[i]);
++            }
++        }
++        for (size_t i = 0; i < issued; ++i) {
++            DWORD got = 0;
++            const BOOL r = GetOverlappedResult(d.h, &d.ov[i], &got, TRUE);
++            got_of[i] = got;
++            if (ok && (!r || got == 0)) {
++                ok = false;
++                for (size_t j = i + 1; j < issued; ++j) {
++                    CancelIoEx(d.h, &d.ov[j]);
++                }
++            }
++        }
++        if (!ok) {
++            return false;
++        }
++        for (size_t i = 0; i < issued; ++i) {
++            const size_t at   = (b + i)*rs;
++            const size_t want = std::min(rs, len - at);
++            size_t       done = got_of[i];
++            while (done < want && lo + at + done < end) {
++                const DWORD got = ec_direct_read1(d, i, buf + at + done, (uint64_t) (lo + at + done), (DWORD) (want - done));
++                if (got == 0) {
++                    return false;
++                }
++                done += got;
++            }
++        }
++    }
++    return true;
++}
++#endif
++
 +// unbuffered read of the aligned span [lo, lo + len) into buf, stopping once it holds [lo, end): the
 +// span may run past the end of the file, where the read stops short
 +static bool ec_direct_span(ec_direct & d, char * buf, size_t lo, size_t len, size_t end) {
++#if defined(_WIN32) && defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x0602
++    if (!d.ev.empty()) {
++        return ec_direct_span_qd(d, buf, lo, len, end);
++    }
++#endif
 +    size_t done = 0;
 +    while (lo + done < end) {
 +        const size_t want = std::min<size_t>(len - done, (size_t) 1 << 30);
@@ -522,7 +683,7 @@ index 0000000..76862f9
 +static bool ec_read_direct(ec_file & f, int ith, void * dst, size_t n, size_t offs) {
 +    ec_direct & d = f.dio[ith];
 +    if (d.state == 0) {
-+        d.state = ec_direct_open(f.path, d) ? 1 : -1;
++        d.state = ec_direct_open(f.path, d, f.qd) ? 1 : -1;
 +    }
 +    if (d.state < 0) {
 +        return false;
@@ -1366,9 +1527,25 @@ index 0000000..76862f9
 +        C.em_kept += L.em_kept.size();
 +        if (L.id == C.first_layer) {
 +            C.em_rounds++;
++            // no matmul runs during a prep op: the halving races no thread's sum
++            C.em_file_b.store(C.em_file_b.load() / 2);
++            C.em_file_us.store(C.em_file_us.load() / 2);
 +        }
 +    }
 +    L.em_state[E.pos] = 1;
++}
++
++// LLAMA_EXPERT_EM_RESIDENT: a resident expert read from the file instead of copied from its slot.
++// auto: once both have filled 4 MiB of stage, if the file did it faster
++static bool ec_em_resident_from_file(const llama_expert_cache & C) {
++    if (C.em_resident != 2) {
++        return C.em_resident == 1;
++    }
++    const double min = 4.0*1024*1024;
++    const double sb  = (double) C.em_slot_b.load(std::memory_order_relaxed);
++    const double fb  = (double) C.em_file_b.load(std::memory_order_relaxed);
++    return sb >= min && fb >= min &&
++           (double) C.em_file_us.load(std::memory_order_relaxed)*sb < (double) C.em_slot_us.load(std::memory_order_relaxed)*fb;
 +}
 +
 +// all threads: dst [rows, n_used, n_tokens] (F32) = ggml_mul_mat_id(w, b, ids); the threads take the
@@ -1392,9 +1569,15 @@ index 0000000..76862f9
 +    const size_t  qrs    = ggml_row_size(tr->vec_dot_type, k);
 +    const size_t  nb2    = w->nb[2];
 +    const int32_t n_list = (int32_t) E.list.size();
++    const bool    res_file = ec_em_resident_from_file(C);
 +
-+    uint64_t reads = 0;
-+    uint64_t hits  = 0;
++    uint64_t reads     = 0;
++    uint64_t hits      = 0;
++    uint64_t from_file = 0;
++    uint64_t slot_b    = 0; // bytes to the stage from slots and from the file, and the time it took
++    uint64_t slot_us   = 0;
++    uint64_t file_b    = 0;
++    uint64_t file_us   = 0;
 +    const char * src[EC_EM_CHUNK];
 +    float      * out[EC_EM_CHUNK];
 +    std::vector<uint8_t> & stage = C.em_stage[ith];
@@ -1433,24 +1616,36 @@ index 0000000..76862f9
 +        };
 +        // the CPU never computes from a slot: a write-combined slot (XLLAMA_D3D12_WC_MIB) is uncached,
 +        // each load a bus read. A read goes to the stage, then to the round's slot with streaming
-+        // stores; a resident expert comes to the stage a block of rows at a time with streaming loads
-+        if (v < 0 && s >= 0) {
++        // stores; a resident expert comes to the stage a block of rows at a time with streaming loads,
++        // or is read from the file like a missing one (res_file), its slot left as it is
++        if (v < 0 && s >= 0 && !res_file) {
 +            const char * slot = (const char *) w->data + (size_t) s*nb2;
 +            char       * buf  = stage_buf(std::min<size_t>(nb2, (size_t) blk*nb1));
 +            for (int64_t r0 = 0; r0 < n_rows; r0 += blk) {
 +                const int64_t r1 = std::min(n_rows, r0 + blk);
++                const int64_t c0 = ggml_time_us();
 +                ec_copy_stream(buf, slot + (size_t) r0*nb1, (size_t) (r1 - r0)*nb1, false);
++                slot_us += (uint64_t) (ggml_time_us() - c0);
 +                mm_rows(buf, r0, r1);
 +            }
++            slot_b += (size_t) n_rows*nb1;
 +            hits++;
 +        } else {
 +            char * buf = stage_buf(nb2);
++            const int64_t c0 = ggml_time_us();
 +            ec_read(*C.files[T.file], ith, buf, nb2, T.offs + (size_t) e*nb2);
++            file_us += (uint64_t) (ggml_time_us() - c0);
++            file_b  += nb2;
 +            if (v >= 0) {
 +                ec_copy_stream((char *) w->data + (size_t) v*nb2, buf, nb2, true);
 +            }
 +            mm_rows(buf, 0, n_rows);
-+            reads++;
++            if (v < 0 && s >= 0) {
++                hits++;
++                from_file++;
++            } else {
++                reads++;
++            }
 +        }
 +    }
 +
@@ -1460,6 +1655,17 @@ index 0000000..76862f9
 +    }
 +    if (hits > 0) {
 +        C.em_hits += hits;
++    }
++    if (from_file > 0) {
++        C.em_from_file += from_file;
++    }
++    if (slot_b > 0) {
++        C.em_slot_b  += slot_b;
++        C.em_slot_us += slot_us;
++    }
++    if (file_b > 0) {
++        C.em_file_b  += file_b;
++        C.em_file_us += file_us;
 +    }
 +    // the threads start together after the graph barrier: the op lasts as long as the slowest
 +    const int64_t dt = ggml_time_us() - t0;
@@ -1549,6 +1755,16 @@ index 0000000..76862f9
 +    cache->io_direct = dio == nullptr || *dio == '\0' || atoi(dio) != 0;
 +    const char * split = getenv("LLAMA_EXPERT_SPLIT");
 +    cache->io_split = split == nullptr || *split == '\0' || atoi(split) != 0;
++    // LLAMA_EXPERT_IO_QD: requests in flight per unbuffered read on Windows (1, the default: one)
++    const char * qd = getenv("LLAMA_EXPERT_IO_QD");
++    cache->io_qd = qd != nullptr && *qd != '\0' ? std::min(std::max(atoi(qd), 1), EC_IO_QD_MAX) : 1;
++    // LLAMA_EXPERT_EM_RESIDENT: where an expert-major ubatch's resident experts come from (slot,
++    // file, auto - the default; also 0, 1, 2)
++    const char * res = getenv("LLAMA_EXPERT_EM_RESIDENT");
++    if (res != nullptr && *res != '\0') {
++        cache->em_resident = strcmp(res, "slot") == 0 || strcmp(res, "0") == 0 ? 0 :
++                             strcmp(res, "file") == 0 || strcmp(res, "1") == 0 ? 1 : 2;
++    }
 +
 +    cache->buft = {
 +        /* .iface = */ {
@@ -1656,6 +1872,7 @@ index 0000000..76862f9
 +        cache->files.emplace_back(new ec_file());
 +        cache->files.back()->path   = path;
 +        cache->files.back()->direct = cache->io_direct;
++        cache->files.back()->qd     = cache->io_qd;
 +    }
 +
 +    auto & slot = cache->layers[il];

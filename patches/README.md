@@ -149,6 +149,19 @@ load, or in the middle of an expert-major round, leaves no slot pointing at
 data that never arrived: the next op of the layer empties those slots. The
 stats line adds expert-major ubatches, reads, MiB, resident hits, experts kept
 in slots and the time the matmuls took.
+A resident expert of an expert-major ubatch reaches the stage from its slot or
+from the file (env `LLAMA_EXPERT_EM_RESIDENT`: `slot`, `file`, `auto` - the
+default; also 0, 1, 2). Write-combined slots (`XLLAMA_D3D12_WC_MIB`) are read
+by the CPU at about 1 GB/s on the console, slower than the disk: with WC40 a
+1038-token prompt took 51.4 s against 40.4 s with write-back slots. `auto`
+times every copy from a slot and every read from the file per thread and,
+once both have moved 4 MiB, reads a resident expert from the file whenever the
+file filled the stage faster; the file's totals are halved every ubatch so the
+choice follows the disk's load (the misses share it), the slots' stay the
+memory's own. Write-back slots copy far faster than the disk reads, so `auto`
+keeps them. Either way the same bytes reach the stage: same results. The stats
+line adds the resident experts read from the file, the mode, and the stage
+fill rate per thread from slots and from the file (MB/s).
 Reads are unbuffered (env `LLAMA_EXPERT_DIRECT`, default 1; `CreateFile2` with
 `FILE_FLAG_NO_BUFFERING | FILE_FLAG_RANDOM_ACCESS`, `O_DIRECT` on Linux): no
 copy through the OS file cache, no read-ahead. A read whose file span,
@@ -163,18 +176,29 @@ parts of at least 128 KiB until every thread has one in flight
 whole reads, vs 2.13 GB/s for unbuffered sequential reads in `diskbw`. The
 stats line ends with the direct, staged and buffered read counts, plus
 `split` when splitting is on.
+A thread's unbuffered read keeps one request in flight, so the disk sees as
+many as there are threads reading (6; 1.68 GB/s in a 35B decode on the
+console). On Windows, env `LLAMA_EXPERT_IO_QD` (1..64, default 1) opens the
+handles with `FILE_FLAG_OVERLAPPED` and issues each read as up to that many
+4 KiB-aligned requests of at least 32 KiB at once, then waits for all of them
+(`GetOverlappedResult`); a request that fails cancels the others still in
+flight, every one is waited for before the read returns (the buffer is the
+caller's) and the thread falls back as above. Elsewhere the knob does nothing.
+The stats line adds `, qd N` when it is on (Windows).
 `tests/test_expert_cache.cpp` decodes a small MoE with 2 and 3 of its 4 experts
 resident and checks the tokens and logits against the same model fully
 resident, with prefetch on (it must read ahead somewhere) and off, that
 buffered whole reads give the same tokens and logits bit for bit as the
-unbuffered split ones (which must happen on Linux), that prefetch with whole
+unbuffered split ones (which must happen on Linux), and so do reads with 8
+requests in flight (`LLAMA_EXPERT_IO_QD=8`, unbuffered and reported on Windows), that prefetch with whole
 jobs gives the same tokens as with parts and logits within 1e-4 of the fully
 resident model, that prefetch ahead does too (and must read ahead somewhere),
 that plans which only wait for the I/O threads give the same tokens and read no
 part themselves (with help on, never more parts than the reads they waited
 for hold), that a swap ratio of 0.5 reads less, and that expert-major prompts (with and without
 experts resident from earlier tokens, and with every slot free so the decode
-starts from the experts the prompt kept) give the same tokens and logits
+starts from the experts the prompt kept) give the same tokens and logits,
+bit for bit whether their resident experts come from the slots or the file
 (`.github/workflows/expert-cache-host.yml`); its opt-in "expert-cache bench"
 measures speed, hit rate, top-1 agreement and KL per `ratio[:k[a][:em]]` config
 on the 35B and keeps the routing trace (`.github/workflows/expert-cache-bench.yml`).

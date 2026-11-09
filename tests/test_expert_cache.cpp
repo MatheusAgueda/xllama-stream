@@ -101,20 +101,24 @@ WaitStats waits_of(const std::string& line) {
     return w;
 }
 
-// The "expert-major N ubatches, R read (M MiB), H resident, K kept" counts of a
-// stats line, all -1 when no ubatch ran expert-major.
+// The "expert-major N ubatches, R read (M MiB), H resident, K kept, T ms, F
+// resident read from the file (mode" counts of a stats line, all -1 (mode
+// empty) when no ubatch ran expert-major.
 struct EmStats {
     long long ubatches = -1;
     long long reads = -1;
     long long resident = -1;
     long long kept = -1;
+    long long from_file = -1;
+    std::string mode;
 };
 
 EmStats em_of(const std::string& line) {
     EmStats s;
     const char* p = std::strstr(line.c_str(), "; expert-major ");
-    unsigned long long u = 0, r = 0, h = 0, k = 0;
-    double mib = 0.0;
+    unsigned long long u = 0, r = 0, h = 0, k = 0, f = 0;
+    double mib = 0.0, ms = 0.0;
+    char mode[8] = "";
     if (p && std::sscanf(
                  p, "; expert-major %llu ubatches, %llu read (%lf MiB), %llu resident, %llu kept",
                  &u, &r, &mib, &h, &k) == 5) {
@@ -122,6 +126,13 @@ EmStats em_of(const std::string& line) {
         s.reads = static_cast<long long>(r);
         s.resident = static_cast<long long>(h);
         s.kept = static_cast<long long>(k);
+    }
+    if (p && std::sscanf(p,
+                         "; expert-major %llu ubatches, %llu read (%lf MiB), %llu resident, %llu "
+                         "kept, %lf ms, %llu resident read from the file (%7[a-z]",
+                         &u, &r, &mib, &h, &k, &ms, &f, mode) == 8) {
+        s.from_file = static_cast<long long>(f);
+        s.mode = mode;
     }
     return s;
 }
@@ -153,6 +164,18 @@ void set_env_k(const char* name, int k) {
     #else
     if (k >= 0)
         setenv(name, std::to_string(k).c_str(), 1);
+    else
+        unsetenv(name);
+    #endif
+}
+
+// A string env knob read at model load: nullptr restores the default.
+void set_env_s(const char* name, const char* value) {
+    #ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+    #else
+    if (value)
+        setenv(name, value, 1);
     else
         unsetenv(name);
     #endif
@@ -473,6 +496,34 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
         CHECK(buffered.tokens == plain.tokens);
         CHECK(buffered.logits == plain.logits);
 
+        // Unbuffered reads with 8 requests in flight (LLAMA_EXPERT_IO_QD=8, an
+        // overlapped handle on Windows; elsewhere the knob does nothing): the
+        // same bytes reach the slots, so the same tokens and logits bit for bit.
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            log.final_line.clear();
+        }
+        set_env_k("LLAMA_EXPERT_IO_QD", 8);
+        const EcRun queued = run_greedy(path, c.slots, 512, c.used, 24);
+        set_env_k("LLAMA_EXPERT_IO_QD", -1);
+        REQUIRE(queued.ok);
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            MESSAGE(log.final_line);
+            const IoStats io = io_of(log.final_line);
+            CHECK(io.direct + io.staged + io.buffered > 0);
+            CHECK(misses_of(log.final_line) == plain_misses);
+    #ifdef _WIN32
+            CHECK(log.final_line.find(", qd 8") != std::string::npos);
+            // NTFS on the runner: the overlapped reads must not fall back
+            CHECK(io.direct + io.staged > 0);
+    #else
+            CHECK(log.final_line.find(", qd ") == std::string::npos);
+    #endif
+        }
+        CHECK(queued.tokens == plain.tokens);
+        CHECK(queued.logits == plain.logits);
+
         // Prefetch jobs read whole by one I/O thread (LLAMA_EXPERT_SPLIT=0), where
         // the cached run above split each expert in parts over all of them: the
         // reads change which experts are resident, never the routing.
@@ -666,6 +717,40 @@ TEST_CASE(
             CHECK(s.kept > 0);
         CHECK(s.kept <= s.reads);
         CHECK(misses_of(final_line) > 0); // the decode
+        // auto (the default): any resident expert may come from the file
+        CHECK(s.mode == "auto");
+        CHECK(s.from_file >= 0);
+        CHECK(s.from_file <= s.resident);
+
+        // Resident experts read from the file (LLAMA_EXPERT_EM_RESIDENT=file)
+        // or copied from their slots (=slot): the same bytes reach the stage,
+        // so the same tokens and logits bit for bit.
+        for (const char* mode : {"file", "slot"}) {
+            CAPTURE(mode);
+            {
+                std::lock_guard<std::mutex> lock(log.mtx);
+                log.final_line.clear();
+            }
+            set_expert_major(64);
+            set_env_s("LLAMA_EXPERT_EM_RESIDENT", mode);
+            const EcRun forced = run_greedy(path, c.slots, 512, c.used, 24, 0.0f, c.split);
+            set_env_s("LLAMA_EXPERT_EM_RESIDENT", nullptr);
+            set_expert_major(-1);
+            REQUIRE(forced.ok);
+            std::string forced_line;
+            {
+                std::lock_guard<std::mutex> lock(log.mtx);
+                forced_line = log.final_line;
+            }
+            MESSAGE(forced_line);
+            const EmStats f = em_of(forced_line);
+            CHECK(f.mode == mode);
+            CHECK(f.resident == s.resident);
+            CHECK(f.kept == s.kept);
+            CHECK(f.from_file == (std::strcmp(mode, "file") == 0 ? f.resident : 0));
+            CHECK(forced.tokens == em.tokens);
+            CHECK(forced.logits == em.logits);
+        }
 
         const EcRun full = run_greedy(path, 0, 64, c.used, 24, 0.0f, c.split);
         REQUIRE(full.ok);
