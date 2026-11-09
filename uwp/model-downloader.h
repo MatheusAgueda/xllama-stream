@@ -110,6 +110,10 @@ struct ManifestEntry {
     // "expert_swap": (0, 1] → cache-aware routing with expert_slots, fewer reads
     // for a small change in output. SessionParams::expert_swap.
     double expert_swap = 0.0;
+    // "expert_prefetch" / "expert_major": with expert_slots, experts read ahead
+    // per token and the largest expert-major prompt ubatch (0 = off).
+    int expert_prefetch = 0;
+    int expert_major = 0;
 };
 
 // Load the model catalogue: InstalledPath\models\manifest.json (bundled) is

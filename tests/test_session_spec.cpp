@@ -91,6 +91,21 @@ TEST_CASE("resolve_session_params: one resolver for every surface (ADR 0007)") {
     sw.expert_swap = 0.5f;
     sw.expert_slots = 0;
     CHECK(resolve_session_params("moe", sw, "D:\\m\\moe", -1).expert_swap == 0.0f);
+
+    // Prefetch and expert-major need the cache; prefetch is capped at 64.
+    CatalogueLoad pf = g;
+    pf.expert_slots = 32;
+    pf.expert_prefetch = 8;
+    pf.expert_major = 256;
+    CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).expert_prefetch == 8);
+    CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).expert_major == 256);
+    pf.expert_prefetch = 500;
+    pf.expert_major = -3;
+    CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).expert_prefetch == 64);
+    CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).expert_major == 0);
+    pf.expert_slots = 0;
+    pf.expert_prefetch = 8;
+    CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).expert_prefetch == 0);
 }
 
 TEST_CASE("same_load: an adapter, context or GPU split is a different model in RAM") {
@@ -104,7 +119,7 @@ TEST_CASE("same_load: an adapter, context or GPU split is a different model in R
     other.n_threads = 6; // a tuning knob, not the load
     other.n_batch = 256;
     CHECK(same_load(base, other));
-    for (int field = 0; field < 8; ++field) {
+    for (int field = 0; field < 10; ++field) {
         auto changed = base;
         switch (field) {
         case 0:
@@ -130,6 +145,12 @@ TEST_CASE("same_load: an adapter, context or GPU split is a different model in R
             break;
         case 7:
             changed.expert_swap = 0.5f; // the cache is built at load with its routing
+            break;
+        case 8:
+            changed.expert_prefetch = 8; // read from the environment at load
+            break;
+        case 9:
+            changed.expert_major = 256;
             break;
         }
         CHECK_MESSAGE(!same_load(base, changed), field);

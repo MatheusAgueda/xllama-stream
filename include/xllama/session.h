@@ -76,6 +76,11 @@ struct SessionParams {
     // outside a token's top-k replaces a missing one when its router score is at
     // least this fraction of the missing one's. 0 = exact routing.
     float expert_swap = 0.0f;
+    // With expert_slots: predicted experts per token read ahead
+    // (LLAMA_EXPERT_PREFETCH, 0..64), and the largest prompt ubatch run
+    // expert-major, each expert read once (LLAMA_EXPERT_MAJOR). 0 = off.
+    int expert_prefetch = 0;
+    int expert_major = 0;
 };
 
 struct GenerateParams {

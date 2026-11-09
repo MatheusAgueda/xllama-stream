@@ -10,6 +10,7 @@
 #include "xllama/routing_policy.h" // resolve_n_ctx, resolve_gguf_gpu_layers
 #include "xllama/session.h"
 
+#include <algorithm>
 #include <string>
 
 namespace xllama {
@@ -25,6 +26,8 @@ struct CatalogueLoad {
     bool stream = false;      // "stream": weights stay file-backed (SessionParams::stream_weights)
     int expert_slots = 0;     // "expert_slots": experts kept per MoE layer (SessionParams)
     float expert_swap = 0.0f; // "expert_swap": cache-aware routing ratio (SessionParams)
+    int expert_prefetch = 0;  // "expert_prefetch": experts read ahead per token (SessionParams)
+    int expert_major = 0;     // "expert_major": largest expert-major prompt ubatch (SessionParams)
 };
 
 // `model_dir` is where the model's files live (resolve_model_path on the bare
@@ -45,6 +48,8 @@ inline SessionParams resolve_session_params(const std::string& model, const Cata
     sp.expert_slots = c.expert_slots > 0 ? c.expert_slots : 0;
     sp.expert_swap =
         sp.expert_slots > 0 && c.expert_swap > 0.0f && c.expert_swap <= 1.0f ? c.expert_swap : 0.0f;
+    sp.expert_prefetch = sp.expert_slots > 0 ? std::clamp(c.expert_prefetch, 0, 64) : 0;
+    sp.expert_major = sp.expert_slots > 0 ? std::clamp(c.expert_major, 0, 65536) : 0;
     // A streamed model is larger than any GPU budget: d3d12 layers would copy
     // its experts into video memory, so the knob does not apply to it. The
     // expert cache keeps its experts in the CPU cache whatever the layer device,
@@ -68,7 +73,8 @@ inline bool same_load(const SessionParams& a, const SessionParams& b) {
            a.n_gpu_layers == b.n_gpu_layers && a.lora_path == b.lora_path &&
            a.lora_scale == b.lora_scale && a.kv_q8 == b.kv_q8 &&
            a.stream_weights == b.stream_weights && a.expert_slots == b.expert_slots &&
-           a.expert_swap == b.expert_swap;
+           a.expert_swap == b.expert_swap && a.expert_prefetch == b.expert_prefetch &&
+           a.expert_major == b.expert_major;
 }
 
 } // namespace xllama
