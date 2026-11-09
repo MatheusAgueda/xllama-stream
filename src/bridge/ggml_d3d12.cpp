@@ -568,6 +568,7 @@ void run_d3d12_memprobe(const std::function<void(const std::string&)>& emit) {
         #include "ggml-alloc.h"
         #include "ggml-backend-impl.h"
         #include "ggml-backend.h"
+        #include "ggml-impl.h"
         #include "ggml_d3d12_elt_binary_dxil.h"
         #include "ggml_d3d12_elt_quant_q8_k_dxil.h"
         #include "ggml_d3d12_elt_rms_norm_dxil.h"
@@ -587,6 +588,9 @@ void run_d3d12_memprobe(const std::function<void(const std::string&)>& emit) {
         #include "ggml_d3d12_mmv_q5_k_t64_dxil.h"
         #include "ggml_d3d12_mmv_q6_k_t128_dxil.h"
         #include "ggml_d3d12_mmv_q6_k_t64_dxil.h"
+        #include "ggml_d3d12_moe_combine_dxil.h"
+        #include "ggml_d3d12_moe_emu.h"
+        #include "ggml_d3d12_moe_tail_dxil.h"
         #include "xllama/d3d12_dyn.h"
         #include "xllama/platform.h"
 
@@ -605,6 +609,7 @@ enum Pso {
     kPsoCount = 6
 };
 enum Elt { kEltBinary = 0, kEltRmsNorm = 1, kEltQuantQ8K = 2, kEltCount = 3 };
+enum Moe { kMoeCombine = 0, kMoeTail = 1, kMoeCount = 2 };
 // Root constants: the 8 every kernel reads, then MUL_MAT_ID's 5
 // (shaders/ggml_d3d12_mmid_iq4_xs.hlsl).
 constexpr UINT kOpConstants = 13;
@@ -643,6 +648,10 @@ struct Gpu {
     // the q8_K quantization run on the CPU inside graph_compute.
     ComPtr<ID3D12PipelineState> pso_elt[kEltCount];
     bool elt_ok = false;
+    // shaders/ggml_d3d12_moe.hlsl: the routed experts' weighted sum and the
+    // shared expert's gate + both residual adds, each one dispatch.
+    ComPtr<ID3D12PipelineState> pso_moe[kMoeCount];
+    bool moe_ok = false;
     ComPtr<ID3D12QueryHeap> ts;
     ComPtr<ID3D12Resource> ts_rb;
     ComPtr<ID3D12Resource> staging;  // weight upload ring (kStagingBytes)
@@ -684,8 +693,9 @@ constexpr UINT64 kStagingBytes = 8ull << 20;
 
 ComPtr<ID3D12RootSignature> make_root_sig(ID3D12Device* device, std::string* err) {
     // b0 constants, t0 weights, u0 output, u1 activations, u2 / u3 (elt: b or
-    // norm weight, fused-MUL output), t1 (MUL_MAT_ID: expert ids).
-    D3D12_ROOT_PARAMETER p[7] = {};
+    // norm weight, fused-MUL output), t1 (MUL_MAT_ID: expert ids), u4 (MoE
+    // tail: the residual).
+    D3D12_ROOT_PARAMETER p[8] = {};
     p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     p[0].Constants.ShaderRegister = 0;
     p[0].Constants.Num32BitValues = kOpConstants;
@@ -697,10 +707,12 @@ ComPtr<ID3D12RootSignature> make_root_sig(ID3D12Device* device, std::string* err
     }
     p[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
     p[6].Descriptor.ShaderRegister = 1;
+    p[7].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    p[7].Descriptor.ShaderRegister = 4;
     for (auto& q : p)
         q.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     D3D12_ROOT_SIGNATURE_DESC desc = {};
-    desc.NumParameters = 7;
+    desc.NumParameters = 8;
     desc.pParameters = p;
     auto serialize = d3d12_dyn::SerializeRootSignature();
     if (!serialize) {
@@ -827,6 +839,24 @@ bool init_gpu(Gpu& g) {
                            d3d12c::hr_message("CreateComputePipelineState (elt)", hr) +
                            " — elementwise ops stay on the CPU\n");
                 g.elt_ok = false;
+            }
+        }
+    }
+    {
+        const void* mb[kMoeCount] = {kGgmlD3d12MoeCombineDxil, kGgmlD3d12MoeTailDxil};
+        const size_t ms[kMoeCount] = {kGgmlD3d12MoeCombineDxilSize, kGgmlD3d12MoeTailDxilSize};
+        g.moe_ok = g.elt_ok; // their fallbacks are the elementwise kernels
+        for (int i = 0; i < kMoeCount && g.moe_ok; ++i) {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
+            pd.pRootSignature = g.root.Get();
+            pd.CS.pShaderBytecode = mb[i];
+            pd.CS.BytecodeLength = ms[i];
+            hr = g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.pso_moe[i]));
+            if (FAILED(hr)) {
+                log_output("[xllama] d3d12: " +
+                           d3d12c::hr_message("CreateComputePipelineState (moe)", hr) +
+                           " — the MoE tail stays on the CPU\n");
+                g.moe_ok = false;
             }
         }
     }
@@ -1437,7 +1467,7 @@ struct Op {
     std::uint32_t c[kOpConstants] = {};
     D3D12_GPU_VIRTUAL_ADDRESS t0 = 0;
     D3D12_GPU_VIRTUAL_ADDRESS t1 = 0;
-    D3D12_GPU_VIRTUAL_ADDRESS u[4] = {};
+    D3D12_GPU_VIRTUAL_ADDRESS u[5] = {};
     UINT gx = 0, gy = 0;
 };
 
@@ -1474,6 +1504,7 @@ bool submit_ops(Gpu& g, const std::vector<Op>& ops) {
             for (UINT i = 0; i < 4; ++i)
                 cl->SetComputeRootUnorderedAccessView(2 + i, op.u[i] ? op.u[i] : op.u[0]);
             cl->SetComputeRootShaderResourceView(6, op.t1 ? op.t1 : op.u[0]);
+            cl->SetComputeRootUnorderedAccessView(7, op.u[4] ? op.u[4] : op.u[0]);
             cl->Dispatch(op.gx, op.gy, 1);
             ++n;
         }
@@ -1499,9 +1530,35 @@ bool submit_ops(Gpu& g, const std::vector<Op>& ops) {
     return true;
 }
 
+// Whether the nodes of a MoE plan can run as one dispatch that writes only
+// `out`: all are nodes of this graph from index `from` on, and nothing outside
+// them reads the others (ggml's fusion check, with the graph's use counts).
+bool moe_fusable(ggml_cgraph* cgraph, int from, const std::vector<const ggml_tensor*>& sub,
+                 const ggml_tensor* out) {
+    std::vector<int> idx;
+    std::vector<ggml_op> ops;
+    int out_idx = -1;
+    const int n = ggml_graph_n_nodes(cgraph);
+    for (const ggml_tensor* t : sub) {
+        int j = from;
+        while (j < n && ggml_graph_node(cgraph, j) != t)
+            ++j;
+        if (j == n)
+            return false;
+        idx.push_back(j);
+        ops.push_back(t->op);
+        if (t == out)
+            out_idx = j;
+    }
+    return out_idx >= 0 &&
+           ggml_can_fuse_subgraph_ext(cgraph, idx.data(), static_cast<int>(idx.size()), ops.data(),
+                                      &out_idx, 1);
+}
+
 ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
     Gpu& g = gpu();
     std::vector<ggml_tensor*> nodes;
+    std::vector<int> node_idx; // each node's index in cgraph, for moe_fusable
     for (int i = 0; i < ggml_graph_n_nodes(cgraph); ++i) {
         ggml_tensor* node = ggml_graph_node(cgraph, i);
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0)
@@ -1515,6 +1572,7 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
         case GGML_OP_GLU:
         case GGML_OP_RMS_NORM:
             nodes.push_back(node);
+            node_idx.push_back(i);
             break;
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
@@ -1642,6 +1700,87 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
         done.push_back({x->data, x->nb[1], at, *off, row, ncols, xr});
         return true;
     };
+    // A MoE layer's tail at nodes[i], a MUL (ggml_d3d12_moe_emu.h): the routed
+    // experts' MUL by their weights with the n - 1 ADDs of its views as one
+    // combine; else the shared expert's gate with the ADD to the routed experts
+    // and the residual ADD after it as one tail; else that MUL alone. Fused
+    // nodes must follow it back to back, so nothing runs between them. Returns
+    // how many nodes after nodes[i] it consumed, -1 when nodes[i] is none of
+    // these, -2 on a failed flush.
+    auto moe = [&](std::size_t i) -> int {
+        const ggml_tensor* first = nodes[i];
+        const std::int64_t n_add = first->ne[1] - 1;
+        D3d12MoeCombinePlan cp;
+        if (n_add >= 1 && i + static_cast<std::size_t>(n_add) < nodes.size()) {
+            const ggml_tensor* last = nodes[i + static_cast<std::size_t>(n_add)];
+            bool ok = d3d12_moe_combine_plan(last, &cp) && cp.nodes.front() == first &&
+                      cp.params.n == static_cast<std::uint32_t>(n_add) + 1 && elt_operand(last) &&
+                      elt_operand(cp.e) && elt_operand(cp.w) &&
+                      !overlaps(rng_of(last), rng_of(cp.e)) &&
+                      !overlaps(rng_of(last), rng_of(cp.w));
+            const std::size_t n = cp.params.n;
+            for (std::size_t k = 1; ok && k < n; ++k)
+                ok = cp.nodes[n + k] == nodes[i + k]; // A_1 .. A_(n-1)
+            if (ok && moe_fusable(cgraph, node_idx[i], cp.nodes, last)) {
+                Op c;
+                c.pso = g.pso_moe[kMoeCombine].Get();
+                static_assert(sizeof(cp.params) <= sizeof(c.c), "8 root constants");
+                std::memcpy(c.c, &cp.params, sizeof(cp.params));
+                c.u[0] = tensor_va(last);
+                c.u[1] = tensor_va(cp.e);
+                c.u[2] = tensor_va(cp.w);
+                c.gx = cp.groups_x;
+                c.gy = cp.groups_y;
+                record(c, {rng_of(cp.e), rng_of(cp.w)}, {rng_of(last)});
+                return static_cast<int>(n_add);
+            }
+        }
+        for (int extra = 2; extra >= 0; --extra) {
+            D3d12MoeTailPlan tp;
+            const std::size_t j = i + static_cast<std::size_t>(extra);
+            if (j >= nodes.size() || !d3d12_moe_tail_plan(nodes[j], &tp) ||
+                tp.nodes.size() != static_cast<std::size_t>(extra) + 1 ||
+                tp.nodes.front() != first || (extra == 2 && tp.nodes[1] != nodes[i + 1]))
+                continue;
+            ggml_tensor* dst = nodes[j];
+            const bool ok = elt_operand(dst) && elt_operand(tp.s) && elt_operand(tp.g) &&
+                            (!tp.m || elt_operand(tp.m)) && (!tp.q || elt_operand(tp.q)) &&
+                            same_or_apart(dst, tp.s) && (!tp.m || same_or_apart(dst, tp.m)) &&
+                            (!tp.q || same_or_apart(dst, tp.q)) &&
+                            !overlaps(rng_of(dst), rng_of(tp.g));
+            if (extra > 0 && !(ok && moe_fusable(cgraph, node_idx[i], tp.nodes, dst)))
+                continue;
+            if (!ok) {
+                // The gate MUL alone on the CPU: the kernel's arithmetic, in place.
+                if (!flush())
+                    return -2;
+                d3d12_moe_tail_emulate(tp.params, tp.groups_x, tp.groups_y,
+                                       static_cast<const float*>(tp.s->data),
+                                       static_cast<const float*>(tp.g->data), nullptr, nullptr,
+                                       static_cast<float*>(dst->data));
+                return 0;
+            }
+            Op t;
+            t.pso = g.pso_moe[kMoeTail].Get();
+            static_assert(sizeof(tp.params) <= sizeof(t.c), "8 root constants");
+            std::memcpy(t.c, &tp.params, sizeof(tp.params));
+            t.u[0] = tensor_va(dst);
+            t.u[1] = tensor_va(tp.s);
+            t.u[2] = tensor_va(tp.g);
+            if (tp.m)
+                t.u[3] = tensor_va(tp.m);
+            if (tp.q)
+                t.u[4] = tensor_va(tp.q);
+            t.gx = tp.groups_x;
+            t.gy = tp.groups_y;
+            record(t,
+                   {rng_of(tp.s), rng_of(tp.g), rng_of(tp.m ? tp.m : tp.s),
+                    rng_of(tp.q ? tp.q : tp.s)},
+                   {rng_of(dst)});
+            return extra;
+        }
+        return -1;
+    };
 
     for (std::size_t i = 0; i < nodes.size(); ++i) {
         ggml_tensor* node = nodes[i];
@@ -1765,6 +1904,15 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
         case GGML_OP_ADD:
         case GGML_OP_MUL:
         case GGML_OP_GLU: {
+            if (node->op == GGML_OP_MUL && g.moe_ok) {
+                const int took = moe(i);
+                if (took == -2)
+                    return GGML_STATUS_FAILED;
+                if (took >= 0) {
+                    i += static_cast<std::size_t>(took);
+                    break;
+                }
+            }
             const int kind = node->op == GGML_OP_ADD ? 0 : node->op == GGML_OP_MUL ? 1 : 2;
             // supports_op admits these shapes only: b is a's shape or one row.
             GGML_ASSERT(ggml_are_same_shape(node, a) && b->ne[0] == node->ne[0] &&
@@ -1934,15 +2082,36 @@ bool elt_f32(const ggml_tensor* t) {
            (!t->buffer || t->buffer->buft == &kHostBuft);
 }
 
+// The output of a D3D12 matmul: a weight in D3D12_Weights, or the routed
+// experts' MUL_MAT_ID over the expert cache.
+bool d3d12_matmul_out(const ggml_tensor* t) {
+    t = base_of(t);
+    const ggml_tensor* w = t->src[0];
+    return (t->op == GGML_OP_MUL_MAT && w && w->buffer && w->buffer->buft == &kWeightsBuft) ||
+           (t->op == GGML_OP_MUL_MAT_ID && w && in_expert_cache(w));
+}
+
+// G, O or P of a MoE layer's tail (ggml_d3d12_moe_emu.h) — the routed experts'
+// MUL by their weights is a G too — whose gated operand comes straight from a
+// D3D12 matmul. Gates fed by CPU ops (the delta net's) stay on the CPU.
+bool moe_tail_node(const ggml_tensor* op) {
+    D3d12MoeTailPlan p;
+    return gpu().moe_ok && d3d12_moe_tail_plan(op, &p) && d3d12_matmul_out(p.s) && elt_f32(op) &&
+           elt_f32(p.s) && elt_f32(p.g) && (!p.m || elt_f32(p.m)) && (!p.q || elt_f32(p.q));
+}
+
 // Whether t is computed from a D3D12 matmul or get_rows within `depth`
 // elementwise ops. Only those elementwise ops move to the GPU: the ones fed by
-// CPU ops (the embedding lookup, the MoE experts, the last layer's row
+// CPU ops (the embedding lookup, the MoE router, the last layer's row
 // selection) stay with them instead of adding a CPU -> GPU -> CPU round trip.
+// A MoE tail counts as a matmul: the next layer's norm joins it.
 bool fed_by_d3d12(const ggml_tensor* t, int depth = 2) {
     while (t) {
         t = base_of(t);
         if ((t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_GET_ROWS) && t->src[0] &&
             t->src[0]->buffer && t->src[0]->buffer->buft == &kWeightsBuft)
+            return true;
+        if ((t->op == GGML_OP_ADD || t->op == GGML_OP_MUL) && moe_tail_node(t))
             return true;
         if (depth-- <= 0)
             return false;
@@ -2035,6 +2204,14 @@ bool dev_supports_op(ggml_backend_dev_t, const ggml_tensor* op) {
     case GGML_OP_RMS_NORM: {
         const ggml_tensor* a = op->src[0];
         const ggml_tensor* b = op->src[1];
+        if ((op->op == GGML_OP_MUL || op->op == GGML_OP_ADD) && moe_tail_node(op))
+            return true;
+        if (op->op == GGML_OP_ADD && a && b && b->op == GGML_OP_VIEW && b->view_src &&
+            b->view_src->op == GGML_OP_MUL && moe_tail_node(b->view_src))
+            // A_1 .. A_(n-1), the sum over the routed experts' weighted outputs:
+            // one combine, or binary kernels over the views when it cannot fuse.
+            return gpu().elt_ok && elt_rows(op) && elt_f32(op) && elt_f32(a) && elt_f32(b) &&
+                   ggml_are_same_shape(op, a) && ggml_are_same_shape(op, b);
         if (op->op == GGML_OP_GLU && a && gpu().elt_ok && glu_rows(op) && !elt_rows(op)) {
             // A SwiGLU narrower than kD3d12EltMinRow: the routed experts' between two
             // MUL_MAT_IDs, or a shared expert's (n_ff_shexp 512 on Qwen3.6-35B-A3B)
@@ -2751,6 +2928,134 @@ D3d12SelftestRow run_mmid_case(ggml_backend_t backend, int n, int k, int ne11, i
     return row;
 }
 
+// A MoE layer's tail as llama builds it (qwen35moe, patches 0007/0008): mode -1
+// is the routed experts' combine, E [ne0, n, T] by w [1, n, T] then the n - 1
+// ADDs of its views; modes 0..2 the tail, s [ne0, T] (mode 0: [ne0, n, T], the
+// combine's MUL alone) by g, + m, + q. One dispatch, bit for bit the host
+// emulation, which tests/test_ggml_d3d12_moe.cpp holds to ggml's CPU ops.
+D3d12SelftestRow run_moe_case(ggml_backend_t backend, int mode, int ne0, int n, int n_tok) {
+    D3d12SelftestRow row;
+    row.type = mode < 0 ? "moe_combine" : "moe_tail" + std::to_string(mode);
+    row.n = ne0;
+    row.k = n;
+    row.ncols = n_tok;
+
+    ggml_init_params ip = {};
+    ip.mem_size =
+        static_cast<std::size_t>(4 * n + 16) * ggml_tensor_overhead() + ggml_graph_overhead();
+    ip.no_alloc = true;
+    ggml_context* ctx_x = ggml_init(ip);
+    ggml_context* ctx_g = ggml_init(ip);
+    const bool three_d = mode <= 0;
+    const int rows = three_d ? n : 1;
+    ggml_tensor* s = ggml_new_tensor_3d(ctx_x, GGML_TYPE_F32, ne0, rows, n_tok);
+    ggml_tensor* gt = ggml_new_tensor_3d(ctx_x, GGML_TYPE_F32, 1, rows, n_tok);
+    ggml_tensor* m = ggml_new_tensor_3d(ctx_x, GGML_TYPE_F32, ne0, 1, n_tok);
+    ggml_tensor* q = ggml_new_tensor_3d(ctx_x, GGML_TYPE_F32, ne0, 1, n_tok);
+    ggml_backend_buffer_t xbuf = ggml_backend_alloc_ctx_tensors_from_buft(ctx_x, &kHostBuft);
+    ggml_gallocr_t galloc = nullptr;
+    auto cleanup = [&] {
+        if (galloc)
+            ggml_gallocr_free(galloc);
+        if (xbuf)
+            ggml_backend_buffer_free(xbuf);
+        ggml_free(ctx_g);
+        ggml_free(ctx_x);
+    };
+    if (!xbuf) {
+        row.error = "buffer allocation failed";
+        cleanup();
+        return row;
+    }
+    std::mt19937 rng(777u + static_cast<unsigned>(mode + 2 + ne0 + n + n_tok));
+    std::uniform_real_distribution<float> uni(-1.f, 1.f);
+    auto fill = [&](ggml_tensor* t) {
+        std::vector<float> v(static_cast<std::size_t>(ggml_nelements(t)));
+        for (float& x : v)
+            x = uni(rng);
+        ggml_backend_tensor_set(t, v.data(), 0, v.size() * sizeof(float));
+        return v;
+    };
+    const std::vector<float> sv = fill(s), gv = fill(gt), mv = fill(m), qv = fill(q);
+
+    // 2-d views of m and q: [ne0, T], as llama's moe_out and residual are.
+    ggml_tensor* m2 = ggml_reshape_2d(ctx_g, m, ne0, n_tok);
+    ggml_tensor* q2 = ggml_reshape_2d(ctx_g, q, ne0, n_tok);
+    ggml_tensor* out = nullptr;
+    if (mode < 0) {
+        ggml_tensor* w = ggml_mul(ctx_g, s, gt);
+        for (int i = 0; i < n; ++i) {
+            ggml_tensor* v = ggml_view_2d(ctx_g, w, ne0, n_tok, w->nb[2],
+                                          static_cast<std::size_t>(i) * w->nb[1]);
+            out = out ? ggml_add(ctx_g, out, v) : v;
+        }
+    } else if (mode == 0) {
+        out = ggml_mul(ctx_g, s, gt);
+    } else {
+        ggml_tensor* s2 = ggml_reshape_2d(ctx_g, s, ne0, n_tok);
+        ggml_tensor* g2 = ggml_reshape_2d(ctx_g, gt, 1, n_tok);
+        out = ggml_add(ctx_g, m2, ggml_mul(ctx_g, s2, g2));
+        if (mode == 2)
+            out = ggml_add(ctx_g, out, q2);
+    }
+    ggml_cgraph* gf = ggml_new_graph(ctx_g);
+    ggml_build_forward_expand(gf, out);
+    galloc = ggml_gallocr_new(&kHostBuft);
+    if (!ggml_gallocr_alloc_graph(galloc, gf)) {
+        row.error = "graph allocation failed";
+        cleanup();
+        return row;
+    }
+    const std::uint64_t d0 = gpu().n_dispatches;
+    row.d3d12_ran = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+    const std::uint64_t dispatches = gpu().n_dispatches - d0;
+    if (!row.d3d12_ran) {
+        row.error = "graph_compute failed";
+        cleanup();
+        return row;
+    }
+    row.gpu_ms = gpu().last_gpu_ms;
+
+    std::vector<float> got(static_cast<std::size_t>(ggml_nelements(out)));
+    ggml_backend_tensor_get(out, got.data(), 0, got.size() * sizeof(float));
+    std::vector<float> ref(got.size());
+    bool planned = false;
+    if (mode < 0) {
+        D3d12MoeCombinePlan p;
+        planned = d3d12_moe_combine_plan(out, &p) &&
+                  p.params.dst_token_stride == static_cast<std::uint32_t>(ne0);
+        if (planned)
+            d3d12_moe_combine_emulate(p.params, p.groups_x, p.groups_y, sv.data(), gv.data(),
+                                      ref.data());
+    } else {
+        D3d12MoeTailPlan p;
+        planned = d3d12_moe_tail_plan(out, &p) &&
+                  p.params.dst_row_stride == static_cast<std::uint32_t>(ne0);
+        if (planned)
+            d3d12_moe_tail_emulate(p.params, p.groups_x, p.groups_y, sv.data(), gv.data(),
+                                   mv.data(), qv.data(), ref.data());
+    }
+    if (!planned) {
+        row.error = "no MoE plan for the graph";
+        cleanup();
+        return row;
+    }
+    double max_ref = 0.0, max_diff = 0.0;
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        max_ref = std::max(max_ref, std::fabs(static_cast<double>(ref[i])));
+        max_diff = std::max(max_diff, std::fabs(static_cast<double>(ref[i]) - got[i]));
+    }
+    row.rel_err = max_ref > 0.0 ? max_diff / max_ref : max_diff;
+    row.ok =
+        std::memcmp(got.data(), ref.data(), got.size() * sizeof(float)) == 0 && dispatches == 1;
+    if (dispatches != 1)
+        row.error = "not fused: " + std::to_string(dispatches) + " dispatches";
+    else if (!row.ok)
+        row.error = "mismatch vs the host emulation (bit for bit)";
+    cleanup();
+    return row;
+}
+
 // The fixed cost of one graph_compute: an empty command list submitted and
 // waited for, median wall of 256 (in gpu_ms). Every CPU<->GPU split of a
 // model pays it once per ubatch.
@@ -2830,6 +3135,15 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
         out->push_back(run_mmid_case(backend, 2048, 512, 8, 1));
         out->push_back(run_mmid_case(backend, 512, 2048, 1, 5));
         out->push_back(run_mmid_case(backend, 2048, 512, 8, 5));
+    }
+    if (gpu().moe_ok) {
+        // Qwen3.6-35B-A3B: n_embd 2048, 8 routed experts; decode and a prefill ubatch.
+        out->push_back(run_moe_case(backend, -1, 2048, 8, 1));
+        out->push_back(run_moe_case(backend, -1, 2048, 8, 4));
+        out->push_back(run_moe_case(backend, 0, 2048, 8, 1));
+        out->push_back(run_moe_case(backend, 1, 2048, 1, 1));
+        out->push_back(run_moe_case(backend, 2, 2048, 1, 1));
+        out->push_back(run_moe_case(backend, 2, 2048, 1, 5));
     }
     out->push_back(run_submit_rtt());
     ggml_backend_free(backend);

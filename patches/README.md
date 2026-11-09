@@ -153,6 +153,17 @@ its matmuls follow the output projection and the post-attention norm in node
 order and join that submission. Only the order changes; the results stay the
 same.
 
+`0008-qwen35moe-shared-gate-with-router.patch` (applies after 0004–0007): in
+`qwen35moe` the shared expert's gate (`ffn_gate_inp_shexp`, an F32 matmul to one
+value per token, then a sigmoid) was built after the routed experts, so on the
+D3D12 backend, which takes no F32 weights, each MoE layer had a CPU split between
+the routed experts and the residual adds. The patch builds the gate first and
+calls `ggml_build_forward_expand` on it before `build_moe_ffn`, so it runs in the
+router's CPU split (the router is also F32). With the MoE combine and tail
+kernels (`shaders/ggml_d3d12_moe.hlsl`) the routed experts, their combine and
+the residual adds then form one GPU split (the shared FFN runs earlier, 0007).
+Only the order changes; the graph and its results stay the same.
+
 ## Applying
 
 ```bash
