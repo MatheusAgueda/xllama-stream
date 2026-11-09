@@ -2,11 +2,13 @@ name: expert-cache-bench
 
 # A measurement of llama.cpp patch 0004 on a real MoE, not a gate: build the
 # patched tree in Release for Linux, decode Qwen3.6 35B-A3B (uncensored heretic,
-# i1-IQ4_XS, 18.7 GB, the console's catalogue model) with 32 resident experts
-# per layer at several swap ratio[:prefetch width] configs ("expert-cache
-# bench" in tests/test_expert_cache.cpp; "0:0" = exact routing, no prefetch),
-# and keep the reference run's routing trace for offline cache-policy
-# simulation. The runner's disk and CPU are not the
+# i1-IQ4_XS, 18.7 GB, the console's catalogue model) with 41 resident experts
+# per layer (the console's) at several swap ratio[:prefetch width[:largest
+# expert-major ubatch]] configs ("expert-cache bench" in
+# tests/test_expert_cache.cpp; "0" = exact routing, no prefetch, slot-path
+# prompts; "0::512" = the same with expert-major prompts), and keep the
+# reference run's routing trace for offline cache-policy simulation. long = a
+# fourth prompt of ~350 tokens. The runner's disk and CPU are not the
 # console's: hits, misses, swaps, top-1 agreement and KL carry over; tok/s and
 # read ms do not.
 
@@ -16,14 +18,17 @@ on:
   workflow_dispatch:
     inputs:
       swaps:
-        description: Swap ratio[:prefetch width] configs, the first is the reference
-        default: "0:0,0,0.7:0,0.7"
+        description: Swap ratio[:prefetch width[:expert-major]] configs, the first is the reference
+        default: "0,0::512,0.7::512"
+      long:
+        description: 1 = add the ~350-token prompt
+        default: "1"
       tokens:
         description: Tokens generated per prompt
         default: "64"
       slots:
         description: Resident experts per layer
-        default: "32"
+        default: "41"
 
 permissions:
   contents: read
@@ -83,9 +88,10 @@ jobs:
 
       - name: Bench
         env:
-          XLLAMA_EC_BENCH_SWAPS: ${{ inputs.swaps || '0:0,0,0.7:0,0.7' }}
+          XLLAMA_EC_BENCH_SWAPS: ${{ inputs.swaps || '0,0::512,0.7::512' }}
+          XLLAMA_EC_BENCH_LONG: ${{ inputs.long || '1' }}
           XLLAMA_EC_BENCH_TOKENS: ${{ inputs.tokens || '64' }}
-          XLLAMA_EC_BENCH_SLOTS: ${{ inputs.slots || '32' }}
+          XLLAMA_EC_BENCH_SLOTS: ${{ inputs.slots || '41' }}
           XLLAMA_EC_BENCH_TRACE: ${{ runner.temp }}/ec-trace.txt
         run: |
           set -o pipefail
