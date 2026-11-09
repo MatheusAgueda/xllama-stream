@@ -37,6 +37,20 @@ on top of the weights already placed overflows the title's single ~5 GB pool
 `ggml_backend_tensor_set(..., offset, len)`. `--check-tensors` keeps the
 whole-tensor path, since `ggml_validate_row_data` needs the full buffer.
 
+`0005-graph-order-shared-input-projections.patch` (applies after 0003; 0004 is
+reserved for the expert cache): the D3D12 backend runs only the matmuls, so every
+switch between it and the CPU is one submit plus a fence wait (~90 µs measured on
+Series X). The graph is built depth first from the outputs, which puts the CPU
+ops of the q projection between it and the k projection, and the same for the
+four linear-attention projections of Qwen3.5 (qkv, z, beta, alpha). Measured on
+2026-11-09 with Qwen3.5 9B fully offloaded: 207 graph_compute calls for each token,
+~19 ms of a 55 ms token. The patch calls `ggml_build_forward_expand` on each
+projection right after it is built (generic separate-QKV path in
+`llm_graph_context::build_qkv`, plus `qwen35` and `qwen35moe`). Those matmuls then
+sit next to each other in the graph and land in one split, which also quantizes
+their shared input once. Only the order changes; the graph and its results stay
+the same.
+
 ## Applying
 
 ```bash
