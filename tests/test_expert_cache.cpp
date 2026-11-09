@@ -73,6 +73,27 @@ long long swaps_of(const std::string& line) {
     return static_cast<long long>(swaps);
 }
 
+// The "prefetch N read" count of a stats line, or -1 when prefetch is off.
+long long prefetched_of(const std::string& line) {
+    const char* p = std::strstr(line.c_str(), "; prefetch ");
+    unsigned long long reads = 0;
+    if (!p || std::sscanf(p, "; prefetch %llu read", &reads) != 1)
+        return -1;
+    return static_cast<long long>(reads);
+}
+
+// LLAMA_EXPERT_PREFETCH for the next model load: k >= 0 sets it, k < 0 restores the default.
+void set_prefetch(int k) {
+    #ifdef _WIN32
+    _putenv_s("LLAMA_EXPERT_PREFETCH", k >= 0 ? std::to_string(k).c_str() : "");
+    #else
+    if (k >= 0)
+        setenv("LLAMA_EXPERT_PREFETCH", std::to_string(k).c_str(), 1);
+    else
+        unsetenv("LLAMA_EXPERT_PREFETCH");
+    #endif
+}
+
 struct EcRun {
     bool ok = false;
     uint32_t n_ubatch = 0;
@@ -166,16 +187,29 @@ int env_int(const char* name, int def) {
     return v && *v ? std::atoi(v) : def;
 }
 
-std::vector<float> env_ratios(const char* name, const char* def) {
+// One bench run: a swap ratio and a prefetch width (-1 = the cache's default).
+struct BenchCfg {
+    float swap = 0.0f;
+    int pf = -1;
+};
+
+// "ratio[:k],..." e.g. "0:0,0,0.7:0,0.7".
+std::vector<BenchCfg> env_configs(const char* name, const char* def) {
     const char* v = std::getenv(name);
     const std::string s = v && *v ? v : def;
-    std::vector<float> out;
+    std::vector<BenchCfg> out;
     size_t pos = 0;
     while (pos <= s.size()) {
         const size_t comma = s.find(',', pos);
         const std::string item = s.substr(pos, comma == std::string::npos ? comma : comma - pos);
-        if (!item.empty())
-            out.push_back(std::strtof(item.c_str(), nullptr));
+        if (!item.empty()) {
+            BenchCfg c;
+            char* end = nullptr;
+            c.swap = std::strtof(item.c_str(), &end);
+            if (end && *end == ':')
+                c.pf = std::atoi(end + 1);
+            out.push_back(c);
+        }
         if (comma == std::string::npos)
             break;
         pos = comma + 1;
@@ -257,7 +291,10 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
     };
     // 2 slots with 2 used: every token's experts evict the previous token's.
     // 3 slots: a partial LRU, hits and misses mixed. used 1: ubatches of 2 and 3
-    // tokens whose experts must all be resident at once.
+    // tokens whose experts must all be resident at once. Pre-gating prefetch is on
+    // by default: its reads change which experts are resident, never the routing.
+    set_prefetch(-1);
+    long long prefetched = 0;
     const Case cases[] = {{2, 0}, {3, 0}, {2, 1}, {3, 1}};
     for (const Case& c : cases) {
         CAPTURE(c.slots);
@@ -279,6 +316,26 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
         const long long misses = misses_of(final_line);
         CHECK(misses > 0);
         CHECK(swaps_of(final_line) == 0);
+        CHECK(prefetched_of(final_line) >= 0);
+        prefetched += prefetched_of(final_line);
+
+        // Prefetch off: the plan alone, no prefetch stats.
+        set_prefetch(0);
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            log.final_line.clear();
+        }
+        const EcRun plain = run_greedy(path, c.slots, 512, c.used, 24);
+        REQUIRE(plain.ok);
+        CHECK(plain.n_ubatch == cached.n_ubatch);
+        long long plain_misses = -1;
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            MESSAGE(log.final_line);
+            plain_misses = misses_of(log.final_line);
+            CHECK(plain_misses > 0);
+            CHECK(prefetched_of(log.final_line) == -1);
+        }
 
         // Cache-aware routing: a resident expert stands in for a missing one
         // with at least half its probability, so the same run reads less.
@@ -287,6 +344,7 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
             log.final_line.clear();
         }
         const EcRun swapped = run_greedy(path, c.slots, 512, c.used, 24, 0.5f);
+        set_prefetch(-1);
         REQUIRE(swapped.ok);
         CHECK(swapped.n_ubatch == cached.n_ubatch);
         {
@@ -294,7 +352,7 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
             MESSAGE(log.final_line);
             CHECK(swaps_of(log.final_line) > 0);
             CHECK(misses_of(log.final_line) >= 0);
-            CHECK(misses_of(log.final_line) < misses);
+            CHECK(misses_of(log.final_line) < plain_misses);
         }
 
         // Same ubatch size: the CPU kernels differ between batch shapes.
@@ -302,9 +360,14 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
         REQUIRE(full.ok);
         CHECK(full.n_ubatch == cached.n_ubatch);
         CHECK(cached.tokens == full.tokens);
+        CHECK(plain.tokens == full.tokens);
         REQUIRE(cached.logits.size() == full.logits.size());
+        REQUIRE(plain.logits.size() == full.logits.size());
         CHECK(max_abs_diff(cached.logits, full.logits) <= 1e-4f);
+        CHECK(max_abs_diff(plain.logits, full.logits) <= 1e-4f);
     }
+    // The predictions really read ahead somewhere (layers 1+ of each case).
+    CHECK(prefetched > 0);
 
     // As many slots as experts: no cache, no ubatch cap, no stats line.
     {
@@ -323,12 +386,14 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
 }
 
 // A measurement, not a check (the hyphen keeps it out of "expert cache*"): per
-// swap ratio, prefill and decode speed and the cache's final stats; for every
-// ratio after the first, the top-1 agreement and the mean KL against the first
-// ratio's greedy run, teacher-forced on its tokens so a diverging continuation
-// cannot hide or inflate the difference. Env: XLLAMA_EC_BENCH_SLOTS (32),
-// _SWAPS ("0,0.5,0.7"), _TOKENS (64), _THREADS (4), _TRACE (path: the first
-// ratio's routing, for offline cache-policy simulation).
+// config (swap ratio[:prefetch width]), prefill and decode speed and the cache's
+// final stats; for every config after the first, the top-1 agreement and the
+// mean KL against the first config's greedy run, teacher-forced on its tokens so
+// a diverging continuation cannot hide or inflate the difference. Prefetch never
+// changes the routing: "0" against "0:0" must agree 100% with KL 0. Env:
+// XLLAMA_EC_BENCH_SLOTS (32), _SWAPS ("0:0,0,0.7:0,0.7"), _TOKENS (64),
+// _THREADS (4), _TRACE (path: the first config's routing, for offline
+// cache-policy simulation).
 TEST_CASE("expert-cache bench (opt-in: XLLAMA_EC_BENCH_MODEL)") {
     const char* path = std::getenv("XLLAMA_EC_BENCH_MODEL");
     if (!path)
@@ -336,9 +401,9 @@ TEST_CASE("expert-cache bench (opt-in: XLLAMA_EC_BENCH_MODEL)") {
     const auto slots = static_cast<uint32_t>(env_int("XLLAMA_EC_BENCH_SLOTS", 32));
     const int n_gen = env_int("XLLAMA_EC_BENCH_TOKENS", 64);
     const int n_threads = env_int("XLLAMA_EC_BENCH_THREADS", 4);
-    const std::vector<float> ratios = env_ratios("XLLAMA_EC_BENCH_SWAPS", "0,0.5,0.7");
+    const std::vector<BenchCfg> configs = env_configs("XLLAMA_EC_BENCH_SWAPS", "0:0,0,0.7:0,0.7");
     const char* trace_path = std::getenv("XLLAMA_EC_BENCH_TRACE");
-    REQUIRE(!ratios.empty());
+    REQUIRE(!configs.empty());
     REQUIRE(n_gen > 0);
 
     // Chat format with an empty think block: answers, not reasoning, in n_gen tokens.
@@ -360,9 +425,15 @@ TEST_CASE("expert-cache bench (opt-in: XLLAMA_EC_BENCH_MODEL)") {
     std::vector<std::vector<float>> ref_logp[n_prompts];
     std::vector<float> logp;
 
-    for (size_t r = 0; r < ratios.size(); ++r) {
+    for (size_t r = 0; r < configs.size(); ++r) {
         const bool reference = r == 0;
-        CAPTURE(ratios[r]);
+        const BenchCfg& cfg = configs[r];
+        char label[48];
+        if (cfg.pf >= 0)
+            std::snprintf(label, sizeof(label), "ratio %.2f pf %d", cfg.swap, cfg.pf);
+        else
+            std::snprintf(label, sizeof(label), "ratio %.2f", cfg.swap);
+        CAPTURE(label);
         {
             std::lock_guard<std::mutex> lock(log.mtx);
             log.final_line.clear();
@@ -372,9 +443,11 @@ TEST_CASE("expert-cache bench (opt-in: XLLAMA_EC_BENCH_MODEL)") {
         mp.n_gpu_layers = 0;
         mp.load_mode = LLAMA_LOAD_MODE_NONE;
         mp.n_expert_slots = slots;
-        mp.expert_swap_ratio = ratios[r];
+        mp.expert_swap_ratio = cfg.swap;
+        set_prefetch(cfg.pf);
         auto t_load = std::chrono::steady_clock::now();
         llama_model* model = llama_model_load_from_file(path, mp);
+        set_prefetch(-1);
         REQUIRE(model);
         const double load_s = seconds_since(t_load);
 
@@ -396,8 +469,8 @@ TEST_CASE("expert-cache bench (opt-in: XLLAMA_EC_BENCH_MODEL)") {
         REQUIRE(ctx);
         const llama_vocab* vocab = llama_model_get_vocab(model);
         const int32_t n_vocab = llama_vocab_n_tokens(vocab);
-        std::printf("[ec-bench] ratio %.2f: load %.1f s, %u slots, n_ubatch %u, %d threads\n",
-                    ratios[r], load_s, slots, llama_n_ubatch(ctx), n_threads);
+        std::printf("[ec-bench] %s: load %.1f s, %u slots, n_ubatch %u, %d threads\n",
+                    label, load_s, slots, llama_n_ubatch(ctx), n_threads);
 
         int gen_total = 0;
         double gen_s_total = 0.0;
@@ -421,7 +494,7 @@ TEST_CASE("expert-cache bench (opt-in: XLLAMA_EC_BENCH_MODEL)") {
             REQUIRE(llama_decode(ctx, llama_batch_get_one(toks.data(), n)) == 0);
             const double prompt_s = seconds_since(t0);
 
-            // The reference generates; the other ratios replay its tokens.
+            // The reference generates; the other configs replay its tokens.
             const int steps = reference ? n_gen : static_cast<int>(ref_tokens[p].size());
             int agree = 0;
             int decoded = 0;
@@ -464,9 +537,9 @@ TEST_CASE("expert-cache bench (opt-in: XLLAMA_EC_BENCH_MODEL)") {
             const double gen_s = seconds_since(t0);
             gen_total += decoded;
             gen_s_total += gen_s;
-            std::printf("[ec-bench] ratio %.2f prompt %zu: prefill %d tok %.2f s (%.2f tok/s), "
+            std::printf("[ec-bench] %s prompt %zu: prefill %d tok %.2f s (%.2f tok/s), "
                         "decode %d tok %.2f s (%.2f tok/s)",
-                        ratios[r], p, n, prompt_s, n / prompt_s, decoded, gen_s,
+                        label, p, n, prompt_s, n / prompt_s, decoded, gen_s,
                         decoded > 0 ? decoded / gen_s : 0.0);
             if (reference) {
                 std::printf("\n[ec-bench] text %zu: %s\n", p, out.c_str());
@@ -491,13 +564,13 @@ TEST_CASE("expert-cache bench (opt-in: XLLAMA_EC_BENCH_MODEL)") {
             std::lock_guard<std::mutex> lock(log.mtx);
             final_line = log.final_line;
         }
-        std::printf("[ec-bench] ratio %.2f total: decode %.2f tok/s", ratios[r],
+        std::printf("[ec-bench] %s total: decode %.2f tok/s", label,
                     gen_s_total > 0.0 ? gen_total / gen_s_total : 0.0);
         if (!reference)
             std::printf(", top-1 %.1f%%, mean KL %.5f",
                         steps_total > 0 ? 100.0 * agree_total / steps_total : 0.0,
                         steps_total > 0 ? kl_sum / steps_total : 0.0);
-        std::printf("\n[ec-bench] ratio %.2f %s", ratios[r],
+        std::printf("\n[ec-bench] %s %s", label,
                     final_line.empty() ? "no cache stats\n" : final_line.c_str());
         std::fflush(stdout);
         CHECK(swaps_of(final_line) >= 0);
