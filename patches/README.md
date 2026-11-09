@@ -115,9 +115,25 @@ load, or in the middle of an expert-major round, leaves no slot pointing at
 data that never arrived: the next op of the layer empties those slots. The
 stats line adds expert-major ubatches, reads, MiB, resident hits, experts kept
 in slots and the time the matmuls took.
+Reads are unbuffered (env `LLAMA_EXPERT_DIRECT`, default 1; `CreateFile2` with
+`FILE_FLAG_NO_BUFFERING | FILE_FLAG_RANDOM_ACCESS`, `O_DIRECT` on Linux): no
+copy through the OS file cache, no read-ahead. A read whose file span,
+size and destination are 4 KiB-aligned lands in the slot itself; any other
+read takes the aligned span around it into a per-thread staging buffer and
+copies it out. If a read into the slot fails, that thread switches to staging;
+if the open or a staged read fails (macOS, tmpfs), it switches to buffered
+reads (`"rbR"` on Windows). A decode ubatch misses about one expert per layer,
+which is 3 reads for 6 threads, so the load op splits each read into 4 KiB-aligned
+parts of at least 128 KiB until every thread has one in flight
+(`LLAMA_EXPERT_SPLIT`, default 1). On the console: 1.34 GB/s with buffered
+whole reads, vs 2.13 GB/s for unbuffered sequential reads in `diskbw`. The
+stats line ends with the direct, staged and buffered read counts, plus
+`split` when splitting is on.
 `tests/test_expert_cache.cpp` decodes a small MoE with 2 and 3 of its 4 experts
 resident and checks the tokens and logits against the same model fully
-resident, with prefetch on (it must read ahead somewhere) and off, that a
+resident, with prefetch on (it must read ahead somewhere) and off, that
+buffered whole reads give the same tokens and logits bit for bit as the
+unbuffered split ones (which must happen on Linux), that a
 swap ratio of 0.5 reads less, and that expert-major prompts (with and without
 experts resident from earlier tokens, and with every slot free so the decode
 starts from the experts the prompt kept) give the same tokens and logits
