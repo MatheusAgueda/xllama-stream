@@ -14,6 +14,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace xllama {
@@ -84,6 +85,12 @@ struct SessionParams {
     // With expert_prefetch: predict each layer's experts one layer earlier, so
     // the reads overlap a whole layer (LLAMA_EXPERT_PREFETCH_AHEAD).
     bool expert_prefetch_ahead = false;
+    // Tuning variables put in the process environment for the load (catalogue
+    // "env"), which llama.cpp's patches and xllama read there: e.g.
+    // LLAMA_EXPERT_PREFETCH_PRIO, XLLAMA_CPU_POLL. LLAMA_*, GGML_* and XLLAMA_*
+    // names only, sorted by name; a listed name wins over the value xllama would
+    // set itself.
+    std::vector<std::pair<std::string, std::string>> env;
 };
 
 struct GenerateParams {

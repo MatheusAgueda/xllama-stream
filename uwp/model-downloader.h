@@ -116,6 +116,9 @@ struct ManifestEntry {
     int expert_major = 0;
     // "expert_prefetch_ahead": with expert_prefetch, predict a layer early.
     bool expert_prefetch_ahead = false;
+    // "env": {NAME: number | bool | string}, tuning variables set for the load
+    // (SessionParams::env); numbers as integers, booleans as 1 / 0.
+    std::vector<std::pair<std::wstring, std::wstring>> env;
 };
 
 // Load the model catalogue: InstalledPath\models\manifest.json (bundled) is

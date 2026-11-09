@@ -118,6 +118,28 @@ TEST_CASE("resolve_session_params: one resolver for every surface (ADR 0007)") {
     CHECK_FALSE(resolve_session_params("moe", pf, "D:\\m\\moe", -1).expert_prefetch_ahead);
 }
 
+TEST_CASE("catalogue env: tuning names only, sorted, the last repeat wins") {
+    CatalogueLoad g;
+    g.found = true;
+    g.gguf = true;
+    g.env = {{"XLLAMA_CPU_POLL", "0"},  {"LLAMA_EXPERT_PREFETCH_PRIO", "0"},
+             {"PATH", "C:\\evil"},      {"llama_lower", "1"},
+             {"GGML_SCHED", "1"},       {"LLAMA_", "1"},
+             {"XLLAMA_CPU_POLL", "20"}, {"LLAMA_BAD-NAME", "1"},
+             {"XLLAMAX", "1"},          {"LLAMA_NUL", std::string("a\0b", 3)}};
+    const auto sp = resolve_session_params("moe", g, "D:\\m\\moe", -1);
+    const std::vector<std::pair<std::string, std::string>> want = {
+        {"GGML_SCHED", "1"},
+        {"LLAMA_", "1"},
+        {"LLAMA_EXPERT_PREFETCH_PRIO", "0"},
+        {"XLLAMA_CPU_POLL", "20"}};
+    CHECK(sp.env == want);
+
+    // ORT GenAI models do not read it.
+    g.gguf = false;
+    CHECK(resolve_session_params("m", g, "D:\\m", -1).env.empty());
+}
+
 TEST_CASE("same_load: an adapter, context or GPU split is a different model in RAM") {
     CatalogueLoad g;
     g.found = true;
@@ -129,7 +151,7 @@ TEST_CASE("same_load: an adapter, context or GPU split is a different model in R
     other.n_threads = 6; // a tuning knob, not the load
     other.n_batch = 256;
     CHECK(same_load(base, other));
-    for (int field = 0; field < 11; ++field) {
+    for (int field = 0; field < 12; ++field) {
         auto changed = base;
         switch (field) {
         case 0:
@@ -164,6 +186,9 @@ TEST_CASE("same_load: an adapter, context or GPU split is a different model in R
             break;
         case 10:
             changed.expert_prefetch_ahead = true;
+            break;
+        case 11:
+            changed.env = {{"XLLAMA_CPU_POLL", "0"}}; // read at load
             break;
         }
         CHECK_MESSAGE(!same_load(base, changed), field);

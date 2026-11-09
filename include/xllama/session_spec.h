@@ -29,7 +29,36 @@ struct CatalogueLoad {
     int expert_prefetch = 0;  // "expert_prefetch": experts read ahead per token (SessionParams)
     int expert_major = 0;     // "expert_major": largest expert-major prompt ubatch (SessionParams)
     bool expert_prefetch_ahead = false; // "expert_prefetch_ahead": predict a layer early
+    std::vector<std::pair<std::string, std::string>> env; // "env": {NAME: value} (SessionParams)
 };
+
+// A catalogue "env" name: LLAMA_*, GGML_* or XLLAMA_*, upper case, digits, '_'.
+inline bool catalogue_env_name(const std::string& n) {
+    if (n.rfind("LLAMA_", 0) != 0 && n.rfind("GGML_", 0) != 0 && n.rfind("XLLAMA_", 0) != 0)
+        return false;
+    return std::all_of(n.begin(), n.end(), [](char ch) {
+        return (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_';
+    });
+}
+
+// The usable entries of a catalogue "env", sorted by name (the last of a
+// repeated name wins), values without a NUL.
+inline std::vector<std::pair<std::string, std::string>>
+resolve_env(const std::vector<std::pair<std::string, std::string>>& env) {
+    std::vector<std::pair<std::string, std::string>> out;
+    for (const auto& kv : env) {
+        if (!catalogue_env_name(kv.first) || kv.second.find('\0') != std::string::npos)
+            continue;
+        auto it = std::find_if(out.begin(), out.end(),
+                               [&](const auto& o) { return o.first == kv.first; });
+        if (it != out.end())
+            it->second = kv.second;
+        else
+            out.push_back(kv);
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
 
 // `model_dir` is where the model's files live (resolve_model_path on the bare
 // name); the adapter is resolved against it. `gpu_layers_knob` is the operator
@@ -52,6 +81,7 @@ inline SessionParams resolve_session_params(const std::string& model, const Cata
     sp.expert_prefetch = sp.expert_slots > 0 ? std::clamp(c.expert_prefetch, 0, 64) : 0;
     sp.expert_major = sp.expert_slots > 0 ? std::clamp(c.expert_major, 0, 65536) : 0;
     sp.expert_prefetch_ahead = sp.expert_prefetch > 0 && c.expert_prefetch_ahead;
+    sp.env = resolve_env(c.env);
     // A streamed model is larger than any GPU budget: d3d12 layers would copy
     // its experts into video memory, so the knob does not apply to it. The
     // expert cache keeps its experts in the CPU cache whatever the layer device,
@@ -76,7 +106,8 @@ inline bool same_load(const SessionParams& a, const SessionParams& b) {
            a.lora_scale == b.lora_scale && a.kv_q8 == b.kv_q8 &&
            a.stream_weights == b.stream_weights && a.expert_slots == b.expert_slots &&
            a.expert_swap == b.expert_swap && a.expert_prefetch == b.expert_prefetch &&
-           a.expert_major == b.expert_major && a.expert_prefetch_ahead == b.expert_prefetch_ahead;
+           a.expert_major == b.expert_major && a.expert_prefetch_ahead == b.expert_prefetch_ahead &&
+           a.env == b.env;
 }
 
 } // namespace xllama

@@ -13,10 +13,13 @@
 #include "xllama/platform.h"
 #include "xllama/speculative.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace xllama {
 
@@ -92,13 +95,47 @@ inline bool gguf_embedding_info(const std::string& path, ggml_type* embd_type, b
 // from the environment when the model loads (LLAMA_EXPERT_PREFETCH,
 // LLAMA_EXPERT_MAJOR, LLAMA_EXPERT_PREFETCH_AHEAD); set every load so a reload
 // with other values takes them.
-inline void set_env_int(const char* name, int v) {
-    const std::string s = std::to_string(v);
+inline void put_env(const char* name, const char* value) {
 #ifdef _WIN32
-    _putenv_s(name, s.c_str());
+    _putenv_s(name, value); // "" removes it
 #else
-    setenv(name, s.c_str(), 1);
+    if (*value)
+        setenv(name, value, 1);
+    else
+        unsetenv(name);
 #endif
+}
+
+// The catalogue "env" of the current load (SessionParams::env): a name it lists
+// wins over the value set_env_int would put, and the next load unsets it.
+struct EnvOverrides {
+    std::mutex mtx;
+    std::vector<std::pair<std::string, std::string>> vars;
+};
+inline EnvOverrides& env_overrides() {
+    static EnvOverrides o;
+    return o;
+}
+
+inline void apply_env_overrides(const std::vector<std::pair<std::string, std::string>>& env) {
+    auto& o = env_overrides();
+    std::lock_guard<std::mutex> lock(o.mtx);
+    for (const auto& kv : o.vars)
+        put_env(kv.first.c_str(), "");
+    o.vars = env;
+    for (const auto& kv : env) {
+        put_env(kv.first.c_str(), kv.second.c_str());
+        log_output("[xllama] env " + kv.first + "=" + kv.second + "\n");
+    }
+}
+
+inline void set_env_int(const char* name, int v) {
+    auto& o = env_overrides();
+    std::lock_guard<std::mutex> lock(o.mtx);
+    for (const auto& kv : o.vars)
+        if (kv.first == name)
+            return;
+    put_env(name, std::to_string(v).c_str());
 }
 
 inline void apply_gguf_residency(bool stream, llama_model_params& mparams, int expert_slots = 0,
@@ -258,11 +295,15 @@ class GgufCpuThreadpools {
             return;
         if (!tp_) {
             ggml_threadpool_params p = ggml_threadpool_params_default(n_threads);
+            tune(p);
             tp_ = ggml_threadpool_new(&p);
             if (n_threads_batch > 0 && n_threads_batch != n_threads) {
                 ggml_threadpool_params pb = ggml_threadpool_params_default(n_threads_batch);
+                tune(pb);
                 tp_batch_ = ggml_threadpool_new(&pb);
             }
+            log_output("[xllama] cpu threadpool: " + std::to_string(n_threads) + " threads, poll " +
+                       std::to_string(p.poll) + ", prio " + std::to_string(int(p.prio)) + "\n");
         }
         if (tp_)
             llama_attach_threadpool(ctx, tp_, tp_batch_ ? tp_batch_ : tp_);
@@ -277,6 +318,16 @@ class GgufCpuThreadpools {
     }
 
   private:
+    // XLLAMA_CPU_POLL (0..100, ggml's default 50): how long the workers spin
+    // before sleeping between graphs; XLLAMA_CPU_PRIO (-1..3, GGML_SCHED_PRIO_*).
+    // Both from the catalogue "env".
+    static void tune(ggml_threadpool_params& p) {
+        if (const char* s = std::getenv("XLLAMA_CPU_POLL"); s && *s)
+            p.poll = static_cast<uint32_t>(std::clamp(std::atoi(s), 0, 100));
+        if (const char* s = std::getenv("XLLAMA_CPU_PRIO"); s && *s)
+            p.prio = static_cast<ggml_sched_priority>(std::clamp(std::atoi(s), -1, 3));
+    }
+
     ggml_threadpool_t tp_ = nullptr;
     ggml_threadpool_t tp_batch_ = nullptr;
 };

@@ -1485,6 +1485,7 @@ std::unique_ptr<Session> create_llama(const SessionParams& sp, std::string* err)
     llama_model_params mparams = llama_model_default_params();
     // the expert cache (which wins over stream) keeps the experts on the CPU itself
     const bool cpu_only = sp.stream_weights && sp.expert_slots <= 0;
+    apply_env_overrides(sp.env); // first: the set_env_int below honour it
     const int gpu_layers = apply_gguf_gpu_layers(cpu_only ? 0 : sp.n_gpu_layers, mparams, abs_path);
     apply_gguf_residency(sp.stream_weights, mparams, sp.expert_slots, sp.expert_swap,
                          sp.expert_prefetch, sp.expert_major, sp.expert_prefetch_ahead);

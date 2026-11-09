@@ -722,6 +722,27 @@ std::vector<ManifestEntry> parse_manifest(winrt::hstring const& text) {
         e.expert_prefetch = static_cast<int>(obj.GetNamedNumber(L"expert_prefetch", 0));
         e.expert_major = static_cast<int>(obj.GetNamedNumber(L"expert_major", 0));
         e.expert_prefetch_ahead = obj.GetNamedBoolean(L"expert_prefetch_ahead", false);
+        if (obj.HasKey(L"env") && obj.GetNamedValue(L"env").ValueType() ==
+                                      winrt::Windows::Data::Json::JsonValueType::Object) {
+            for (auto const& kv : obj.GetNamedObject(L"env")) {
+                auto const v = kv.Value();
+                std::wstring s;
+                switch (v.ValueType()) {
+                case winrt::Windows::Data::Json::JsonValueType::Number:
+                    s = std::to_wstring(static_cast<long long>(v.GetNumber()));
+                    break;
+                case winrt::Windows::Data::Json::JsonValueType::Boolean:
+                    s = v.GetBoolean() ? L"1" : L"0";
+                    break;
+                case winrt::Windows::Data::Json::JsonValueType::String:
+                    s = std::wstring(v.GetString());
+                    break;
+                default:
+                    continue;
+                }
+                e.env.emplace_back(std::wstring(kv.Key()), std::move(s));
+            }
+        }
         if (obj.HasKey(L"files")) {
             for (auto const& f : obj.GetNamedArray(L"files")) {
                 auto fo = f.GetObject();
@@ -889,6 +910,8 @@ SessionParams CatalogueSessionParams(const std::string& model) {
         c.expert_prefetch = entry->expert_prefetch;
         c.expert_major = entry->expert_major;
         c.expert_prefetch_ahead = entry->expert_prefetch_ahead;
+        for (const auto& kv : entry->env)
+            c.env.emplace_back(wstring_to_utf8(kv.first), wstring_to_utf8(kv.second));
         c.lora = wstring_to_utf8(entry->lora);
         c.lora_scale = static_cast<float>(entry->lora_scale);
     }
