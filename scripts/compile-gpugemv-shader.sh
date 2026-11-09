@@ -13,8 +13,9 @@
 #   shaders/ggml_d3d12_elt.hlsl → ggml_d3d12_elt_{binary,rms_norm,quant_q8_k}_dxil.h (cs_6_4, -D KERNEL)
 #   shaders/ggml_d3d12_moe.hlsl → ggml_d3d12_moe_{combine,tail}_dxil.h (cs_6_4, -D KERNEL)
 #   shaders/ggml_d3d12_ssm.hlsl → ggml_d3d12_ssm_{unary,copy,get_rows,conv,gdn}_dxil.h (cs_6_4, -D KERNEL)
+#   shaders/ggml_d3d12_attn.hlsl → ggml_d3d12_attn_{rope,set_rows,fa,fa_reduce}_dxil.h (cs_6_4, -D KERNEL)
 #
-# Usage: compile-gpugemv-shader.sh [naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q5_k|mmv_q6_k|mmv_iq3_s|mmv_iq4_xs|mmv_f32|mmid_iq4_xs|get_rows_q6_k|elt|moe|ssm ...]
+# Usage: compile-gpugemv-shader.sh [naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q5_k|mmv_q6_k|mmv_iq3_s|mmv_iq4_xs|mmv_f32|mmid_iq4_xs|get_rows_q6_k|elt|moe|ssm|attn ...]
 #        (default: all)
 # A different dxc release emits different bytes: regenerate only the targets
 # you changed so measured blobs stay the ones the CSVs were recorded with.
@@ -146,15 +147,25 @@ compile_target() {
 				-D "KERNEL=${n}"
 		done
 		;;
+	attn)
+		local k n name sym
+		for k in 1:rope:Rope 2:set_rows:SetRows 3:fa:Fa 4:fa_reduce:FaReduce; do
+			IFS=: read -r n name sym <<<"$k"
+			compile_one "$ROOT/shaders/ggml_d3d12_attn.hlsl" \
+				"$ROOT/shaders/generated/ggml_d3d12_attn_${name}_dxil.h" \
+				"shaders/ggml_d3d12_attn.hlsl -D KERNEL=${n}" "kGgmlD3d12Attn${sym}Dxil" cs_6_4 \
+				-D "KERNEL=${n}"
+		done
+		;;
 	*)
-		echo "unknown target: $1 (naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q5_k|mmv_q6_k|mmv_iq3_s|mmv_iq4_xs|mmv_f32|mmid_iq4_xs|get_rows_q6_k|elt|moe|ssm)" >&2
+		echo "unknown target: $1 (naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q5_k|mmv_q6_k|mmv_iq3_s|mmv_iq4_xs|mmv_f32|mmid_iq4_xs|get_rows_q6_k|elt|moe|ssm|attn)" >&2
 		exit 2
 		;;
 	esac
 }
 
 if [[ $# -eq 0 ]]; then
-	set -- naive wave32 rows dot4 mmv_q4_0 mmv_q4_k mmv_q5_k mmv_q6_k mmv_iq3_s mmv_iq4_xs mmv_f32 mmid_iq4_xs get_rows_q6_k elt moe ssm
+	set -- naive wave32 rows dot4 mmv_q4_0 mmv_q4_k mmv_q5_k mmv_q6_k mmv_iq3_s mmv_iq4_xs mmv_f32 mmid_iq4_xs get_rows_q6_k elt moe ssm attn
 fi
 for target in "$@"; do
 	compile_target "$target"
