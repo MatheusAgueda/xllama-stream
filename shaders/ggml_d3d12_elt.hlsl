@@ -175,7 +175,7 @@ void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
         GroupMemoryBarrierWithGroupSync();
     }
     const float amax = s_ax[0];
-    const uint out = gid.y * c2 + gid.x * 292u;
+    const uint ob = gid.y * c2 + gid.x * 292u;
     int q[4] = {0, 0, 0, 0};
     float d = 0.0f;
     if (amax != 0.0f) {
@@ -188,16 +188,16 @@ void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
         for (uint j = 0; j < 4u; ++j)
             q[j] = min(127, (int)round(iscale * x[j])); // round = nearest even, as nearest_int
     }
-    D.Store(out + 4u + 4u * tid, (uint(q[0]) & 0xffu) | ((uint(q[1]) & 0xffu) << 8) |
-                                     ((uint(q[2]) & 0xffu) << 16) | (uint(q[3]) << 24));
+    D.Store(ob + 4u + 4u * tid, (uint(q[0]) & 0xffu) | ((uint(q[1]) & 0xffu) << 8) |
+                                ((uint(q[2]) & 0xffu) << 16) | (uint(q[3]) << 24));
     s_sum[tid] = q[0] + q[1] + q[2] + q[3];
     GroupMemoryBarrierWithGroupSync();
     if ((tid & 7u) == 0u) {
         const int lo = s_sum[tid] + s_sum[tid + 1u] + s_sum[tid + 2u] + s_sum[tid + 3u];
         const int hi = s_sum[tid + 4u] + s_sum[tid + 5u] + s_sum[tid + 6u] + s_sum[tid + 7u];
-        D.Store(out + 260u + (tid >> 1), (uint(lo) & 0xffffu) | (uint(hi) << 16));
+        D.Store(ob + 260u + (tid >> 1), (uint(lo) & 0xffffu) | (uint(hi) << 16));
     }
     if (tid == 0u)
-        D.Store(out, asuint(d));
+        D.Store(ob, asuint(d));
 }
 #endif

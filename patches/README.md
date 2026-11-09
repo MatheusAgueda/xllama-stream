@@ -85,6 +85,17 @@ sit next to each other in the graph and land in one split, which also quantizes
 their shared input once. Only the order changes; the graph and its results stay
 the same.
 
+`0006-qwen35-mtp-tensors-optional.patch`: Qwen3.5 GGUFs declare
+`nextn_predict_layers = 1`, so `block_count` counts the multi-token-prediction
+block (33 for the 9B) and the loader asks for `blk.32.*`. Re-quants that drop
+that block fail with `check_tensor_dims: tensor 'blk.32.attn_norm.weight' not
+found`. Measured 2026-11-09 on mradermacher's
+DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic i1-IQ3_M, which has 427 tensors for
+blk.0–31 only. Without `load_mtp` the block is skipped anyway (`TENSOR_SKIP`), so
+the patch also marks it `TENSOR_NOT_REQUIRED` in `qwen35` and `qwen35moe`. A
+missing MTP tensor then loads as null, the same result a skipped one gives. With
+MTP on, the tensors are still required.
+
 ## Applying
 
 ```bash
