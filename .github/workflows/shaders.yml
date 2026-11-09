@@ -1,0 +1,86 @@
+name: shaders
+
+# AOT-compile D3D12 compute shaders to the DXIL headers in shaders/generated/
+# with the Linux DXC release (dxc + libdxil.so, so the blobs are signed like the
+# committed ones). The artifact is reviewed and committed by hand,
+# since a different dxc emits different bytes (scripts/compile-gpugemv-shader.sh).
+
+on:
+  # A new workflow file is dispatchable only once it is on the default branch;
+  # until then a push touching the shaders runs it with the input defaults.
+  push:
+    paths: [shaders/**.hlsl, shaders/**.hlsli, shaders/**.inc, .github/workflows/shaders.yml]
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: compile-gpugemv-shader.sh targets, space-separated
+        required: true
+        default: mmv_iq3_s
+      dxc_tag:
+        description: microsoft/DirectXShaderCompiler release tag
+        required: true
+        default: v1.9.2609
+
+permissions:
+  contents: read
+
+jobs:
+  dxil:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Fetch DXC
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DXC_TAG: ${{ inputs.dxc_tag || 'v1.9.2609' }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/dxc"
+          gh release download "$DXC_TAG" -R microsoft/DirectXShaderCompiler \
+            -p 'linux_dxc_*.tar.gz' -D "$RUNNER_TEMP/dxc"
+          tar -xzf "$RUNNER_TEMP"/dxc/linux_dxc_*.tar.gz -C "$RUNNER_TEMP/dxc"
+          dxc_bin="$(find "$RUNNER_TEMP/dxc" -type f -name dxc | head -n1)"
+          dxil_lib="$(find "$RUNNER_TEMP/dxc" -name 'libdxil.so*' | head -n1)"
+          test -n "$dxc_bin" && test -n "$dxil_lib"
+          chmod +x "$dxc_bin"
+          echo "DXC=$dxc_bin" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$(dirname "$dxil_lib")" >> "$GITHUB_ENV"
+          "$dxc_bin" --version
+
+      - name: Compile
+        env:
+          TARGETS: ${{ inputs.targets || 'mmv_iq3_s' }}
+        run: |
+          # shellcheck disable=SC2086 # TARGETS is a word list
+          ./scripts/compile-gpugemv-shader.sh $TARGETS 2> "$RUNNER_TEMP/dxc.err" || {
+            cat "$RUNNER_TEMP/dxc.err"; exit 1; }
+          cat "$RUNNER_TEMP/dxc.err"
+          if grep -qi 'signing\|not be signed' "$RUNNER_TEMP/dxc.err"; then
+            echo "dxc could not sign the DXIL" >&2; exit 1
+          fi
+
+      - name: Check DXIL signatures
+        run: |
+          python3 - <<'PY'
+          import re, subprocess, sys
+          from pathlib import Path
+          changed = subprocess.run(
+              ["git", "ls-files", "--others", "--modified", "shaders/generated"],
+              capture_output=True, text=True, check=True).stdout.split()
+          if not changed:
+              sys.exit("no header was written")
+          for name in changed:
+              blob = bytes(int(h, 16) for h in re.findall(r"0x([0-9a-f]{2})", Path(name).read_text()))
+              digest = blob[4:20]
+              print(name, len(blob), "bytes", blob[:4], digest.hex())
+              if blob[:4] != b"DXBC" or not any(digest):
+                  sys.exit(f"{name}: not a signed DXIL container")
+          PY
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dxil-headers
+          path: shaders/generated/*.h
+          if-no-files-found: error

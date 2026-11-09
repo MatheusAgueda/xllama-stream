@@ -82,6 +82,9 @@ TEST_CASE("ggml_d3d12: weight types") {
     CHECK(d3d12_weight_type_supported(GGML_TYPE_Q4_0));
     CHECK(d3d12_weight_type_supported(GGML_TYPE_Q4_K));
     CHECK(d3d12_weight_type_supported(GGML_TYPE_Q6_K));
+    CHECK(d3d12_weight_type_supported(GGML_TYPE_IQ3_S));
+    CHECK(d3d12_activation_type(GGML_TYPE_IQ3_S) == GGML_TYPE_Q8_K);
+    CHECK_FALSE(d3d12_weight_type_supported(GGML_TYPE_IQ3_XXS));
     CHECK_FALSE(d3d12_weight_type_supported(GGML_TYPE_Q5_K));
     CHECK_FALSE(d3d12_weight_type_supported(GGML_TYPE_Q8_0));
     CHECK_FALSE(d3d12_weight_type_supported(GGML_TYPE_F16));
@@ -182,6 +185,11 @@ TEST_CASE("ggml_d3d12: kernel emulation matches the CPU backend (q8 activations)
         // Coder-3B ffn_down width: 43 super-blocks, 9030-byte rows.
         {GGML_TYPE_Q6_K, 3, 11008},
         {GGML_TYPE_Q4_0, 5, 2304},
+        {GGML_TYPE_IQ3_S, 13, 1024},
+        // 9 super-blocks: 990-byte rows, odd rows start 2-byte aligned.
+        {GGML_TYPE_IQ3_S, 6, 2304},
+        // Qwen3.5-9B ffn_down width: 48 super-blocks, 128 threads.
+        {GGML_TYPE_IQ3_S, 3, 12288},
     };
     for (const auto& c : cases) {
         CAPTURE(ggml_type_name(c.t));
@@ -190,6 +198,7 @@ TEST_CASE("ggml_d3d12: kernel emulation matches the CPU backend (q8 activations)
         CHECK(emulate_rel_err(c.t, c.n, c.k, 7, 12, 3) <= kD3d12SelftestRelTol);
     }
     CHECK(ggml_row_size(GGML_TYPE_Q6_K, 11008) % 4 == 2); // the case the ld32 trick covers
+    CHECK(ggml_row_size(GGML_TYPE_IQ3_S, 2304) % 4 == 2);
 }
 
 TEST_CASE("ggml_d3d12: selftest CSV and non-Windows behaviour") {

@@ -27,6 +27,16 @@ stay file-backed with no repack copy, so a MoE larger than the title's RAM budge
 pages its experts in from storage. Every other model is still read into the heap
 — on UWP `load_mode` is set to `NONE` explicitly, since `AUTO` would now map it.
 
+`0003-loader-chunked-upload.patch` (applies after 0002): `load_all_data`'s
+synchronous upload path (any non-host weight buffer whose device does not take
+the async pinned-buffer route, e.g. `D3D12_Weights`) allocated a staging vector
+the size of the whole tensor. A 248K-vocab Q6_K `output.weight` is 796 MiB, which
+on top of the weights already placed overflows the title's single ~5 GB pool
+(heap and D3D12 share it; measured 2026-11-09, `bad allocation` with
+`gguf_gpu_layers.txt=99`). It now reads and uploads 64 MiB at a time through
+`ggml_backend_tensor_set(..., offset, len)`. `--check-tensors` keeps the
+whole-tensor path, since `ggml_validate_row_data` needs the full buffer.
+
 ## Applying
 
 ```bash

@@ -1,0 +1,25 @@
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 6cc0b20..e795d40 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1733,6 +1733,20 @@ bool llama_model_loader::load_all_data(
+                         ++buffer_idx;
+                         buffer_idx %= n_buffers;
+                     }
++                } else if (!check_tensors) {
++                    // Read and upload in bounded chunks: a staging buffer the size of the
++                    // tensor (796 MiB for a 248K-vocab Q6_K output.weight) on top of the
++                    // already-allocated weights does not fit a fixed title memory budget
++                    // (Xbox UWP: one ~5 GB pool for heap and D3D12).
++                    constexpr size_t chunk_max = 64u << 20;
++                    std::vector<no_init<uint8_t>> read_buf(std::min(n_size, chunk_max));
++                    file->seek(weight->offs, SEEK_SET);
++                    for (size_t done = 0; done < n_size;) {
++                        const size_t len = std::min(chunk_max, n_size - done);
++                        file->read_raw(read_buf.data(), len);
++                        ggml_backend_tensor_set(cur, read_buf.data(), done, len);
++                        done += len;
++                    }
+                 } else {
+                     // scoped to one tensor so only one staging buffer is alive at a time
+                     std::vector<no_init<uint8_t>> read_buf(n_size);

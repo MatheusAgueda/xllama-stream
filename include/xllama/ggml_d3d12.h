@@ -4,7 +4,7 @@
 // ggml backend "d3d12" — GGUF GPU decode D2 (docs/gguf-gpu-decode.md).
 //
 // A GPU-type ggml device, registered at runtime, that runs MUL_MAT with
-// Q4_0 / Q4_K / Q6_K weights and GET_ROWS from a Q6_K weight on our D3D12
+// Q4_0 / Q4_K / Q6_K / IQ3_S weights and GET_ROWS from a Q6_K weight on our D3D12
 // compute shaders; matmul inputs are quantized to q8 on the CPU first, exactly
 // as the CPU backend does.
 // Two buffer types:

@@ -23,7 +23,8 @@ namespace xllama {
 // --- Pure rules (host-tested) ---
 
 bool d3d12_weight_type_supported(ggml_type t) {
-    return t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q6_K;
+    return t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q6_K ||
+           t == GGML_TYPE_IQ3_S;
 }
 
 D3d12Dispatch d3d12_mm_dispatch(std::int64_t n, std::int64_t ncols) {
@@ -132,10 +133,20 @@ void q4k_scale_min(std::uint32_t j, const std::uint8_t* sc, std::int32_t* d, std
     *m = static_cast<std::int32_t>(mm);
 }
 
+constexpr std::uint32_t kIq3sGrid[512] = {
+    #include "../../shaders/ggml_d3d12_iq3s_grid.inc"
+};
+
+// shaders/ggml_d3d12_mmv_iq3_s.hlsl signed4: negate the bytes selected by s4.
+std::uint32_t iq3s_signed4(std::uint32_t g, std::uint32_t s4) {
+    const std::uint32_t m = ((s4 * 0x00204081u) & 0x01010101u) * 0xffu;
+    return (g ^ m) + (m & 0x01010101u);
+}
+
 // One thread's contribution for one row and one 256-element chunk. `xq` is
 // one activation column in the vec_dot type's ggml blocks (block_q8_0 for
-// Q4_0, block_q8_K for Q4_K / Q6_K). Integer sums are exact; the float terms
-// follow ggml's vec_dot (#312).
+// Q4_0, block_q8_K for Q4_K / Q6_K / IQ3_S). Integer sums are exact; the float
+// terms follow ggml's vec_dot (#312).
 float thread_chunk(ggml_type t, const std::uint8_t* w, std::uint32_t row_off, std::uint32_t blk,
                    std::uint32_t itid, const std::uint8_t* xq) {
     if (t == GGML_TYPE_Q4_0) {
@@ -157,6 +168,25 @@ float thread_chunk(ggml_type t, const std::uint8_t* w, std::uint32_t row_off, st
     float dy;
     std::memcpy(&dy, xq + blk * 292u, 4); // block_q8_K: float d; int8 qs[256]; ...
     const auto* qx = reinterpret_cast<const std::int8_t*>(xq + blk * 292u + 4u);
+    if (t == GGML_TYPE_IQ3_S) {
+        const std::uint32_t ib32 = itid >> 1, h = itid & 1u, e = 32u * ib32 + 16u * h;
+        const std::uint32_t bb = row_off + blk * 110u;
+        const float d = h2f(ld16(w, bb));
+        const std::uint32_t qs = ld32(w, bb + 2u + 8u * ib32 + 4u * h);
+        const std::uint32_t hb = (w[bb + 66u + ib32] >> (4u * h)) & 0xFu;
+        const std::uint32_t sg = ld16(w, bb + 74u + 4u * ib32 + 2u * h);
+        const std::int32_t ls =
+            2 * static_cast<std::int32_t>((w[bb + 106u + (ib32 >> 1)] >> (4u * (ib32 & 1u))) & 0xFu) +
+            1;
+        std::int32_t sumi = 0;
+        for (std::uint32_t k = 0; k < 4; ++k) {
+            const std::uint32_t g = iq3s_signed4(
+                kIq3sGrid[((qs >> (8u * k)) & 0xFFu) | (((hb >> k) & 1u) << 8)], (sg >> (4u * k)) & 0xFu);
+            for (std::uint32_t j = 0; j < 4; ++j)
+                sumi += sbyte(g, j) * qx[e + 4u * k + j];
+        }
+        return (d * dy) * static_cast<float>(ls * sumi);
+    }
     if (t == GGML_TYPE_Q4_K) {
         const std::uint32_t il = itid >> 2, ir = itid & 3u;
         const std::uint32_t e_lo = il * 64u + ir * 8u, e_hi = e_lo + 32u;
@@ -353,6 +383,8 @@ void run_d3d12_memprobe(const std::function<void(const std::string&)>& emit) {
         #include "ggml-backend-impl.h"
         #include "ggml-backend.h"
         #include "ggml_d3d12_get_rows_q6_k_dxil.h"
+        #include "ggml_d3d12_mmv_iq3_s_t128_dxil.h"
+        #include "ggml_d3d12_mmv_iq3_s_t64_dxil.h"
         #include "ggml_d3d12_mmv_q4_0_t128_dxil.h"
         #include "ggml_d3d12_mmv_q4_0_t64_dxil.h"
         #include "ggml_d3d12_mmv_q4_k_t128_dxil.h"
@@ -367,7 +399,7 @@ namespace {
 
 using d3d12c::ComPtr;
 
-enum Pso { kPsoQ40 = 0, kPsoQ4K = 1, kPsoQ6K = 2, kPsoCount = 3 };
+enum Pso { kPsoQ40 = 0, kPsoQ4K = 1, kPsoQ6K = 2, kPsoIq3S = 3, kPsoCount = 4 };
 
 int pso_for(ggml_type t) {
     switch (t) {
@@ -377,6 +409,8 @@ int pso_for(ggml_type t) {
         return kPsoQ4K;
     case GGML_TYPE_Q6_K:
         return kPsoQ6K;
+    case GGML_TYPE_IQ3_S:
+        return kPsoIq3S;
     default:
         return -1;
     }
@@ -495,11 +529,13 @@ bool init_gpu(Gpu& g) {
         return false;
     const void* blobs[kPsoCount][2] = {{kGgmlD3d12MmvQ40T64Dxil, kGgmlD3d12MmvQ40T128Dxil},
                                        {kGgmlD3d12MmvQ4KT64Dxil, kGgmlD3d12MmvQ4KT128Dxil},
-                                       {kGgmlD3d12MmvQ6KT64Dxil, kGgmlD3d12MmvQ6KT128Dxil}};
+                                       {kGgmlD3d12MmvQ6KT64Dxil, kGgmlD3d12MmvQ6KT128Dxil},
+                                       {kGgmlD3d12MmvIq3ST64Dxil, kGgmlD3d12MmvIq3ST128Dxil}};
     const size_t sizes[kPsoCount][2] = {
         {kGgmlD3d12MmvQ40T64DxilSize, kGgmlD3d12MmvQ40T128DxilSize},
         {kGgmlD3d12MmvQ4KT64DxilSize, kGgmlD3d12MmvQ4KT128DxilSize},
-        {kGgmlD3d12MmvQ6KT64DxilSize, kGgmlD3d12MmvQ6KT128DxilSize}};
+        {kGgmlD3d12MmvQ6KT64DxilSize, kGgmlD3d12MmvQ6KT128DxilSize},
+        {kGgmlD3d12MmvIq3ST64DxilSize, kGgmlD3d12MmvIq3ST128DxilSize}};
     for (int i = 0; i < kPsoCount; ++i) {
         for (int wd = 0; wd < 2; ++wd) {
             D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
@@ -808,7 +844,7 @@ size_t buft_alignment(ggml_backend_buffer_type_t) {
 bool buft_is_host_true(ggml_backend_buffer_type_t) {
     return true;
 }
-// The Q4_0/Q6_K kernels read whole aligned dwords, up to 2 bytes past a
+// The Q4_0/Q6_K/IQ3_S kernels read whole aligned dwords, up to 2 bytes past a
 // tensor's last block; root descriptors have no bounds check, so pad.
 size_t weights_alloc_size(ggml_backend_buffer_type_t, const ggml_tensor* t) {
     return ggml_nbytes(t) + 16;
@@ -1205,7 +1241,7 @@ const char* dev_name(ggml_backend_dev_t) {
     return "D3D12";
 }
 const char* dev_description(ggml_backend_dev_t) {
-    return "xllama D3D12 compute (Q4_0/Q4_K/Q6_K matmul, Q6_K get_rows)";
+    return "xllama D3D12 compute (Q4_0/Q4_K/Q6_K/IQ3_S matmul, Q6_K get_rows)";
 }
 void dev_memory(ggml_backend_dev_t, size_t* free, size_t* total) {
     *free = *total = 0;
@@ -1851,6 +1887,9 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
         {GGML_TYPE_Q4_0, "q4_0", 1024, 1024, 7},   {GGML_TYPE_Q4_K, "q4_k", 1024, 1024, 7},
         {GGML_TYPE_Q6_K, "q6_k", 1024, 1024, 7},   {GGML_TYPE_Q4_0, "q4_0", 1024, 1024, 512},
         {GGML_TYPE_Q4_K, "q4_k", 1024, 1024, 512}, {GGML_TYPE_Q6_K, "q6_k", 1024, 1024, 512},
+        // Qwen3.5-9B IQ3_M: ffn_gate/up 4096->12288 and ffn_down 12288->4096 are IQ3_S.
+        {GGML_TYPE_IQ3_S, "iq3_s", 12288, 4096, 1}, {GGML_TYPE_IQ3_S, "iq3_s", 4096, 12288, 1},
+        {GGML_TYPE_IQ3_S, "iq3_s", 1024, 1024, 7},
     };
     for (const auto& sc : cases)
         out->push_back(run_case(backend, sc));
