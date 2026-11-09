@@ -256,14 +256,18 @@ TEST_CASE("chatml render is byte-exact with the legacy hand-built prompt") {
     CHECK(f.render_prompt(sys, hist, final_user) == legacy);
 }
 
-TEST_CASE("chatml render appends qwen suffix only to the trailing header") {
+TEST_CASE("chatml render keeps the qwen suffix on history turns and the trailing header") {
     const ChatFormat f = chat_format_for("qwen35-0.8b");
     const std::string p = f.render_prompt("sys", {{"u1", "a1"}}, "u2");
     // Trailing header carries the suffix...
     CHECK(p.substr(p.size() - f.gen_suffix.size()) == f.gen_suffix);
-    // ...but the completed history assistant turn does not.
-    const std::string hist_hdr = "<|im_start|>assistant\na1<|im_end|>\n";
+    // ...and so does the completed history turn, as it was generated.
+    const std::string hist_hdr = "<|im_start|>assistant\n<think>\n\n</think>\n\na1<|im_end|>\n";
     CHECK(p.find(hist_hdr) != std::string::npos);
+    // Non-Qwen3 ChatML history stays bare.
+    const std::string bare =
+        chat_format_for("smollm2-360m-cpu-int4").render_prompt("sys", {{"u1", "a1"}}, "u2");
+    CHECK(bare.find("<|im_start|>assistant\na1<|im_end|>\n") != std::string::npos);
 }
 
 TEST_CASE("gemma render merges system into the first user turn, no bos/system") {
@@ -349,11 +353,9 @@ TEST_CASE("postprocess_output strips empty think for chatml, passthrough otherwi
 // The core KV-reuse safety net: the string a reused KV holds after a turn — the
 // full prompt, the assistant output, plus the delta for the next turn — must
 // equal a cold full re-prefill of the same conversation with that turn appended.
-// Only meaningful when gen_suffix is empty: a non-empty suffix is prefilled into
-// the KV but intentionally absent from stored output, a known/preserved
-// discrepancy (see chat_prompt.cpp risks), so the strings would differ by design.
+// Holds with a gen_suffix too (Qwen3 no-think, MiniCPM5): history turns carry it,
+// so a hybrid cache that cannot rewind still sees a pure extension.
 static void check_kv_reuse_invariant(const ChatFormat& f) {
-    REQUIRE(f.gen_suffix.empty());
     const std::string sys = "sys";
     const std::vector<ChatTurn> hist = {{"u1", "a1"}};
     const std::string final_user = "u2";
@@ -376,11 +378,13 @@ static void check_kv_reuse_invariant(const ChatFormat& f) {
     CHECK(base + raw_out + f.render_delta(next_user, /*prev_ended_with_stop=*/false) == cold);
 }
 
-TEST_CASE("kv-reuse invariant holds for chatml, gemma, llama3, and phi3") {
+TEST_CASE("kv-reuse invariant holds for chatml, gemma, llama3, phi3, qwen3 and minicpm5") {
     check_kv_reuse_invariant(chat_format_for("smollm2-360m-cpu-int4"));
     check_kv_reuse_invariant(chat_format_for("gemma3-270m"));
     check_kv_reuse_invariant(chat_format_for("llama32-3b"));
     check_kv_reuse_invariant(chat_format_for("phi35-mini"));
+    check_kv_reuse_invariant(chat_format_for("qwen36-35b-a3b-heretic"));
+    check_kv_reuse_invariant(chat_format_for("minicpm5-1b-Q4_K_M.gguf"));
 }
 
 TEST_CASE("render_system_prefix is the exact head of render_prompt (#169)") {
