@@ -24,7 +24,8 @@ namespace xllama {
 
 bool d3d12_weight_type_supported(ggml_type t) {
     return t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q6_K ||
-           t == GGML_TYPE_IQ3_S || t == GGML_TYPE_IQ4_XS || t == GGML_TYPE_Q5_K;
+           t == GGML_TYPE_IQ3_S || t == GGML_TYPE_IQ4_XS || t == GGML_TYPE_Q5_K ||
+           t == GGML_TYPE_F32;
 }
 
 D3d12Dispatch d3d12_mm_dispatch(std::int64_t n, std::int64_t ncols) {
@@ -149,6 +150,21 @@ std::uint32_t iq3s_signed4(std::uint32_t g, std::uint32_t s4) {
 // terms follow ggml's vec_dot (#312).
 float thread_chunk(ggml_type t, const std::uint8_t* w, std::uint32_t row_off, std::uint32_t blk,
                    std::uint32_t itid, const std::uint8_t* xq) {
+    if (t == GGML_TYPE_F32) { // shaders/ggml_d3d12_mmv_f32.hlsl: f32 activations as they are
+        float acc = 0.f;
+        for (std::uint32_t j = 0; j < 4; ++j) {
+            const std::uint32_t e = (blk * 256u + 64u * j + 4u * itid) * 4u;
+            float wv[4], xv[4];
+            std::memcpy(wv, w + row_off + e, sizeof(wv));
+            std::memcpy(xv, xq + e, sizeof(xv));
+            float s = wv[0] * xv[0];
+            s += wv[1] * xv[1];
+            s += wv[2] * xv[2];
+            s += wv[3] * xv[3];
+            acc += s;
+        }
+        return acc;
+    }
     if (t == GGML_TYPE_Q4_0) {
         const std::uint32_t b = itid >> 1, h = itid & 1u;
         const std::uint8_t* xb = xq + (blk * 8u + b) * 34u; // block_q8_0
@@ -285,6 +301,8 @@ float thread_chunk(ggml_type t, const std::uint8_t* w, std::uint32_t row_off, st
 } // namespace
 
 ggml_type d3d12_activation_type(ggml_type weight) {
+    if (weight == GGML_TYPE_F32)
+        return GGML_TYPE_F32; // the kernel reads the f32 activations as they are
     return weight == GGML_TYPE_Q4_0 ? GGML_TYPE_Q8_0 : GGML_TYPE_Q8_K;
 }
 
@@ -576,6 +594,8 @@ void run_d3d12_memprobe(const std::function<void(const std::string&)>& emit) {
         #include "ggml_d3d12_mmid_emu.h"
         #include "ggml_d3d12_mmid_iq4_xs_t128_dxil.h"
         #include "ggml_d3d12_mmid_iq4_xs_t64_dxil.h"
+        #include "ggml_d3d12_mmv_f32_t128_dxil.h"
+        #include "ggml_d3d12_mmv_f32_t64_dxil.h"
         #include "ggml_d3d12_mmv_iq3_s_t128_dxil.h"
         #include "ggml_d3d12_mmv_iq3_s_t64_dxil.h"
         #include "ggml_d3d12_mmv_iq4_xs_t128_dxil.h"
@@ -606,7 +626,8 @@ enum Pso {
     kPsoIq3S = 3,
     kPsoIq4Xs = 4,
     kPsoQ5K = 5,
-    kPsoCount = 6
+    kPsoF32 = 6,
+    kPsoCount = 7
 };
 enum Elt { kEltBinary = 0, kEltRmsNorm = 1, kEltQuantQ8K = 2, kEltCount = 3 };
 enum Moe { kMoeCombine = 0, kMoeTail = 1, kMoeCount = 2 };
@@ -628,6 +649,8 @@ int pso_for(ggml_type t) {
         return kPsoIq4Xs;
     case GGML_TYPE_Q5_K:
         return kPsoQ5K;
+    case GGML_TYPE_F32:
+        return kPsoF32;
     default:
         return -1;
     }
@@ -779,14 +802,16 @@ bool init_gpu(Gpu& g) {
                                        {kGgmlD3d12MmvQ6KT64Dxil, kGgmlD3d12MmvQ6KT128Dxil},
                                        {kGgmlD3d12MmvIq3ST64Dxil, kGgmlD3d12MmvIq3ST128Dxil},
                                        {kGgmlD3d12MmvIq4XsT64Dxil, kGgmlD3d12MmvIq4XsT128Dxil},
-                                       {kGgmlD3d12MmvQ5KT64Dxil, kGgmlD3d12MmvQ5KT128Dxil}};
+                                       {kGgmlD3d12MmvQ5KT64Dxil, kGgmlD3d12MmvQ5KT128Dxil},
+                                       {kGgmlD3d12MmvF32T64Dxil, kGgmlD3d12MmvF32T128Dxil}};
     const size_t sizes[kPsoCount][2] = {
         {kGgmlD3d12MmvQ40T64DxilSize, kGgmlD3d12MmvQ40T128DxilSize},
         {kGgmlD3d12MmvQ4KT64DxilSize, kGgmlD3d12MmvQ4KT128DxilSize},
         {kGgmlD3d12MmvQ6KT64DxilSize, kGgmlD3d12MmvQ6KT128DxilSize},
         {kGgmlD3d12MmvIq3ST64DxilSize, kGgmlD3d12MmvIq3ST128DxilSize},
         {kGgmlD3d12MmvIq4XsT64DxilSize, kGgmlD3d12MmvIq4XsT128DxilSize},
-        {kGgmlD3d12MmvQ5KT64DxilSize, kGgmlD3d12MmvQ5KT128DxilSize}};
+        {kGgmlD3d12MmvQ5KT64DxilSize, kGgmlD3d12MmvQ5KT128DxilSize},
+        {kGgmlD3d12MmvF32T64DxilSize, kGgmlD3d12MmvF32T128DxilSize}};
     for (int i = 0; i < kPsoCount; ++i) {
         for (int wd = 0; wd < 2; ++wd) {
             D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
@@ -1846,26 +1871,39 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
             const ggml_tensor* x = b;
             GGML_ASSERT(w->buffer && w->buffer->buft == &kWeightsBuft);
             GGML_ASSERT(x->buffer && ggml_backend_buffer_is_host(x->buffer));
-            const ggml_type at = d3d12_activation_type(w->type);
             const int ncols = static_cast<int>(x->ne[1]);
-            const std::uint32_t row = static_cast<std::uint32_t>(ggml_row_size(at, x->ne[0]));
-            const std::size_t bytes = static_cast<std::size_t>(row) * ncols;
-            std::size_t off = 0;
-            if (!quantize(x, w->type, ncols, &off))
-                return GGML_STATUS_FAILED;
+            D3D12_GPU_VIRTUAL_ADDRESS x_va = 0;
+            std::uint64_t x_stride = 0;
+            Rng xr;
+            if (w->type == GGML_TYPE_F32 && elt_operand(x)) {
+                // The f32 kernel reads the activations where they are: no
+                // copy, so no flush when this split's GPU work wrote them.
+                x_va = tensor_va(x);
+                x_stride = x->nb[1];
+                xr = rng_of(x);
+            } else {
+                const ggml_type at = d3d12_activation_type(w->type);
+                const std::uint32_t row = static_cast<std::uint32_t>(ggml_row_size(at, x->ne[0]));
+                std::size_t off = 0;
+                if (!quantize(x, w->type, ncols, &off))
+                    return GGML_STATUS_FAILED;
+                x_va = xq_va(off);
+                x_stride = row;
+                xr = xq_rng(off, static_cast<std::size_t>(row) * ncols);
+            }
             const D3d12Dispatch d = d3d12_mm_dispatch(node->ne[0], node->ne[1]);
             const int wide = d3d12_mm_threads(w->ne[0]) == kD3d12MmvThreadsLong ? 1 : 0;
             Op m;
             m.pso = g.pso[pso_for(w->type)][wide].Get();
             set_c(m, {static_cast<std::uint64_t>(w->ne[1]), static_cast<std::uint64_t>(w->ne[0]),
-                      static_cast<std::uint64_t>(w->ne[0] / kD3d12Chunk), w->nb[1], row,
+                      static_cast<std::uint64_t>(w->ne[0] / kD3d12Chunk), w->nb[1], x_stride,
                       node->nb[1] / sizeof(float)});
             m.t0 = tensor_va(w);
             m.u[0] = tensor_va(node);
-            m.u[1] = xq_va(off);
+            m.u[1] = x_va;
             m.gx = d.groups_x;
             m.gy = d.groups_y;
-            record(m, {xq_rng(off, bytes)}, {rng_of(node)});
+            record(m, {xr}, {rng_of(node)});
             break;
         }
         case GGML_OP_MUL_MAT_ID: {
@@ -3051,8 +3089,9 @@ D3d12SelftestRow run_moe_case(ggml_backend_t backend, int mode, int ne0, int n, 
                                       ref.data());
     } else {
         D3d12MoeTailPlan p;
+        // One token has no second row, so the plan's row stride is 0 there.
         planned = d3d12_moe_tail_plan(out, &p) &&
-                  p.params.dst_row_stride == static_cast<std::uint32_t>(ne0);
+                  (p.groups_y == 1 || p.params.dst_row_stride == static_cast<std::uint32_t>(ne0));
         if (planned)
             d3d12_moe_tail_emulate(p.params, p.groups_x, p.groups_y, sv.data(), gv.data(),
                                    mv.data(), qv.data(), ref.data());
@@ -3145,6 +3184,10 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
         {GGML_TYPE_Q5_K, "q5_k", 8192, 2048, 1},
         {GGML_TYPE_Q5_K, "q5_k", 512, 2048, 1},
         {GGML_TYPE_Q5_K, "q5_k", 1024, 1024, 7},
+        // Its router (ffn_gate_inp 2048 -> 256) and shared expert gate (2048 -> 1), kept in f32.
+        {GGML_TYPE_F32, "f32", 256, 2048, 1},
+        {GGML_TYPE_F32, "f32", 1, 2048, 1},
+        {GGML_TYPE_F32, "f32", 256, 2048, 7},
     };
     for (const auto& sc : cases)
         out->push_back(run_case(backend, sc));

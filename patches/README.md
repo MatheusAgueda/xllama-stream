@@ -164,6 +164,16 @@ kernels (`shaders/ggml_d3d12_moe.hlsl`) the routed experts, their combine and
 the residual adds then form one GPU split (the shared FFN runs earlier, 0007).
 Only the order changes; the graph and its results stay the same.
 
+`0009-qwen35moe-router-logits-with-shared-gate.patch` (applies after 0008): the
+D3D12 backend now runs F32 weights (`shaders/ggml_d3d12_mmv_f32.hlsl`), so the
+router (`ffn_gate_inp`, 2048 x 256) and the shared expert's gate move to the GPU.
+Built as before, the gate's sigmoid sat between the two matmuls and would have
+split the GPU submission. The patch builds the router's logits right after the
+gate's matmul and hands them to `build_moe_ffn` through `probs_in`, then the
+sigmoid: the two matmuls join the shared expert's GPU split and the sigmoid joins
+the router's CPU split (softmax, top-k). Only the order changes; the results stay
+the same.
+
 ## Applying
 
 ```bash

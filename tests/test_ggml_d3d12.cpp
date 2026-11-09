@@ -94,7 +94,9 @@ TEST_CASE("ggml_d3d12: weight types") {
     CHECK_FALSE(d3d12_weight_type_supported(GGML_TYPE_IQ4_NL));
     CHECK_FALSE(d3d12_weight_type_supported(GGML_TYPE_Q8_0));
     CHECK_FALSE(d3d12_weight_type_supported(GGML_TYPE_F16));
-    CHECK_FALSE(d3d12_weight_type_supported(GGML_TYPE_F32));
+    // F32 (MoE routers): the kernel reads the f32 activations themselves.
+    CHECK(d3d12_weight_type_supported(GGML_TYPE_F32));
+    CHECK(d3d12_activation_type(GGML_TYPE_F32) == GGML_TYPE_F32);
 }
 
 TEST_CASE("ggml_d3d12: supports_op rules for MUL_MAT") {
@@ -204,6 +206,9 @@ TEST_CASE("ggml_d3d12: kernel emulation matches the CPU backend (q8 activations)
         {GGML_TYPE_Q5_K, 13, 1024},
         {GGML_TYPE_Q5_K, 6, 2304},
         {GGML_TYPE_Q5_K, 3, 4096},
+        // Qwen3.6-35B-A3B router and shared expert gate: f32 weights and activations.
+        {GGML_TYPE_F32, 13, 1024},
+        {GGML_TYPE_F32, 3, 2048},
     };
     for (const auto& c : cases) {
         CAPTURE(ggml_type_name(c.t));
