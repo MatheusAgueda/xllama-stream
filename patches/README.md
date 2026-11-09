@@ -143,6 +143,17 @@ the patch also marks it `TENSOR_NOT_REQUIRED` in `qwen35` and `qwen35moe`. A
 missing MTP tensor then loads as null, the same result a skipped one gives. With
 MTP on, the tensors are still required.
 
+`0007-qwen35moe-shared-gate-with-router.patch` (applies after 0004–0006): in
+`qwen35moe` the shared expert's gate (`ffn_gate_inp_shexp`, an F32 matmul to one
+value per token, then a sigmoid) was built after the shared expert, so on the
+D3D12 backend, which takes no F32 weights, each MoE layer had a CPU split between
+the shared expert and the residual adds. The patch builds the gate first and
+calls `ggml_build_forward_expand` on it before `build_moe_ffn`, so it runs in the
+router's CPU split (the router is also F32). With the MoE combine and tail
+kernels (`shaders/ggml_d3d12_moe.hlsl`) the routed experts, the shared expert and
+the adds then form one GPU split. Only the order changes; the graph and its
+results stay the same.
+
 ## Applying
 
 ```bash

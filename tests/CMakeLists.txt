@@ -39,6 +39,7 @@ add_executable(xllama-tests
     test_gpustep.cpp
     test_ggml_d3d12.cpp
     test_ggml_d3d12_mmid.cpp
+    test_ggml_d3d12_moe.cpp
     test_ramceil.cpp
     test_model_provision.cpp
     test_model_file_plan.cpp

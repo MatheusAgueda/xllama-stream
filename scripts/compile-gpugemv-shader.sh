@@ -10,8 +10,10 @@
 #     (D2 backend; one blob per thread-group width, -D NUM_THREADS)
 #   shaders/ggml_d3d12_mmid_iq4_xs.hlsl → ggml_d3d12_mmid_iq4_xs_t{64,128}_dxil.h (cs_6_4, MUL_MAT_ID)
 #   shaders/ggml_d3d12_get_rows_q6_k.hlsl → ggml_d3d12_get_rows_q6_k_dxil.h (cs_6_4)
+#   shaders/ggml_d3d12_elt.hlsl → ggml_d3d12_elt_{binary,rms_norm,quant_q8_k}_dxil.h (cs_6_4, -D KERNEL)
+#   shaders/ggml_d3d12_moe.hlsl → ggml_d3d12_moe_{combine,tail}_dxil.h (cs_6_4, -D KERNEL)
 #
-# Usage: compile-gpugemv-shader.sh [naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q5_k|mmv_q6_k|mmv_iq3_s|mmv_iq4_xs|mmid_iq4_xs|get_rows_q6_k ...]
+# Usage: compile-gpugemv-shader.sh [naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q5_k|mmv_q6_k|mmv_iq3_s|mmv_iq4_xs|mmid_iq4_xs|get_rows_q6_k|elt|moe ...]
 #        (default: all)
 # A different dxc release emits different bytes: regenerate only the targets
 # you changed so measured blobs stay the ones the CSVs were recorded with.
@@ -123,15 +125,25 @@ compile_target() {
 				-D "KERNEL=${n}"
 		done
 		;;
+	moe)
+		local k n name sym
+		for k in 1:combine:Combine 2:tail:Tail; do
+			IFS=: read -r n name sym <<<"$k"
+			compile_one "$ROOT/shaders/ggml_d3d12_moe.hlsl" \
+				"$ROOT/shaders/generated/ggml_d3d12_moe_${name}_dxil.h" \
+				"shaders/ggml_d3d12_moe.hlsl -D KERNEL=${n}" "kGgmlD3d12Moe${sym}Dxil" cs_6_4 \
+				-D "KERNEL=${n}"
+		done
+		;;
 	*)
-		echo "unknown target: $1 (naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q5_k|mmv_q6_k|mmv_iq3_s|mmv_iq4_xs|mmid_iq4_xs|get_rows_q6_k|elt)" >&2
+		echo "unknown target: $1 (naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q5_k|mmv_q6_k|mmv_iq3_s|mmv_iq4_xs|mmid_iq4_xs|get_rows_q6_k|elt|moe)" >&2
 		exit 2
 		;;
 	esac
 }
 
 if [[ $# -eq 0 ]]; then
-	set -- naive wave32 rows dot4 mmv_q4_0 mmv_q4_k mmv_q5_k mmv_q6_k mmv_iq3_s mmv_iq4_xs mmid_iq4_xs get_rows_q6_k elt
+	set -- naive wave32 rows dot4 mmv_q4_0 mmv_q4_k mmv_q5_k mmv_q6_k mmv_iq3_s mmv_iq4_xs mmid_iq4_xs get_rows_q6_k elt moe
 fi
 for target in "$@"; do
 	compile_target "$target"
