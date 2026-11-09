@@ -71,10 +71,10 @@ index 07b4c61..6557247 100644
              cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
 diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
 new file mode 100644
-index 0000000..42cd322
+index 0000000..b087c92
 --- /dev/null
 +++ b/src/llama-expert-cache.cpp
-@@ -0,0 +1,1279 @@
+@@ -0,0 +1,1316 @@
 +#include "llama-expert-cache.h"
 +
 +#include "llama-impl.h"
@@ -187,6 +187,7 @@ index 0000000..42cd322
 +    std::vector<uint64_t> seen;   // expert -> tick of the last prefetch that ranked it
 +    std::vector<int32_t>  ranked; // prefetch scratch: each token's predicted experts, best first
 +    std::vector<int32_t>  missing;
++    std::vector<float>    prob;   // prefetch scratch with a swap ratio: a token's unnormalized softmax
 +
 +    // expert-major round (one ubatch, every expert tensor of the layer): the missing experts whose
 +    // reads go to a slot instead of a staging buffer (expert -> slot, -1, and the list of them), each
@@ -548,10 +549,54 @@ index 0000000..42cd322
 +    return *(const int32_t *) ((const char *) ids->data + i0*ids->nb[0] + i1*ids->nb[1]);
 +}
 +
++// all experts by score s, best first (ties: lower id first)
++static void ec_rank(std::vector<int32_t> & order, const float * s) {
++    for (size_t e = 0; e < order.size(); ++e) {
++        order[e] = (int32_t) e;
++    }
++    std::sort(order.begin(), order.end(), [s](int32_t a, int32_t b) {
++        return s[a] > s[b] || (s[a] == s[b] && a < b);
++    });
++}
++
++// cache-aware routing of one token, order ranked by score s: resident experts outside the top
++// n_used take the place of missing ones inside it - the strongest resident for the weakest
++// missing - while the resident's score is at least ratio times the missing one's (a test on the
++// ratio of two scores: unnormalized probabilities give the same swaps); returns the swaps made
++static uint64_t ec_swap_missing(const ec_layer & L, std::vector<int32_t> & order, const float * s, int64_t n_used, float ratio) {
++    const int64_t n_expert = (int64_t) order.size();
++    uint64_t swaps = 0;
++    int64_t i = n_used; // next resident candidate outside the top-k, strongest first
++    for (int64_t j = n_used - 1; j >= 0; --j) { // missing experts inside it, weakest first
++        const int32_t m = order[j];
++        if (L.slot_of[m] >= 0) {
++            continue;
++        }
++        while (i < n_expert && L.slot_of[order[i]] < 0) {
++            i++;
++        }
++        if (i == n_expert) {
++            break;
++        }
++        const int32_t r = order[i];
++        if (!(s[r] > 0.0f) || s[r] < ratio*s[m]) {
++            break; // weaker candidates and stronger missing experts only from here
++        }
++        std::swap(order[j], order[i]);
++        i++;
++        swaps++;
++    }
++    return swaps;
++}
++
 +// 1 thread: pre-gating prefetch of the layer's next plan. src = router logits [n_expert, n_tokens]
-+// of an earlier residual (top-k only: no softmax needed). Each token's top pf_k, rank by rank:
-+// resident ones are pinned, the others take the least recently used slots outside the prediction
-+// and are queued for the I/O threads, best first; dst = unused
++// of an earlier residual. Without a swap ratio the prediction is each token's top pf_k (by logit:
++// no softmax needed); with one it is the routing ec_select would pick against the current
++// residency, n_expert_used per token with its stand-ins, so the residents a missing expert would
++// be swapped for are kept and a missing expert that would be swapped out is not read. Rank by
++// rank: the predicted resident experts are pinned, the missing ones among the first pf_k ranks
++// take the least recently used slots outside the prediction and are queued for the I/O threads,
++// best first; dst = unused
 +static void ec_prefetch(ggml_tensor * dst, int ith, int nth, void * userdata) {
 +    GGML_UNUSED(nth);
 +    if (ith != 0) {
@@ -566,35 +611,53 @@ index 0000000..42cd322
 +    const int32_t n_slots  = (int32_t) L.expert_of.size();
 +    const int64_t n_tokens = logits->ne[1];
 +    const int32_t k        = std::min<int32_t>((int32_t) C.pf_k, n_expert);
++    const bool    swap     = C.swap_ratio > 0.0f;
++    const int32_t w        = swap ? std::min<int32_t>((int32_t) C.n_expert_used, n_expert) : k; // predicted per token
 +
 +    // a round no plan settled (a graph stopped by its abort callback)
 +    ec_settle(L);
 +    L.n_pf = 0;
 +    ec_drop_unloaded(L);
 +    ec_em_end(L);
-+    if (k <= 0 || n_tokens <= 0) {
++    if (k <= 0 || w <= 0 || n_tokens <= 0) {
 +        return;
 +    }
 +
 +    std::vector<int32_t> & order = L.order;
 +    order.resize((size_t) n_expert);
-+    L.ranked.resize((size_t) (n_tokens*k));
++    L.ranked.resize((size_t) (n_tokens*w));
++    if (swap) {
++        L.prob.resize((size_t) n_expert);
++    }
 +    for (int64_t t = 0; t < n_tokens; ++t) {
 +        const float * s = (const float *) ((const char *) logits->data + t*logits->nb[1]);
-+        for (int32_t e = 0; e < n_expert; ++e) {
-+            order[e] = e;
++        if (swap) {
++            float mx = -INFINITY;
++            for (int32_t e = 0; e < n_expert; ++e) {
++                mx = s[e] > mx ? s[e] : mx;
++            }
++            for (int32_t e = 0; e < n_expert; ++e) {
++                const float p = std::exp(s[e] - mx);
++                L.prob[e] = p == p ? p : 0.0f; // NaN (a NaN or infinite logit) ranks last
++            }
++            ec_rank(order, L.prob.data());
++            ec_swap_missing(L, order, L.prob.data(), w, C.swap_ratio);
++        } else {
++            for (int32_t e = 0; e < n_expert; ++e) {
++                order[e] = e;
++            }
++            std::partial_sort(order.begin(), order.begin() + k, order.end(), [s](int32_t a, int32_t b) {
++                return s[a] > s[b] || (s[a] == s[b] && a < b);
++            });
 +        }
-+        std::partial_sort(order.begin(), order.begin() + k, order.end(), [s](int32_t a, int32_t b) {
-+            return s[a] > s[b] || (s[a] == s[b] && a < b);
-+        });
-+        std::copy(order.begin(), order.begin() + k, L.ranked.begin() + t*k);
++        std::copy(order.begin(), order.begin() + w, L.ranked.begin() + t*w);
 +    }
 +
 +    const uint64_t tick = ++L.tick;
 +    L.missing.clear();
-+    for (int32_t r = 0; r < k; ++r) {
++    for (int32_t r = 0; r < w; ++r) {
 +        for (int64_t t = 0; t < n_tokens; ++t) {
-+            const int32_t e = L.ranked[t*k + r];
++            const int32_t e = L.ranked[t*w + r];
 +            if (L.seen[e] == tick) {
 +                continue;
 +            }
@@ -602,7 +665,7 @@ index 0000000..42cd322
 +            const int32_t s = L.slot_of[e];
 +            if (s >= 0) {
 +                L.used[s] = tick;
-+            } else {
++            } else if (r < k) {
 +                L.missing.push_back(e);
 +            }
 +        }
@@ -637,9 +700,8 @@ index 0000000..42cd322
 +    }
 +}
 +
-+// 1 thread: each token's top-k by router score, then resident experts outside it take the place
-+// of missing ones inside it - the strongest resident for the weakest missing - while the
-+// resident's score is at least swap_ratio times the missing one's; dst = expert ids
++// 1 thread: each token's top-k by router score with resident experts standing in for missing ones
++// (ec_swap_missing, swap_ratio); dst = expert ids
 +static void ec_select(ggml_tensor * dst, int ith, int nth, void * userdata) {
 +    GGML_UNUSED(nth);
 +    if (ith != 0) {
@@ -660,33 +722,8 @@ index 0000000..42cd322
 +    uint64_t swaps = 0;
 +    for (int64_t t = 0; t < n_tokens; ++t) {
 +        const float * s = (const float *) ((const char *) scores->data + t*scores->nb[1]);
-+        for (int32_t e = 0; e < (int32_t) n_expert; ++e) {
-+            order[e] = e;
-+        }
-+        std::sort(order.begin(), order.end(), [s](int32_t a, int32_t b) {
-+            return s[a] > s[b] || (s[a] == s[b] && a < b);
-+        });
-+
-+        int64_t i = n_used; // next resident candidate outside the top-k, strongest first
-+        for (int64_t j = n_used - 1; j >= 0; --j) { // missing experts inside it, weakest first
-+            const int32_t m = order[j];
-+            if (L.slot_of[m] >= 0) {
-+                continue;
-+            }
-+            while (i < n_expert && L.slot_of[order[i]] < 0) {
-+                i++;
-+            }
-+            if (i == n_expert) {
-+                break;
-+            }
-+            const int32_t r = order[i];
-+            if (!(s[r] > 0.0f) || s[r] < C.swap_ratio*s[m]) {
-+                break; // weaker candidates and stronger missing experts only from here
-+            }
-+            std::swap(order[j], order[i]);
-+            i++;
-+            swaps++;
-+        }
++        ec_rank(order, s);
++        swaps += ec_swap_missing(L, order, s, n_used, C.swap_ratio);
 +
 +        int32_t * out = (int32_t *) ((char *) dst->data + t*dst->nb[1]);
 +        for (int64_t k = 0; k < n_used; ++k) {
@@ -1356,10 +1393,10 @@ index 0000000..42cd322
 +}
 diff --git a/src/llama-expert-cache.h b/src/llama-expert-cache.h
 new file mode 100644
-index 0000000..ec5d1a1
+index 0000000..82b5097
 --- /dev/null
 +++ b/src/llama-expert-cache.h
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,102 @@
 +#pragma once
 +
 +#include "ggml.h"
@@ -1383,7 +1420,9 @@ index 0000000..ec5d1a1
 +// Pre-gating prefetch (LLAMA_EXPERT_PREFETCH = k, 0 = off, the default): the layer's router applied
 +// to its input residual predicts its routing before the attention; a fourth op queues the predicted
 +// experts that are missing for background I/O threads, and the plan drops the reads not started and
-+// waits for the running ones. Routing is unchanged: the output stays exact.
++// waits for the running ones. Without a swap ratio routing is unchanged: the output stays exact.
++// With one, the prediction is the swapped routing: the residents that would stand in are kept and
++// only the experts still missing after the swaps are read.
 +// Expert-major ubatches (LLAMA_EXPERT_MAJOR = largest one, 0 = off, the default): a ubatch with more
 +// tokens than the slots take does not map them all to slots. Each expert tensor's matmul is two
 +// custom ops (activations quantized for the CPU dot product of the expert type, then the experts one

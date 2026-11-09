@@ -402,6 +402,26 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
             CHECK(misses_of(log.final_line) < plain_misses);
         }
 
+        // Both: the prefetch predicts the swapped routing (stand-ins kept, only
+        // the experts still missing read ahead). Its reads change the residency
+        // and so the routing; the run must hold together and report both.
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            log.final_line.clear();
+        }
+        set_prefetch(2);
+        const EcRun both = run_greedy(path, c.slots, 512, c.used, 24, 0.5f);
+        set_prefetch(-1);
+        REQUIRE(both.ok);
+        CHECK(both.n_ubatch == cached.n_ubatch);
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            MESSAGE(log.final_line);
+            CHECK(misses_of(log.final_line) >= 0);
+            CHECK(swaps_of(log.final_line) >= 0);
+            CHECK(prefetched_of(log.final_line) >= 0);
+        }
+
         // Same ubatch size: the CPU kernels differ between batch shapes.
         const EcRun full = run_greedy(path, 0, cached.n_ubatch, c.used, 24);
         REQUIRE(full.ok);
