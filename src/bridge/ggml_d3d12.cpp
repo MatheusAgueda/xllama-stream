@@ -579,6 +579,8 @@ void run_d3d12_memprobe(const std::function<void(const std::string&)>& emit) {
         #include <map>
         #include <mutex>
         #include <random>
+        #include <unordered_map>
+        #include <unordered_set>
 
         #include <dxgi1_4.h>
 
@@ -694,6 +696,7 @@ struct Gpu {
     std::uint64_t n_calls = 0;
     std::uint64_t n_dispatches = 0;
     std::uint64_t n_submits = 0;
+    std::uint64_t n_replays = 0; // submits that executed a kept command list again
     double wall_ms = 0.0;
     double gpu_ms = 0.0;
     // Of wall_ms: recording + submitting the graph submissions, then waiting for
@@ -929,17 +932,12 @@ Gpu& gpu() {
     return g;
 }
 
-// Record into the shared list and run it to completion. Caller holds g.mu.
-// rec_ms / wait_ms, when given, gain the time spent recording and submitting
-// the list and the time then spent waiting for the fence.
-template <typename F>
-bool run_now(Gpu& g, F&& record, double* rec_ms = nullptr, double* wait_ms = nullptr) {
-    const auto t0 = std::chrono::steady_clock::now();
-    g.alloc->Reset();
-    g.cl->Reset(g.alloc.Get(), nullptr);
-    record(g.cl.Get());
-    g.cl->Close();
-    ID3D12CommandList* lists[] = {g.cl.Get()};
+// Execute a closed list and wait for it. Caller holds g.mu. rec_ms / wait_ms,
+// when given, gain the time from t0 (recording started) to the submit and the
+// time then spent waiting for the fence.
+bool execute_and_wait(Gpu& g, ID3D12GraphicsCommandList* cl,
+                      std::chrono::steady_clock::time_point t0, double* rec_ms, double* wait_ms) {
+    ID3D12CommandList* lists[] = {cl};
     g.queue->ExecuteCommandLists(1, lists);
     const auto t1 = std::chrono::steady_clock::now();
     const bool ok = g.fence.signal_and_wait(g.queue.Get(), /*spin=*/true);
@@ -949,6 +947,17 @@ bool run_now(Gpu& g, F&& record, double* rec_ms = nullptr, double* wait_ms = nul
         *wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1)
                         .count();
     return ok;
+}
+
+// Record into the shared list and run it to completion. Caller holds g.mu.
+template <typename F>
+bool run_now(Gpu& g, F&& record, double* rec_ms = nullptr, double* wait_ms = nullptr) {
+    const auto t0 = std::chrono::steady_clock::now();
+    g.alloc->Reset();
+    g.cl->Reset(g.alloc.Get(), nullptr);
+    record(g.cl.Get());
+    g.cl->Close();
+    return execute_and_wait(g, g.cl.Get(), t0, rec_ms, wait_ms);
 }
 
 // --- Buffers ---
@@ -1333,15 +1342,16 @@ void backend_free(ggml_backend_t b) {
     Gpu& g = gpu();
     {
         std::lock_guard<std::mutex> lock(g.mu);
-        char msg[320];
+        char msg[384];
         std::snprintf(msg, sizeof(msg),
                       "[xllama] d3d12: %llu graph_compute calls, %llu submits, %llu dispatches, "
                       "%.1f ms wall (%.1f ms GPU; %.1f ms recording, %.1f ms waiting, %.1f ms "
-                      "host)\n",
+                      "host); %llu submits replayed a kept list\n",
                       static_cast<unsigned long long>(g.n_calls),
                       static_cast<unsigned long long>(g.n_submits),
                       static_cast<unsigned long long>(g.n_dispatches), g.wall_ms, g.gpu_ms,
-                      g.rec_ms, g.wait_ms, g.wall_ms - g.rec_ms - g.wait_ms);
+                      g.rec_ms, g.wait_ms, g.wall_ms - g.rec_ms - g.wait_ms,
+                      static_cast<unsigned long long>(g.n_replays));
         log_output(msg);
         std::vector<std::pair<std::string, Gpu::SegStat>> top(g.segs.begin(), g.segs.end());
         std::sort(top.begin(), top.end(),
@@ -1354,7 +1364,7 @@ void backend_free(ggml_backend_t b) {
                           static_cast<unsigned long long>(s.n), s.ms, key.c_str());
             log_output(line);
         }
-        g.n_calls = g.n_submits = g.n_dispatches = 0;
+        g.n_calls = g.n_submits = g.n_dispatches = g.n_replays = 0;
         g.wall_ms = g.gpu_ms = g.rec_ms = g.wait_ms = 0.0;
         g.segs.clear();
     }
@@ -1521,45 +1531,141 @@ void set_c(Op& op, std::initializer_list<std::uint64_t> c) {
         op.c[i++] = static_cast<std::uint32_t>(v);
 }
 
+// The commands of one submission; returns its dispatch count. A pure function
+// of ops and ts (with the process-lifetime root signature, PSOs and query
+// heap), which is what lets a kept list stand in for a fresh recording.
+std::uint64_t record_ops(Gpu& g, ID3D12GraphicsCommandList* cl, const std::vector<Op>& ops,
+                         bool ts) {
+    std::uint64_t n = 0;
+    cl->SetComputeRootSignature(g.root.Get());
+    if (ts)
+        cl->EndQuery(g.ts.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+    ID3D12PipelineState* bound = nullptr;
+    for (const Op& op : ops) {
+        if (!op.pso) {
+            D3D12_RESOURCE_BARRIER b = {};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            b.UAV.pResource = nullptr; // every UAV access
+            cl->ResourceBarrier(1, &b);
+            continue;
+        }
+        if (op.pso != bound) {
+            cl->SetPipelineState(op.pso);
+            bound = op.pso;
+        }
+        cl->SetComputeRoot32BitConstants(0, kOpConstants, op.c, 0);
+        cl->SetComputeRootShaderResourceView(1, op.t0 ? op.t0 : op.u[0]);
+        for (UINT i = 0; i < 4; ++i)
+            cl->SetComputeRootUnorderedAccessView(2 + i, op.u[i] ? op.u[i] : op.u[0]);
+        cl->SetComputeRootShaderResourceView(6, op.t1 ? op.t1 : op.u[0]);
+        cl->SetComputeRootUnorderedAccessView(7, op.u[4] ? op.u[4] : op.u[0]);
+        cl->Dispatch(op.gx, op.gy, 1);
+        ++n;
+    }
+    if (ts) {
+        cl->EndQuery(g.ts.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+        cl->ResolveQueryData(g.ts.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, g.ts_rb.Get(), 0);
+    }
+    return n;
+}
+
+bool same_op(const Op& a, const Op& b) {
+    return a.pso == b.pso && std::equal(std::begin(a.c), std::end(a.c), std::begin(b.c)) &&
+           a.t0 == b.t0 && a.t1 == b.t1 &&
+           std::equal(std::begin(a.u), std::end(a.u), std::begin(b.u)) && a.gx == b.gx &&
+           a.gy == b.gy;
+}
+
+std::uint64_t ops_hash(const std::vector<Op>& ops, bool ts) {
+    std::uint64_t h = 1469598103934665603ull ^ (ts ? 1u : 0u);
+    auto mix = [&h](std::uint64_t v) {
+        h = (h ^ v) * 1099511628211ull;
+        h ^= h >> 29;
+    };
+    for (const Op& op : ops) {
+        mix(reinterpret_cast<std::uintptr_t>(op.pso));
+        for (const std::uint32_t c : op.c)
+            mix(c);
+        mix(op.t0);
+        mix(op.t1);
+        for (const D3D12_GPU_VIRTUAL_ADDRESS u : op.u)
+            mix(u);
+        mix((static_cast<std::uint64_t>(op.gx) << 32) | op.gy);
+    }
+    return h;
+}
+
+// Once llama.cpp reuses the decode graph, every token submits the same ops on
+// the same addresses (row ids and expert ids change in the scratch, not in the
+// commands). A submission seen a second time is recorded into a list of its
+// own and kept; from then on that list is executed again instead of recorded:
+// ~57 us of D3D12 calls per submission on Series X (1.7.12.21, 35B decode).
+// Every submission is waited for, so a kept list is never in flight when it is
+// executed again or dropped.
+struct KeptList {
+    ComPtr<ID3D12CommandAllocator> alloc;
+    ComPtr<ID3D12GraphicsCommandList> cl;
+    std::vector<Op> ops;
+    std::uint64_t n = 0;
+};
+struct ListCache {
+    std::unordered_map<std::uint64_t, KeptList> kept; // by ops_hash
+    std::unordered_set<std::uint64_t> seen;
+};
+// The 35B decode graph has ~84 GPU submissions; prefill adds its own.
+constexpr std::size_t kMaxKeptLists = 256;
+
+ListCache& list_cache() { // guarded by gpu().mu
+    static ListCache c;
+    return c;
+}
+
 // Record and run one submission. Caller holds g.mu.
 bool submit_ops(Gpu& g, const std::vector<Op>& ops) {
     const bool ts = g.ts && g.ts_rb;
+    ListCache& lc = list_cache();
+    const std::uint64_t h = ops_hash(ops, ts);
+    const auto it = lc.kept.find(h);
     std::uint64_t n = 0;
-    const bool ran = run_now(
-        g,
-        [&](ID3D12GraphicsCommandList* cl) {
-            cl->SetComputeRootSignature(g.root.Get());
-            if (ts)
-                cl->EndQuery(g.ts.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
-            ID3D12PipelineState* bound = nullptr;
-            for (const Op& op : ops) {
-                if (!op.pso) {
-                    D3D12_RESOURCE_BARRIER b = {};
-                    b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-                    b.UAV.pResource = nullptr; // every UAV access
-                    cl->ResourceBarrier(1, &b);
-                    continue;
-                }
-                if (op.pso != bound) {
-                    cl->SetPipelineState(op.pso);
-                    bound = op.pso;
-                }
-                cl->SetComputeRoot32BitConstants(0, kOpConstants, op.c, 0);
-                cl->SetComputeRootShaderResourceView(1, op.t0 ? op.t0 : op.u[0]);
-                for (UINT i = 0; i < 4; ++i)
-                    cl->SetComputeRootUnorderedAccessView(2 + i, op.u[i] ? op.u[i] : op.u[0]);
-                cl->SetComputeRootShaderResourceView(6, op.t1 ? op.t1 : op.u[0]);
-                cl->SetComputeRootUnorderedAccessView(7, op.u[4] ? op.u[4] : op.u[0]);
-                cl->Dispatch(op.gx, op.gy, 1);
-                ++n;
+    bool ran = false;
+    bool done = false;
+    if (it != lc.kept.end() && it->second.ops.size() == ops.size() &&
+        std::equal(ops.begin(), ops.end(), it->second.ops.begin(), same_op)) {
+        ran = execute_and_wait(g, it->second.cl.Get(), std::chrono::steady_clock::now(), &g.rec_ms,
+                               &g.wait_ms);
+        n = it->second.n;
+        ++g.n_replays;
+        done = true;
+    } else if (it == lc.kept.end() && !lc.seen.insert(h).second) {
+        if (lc.kept.size() >= kMaxKeptLists)
+            lc.kept.clear();
+        if (lc.seen.size() > 4 * kMaxKeptLists)
+            lc.seen.clear();
+        const auto t0 = std::chrono::steady_clock::now();
+        KeptList k;
+        HRESULT hr = g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                      IID_PPV_ARGS(&k.alloc));
+        if (SUCCEEDED(hr))
+            hr = g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, k.alloc.Get(),
+                                             nullptr, IID_PPV_ARGS(&k.cl));
+        if (SUCCEEDED(hr)) {
+            k.n = record_ops(g, k.cl.Get(), ops, ts);
+            hr = k.cl->Close();
+        }
+        if (SUCCEEDED(hr)) {
+            ran = execute_and_wait(g, k.cl.Get(), t0, &g.rec_ms, &g.wait_ms);
+            n = k.n;
+            done = true;
+            if (ran) {
+                k.ops = ops;
+                lc.kept.emplace(h, std::move(k));
             }
-            if (ts) {
-                cl->EndQuery(g.ts.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
-                cl->ResolveQueryData(g.ts.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, g.ts_rb.Get(),
-                                     0);
-            }
-        },
-        &g.rec_ms, &g.wait_ms);
+        }
+    }
+    if (!done)
+        ran = run_now(
+            g, [&](ID3D12GraphicsCommandList* cl) { n = record_ops(g, cl, ops, ts); }, &g.rec_ms,
+            &g.wait_ms);
     if (!ran)
         return false;
     if (ts) {
