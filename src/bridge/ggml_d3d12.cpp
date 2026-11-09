@@ -1279,8 +1279,8 @@ bool create_host_res(Gpu& g, size_t size, bool wc, BufCtx* c, std::string* err) 
         g.device.Get(), size, hp, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS, wc ? "D3D12_Host_WC" : "D3D12_Host", err);
     void* p = nullptr;
-    c->host = c->res && SUCCEEDED(c->res->Map(0, nullptr, &p)) ? static_cast<std::uint8_t*>(p)
-                                                                 : nullptr;
+    c->host =
+        c->res && SUCCEEDED(c->res->Map(0, nullptr, &p)) ? static_cast<std::uint8_t*>(p) : nullptr;
     if (c->res && !c->host)
         c->res.Reset();
     c->va = c->res ? c->res->GetGPUVirtualAddress() : 0;
