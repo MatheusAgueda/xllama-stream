@@ -116,6 +116,9 @@ struct ManifestEntry {
     int expert_major = 0;
     // "expert_prefetch_ahead": with expert_prefetch, predict a layer early.
     bool expert_prefetch_ahead = false;
+    // "n_ubatch": llama.cpp physical prefill chunk (0 = default 512). With
+    // expert_major, each expert is read once per ubatch: a larger one reads less.
+    int n_ubatch = 0;
     // "env": {NAME: number | bool | string}, tuning variables set for the load
     // (SessionParams::env); numbers as integers, booleans as 1 / 0.
     std::vector<std::pair<std::wstring, std::wstring>> env;

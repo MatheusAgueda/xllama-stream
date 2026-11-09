@@ -116,6 +116,15 @@ TEST_CASE("resolve_session_params: one resolver for every surface (ADR 0007)") {
     pf.expert_prefetch = 8;
     pf.expert_slots = 0;
     CHECK_FALSE(resolve_session_params("moe", pf, "D:\\m\\moe", -1).expert_prefetch_ahead);
+
+    // n_ubatch: 0 keeps llama.cpp's default, the rest is clamped to [32, 2048].
+    CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).n_ubatch == 0);
+    pf.n_ubatch = 1024;
+    CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).n_ubatch == 1024);
+    pf.n_ubatch = 9;
+    CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).n_ubatch == 32);
+    pf.n_ubatch = 100000;
+    CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).n_ubatch == 2048);
 }
 
 TEST_CASE("catalogue env: tuning names only, sorted, the last repeat wins") {

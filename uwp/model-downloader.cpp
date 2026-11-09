@@ -722,6 +722,7 @@ std::vector<ManifestEntry> parse_manifest(winrt::hstring const& text) {
         e.expert_prefetch = static_cast<int>(obj.GetNamedNumber(L"expert_prefetch", 0));
         e.expert_major = static_cast<int>(obj.GetNamedNumber(L"expert_major", 0));
         e.expert_prefetch_ahead = obj.GetNamedBoolean(L"expert_prefetch_ahead", false);
+        e.n_ubatch = static_cast<int>(obj.GetNamedNumber(L"n_ubatch", 0));
         if (obj.HasKey(L"env") && obj.GetNamedValue(L"env").ValueType() ==
                                       winrt::Windows::Data::Json::JsonValueType::Object) {
             for (auto const& kv : obj.GetNamedObject(L"env")) {
@@ -910,6 +911,7 @@ SessionParams CatalogueSessionParams(const std::string& model) {
         c.expert_prefetch = entry->expert_prefetch;
         c.expert_major = entry->expert_major;
         c.expert_prefetch_ahead = entry->expert_prefetch_ahead;
+        c.n_ubatch = entry->n_ubatch;
         for (const auto& kv : entry->env)
             c.env.emplace_back(wstring_to_utf8(kv.first), wstring_to_utf8(kv.second));
         c.lora = wstring_to_utf8(entry->lora);

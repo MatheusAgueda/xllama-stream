@@ -1011,6 +1011,8 @@ struct BufCtx {
     D3D12_GPU_VIRTUAL_ADDRESS va = 0;
     std::uint8_t* host = nullptr; // mapped pointer (D3D12_Host only)
     bool is_host = false;
+    bool wc = false;      // D3D12_Host created write-combined (XLLAMA_D3D12_WC_MIB)
+    bool settled = false; // memory type final: checked on the first base / clear
 };
 
 // Series X Dev Mode (2026-11-09): a committed DEFAULT buffer of 834,355,456 B
@@ -1110,8 +1112,12 @@ ComPtr<ID3D12Resource> create_tiled_buffer(Gpu& g, UINT64 bytes,
 
 std::size_t g_weights_max_buffer = 0; // 0 = no limit (ggml_d3d12_set_weights_max_buffer)
 
+void settle_host(ggml_backend_buffer_t b, BufCtx* c);
+
 void* buf_base(ggml_backend_buffer_t b) {
     auto* c = static_cast<BufCtx*>(b->context);
+    if (c->wc && !c->settled)
+        settle_host(b, c);
     return c->is_host ? static_cast<void*>(c->host)
                       : reinterpret_cast<void*>(static_cast<std::uintptr_t>(c->va));
 }
@@ -1146,7 +1152,7 @@ bool host_cpy(ggml_backend_buffer_t, const ggml_tensor* src, ggml_tensor* dst) {
     return true;
 }
 void host_clear(ggml_backend_buffer_t b, uint8_t v) {
-    std::memset(static_cast<BufCtx*>(b->context)->host, v, b->size);
+    std::memset(buf_base(b), v, b->size);
 }
 
 const ggml_backend_buffer_i kHostBufIface = {
@@ -1252,6 +1258,9 @@ size_t weights_alloc_size(ggml_backend_buffer_type_t, const ggml_tensor* t) {
 // and the ssm kernels on the write-back recurrent state 50-80 GB/s. The CPU
 // only writes the big ones (ReadFile into slots); it reads the small output
 // and model buffers, which a threshold keeps write-back. Unset or 0 = off.
+// A compute buffer is never write-combined, whatever its size: the CPU splits
+// read their inputs from it (WC_MIB=16 put the 34 MiB one there: decode 2.2x
+// slower); settle_host moves one back to write-back on its first use.
 bool host_wc(size_t bytes) {
     const char* v = std::getenv("XLLAMA_D3D12_WC_MIB");
     if (!v || !*v)
@@ -1259,6 +1268,48 @@ bool host_wc(size_t bytes) {
     char* end = nullptr;
     const unsigned long long mib = std::strtoull(v, &end, 10);
     return end != v && mib > 0 && bytes >= (static_cast<std::size_t>(mib) << 20);
+}
+
+// A mapped D3D12_Host resource (CUSTOM, L0), write-back or write-combined.
+bool create_host_res(Gpu& g, size_t size, bool wc, BufCtx* c, std::string* err) {
+    D3D12_HEAP_PROPERTIES hp = custom_l0_props();
+    if (wc)
+        hp.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE;
+    c->res = d3d12c::create_buffer_props(
+        g.device.Get(), size, hp, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, wc ? "D3D12_Host_WC" : "D3D12_Host", err);
+    void* p = nullptr;
+    c->host = c->res && SUCCEEDED(c->res->Map(0, nullptr, &p)) ? static_cast<std::uint8_t*>(p)
+                                                                 : nullptr;
+    if (c->res && !c->host)
+        c->res.Reset();
+    c->va = c->res ? c->res->GetGPUVirtualAddress() : 0;
+    c->wc = wc && c->res;
+    return c->res != nullptr;
+}
+
+// The memory type is chosen at allocation, by size; what the buffer is for is
+// only known later: ggml-alloc marks a graph allocator's buffer COMPUTE right
+// after allocating it and before its first get_base (ggml_vbuffer_alloc), the
+// recurrent state and the expert slots stay ANY. On the first base or clear,
+// before any tensor has an address in it, a write-combined compute buffer is
+// replaced by a write-back one of the same size (released first, so the heap
+// never holds both).
+void settle_host(ggml_backend_buffer_t b, BufCtx* c) {
+    c->settled = true;
+    if (ggml_backend_buffer_get_usage(b) != GGML_BACKEND_BUFFER_USAGE_COMPUTE)
+        return;
+    Gpu& g = gpu();
+    c->res.Reset();
+    std::string err;
+    const bool wb = create_host_res(g, b->size, false, c, &err);
+    if (!wb && !create_host_res(g, b->size, true, c, &err))
+        GGML_ABORT("d3d12: compute buffer of %zu bytes lost its memory: %s", b->size, err.c_str());
+    char msg[160];
+    std::snprintf(msg, sizeof(msg), "[xllama] d3d12: compute buffer %.1f MiB %s\n",
+                  static_cast<double>(b->size) / 1048576.0,
+                  wb ? "moved to write-back" : "stays write-combined (write-back failed)");
+    log_output(wb ? std::string(msg) : std::string(msg) + "  " + err + "\n");
 }
 
 ggml_backend_buffer_t alloc_buf(ggml_backend_buffer_type_t buft, size_t size, bool host) {
@@ -1271,30 +1322,16 @@ ggml_backend_buffer_t alloc_buf(ggml_backend_buffer_type_t buft, size_t size, bo
     std::string err;
     bool wc = false;
     if (host) {
-        D3D12_HEAP_PROPERTIES hp = {};
-        hp.Type = D3D12_HEAP_TYPE_CUSTOM;
-        hp.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
-        hp.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
         if (host_wc(size)) {
-            D3D12_HEAP_PROPERTIES wcp = hp;
-            wcp.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE;
             std::string err_wc;
-            c->res = d3d12c::create_buffer_props(
-                g.device.Get(), size, wcp, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "D3D12_Host_WC", &err_wc);
-            wc = c->res != nullptr;
+            wc = create_host_res(g, size, true, c, &err_wc);
             if (!wc)
                 log_output(
                     "[xllama] d3d12: write-combined host buffer failed, write-back instead: " +
                     err_wc + "\n");
         }
         if (!c->res)
-            c->res = d3d12c::create_buffer_props(
-                g.device.Get(), size, hp, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "D3D12_Host", &err);
-        void* p = nullptr;
-        if (c->res && SUCCEEDED(c->res->Map(0, nullptr, &p)))
-            c->host = static_cast<std::uint8_t*>(p);
+            create_host_res(g, size, false, c, &err);
     } else {
         c->res = d3d12c::create_buffer(g.device.Get(), size, D3D12_HEAP_TYPE_DEFAULT,
                                        D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON,

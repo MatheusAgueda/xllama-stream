@@ -29,6 +29,7 @@ struct CatalogueLoad {
     int expert_prefetch = 0;  // "expert_prefetch": experts read ahead per token (SessionParams)
     int expert_major = 0;     // "expert_major": largest expert-major prompt ubatch (SessionParams)
     bool expert_prefetch_ahead = false; // "expert_prefetch_ahead": predict a layer early
+    int n_ubatch = 0;                   // "n_ubatch": physical prefill chunk (0 = llama default)
     std::vector<std::pair<std::string, std::string>> env; // "env": {NAME: value} (SessionParams)
 };
 
@@ -81,6 +82,9 @@ inline SessionParams resolve_session_params(const std::string& model, const Cata
     sp.expert_prefetch = sp.expert_slots > 0 ? std::clamp(c.expert_prefetch, 0, 64) : 0;
     sp.expert_major = sp.expert_slots > 0 ? std::clamp(c.expert_major, 0, 65536) : 0;
     sp.expert_prefetch_ahead = sp.expert_prefetch > 0 && c.expert_prefetch_ahead;
+    // llama.cpp clamps n_ubatch to n_batch (default 2048), and the expert cache
+    // to max(slots / experts used, expert_major).
+    sp.n_ubatch = c.n_ubatch > 0 ? std::clamp(c.n_ubatch, 32, 2048) : 0;
     sp.env = resolve_env(c.env);
     // A streamed model is larger than any GPU budget: d3d12 layers would copy
     // its experts into video memory, so the knob does not apply to it. The
