@@ -71,10 +71,10 @@ index 07b4c61..6557247 100644
              cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
 diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
 new file mode 100644
-index 0000000..19d2d4f
+index 0000000..dda33a1
 --- /dev/null
 +++ b/src/llama-expert-cache.cpp
-@@ -0,0 +1,1569 @@
+@@ -0,0 +1,1650 @@
 +#include "llama-expert-cache.h"
 +
 +#include "llama-impl.h"
@@ -204,9 +204,11 @@ index 0000000..19d2d4f
 +    int32_t  old_expert = -1;
 +    uint64_t old_used   = 0;
 +    int32_t  parts      = 1;
++    int64_t  t_queue    = 0; // when the round was queued (us)
 +    std::atomic<int>      state {EC_PF_DONE};
 +    std::atomic<int32_t>  left  {0};
 +    std::atomic<uint32_t> gen   {0};
++    std::atomic<int64_t>  t_start {0}; // when its first part was taken
 +};
 +
 +struct ec_layer;
@@ -237,6 +239,7 @@ index 0000000..19d2d4f
 +    std::vector<uint64_t> seen;   // expert -> tick of the last prefetch that ranked it
 +    std::vector<int32_t>  ranked; // prefetch scratch: each token's predicted experts, best first
 +    std::vector<int32_t>  missing;
++    std::vector<int32_t>  helped; // settle scratch: the queued parts of a read the plan waits for
 +    std::vector<float>    prob;   // prefetch scratch with a swap ratio: a token's unnormalized softmax
 +
 +    // expert-major round (one ubatch, every expert tensor of the layer): the missing experts whose
@@ -278,12 +281,23 @@ index 0000000..19d2d4f
 +    // pre-gating prefetch: pf_k predicted experts per token, read by I/O threads ahead of the plan.
 +    // pf_ahead: layer il+1 is predicted from layer il's post-attention residual and queued right
 +    // after il's load op, in the CPU split il already has (LLAMA_EXPERT_PREFETCH_AHEAD)
++    // pf_prio: the I/O threads' priority on Windows (LLAMA_EXPERT_PREFETCH_PRIO: 0 normal, 1 highest,
++    // 2 time critical): they sleep in their reads, but the graph's threads spin between ops and a
++    // read that completes waits for a core at normal priority. pf_help: a plan waiting for a read
++    // in flight reads its parts no I/O thread has taken (LLAMA_EXPERT_PREFETCH_HELP)
 +    uint32_t pf_k     = 0;
 +    bool     pf_ahead = false;
++    int      pf_prio  = 1;
++    bool     pf_help  = true;
++    std::atomic<int>      pf_prio_threads {0}; // I/O threads running at pf_prio
 +    std::atomic<uint64_t> pf_reads     {0}; // experts read ahead
 +    std::atomic<uint64_t> pf_used      {0}; // of those, used by the ubatch they were read for
 +    std::atomic<uint64_t> pf_cancelled {0}; // dropped before their read started
 +    std::atomic<uint64_t> pf_wait_us   {0}; // plans waiting for reads in flight
++    std::atomic<uint64_t> pf_waits     {0}; // reads in flight a plan waited for
++    std::atomic<uint64_t> pf_helped    {0}; // parts of those the waiting plan read itself
++    std::atomic<uint64_t> pf_lag_us    {0}; // experts read ahead: queued until their first part was taken
++    std::atomic<uint64_t> pf_run_us    {0}; //                    first part taken until read
 +    std::mutex pf_mtx;
 +    std::condition_variable pf_cv;
 +    std::deque<ec_pf_part> pf_queue;
@@ -319,10 +333,17 @@ index 0000000..19d2d4f
 +                em_wall += (uint64_t) T.em->us.load();
 +            }
 +        }
-+        char pf[160] = "";
++        char pf[320] = "";
 +        if (pf_k > 0) {
-+            snprintf(pf, sizeof(pf), "; prefetch %" PRIu64 " read (%" PRIu64 " used), %" PRIu64 " dropped, %.0f ms waited%s",
-+                    pf_reads.load(), pf_used.load(), pf_cancelled.load(), pf_wait_us.load()/1000.0, pf_ahead ? ", ahead" : "");
++            const uint64_t n = pf_reads.load();
++            char prio[32] = "";
++            if (pf_prio_threads.load() > 0) {
++                snprintf(prio, sizeof(prio), ", prio %d", pf_prio);
++            }
++            snprintf(pf, sizeof(pf), "; prefetch %" PRIu64 " read (%" PRIu64 " used), %" PRIu64 " dropped, %.0f ms waited for %" PRIu64 " (%" PRIu64 " parts read by the plan), %.2f ms queued + %.2f ms reading each%s%s%s",
++                    n, pf_used.load(), pf_cancelled.load(), pf_wait_us.load()/1000.0, pf_waits.load(), pf_helped.load(),
++                    n ? pf_lag_us.load()/1000.0/n : 0.0, n ? pf_run_us.load()/1000.0/n : 0.0,
++                    pf_ahead ? ", ahead" : "", pf_help ? ", help" : "", prio);
 +        }
 +        char em[192] = "";
 +        if (em_rounds.load() > 0) {
@@ -595,7 +616,44 @@ index 0000000..19d2d4f
 +static constexpr int    EC_PF_THREADS  = 4;
 +static constexpr size_t EC_PF_SUBPARTS = 2;
 +
++// read part p of a running job (the whole expert when it has one part) with thread ith's file handles
++static void ec_pf_read(llama_expert_cache & C, const ec_layer & L, ec_pf & j, int32_t p, int ith) {
++    size_t bytes = 0;
++    if (j.parts == 1) {
++        for (size_t ti : L.tensors) {
++            const ec_tensor & T = C.tensors[ti];
++            const size_t nb2 = T.t->nb[2];
++            ec_read(*C.files[T.file], ith, (char *) T.t->data + (size_t) j.slot*nb2, nb2, T.offs + (size_t) j.expert*nb2);
++            bytes += nb2;
++        }
++    } else {
++        const ec_tensor & T = C.tensors[L.tensors[(size_t) p / EC_PF_SUBPARTS]];
++        const size_t nb2  = T.t->nb[2];
++        const size_t part = ec_part_size(nb2, EC_PF_SUBPARTS);
++        const size_t b    = ((size_t) p % EC_PF_SUBPARTS)*part;
++        if (b < nb2) {
++            const size_t n = std::min(part, nb2 - b);
++            ec_read(*C.files[T.file], ith, (char *) T.t->data + (size_t) j.slot*nb2 + b, n, T.offs + (size_t) j.expert*nb2 + b);
++            bytes = n;
++        }
++    }
++    C.bytes += bytes;
++    // the slot's data happens before the last part's release: the plan sees done, then the data
++    if (j.left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
++        const int64_t t_start = j.t_start.load(std::memory_order_relaxed);
++        C.pf_reads  += 1;
++        C.pf_lag_us += (uint64_t) std::max<int64_t>(0, t_start - j.t_queue);
++        C.pf_run_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_start);
++        j.state.store(EC_PF_DONE, std::memory_order_release);
++    }
++}
++
 +static void ec_pf_worker(llama_expert_cache * C, int ith) {
++#if defined(_WIN32)
++    if (C->pf_prio > 0 && SetThreadPriority(GetCurrentThread(), C->pf_prio > 1 ? THREAD_PRIORITY_TIME_CRITICAL : THREAD_PRIORITY_HIGHEST)) {
++        C->pf_prio_threads++;
++    }
++#endif
 +    for (;;) {
 +        ec_pf_part e;
 +        {
@@ -610,44 +668,23 @@ index 0000000..19d2d4f
 +        // an entry of an earlier round (its job dropped, the job then reused) has an older gen and
 +        // reads nothing. This round has one entry per part, so while this part is unread the job can
 +        // be neither done nor reused: past the second check, j holds the round the entry was made for.
-+        // The first part taken moves the job from queued to running; a job the plan dropped first
-+        // (cancelled) is skipped
++        // The first part taken moves the job from queued to running (its start, published to the
++        // reader of the last part by the parts' fetch_sub); a job the plan dropped first (cancelled)
++        // is skipped
 +        ec_pf & j = e.L->pf[e.i];
 +        if (j.gen.load(std::memory_order_acquire) != e.gen) {
 +            continue;
 +        }
 +        int st = EC_PF_QUEUED;
-+        if (!j.state.compare_exchange_strong(st, EC_PF_RUNNING, std::memory_order_acq_rel) && st != EC_PF_RUNNING) {
++        if (j.state.compare_exchange_strong(st, EC_PF_RUNNING, std::memory_order_acq_rel)) {
++            j.t_start.store(ggml_time_us(), std::memory_order_relaxed);
++        } else if (st != EC_PF_RUNNING) {
 +            continue;
 +        }
 +        if (j.gen.load(std::memory_order_acquire) != e.gen) {
 +            continue;
 +        }
-+        size_t bytes = 0;
-+        if (j.parts == 1) {
-+            for (size_t ti : e.L->tensors) {
-+                const ec_tensor & T = C->tensors[ti];
-+                const size_t nb2 = T.t->nb[2];
-+                ec_read(*C->files[T.file], ith, (char *) T.t->data + (size_t) j.slot*nb2, nb2, T.offs + (size_t) j.expert*nb2);
-+                bytes += nb2;
-+            }
-+        } else {
-+            const ec_tensor & T = C->tensors[e.L->tensors[(size_t) e.part / EC_PF_SUBPARTS]];
-+            const size_t nb2  = T.t->nb[2];
-+            const size_t part = ec_part_size(nb2, EC_PF_SUBPARTS);
-+            const size_t b    = ((size_t) e.part % EC_PF_SUBPARTS)*part;
-+            if (b < nb2) {
-+                const size_t n = std::min(part, nb2 - b);
-+                ec_read(*C->files[T.file], ith, (char *) T.t->data + (size_t) j.slot*nb2 + b, n, T.offs + (size_t) j.expert*nb2 + b);
-+                bytes = n;
-+            }
-+        }
-+        C->bytes += bytes;
-+        // the slot's data happens before the last part's release: the plan sees done, then the data
-+        if (j.left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-+            C->pf_reads += 1;
-+            j.state.store(EC_PF_DONE, std::memory_order_release);
-+        }
++        ec_pf_read(*C, *e.L, j, e.part, ith);
 +    }
 +}
 +
@@ -661,8 +698,10 @@ index 0000000..19d2d4f
 +        }
 +        // job-major, most likely expert first: it lands soonest, and the jobs no thread reached by
 +        // the plan stay whole and can still be dropped
++        const int64_t now = ggml_time_us();
 +        for (int32_t i = 0; i < L.n_pf; ++i) {
-+            const ec_pf & j = L.pf[i];
++            ec_pf & j = L.pf[i];
++            j.t_queue = now;
 +            for (int32_t p = 0; p < j.parts; ++p) {
 +                pf_queue.push_back({&L, i, p, j.gen.load(std::memory_order_relaxed)});
 +            }
@@ -671,13 +710,40 @@ index 0000000..19d2d4f
 +    pf_cv.notify_all();
 +}
 +
++// a plan waiting for job i of its layer's round: the parts no I/O thread has taken are read here,
++// by the compute thread the plan runs on (thread 0's file handles: the graph's other threads wait
++// at its barrier), instead of waiting for an I/O thread to get a core. Each part is read once: it
++// is either still queued, and taken out of the queue under its lock, or taken by an I/O thread
++static void ec_pf_help(llama_expert_cache & C, ec_layer & L, int32_t i) {
++    ec_pf & j = L.pf[i];
++    const uint32_t gen = j.gen.load(std::memory_order_acquire);
++    L.helped.clear();
++    {
++        std::lock_guard<std::mutex> lock(C.pf_mtx);
++        for (auto it = C.pf_queue.begin(); it != C.pf_queue.end();) {
++            if (it->L == &L && it->i == i && it->gen == gen) {
++                L.helped.push_back(it->part);
++                it = C.pf_queue.erase(it);
++            } else {
++                ++it;
++            }
++        }
++    }
++    for (const int32_t p : L.helped) {
++        ec_pf_read(C, L, j, p, 0);
++    }
++    C.pf_helped += L.helped.size();
++}
++
 +// end a layer's prefetch round: reads not started are dropped and their slots get the old expert
-+// back (its data was never overwritten), reads in flight are waited for; finished jobs stay listed
-+// (n_pf) for the plan's count of the ones it uses
++// back (its data was never overwritten), reads in flight are waited for (pf_help: their parts
++// still queued read by the waiting thread); finished jobs stay listed (n_pf) for the plan's count
++// of the ones it uses
 +static void ec_settle(ec_layer & L) {
 +    llama_expert_cache & C = *L.cache;
 +    int64_t  t0      = 0;
 +    uint64_t dropped = 0;
++    uint64_t waits   = 0;
 +    for (int32_t i = 0; i < L.n_pf; ++i) {
 +        ec_pf & j = L.pf[i];
 +        int st = EC_PF_QUEUED;
@@ -691,16 +757,25 @@ index 0000000..19d2d4f
 +            dropped++;
 +            continue;
 +        }
++        if (st != EC_PF_RUNNING) {
++            continue;
++        }
++        if (t0 == 0) {
++            t0 = ggml_time_us();
++        }
++        waits++;
++        if (C.pf_help && j.parts > 1) {
++            ec_pf_help(C, L, i);
++            st = j.state.load(std::memory_order_acquire);
++        }
 +        while (st == EC_PF_RUNNING) {
-+            if (t0 == 0) {
-+                t0 = ggml_time_us();
-+            }
 +            std::this_thread::yield();
 +            st = j.state.load(std::memory_order_acquire);
 +        }
 +    }
 +    if (t0 != 0) {
 +        C.pf_wait_us += (uint64_t) (ggml_time_us() - t0);
++        C.pf_waits   += waits;
 +    }
 +    if (dropped > 0) {
 +        C.pf_cancelled += dropped;
@@ -1392,6 +1467,12 @@ index 0000000..19d2d4f
 +    // no CPU split of its own, a less exact prediction)
 +    const char * ahead = getenv("LLAMA_EXPERT_PREFETCH_AHEAD");
 +    cache->pf_ahead = ahead != nullptr && *ahead != '\0' && atoi(ahead) != 0;
++    // LLAMA_EXPERT_PREFETCH_PRIO: the I/O threads' priority on Windows (0 normal, 1 highest - the
++    // default, 2 time critical); LLAMA_EXPERT_PREFETCH_HELP=0: a plan only waits for reads in flight
++    const char * prio = getenv("LLAMA_EXPERT_PREFETCH_PRIO");
++    cache->pf_prio = prio != nullptr && *prio != '\0' ? std::min(std::max(atoi(prio), 0), 2) : 1;
++    const char * help = getenv("LLAMA_EXPERT_PREFETCH_HELP");
++    cache->pf_help = help == nullptr || *help == '\0' || atoi(help) != 0;
 +
 +    // LLAMA_EXPERT_MAJOR: largest expert-major ubatch (0 = off, the default)
 +    const char * em = getenv("LLAMA_EXPERT_MAJOR");

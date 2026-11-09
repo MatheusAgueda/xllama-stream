@@ -82,6 +82,25 @@ long long prefetched_of(const std::string& line) {
     return static_cast<long long>(reads);
 }
 
+// The "waited for N (P parts read by the plan)" counts of a stats line: the
+// reads in flight plans waited for and the parts of them they read themselves,
+// both -1 when prefetch is off.
+struct WaitStats {
+    long long waits = -1;
+    long long helped = -1;
+};
+
+WaitStats waits_of(const std::string& line) {
+    WaitStats w;
+    const char* p = std::strstr(line.c_str(), " ms waited for ");
+    unsigned long long n = 0, h = 0;
+    if (p && std::sscanf(p, " ms waited for %llu (%llu parts read by the plan)", &n, &h) == 2) {
+        w.waits = static_cast<long long>(n);
+        w.helped = static_cast<long long>(h);
+    }
+    return w;
+}
+
 // The "expert-major N ubatches, R read (M MiB), H resident, K kept" counts of a
 // stats line, all -1 when no ubatch ran expert-major.
 struct EmStats {
@@ -370,6 +389,7 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
     // which experts are resident, never the routing.
     long long prefetched = 0;
     long long prefetched_ahead = 0;
+    long long helped = 0;
     const Case cases[] = {{2, 0}, {3, 0}, {2, 1}, {3, 1}};
     for (const Case& c : cases) {
         CAPTURE(c.slots);
@@ -395,6 +415,15 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
         CHECK(swaps_of(final_line) == 0);
         CHECK(prefetched_of(final_line) >= 0);
         prefetched += prefetched_of(final_line);
+        // A plan waiting for a read in flight reads its queued parts (the
+        // default): never more parts than reads it waited for times 6 (2 halves
+        // of each of the 3 expert tensors).
+        CHECK(final_line.find(", help") != std::string::npos);
+        const WaitStats waits = waits_of(final_line);
+        CHECK(waits.waits >= 0);
+        CHECK(waits.helped >= 0);
+        CHECK(waits.helped <= 6 * waits.waits);
+        helped += waits.helped;
 
         // Prefetch off (the default): the plan alone, no prefetch stats.
         {
@@ -490,6 +519,27 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
         }
         CHECK(ahead.tokens == cached.tokens);
 
+        // A plan that only waits for the I/O threads (LLAMA_EXPERT_PREFETCH_HELP=0)
+        // reads the same experts: the same tokens, no part read by a plan.
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            log.final_line.clear();
+        }
+        set_prefetch(2);
+        set_env_k("LLAMA_EXPERT_PREFETCH_HELP", 0);
+        const EcRun waiting = run_greedy(path, c.slots, 512, c.used, 24);
+        set_env_k("LLAMA_EXPERT_PREFETCH_HELP", -1);
+        set_prefetch(-1);
+        REQUIRE(waiting.ok);
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            MESSAGE(log.final_line);
+            CHECK(prefetched_of(log.final_line) >= 0);
+            CHECK(log.final_line.find(", help") == std::string::npos);
+            CHECK(waits_of(log.final_line).helped == 0);
+        }
+        CHECK(waiting.tokens == cached.tokens);
+
         // Cache-aware routing: a resident expert stands in for a missing one
         // with at least half its probability, so the same run reads less.
         {
@@ -546,6 +596,9 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
     // both placements.
     CHECK(prefetched > 0);
     CHECK(prefetched_ahead > 0);
+    // Whether a plan found a read in flight with parts still queued depends on
+    // the runner's timing: reported, not checked.
+    MESSAGE("prefetch parts read by waiting plans: " << helped);
 
     // As many slots as experts: no cache, no ubatch cap, no stats line.
     {
