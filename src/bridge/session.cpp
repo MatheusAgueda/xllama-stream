@@ -1087,6 +1087,14 @@ class LlamaSession final : public Session {
                  n_generated, res.t_p_eval_ms, res.n_p_eval, gp.reuse_kv && !gp.reset_kv,
                  dlr.n_drafted, dlr.n_accepted);
         log_output(log_buf);
+        // Where decode time goes: llama_decode vs sampling, and how often llama
+        // reused the previous compute graph instead of rebuilding and splitting it
+        // (the count is the context's, since it was created).
+        snprintf(log_buf, sizeof(log_buf),
+                 "[xllama] session decode: %.1f ms in llama_decode, %.1f ms sampling, "
+                 "graphs reused %d\n",
+                 dlr.decode_ms, dlr.sample_ms, llama_perf_context(m_ctx.get()).n_reused);
+        log_output(log_buf);
 
         return res;
     }

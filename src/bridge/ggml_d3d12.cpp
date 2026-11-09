@@ -673,6 +673,11 @@ struct Gpu {
     std::uint64_t n_submits = 0;
     double wall_ms = 0.0;
     double gpu_ms = 0.0;
+    // Of wall_ms: recording + submitting the graph submissions, then waiting for
+    // them (GPU time + launch and completion latency). The rest is host work
+    // between submissions: planning the ops, CPU fallbacks, q8 activations.
+    double rec_ms = 0.0;
+    double wait_ms = 0.0;
     // graph_compute calls by their first and last node, layer suffix dropped:
     // where the scheduler hands work to the CPU and back (seg_name).
     struct SegStat {
@@ -900,14 +905,25 @@ Gpu& gpu() {
 }
 
 // Record into the shared list and run it to completion. Caller holds g.mu.
-template <typename F> bool run_now(Gpu& g, F&& record) {
+// rec_ms / wait_ms, when given, gain the time spent recording and submitting
+// the list and the time then spent waiting for the fence.
+template <typename F>
+bool run_now(Gpu& g, F&& record, double* rec_ms = nullptr, double* wait_ms = nullptr) {
+    const auto t0 = std::chrono::steady_clock::now();
     g.alloc->Reset();
     g.cl->Reset(g.alloc.Get(), nullptr);
     record(g.cl.Get());
     g.cl->Close();
     ID3D12CommandList* lists[] = {g.cl.Get()};
     g.queue->ExecuteCommandLists(1, lists);
-    return g.fence.signal_and_wait(g.queue.Get(), /*spin=*/true);
+    const auto t1 = std::chrono::steady_clock::now();
+    const bool ok = g.fence.signal_and_wait(g.queue.Get(), /*spin=*/true);
+    if (rec_ms)
+        *rec_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    if (wait_ms)
+        *wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1)
+                        .count();
+    return ok;
 }
 
 // --- Buffers ---
@@ -1292,13 +1308,15 @@ void backend_free(ggml_backend_t b) {
     Gpu& g = gpu();
     {
         std::lock_guard<std::mutex> lock(g.mu);
-        char msg[256];
+        char msg[320];
         std::snprintf(msg, sizeof(msg),
                       "[xllama] d3d12: %llu graph_compute calls, %llu submits, %llu dispatches, "
-                      "%.1f ms wall (%.1f ms GPU)\n",
+                      "%.1f ms wall (%.1f ms GPU; %.1f ms recording, %.1f ms waiting, %.1f ms "
+                      "host)\n",
                       static_cast<unsigned long long>(g.n_calls),
                       static_cast<unsigned long long>(g.n_submits),
-                      static_cast<unsigned long long>(g.n_dispatches), g.wall_ms, g.gpu_ms);
+                      static_cast<unsigned long long>(g.n_dispatches), g.wall_ms, g.gpu_ms,
+                      g.rec_ms, g.wait_ms, g.wall_ms - g.rec_ms - g.wait_ms);
         log_output(msg);
         std::vector<std::pair<std::string, Gpu::SegStat>> top(g.segs.begin(), g.segs.end());
         std::sort(top.begin(), top.end(),
@@ -1312,7 +1330,7 @@ void backend_free(ggml_backend_t b) {
             log_output(line);
         }
         g.n_calls = g.n_submits = g.n_dispatches = 0;
-        g.wall_ms = g.gpu_ms = 0.0;
+        g.wall_ms = g.gpu_ms = g.rec_ms = g.wait_ms = 0.0;
         g.segs.clear();
     }
     delete b;
@@ -1482,37 +1500,41 @@ void set_c(Op& op, std::initializer_list<std::uint64_t> c) {
 bool submit_ops(Gpu& g, const std::vector<Op>& ops) {
     const bool ts = g.ts && g.ts_rb;
     std::uint64_t n = 0;
-    const bool ran = run_now(g, [&](ID3D12GraphicsCommandList* cl) {
-        cl->SetComputeRootSignature(g.root.Get());
-        if (ts)
-            cl->EndQuery(g.ts.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
-        ID3D12PipelineState* bound = nullptr;
-        for (const Op& op : ops) {
-            if (!op.pso) {
-                D3D12_RESOURCE_BARRIER b = {};
-                b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-                b.UAV.pResource = nullptr; // every UAV access
-                cl->ResourceBarrier(1, &b);
-                continue;
+    const bool ran = run_now(
+        g,
+        [&](ID3D12GraphicsCommandList* cl) {
+            cl->SetComputeRootSignature(g.root.Get());
+            if (ts)
+                cl->EndQuery(g.ts.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+            ID3D12PipelineState* bound = nullptr;
+            for (const Op& op : ops) {
+                if (!op.pso) {
+                    D3D12_RESOURCE_BARRIER b = {};
+                    b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                    b.UAV.pResource = nullptr; // every UAV access
+                    cl->ResourceBarrier(1, &b);
+                    continue;
+                }
+                if (op.pso != bound) {
+                    cl->SetPipelineState(op.pso);
+                    bound = op.pso;
+                }
+                cl->SetComputeRoot32BitConstants(0, kOpConstants, op.c, 0);
+                cl->SetComputeRootShaderResourceView(1, op.t0 ? op.t0 : op.u[0]);
+                for (UINT i = 0; i < 4; ++i)
+                    cl->SetComputeRootUnorderedAccessView(2 + i, op.u[i] ? op.u[i] : op.u[0]);
+                cl->SetComputeRootShaderResourceView(6, op.t1 ? op.t1 : op.u[0]);
+                cl->SetComputeRootUnorderedAccessView(7, op.u[4] ? op.u[4] : op.u[0]);
+                cl->Dispatch(op.gx, op.gy, 1);
+                ++n;
             }
-            if (op.pso != bound) {
-                cl->SetPipelineState(op.pso);
-                bound = op.pso;
+            if (ts) {
+                cl->EndQuery(g.ts.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                cl->ResolveQueryData(g.ts.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, g.ts_rb.Get(),
+                                     0);
             }
-            cl->SetComputeRoot32BitConstants(0, kOpConstants, op.c, 0);
-            cl->SetComputeRootShaderResourceView(1, op.t0 ? op.t0 : op.u[0]);
-            for (UINT i = 0; i < 4; ++i)
-                cl->SetComputeRootUnorderedAccessView(2 + i, op.u[i] ? op.u[i] : op.u[0]);
-            cl->SetComputeRootShaderResourceView(6, op.t1 ? op.t1 : op.u[0]);
-            cl->SetComputeRootUnorderedAccessView(7, op.u[4] ? op.u[4] : op.u[0]);
-            cl->Dispatch(op.gx, op.gy, 1);
-            ++n;
-        }
-        if (ts) {
-            cl->EndQuery(g.ts.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
-            cl->ResolveQueryData(g.ts.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, g.ts_rb.Get(), 0);
-        }
-    });
+        },
+        &g.rec_ms, &g.wait_ms);
     if (!ran)
         return false;
     if (ts) {

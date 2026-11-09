@@ -136,6 +136,9 @@ struct DecodeLoopResult {
     // batch. Callers must treat the generation as failed and drop the KV —
     // continuing would desync history from cells (hybrid/LFM caches).
     bool rewind_failed = false;
+    // Wall time of the classic path's llama_decode calls and of sampling.
+    double decode_ms = 0.0;
+    double sample_ms = 0.0;
 };
 
 namespace detail {
@@ -270,7 +273,11 @@ inline bool classic_step(const DecodeLoopParams& p, llama_token token, std::stri
         log_output("[xllama] stop sequence after " + std::to_string(out.n_generated) + " tokens\n");
         return false;
     }
-    if (!decode_one(p.ctx, token)) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool decoded = decode_one(p.ctx, token);
+    out.decode_ms +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (!decoded) {
         log_output("[xllama] decode failed at token, stopping generation\n");
         decode_ok = false;
         return false;
@@ -311,8 +318,12 @@ inline DecodeLoopResult decode_loop(const DecodeLoopParams& p, std::string& outp
         if (p.watchdog && p.watchdog->aborted())
             break;
 
+        const auto ts0 = std::chrono::steady_clock::now();
         llama_token token =
             p.grammar ? detail::sample_with_grammar(p) : llama_sampler_sample(p.sampler, p.ctx, -1);
+        out.sample_ms +=
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts0)
+                .count();
         if (detail::stops_at_eog(p, token)) {
             log_output("[xllama] EOG after " + std::to_string(out.n_generated) + " tokens\n");
             break;
