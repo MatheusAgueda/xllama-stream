@@ -77,8 +77,9 @@ jobs:
           out=$(./build/${{ matrix.preset }}/tests/xllama-tests --test-case='expert cache*' 2>&1) || {
             echo "$out"; exit 1; }
           echo "$out"
-          # doctest exits 0 when the filter matches nothing: require the case ran.
-          grep -Eq 'test cases: +1 \| +1 passed' <<<"$out"
+          # doctest exits 0 when the filter matches nothing: require both cases
+          # ran (slot-mapped decode, expert-major prompts).
+          grep -Eq 'test cases: +2 \| +2 passed' <<<"$out"
 
       - name: Session parameters (expert_slots plumbing)
         run: |
