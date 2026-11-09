@@ -71,10 +71,10 @@ index 07b4c61..6557247 100644
              cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
 diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
 new file mode 100644
-index 0000000..b087c92
+index 0000000..d821524
 --- /dev/null
 +++ b/src/llama-expert-cache.cpp
-@@ -0,0 +1,1316 @@
+@@ -0,0 +1,1502 @@
 +#include "llama-expert-cache.h"
 +
 +#include "llama-impl.h"
@@ -113,21 +113,55 @@ index 0000000..b087c92
 +#    include <windows.h>
 +#    include <io.h>
 +#else
++#    include <fcntl.h>
 +#    include <unistd.h>
 +#endif
 +
 +namespace {
 +
++// unbuffered reads (FILE_FLAG_NO_BUFFERING, O_DIRECT): the disk writes into the slot, with no copy
++// through the OS file cache and no read-ahead. Offsets, sizes and addresses are multiples of
++// EC_DIRECT_ALIGN (512-byte and 4 KiB sectors alike); a read that is not aligned goes through the
++// thread's staging buffer. A thread whose handle cannot read this way reads buffered.
++static constexpr size_t EC_DIRECT_ALIGN = 4096;
++
++struct ec_direct {
++#if defined(_WIN32)
++    HANDLE h = INVALID_HANDLE_VALUE;
++#else
++    int fd = -1;
++#endif
++    int  state    = 0;    // 0 = not opened yet, 1 = open, -1 = buffered reads only
++    bool in_place = true; // aligned reads go straight to their destination
++    std::vector<char> stage;
++};
++
 +struct ec_file {
 +    std::string path;
++    bool direct = true; // try unbuffered reads first (LLAMA_EXPERT_DIRECT)
 +    // one handle per compute thread: positional reads on separate file objects run in parallel
 +    std::array<FILE *, GGML_MAX_N_THREADS> fp {};
++    std::array<ec_direct, GGML_MAX_N_THREADS> dio {};
++    std::atomic<uint64_t> n_direct   {0}; // unbuffered reads straight into their destination
++    std::atomic<uint64_t> n_staged   {0}; // unbuffered reads through the staging buffer
++    std::atomic<uint64_t> n_buffered {0};
 +
 +    ~ec_file() {
 +        for (FILE * f : fp) {
 +            if (f) {
 +                fclose(f);
 +            }
++        }
++        for (ec_direct & d : dio) {
++#if defined(_WIN32)
++            if (d.h != INVALID_HANDLE_VALUE) {
++                CloseHandle(d.h);
++            }
++#else
++            if (d.fd >= 0) {
++                close(d.fd);
++            }
++#endif
 +        }
 +    }
 +};
@@ -222,6 +256,9 @@ index 0000000..b087c92
 +    std::atomic<uint64_t> read_us {0}; // wall time of the load ops (their slowest thread)
 +    uint64_t n_rounds = 0; // plans of first_layer, i.e. ubatches
 +
++    bool io_direct = true; // unbuffered reads (LLAMA_EXPERT_DIRECT)
++    bool io_split  = true; // a load op's reads split over all its threads (LLAMA_EXPERT_SPLIT)
++
 +    // pre-gating prefetch: pf_k predicted experts per token, read by I/O threads ahead of the plan
 +    uint32_t pf_k = 0;
 +    std::atomic<uint64_t> pf_reads     {0}; // experts read ahead
@@ -273,8 +310,19 @@ index 0000000..b087c92
 +            snprintf(em, sizeof(em), "; expert-major %" PRIu64 " ubatches, %" PRIu64 " read (%.1f MiB), %" PRIu64 " resident, %" PRIu64 " kept, %.0f ms",
 +                    em_rounds.load(), em_reads.load(), em_bytes.load()/1024.0/1024.0, em_hits.load(), em_kept.load(), em_wall/1000.0);
 +        }
-+        LLAMA_LOG_INFO("expert cache (%s): %u slots x %zu layers, %" PRIu64 " ubatches, %" PRIu64 " hits, %" PRIu64 " misses (%.1f%% hit), %" PRIu64 " swaps, %.1f MiB read in %.0f ms%s%s\n",
-+                when, n_slots, layers.size(), n_rounds, h, m, h + m ? 100.0*h/(h + m) : 0.0, swaps.load(), bytes.load()/1024.0/1024.0, us/1000.0, pf, em);
++        uint64_t n_direct = 0;
++        uint64_t n_staged = 0;
++        uint64_t n_buffered = 0;
++        for (const auto & f : files) {
++            n_direct   += f->n_direct.load();
++            n_staged   += f->n_staged.load();
++            n_buffered += f->n_buffered.load();
++        }
++        char io[128] = "";
++        snprintf(io, sizeof(io), "; reads %" PRIu64 " direct, %" PRIu64 " staged, %" PRIu64 " buffered%s",
++                n_direct, n_staged, n_buffered, io_split ? ", split" : "");
++        LLAMA_LOG_INFO("expert cache (%s): %u slots x %zu layers, %" PRIu64 " ubatches, %" PRIu64 " hits, %" PRIu64 " misses (%.1f%% hit), %" PRIu64 " swaps, %.1f MiB read in %.0f ms%s%s%s\n",
++                when, n_slots, layers.size(), n_rounds, h, m, h + m ? 100.0*h/(h + m) : 0.0, swaps.load(), bytes.load()/1024.0/1024.0, us/1000.0, pf, em, io);
 +    }
 +
 +    ~llama_expert_cache() {
@@ -353,10 +401,126 @@ index 0000000..b087c92
 +// positional read, safe to run from every compute thread at once
 +//
 +
++static bool ec_direct_open(const std::string & path, ec_direct & d) {
++#if defined(_WIN32) && defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x0602
++    // CreateFile2: the opener an AppContainer (UWP) may call, on the desktop too
++    const int nw = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
++    if (nw <= 0) {
++        return false;
++    }
++    std::wstring wpath((size_t) nw, L'\0');
++    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, &wpath[0], nw);
++    CREATEFILE2_EXTENDED_PARAMETERS p = {};
++    p.dwSize           = sizeof(p);
++    p.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
++    p.dwFileFlags      = FILE_FLAG_NO_BUFFERING | FILE_FLAG_RANDOM_ACCESS;
++    d.h = CreateFile2(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING, &p);
++    return d.h != INVALID_HANDLE_VALUE;
++#elif !defined(_WIN32) && defined(O_DIRECT)
++    d.fd = open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
++    return d.fd >= 0;
++#else
++    GGML_UNUSED(path);
++    GGML_UNUSED(d);
++    return false;
++#endif
++}
++
++static void ec_direct_close(ec_direct & d) {
++#if defined(_WIN32)
++    if (d.h != INVALID_HANDLE_VALUE) {
++        CloseHandle(d.h);
++        d.h = INVALID_HANDLE_VALUE;
++    }
++#else
++    if (d.fd >= 0) {
++        close(d.fd);
++        d.fd = -1;
++    }
++#endif
++    d.state = -1;
++    d.stage = std::vector<char>();
++}
++
++// unbuffered read of the aligned span [lo, lo + len) into buf, stopping once it holds [lo, end): the
++// span may run past the end of the file, where the read stops short
++static bool ec_direct_span(ec_direct & d, char * buf, size_t lo, size_t len, size_t end) {
++    size_t done = 0;
++    while (lo + done < end) {
++        const size_t want = std::min<size_t>(len - done, (size_t) 1 << 30);
++#if defined(_WIN32)
++        const uint64_t pos = (uint64_t) lo + done;
++        OVERLAPPED ov = {};
++        ov.Offset     = (DWORD) (pos & 0xFFFFFFFFu);
++        ov.OffsetHigh = (DWORD) (pos >> 32);
++        DWORD got = 0;
++        if (!ReadFile(d.h, buf + done, (DWORD) want, &got, &ov) || got == 0) {
++            return false;
++        }
++#else
++        const ssize_t got = pread(d.fd, buf + done, want, (off_t) (lo + done));
++        if (got < 0 && errno == EINTR) {
++            continue;
++        }
++        if (got <= 0) {
++            return false;
++        }
++#endif
++        done += (size_t) got;
++    }
++    return true;
++}
++
++// unbuffered read of [offs, offs + n) into dst: the aligned span around it, in place when it is the
++// span itself, else into the staging buffer and copied out. A failed read in place (memory the
++// device cannot write to) moves the thread to the staging buffer; a failed staged read (a file
++// system without O_DIRECT, a larger sector) to buffered reads: false, read it buffered
++static bool ec_read_direct(ec_file & f, int ith, void * dst, size_t n, size_t offs) {
++    ec_direct & d = f.dio[ith];
++    if (d.state == 0) {
++        d.state = ec_direct_open(f.path, d) ? 1 : -1;
++    }
++    if (d.state < 0) {
++        return false;
++    }
++
++    const size_t A  = EC_DIRECT_ALIGN;
++    const size_t lo = offs/A*A;
++    const size_t hi = (offs + n + A - 1)/A*A;
++    if (d.in_place && lo == offs && hi == offs + n && (uintptr_t) dst % A == 0) {
++        if (ec_direct_span(d, (char *) dst, lo, hi - lo, offs + n)) {
++            f.n_direct++;
++            return true;
++        }
++        d.in_place = false;
++    }
++
++    if (d.stage.size() < hi - lo + A) {
++        d.stage.resize(hi - lo + A);
++    }
++    char * buf = d.stage.data() + (A - (uintptr_t) d.stage.data() % A) % A;
++    if (!ec_direct_span(d, buf, lo, hi - lo, offs + n)) {
++        ec_direct_close(d);
++        return false;
++    }
++    memcpy(dst, buf + (offs - lo), n);
++    f.n_staged++;
++    return true;
++}
++
 +static void ec_read(ec_file & f, int ith, void * dst, size_t n, size_t offs) {
++    if (f.direct && ec_read_direct(f, ith, dst, n, offs)) {
++        return;
++    }
++    f.n_buffered++;
++
 +    FILE *& fp = f.fp[ith];
 +    if (fp == nullptr) {
++#if defined(_WIN32)
++        fp = ggml_fopen(f.path.c_str(), "rbR"); // R: the CRT's FILE_FLAG_RANDOM_ACCESS, no read-ahead
++#else
 +        fp = ggml_fopen(f.path.c_str(), "rb");
++#endif
 +        if (fp == nullptr) {
 +            GGML_ABORT("expert cache: cannot open %s: %s", f.path.c_str(), strerror(errno));
 +        }
@@ -826,22 +990,37 @@ index 0000000..b087c92
 +    }
 +}
 +
++// a decode ubatch misses about one expert per layer, one read per expert tensor: fewer reads than
++// threads. Each read is then split in parts, aligned and of at least EC_LOAD_MIN_PART, so that every
++// thread has one in flight (LLAMA_EXPERT_SPLIT=0: whole reads)
++static constexpr size_t EC_LOAD_MIN_PART = 128*1024;
++
 +// all threads: read the pending experts of every tensor of the layer into their slots; dst = slot ids
 +static void ec_load(ggml_tensor * dst, int ith, int nth, void * userdata) {
 +    ec_layer & L = *(ec_layer *) userdata;
 +    llama_expert_cache & C = *L.cache;
 +
-+    const size_t n_t    = L.tensors.size();
-+    const size_t n_jobs = L.pending.size()*n_t;
++    const size_t n_t     = L.tensors.size();
++    const size_t n_reads = L.pending.size()*n_t;
++    const size_t n_parts = C.io_split && n_reads > 0 && n_reads < (size_t) nth ? ((size_t) nth + n_reads - 1)/n_reads : 1;
++    const size_t n_jobs  = n_reads*n_parts;
 +
 +    const int64_t t0 = (size_t) ith < n_jobs ? ggml_time_us() : 0;
 +    size_t bytes = 0;
 +    for (size_t j = ith; j < n_jobs; j += nth) {
-+        const auto & job = L.pending[j / n_t];
-+        const ec_tensor & T = C.tensors[L.tensors[j % n_t]];
-+        const size_t nb2 = T.t->nb[2];
-+        ec_read(*C.files[T.file], ith, (char *) T.t->data + (size_t) job.first*nb2, nb2, T.offs + (size_t) job.second*nb2);
-+        bytes += nb2;
++        const size_t r = j / n_parts;
++        const auto & job = L.pending[r / n_t];
++        const ec_tensor & T = C.tensors[L.tensors[r % n_t]];
++        const size_t nb2  = T.t->nb[2];
++        const size_t per  = (nb2 + n_parts - 1)/n_parts;
++        const size_t part = std::max(EC_LOAD_MIN_PART, (per + EC_DIRECT_ALIGN - 1)/EC_DIRECT_ALIGN*EC_DIRECT_ALIGN);
++        const size_t b    = (j % n_parts)*part;
++        if (b >= nb2) {
++            continue;
++        }
++        const size_t n = std::min(part, nb2 - b);
++        ec_read(*C.files[T.file], ith, (char *) T.t->data + (size_t) job.first*nb2 + b, n, T.offs + (size_t) job.second*nb2 + b);
++        bytes += n;
 +    }
 +    if (bytes > 0) {
 +        C.bytes += bytes;
@@ -1156,6 +1335,12 @@ index 0000000..b087c92
 +    const char * em = getenv("LLAMA_EXPERT_MAJOR");
 +    cache->em_max = em != nullptr && *em != '\0' ? (uint32_t) std::min(std::max(atoi(em), 0), 65536) : 0;
 +
++    // LLAMA_EXPERT_DIRECT=0: buffered reads only; LLAMA_EXPERT_SPLIT=0: a load op reads whole tensors
++    const char * dio = getenv("LLAMA_EXPERT_DIRECT");
++    cache->io_direct = dio == nullptr || *dio == '\0' || atoi(dio) != 0;
++    const char * split = getenv("LLAMA_EXPERT_SPLIT");
++    cache->io_split = split == nullptr || *split == '\0' || atoi(split) != 0;
++
 +    cache->buft = {
 +        /* .iface = */ {
 +            /* .get_name         = */ ec_buft_get_name,
@@ -1260,7 +1445,8 @@ index 0000000..b087c92
 +    }
 +    if (file == cache->files.size()) {
 +        cache->files.emplace_back(new ec_file());
-+        cache->files.back()->path = path;
++        cache->files.back()->path   = path;
++        cache->files.back()->direct = cache->io_direct;
 +    }
 +
 +    auto & slot = cache->layers[il];

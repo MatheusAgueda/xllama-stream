@@ -107,6 +107,26 @@ EmStats em_of(const std::string& line) {
     return s;
 }
 
+// The "reads D direct, S staged, B buffered" counts of a stats line, all -1
+// when it is not one.
+struct IoStats {
+    long long direct = -1;
+    long long staged = -1;
+    long long buffered = -1;
+};
+
+IoStats io_of(const std::string& line) {
+    IoStats s;
+    const char* p = std::strstr(line.c_str(), "; reads ");
+    unsigned long long d = 0, st = 0, b = 0;
+    if (p && std::sscanf(p, "; reads %llu direct, %llu staged, %llu buffered", &d, &st, &b) == 3) {
+        s.direct = static_cast<long long>(d);
+        s.staged = static_cast<long long>(st);
+        s.buffered = static_cast<long long>(b);
+    }
+    return s;
+}
+
 // An env knob read at model load: k >= 0 sets it, k < 0 restores the default.
 void set_env_k(const char* name, int k) {
     #ifdef _WIN32
@@ -383,7 +403,38 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
             plain_misses = misses_of(log.final_line);
             CHECK(plain_misses > 0);
             CHECK(prefetched_of(log.final_line) == -1);
+            const IoStats io = io_of(log.final_line);
+            CHECK(io.direct >= 0);
+            CHECK(io.direct + io.staged + io.buffered > 0);
+    #ifdef __linux__
+            // O_DIRECT on the runner's file system: the reads bypass the page cache
+            CHECK(io.direct + io.staged > 0);
+    #endif
         }
+
+        // Buffered whole reads (LLAMA_EXPERT_DIRECT=0, LLAMA_EXPERT_SPLIT=0):
+        // the same bytes reach the slots, so the same tokens and logits bit for bit.
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            log.final_line.clear();
+        }
+        set_env_k("LLAMA_EXPERT_DIRECT", 0);
+        set_env_k("LLAMA_EXPERT_SPLIT", 0);
+        const EcRun buffered = run_greedy(path, c.slots, 512, c.used, 24);
+        set_env_k("LLAMA_EXPERT_DIRECT", -1);
+        set_env_k("LLAMA_EXPERT_SPLIT", -1);
+        REQUIRE(buffered.ok);
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            MESSAGE(log.final_line);
+            const IoStats io = io_of(log.final_line);
+            CHECK(io.direct == 0);
+            CHECK(io.staged == 0);
+            CHECK(io.buffered > 0);
+            CHECK(misses_of(log.final_line) == plain_misses);
+        }
+        CHECK(buffered.tokens == plain.tokens);
+        CHECK(buffered.logits == plain.logits);
 
         // Cache-aware routing: a resident expert stands in for a missing one
         // with at least half its probability, so the same run reads less.
