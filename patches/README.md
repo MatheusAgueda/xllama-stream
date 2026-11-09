@@ -54,7 +54,13 @@ compute threads. The `mul_mat_id` ops take the slot ids; router weights,
 biases and per-expert scales keep the real ids. Every other weight is read into
 the heap as before (`load_mode` `NONE`). The expert matmuls run on the CPU (the
 buffer type is a host one no GPU backend claims), so `n_gpu_layers` may still
-offload the rest of each layer. `llama_model_params::expert_swap_ratio`
+offload the rest of each layer. With `n_gpu_layers > 0` the cache offers itself
+to each GPU device of the model with the slots in that device's host buft
+(`llama_expert_cache_use_host_of`): the device's `supports_buft` sees the type
+with its own `device` and the name `EXPERT_CACHE`, and claiming it means its
+kernels read the slots in place (unified memory); the buffers keep the host
+buft's iface and context. No device claims it today, and an allocation the host
+buft refuses falls back to CPU memory. The load line says where the slots are. `llama_model_params::expert_swap_ratio`
 (catalogue `"expert_swap"`, 0 = off) adds cache-aware routing, a third op that
 replaces the top-k: a resident expert outside a token's top-k takes the place
 of a missing one inside it when its router score is at least that fraction of
