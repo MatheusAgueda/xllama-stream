@@ -18,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       swaps:
-        description: Swap ratio[:prefetch width[:expert-major]] configs, the first is the reference
+        description: Swap ratio[:prefetch width, "a" for ahead[:expert-major]] configs, the first is the reference
         default: "0,0::512,0.7::512"
       long:
         description: 1 = add the ~350-token prompt
