@@ -1245,6 +1245,22 @@ size_t weights_alloc_size(ggml_backend_buffer_type_t, const ggml_tensor* t) {
     return ggml_nbytes(t) + 16;
 }
 
+// XLLAMA_D3D12_WC_MIB=N: D3D12_Host buffers of at least N MiB are write-combined
+// (CPU-uncached) instead of write-back. Profile of the 35B on Series X
+// (2026-11-09): kernels reading D3D12_Weights (DEFAULT) reach 186-267 GB/s,
+// the same IQ4_XS matvec over expert slots in write-back D3D12_Host ~65 GB/s,
+// and the ssm kernels on the write-back recurrent state 50-80 GB/s. The CPU
+// only writes the big ones (ReadFile into slots); it reads the small output
+// and model buffers, which a threshold keeps write-back. Unset or 0 = off.
+bool host_wc(size_t bytes) {
+    const char* v = std::getenv("XLLAMA_D3D12_WC_MIB");
+    if (!v || !*v)
+        return false;
+    char* end = nullptr;
+    const unsigned long long mib = std::strtoull(v, &end, 10);
+    return end != v && mib > 0 && bytes >= (static_cast<std::size_t>(mib) << 20);
+}
+
 ggml_backend_buffer_t alloc_buf(ggml_backend_buffer_type_t buft, size_t size, bool host) {
     Gpu& g = gpu();
     if (!g.ok)
@@ -1253,14 +1269,29 @@ ggml_backend_buffer_t alloc_buf(ggml_backend_buffer_type_t buft, size_t size, bo
     auto* c = new BufCtx;
     c->is_host = host;
     std::string err;
+    bool wc = false;
     if (host) {
         D3D12_HEAP_PROPERTIES hp = {};
         hp.Type = D3D12_HEAP_TYPE_CUSTOM;
         hp.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
         hp.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
-        c->res = d3d12c::create_buffer_props(
-            g.device.Get(), size, hp, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "D3D12_Host", &err);
+        if (host_wc(size)) {
+            D3D12_HEAP_PROPERTIES wcp = hp;
+            wcp.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE;
+            std::string err_wc;
+            c->res = d3d12c::create_buffer_props(
+                g.device.Get(), size, wcp, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "D3D12_Host_WC", &err_wc);
+            wc = c->res != nullptr;
+            if (!wc)
+                log_output(
+                    "[xllama] d3d12: write-combined host buffer failed, write-back instead: " +
+                    err_wc + "\n");
+        }
+        if (!c->res)
+            c->res = d3d12c::create_buffer_props(
+                g.device.Get(), size, hp, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "D3D12_Host", &err);
         void* p = nullptr;
         if (c->res && SUCCEEDED(c->res->Map(0, nullptr, &p)))
             c->host = static_cast<std::uint8_t*>(p);
@@ -1306,8 +1337,9 @@ ggml_backend_buffer_t alloc_buf(ggml_backend_buffer_type_t buft, size_t size, bo
     c->va = c->res->GetGPUVirtualAddress();
     if (size >= (1u << 20)) {
         char msg[128];
-        std::snprintf(msg, sizeof(msg), "[xllama] d3d12: %s buffer %.1f MiB\n",
-                      host ? "D3D12_Host" : "D3D12_Weights", static_cast<double>(size) / 1048576.0);
+        std::snprintf(msg, sizeof(msg), "[xllama] d3d12: %s buffer %.1f MiB%s\n",
+                      host ? "D3D12_Host" : "D3D12_Weights", static_cast<double>(size) / 1048576.0,
+                      wc ? " (write-combined)" : "");
         log_output(msg);
     }
     return ggml_backend_buffer_init(buft, host ? kHostBufIface : kWeightsBufIface, c, size);
