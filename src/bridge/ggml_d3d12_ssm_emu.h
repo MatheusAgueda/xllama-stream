@@ -180,7 +180,7 @@ inline bool floats(std::size_t nb, std::uint64_t* out) {
     return true;
 }
 
-inline bool small(std::int64_t v, std::int64_t below) {
+inline bool below_limit(std::int64_t v, std::int64_t below) {
     return v >= 1 && v < below;
 }
 
@@ -460,7 +460,7 @@ inline bool d3d12_ssm_conv_plan(const ggml_tensor* node, D3d12SsmConvPlan* plan)
     }
     std::uint64_t xc = 0, xs = 0, wc = 0, dt = 0, ds = 0;
     if (!floats(p.x->nb[1], &xc) || !floats(p.x->nb[2], &xs) || !floats(p.w->nb[1], &wc) ||
-        !floats(node->nb[1], &dt) || !floats(node->nb[2], &ds) || !small(d_conv, 1 << 16) ||
+        !floats(node->nb[1], &dt) || !floats(node->nb[2], &ds) || !below_limit(d_conv, 1 << 16) ||
         n_t > kD3d12MaxGroups || n_s > kD3d12MaxGroups)
         return false;
     const std::uint64_t c1 = static_cast<std::uint64_t>(ch) - 1;
@@ -508,11 +508,11 @@ inline bool d3d12_gdn_plan(const ggml_tensor* node, D3d12GdnPlan* plan) {
     const std::int64_t K = node->op_params[0]; // snapshot slots
     const bool kda = p.g->ne[0] == sv;
     if (p.v->ne[0] != sv || p.q->ne[0] != sv || p.k->ne[0] != sv ||
-        !small(H, kD3d12MaxGroups + 1) || !small(B, kD3d12MaxGroups + 1) || T < 1 ||
-        !small(K, 1 << 16) || !small(p.q->ne[1], 1 << 16) || !small(p.k->ne[1], 1 << 16) ||
-        p.q->ne[2] != T || p.k->ne[2] != T || !small(p.q->ne[3], B + 1) ||
-        !small(p.k->ne[3], B + 1) || B % p.q->ne[3] != 0 || B % p.k->ne[3] != 0 ||
-        B / p.q->ne[3] >= (1 << 16) || B / p.k->ne[3] >= (1 << 16))
+        !below_limit(H, kD3d12MaxGroups + 1) || !below_limit(B, kD3d12MaxGroups + 1) || T < 1 ||
+        !below_limit(K, 1 << 16) || !below_limit(p.q->ne[1], 1 << 16) ||
+        !below_limit(p.k->ne[1], 1 << 16) || p.q->ne[2] != T || p.k->ne[2] != T ||
+        !below_limit(p.q->ne[3], B + 1) || !below_limit(p.k->ne[3], B + 1) || B % p.q->ne[3] != 0 ||
+        B % p.k->ne[3] != 0 || B / p.q->ne[3] >= (1 << 16) || B / p.k->ne[3] >= (1 << 16))
         return false;
     for (const ggml_tensor* t : {p.q, p.k, p.v})
         if (t->nb[1] != sv * sizeof(float))
