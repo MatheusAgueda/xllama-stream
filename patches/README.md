@@ -65,12 +65,27 @@ per model at a time, `n_ubatch` capped at `N / n_expert_used`, not for
 `LLM_ARCH_GRANITE_SWITCH` (it calls `ggml_mul_mat_id` outside
 `build_moe_ffn`). Hits, misses, swaps, MiB read and the time the reads took are
 logged every 64 ubatches and when the model is freed.
+Pre-gating prefetch (env `LLAMA_EXPERT_PREFETCH` = k, default `n_expert_used`,
+0 = off, max 64; `qwen35moe` and `llama` graphs): from layer 1 on, the layer's
+own router is applied to its input residual through the pre-FFN RMS norm right
+after the attention norm (`build_moe_pregate`, on the GPU split with the
+projections), and a fourth op after the attention projections
+(`build_moe_prefetch`) pins the predicted experts already resident and queues
+the missing ones, best first, to two background I/O threads, so their reads
+overlap the attention. The plan settles the round first: unstarted reads are
+cancelled (the slot gets its old expert back, its data was never overwritten),
+running ones are waited for. Routing is untouched, so the output stays exact.
+Offline on the 35B's routing trace (32 slots): 63.0% hits without, 90.4% with
+k = 8. The stats line adds prefetch reads, how many the plan used, dropped
+reads and the time the plan waited; `llama_model` stops the I/O threads before
+freeing the buffers.
 `tests/test_expert_cache.cpp` decodes a small MoE with 2 and 3 of its 4 experts
 resident and checks the tokens and logits against the same model fully
-resident, and that a swap ratio of 0.5 reads less
-(`.github/workflows/expert-cache-host.yml`); its opt-in "expert-cache bench"
-measures speed, hit rate, top-1 agreement and KL per swap ratio on the 35B and
-keeps the routing trace (`.github/workflows/expert-cache-bench.yml`).
+resident, with prefetch on (it must read ahead somewhere) and off, and that a
+swap ratio of 0.5 reads less (`.github/workflows/expert-cache-host.yml`); its
+opt-in "expert-cache bench" measures speed, hit rate, top-1 agreement and KL
+per `ratio[:k]` config on the 35B and keeps the routing trace
+(`.github/workflows/expert-cache-bench.yml`).
 
 `0005-graph-order-shared-input-projections.patch` (applies after 0004): the D3D12 backend runs only the matmuls, so every
 switch between it and the CPU is one submit plus a fence wait (~90 µs measured on

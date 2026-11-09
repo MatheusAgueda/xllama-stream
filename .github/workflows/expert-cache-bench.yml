@@ -3,9 +3,10 @@ name: expert-cache-bench
 # A measurement of llama.cpp patch 0004 on a real MoE, not a gate: build the
 # patched tree in Release for Linux, decode Qwen3.6 35B-A3B (uncensored heretic,
 # i1-IQ4_XS, 18.7 GB, the console's catalogue model) with 32 resident experts
-# per layer at several swap ratios ("expert-cache bench" in
-# tests/test_expert_cache.cpp), and keep the exact run's routing trace for
-# offline cache-policy simulation. The runner's disk and CPU are not the
+# per layer at several swap ratio[:prefetch width] configs ("expert-cache
+# bench" in tests/test_expert_cache.cpp; "0:0" = exact routing, no prefetch),
+# and keep the reference run's routing trace for offline cache-policy
+# simulation. The runner's disk and CPU are not the
 # console's: hits, misses, swaps, top-1 agreement and KL carry over; tok/s and
 # read ms do not.
 
@@ -15,8 +16,8 @@ on:
   workflow_dispatch:
     inputs:
       swaps:
-        description: Swap ratios, the first is the reference
-        default: "0,0.5,0.7"
+        description: Swap ratio[:prefetch width] configs, the first is the reference
+        default: "0:0,0,0.7:0,0.7"
       tokens:
         description: Tokens generated per prompt
         default: "64"
@@ -82,7 +83,7 @@ jobs:
 
       - name: Bench
         env:
-          XLLAMA_EC_BENCH_SWAPS: ${{ inputs.swaps || '0,0.5,0.7' }}
+          XLLAMA_EC_BENCH_SWAPS: ${{ inputs.swaps || '0:0,0,0.7:0,0.7' }}
           XLLAMA_EC_BENCH_TOKENS: ${{ inputs.tokens || '64' }}
           XLLAMA_EC_BENCH_SLOTS: ${{ inputs.slots || '32' }}
           XLLAMA_EC_BENCH_TRACE: ${{ runner.temp }}/ec-trace.txt
