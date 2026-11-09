@@ -103,15 +103,25 @@ compile_target() {
 	get_rows_q6_k) compile_one "$ROOT/shaders/ggml_d3d12_get_rows_q6_k.hlsl" \
 		"$ROOT/shaders/generated/ggml_d3d12_get_rows_q6_k_dxil.h" \
 		"shaders/ggml_d3d12_get_rows_q6_k.hlsl" "kGgmlD3d12GetRowsQ6KDxil" cs_6_4 ;;
+	elt)
+		local k n name sym
+		for k in 1:binary:Binary 2:rms_norm:RmsNorm 3:quant_q8_k:QuantQ8K; do
+			IFS=: read -r n name sym <<<"$k"
+			compile_one "$ROOT/shaders/ggml_d3d12_elt.hlsl" \
+				"$ROOT/shaders/generated/ggml_d3d12_elt_${name}_dxil.h" \
+				"shaders/ggml_d3d12_elt.hlsl -D KERNEL=${n}" "kGgmlD3d12Elt${sym}Dxil" cs_6_4 \
+				-D "KERNEL=${n}"
+		done
+		;;
 	*)
-		echo "unknown target: $1 (naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q6_k|mmv_iq3_s|get_rows_q6_k)" >&2
+		echo "unknown target: $1 (naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q6_k|mmv_iq3_s|get_rows_q6_k|elt)" >&2
 		exit 2
 		;;
 	esac
 }
 
 if [[ $# -eq 0 ]]; then
-	set -- naive wave32 rows dot4 mmv_q4_0 mmv_q4_k mmv_q6_k mmv_iq3_s get_rows_q6_k
+	set -- naive wave32 rows dot4 mmv_q4_0 mmv_q4_k mmv_q6_k mmv_iq3_s get_rows_q6_k elt
 fi
 for target in "$@"; do
 	compile_target "$target"

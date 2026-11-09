@@ -316,6 +316,143 @@ void d3d12_get_rows_emulate(ggml_type t, const std::uint8_t* w, std::size_t w_ro
     }
 }
 
+// --- f32 ops between the matmuls (shaders/ggml_d3d12_elt.hlsl) ---
+
+bool d3d12_elt_rows_supported(std::int64_t ne0, std::int64_t ne1, std::int64_t ne2,
+                              std::int64_t ne3) {
+    // The kernels address rows with 32-bit byte offsets from the tensor start.
+    return ne0 >= kD3d12EltMinRow && ne1 >= 1 && ne1 <= kD3d12MaxGroups && ne2 == 1 && ne3 == 1 &&
+           (ne0 + 255) / 256 <= kD3d12MaxGroups && ne0 * ne1 <= (std::int64_t(1) << 28);
+}
+
+bool d3d12_norm_weight_name(const char* name) {
+    if (!name)
+        return false;
+    if (std::strcmp(name, "output_norm.weight") == 0)
+        return true;
+    if (std::strncmp(name, "blk.", 4) != 0)
+        return false;
+    const char* p = name + 4;
+    const char* digits = p;
+    while (*p >= '0' && *p <= '9')
+        ++p;
+    if (p == digits || *p != '.')
+        return false;
+    ++p;
+    return std::strcmp(p, "attn_norm.weight") == 0 ||
+           std::strcmp(p, "post_attention_norm.weight") == 0 ||
+           std::strcmp(p, "ffn_norm.weight") == 0;
+}
+
+float d3d12_div_rn(std::uint32_t n, float b) {
+    std::uint32_t bb;
+    std::memcpy(&bb, &b, 4);
+    bb &= 0x7fffffffu;
+    const std::uint32_t eb = bb >> 23;
+    auto bits = [](std::uint32_t u) {
+        float f;
+        std::memcpy(&f, &u, 4);
+        return f;
+    };
+    if (eb == 0u || n == 0u)
+        return eb == 0u ? bits(0x7f800000u) : 0.0f;
+    const std::uint32_t mb = (bb & 0x7fffffu) | 0x800000u;
+    std::uint32_t s = 0;
+    while ((n << s) < 0x800000u)
+        ++s;
+    std::uint32_t r = n << s, q = 0;
+    for (int i = 0; i < 26; ++i) {
+        q <<= 1;
+        if (r >= mb) {
+            r -= mb;
+            q |= 1u;
+        }
+        r <<= 1;
+    }
+    int e = 150 - static_cast<int>(s) - static_cast<int>(eb);
+    std::uint32_t m, guard;
+    bool sticky = r != 0u;
+    if (q >= (1u << 25)) {
+        m = q >> 2;
+        guard = (q >> 1) & 1u;
+        sticky = sticky || (q & 1u) != 0u;
+    } else {
+        m = q >> 1;
+        guard = q & 1u;
+        e -= 1;
+    }
+    if (guard != 0u && (sticky || (m & 1u) != 0u)) {
+        m += 1u;
+        if (m == (1u << 24)) {
+            m >>= 1;
+            e += 1;
+        }
+    }
+    if (e > 127)
+        return bits(0x7f800000u);
+    if (e < -126)
+        return 0.0f;
+    return bits((static_cast<std::uint32_t>(e + 127) << 23) | (m & 0x7fffffu));
+}
+
+void d3d12_quant_q8k_emulate(const float* x, int k, std::uint8_t* out) {
+    if (!x || !out || k <= 0 || k % kD3d12Chunk != 0)
+        return;
+    for (int blk = 0; blk < k / kD3d12Chunk; ++blk) {
+        const float* xb = x + blk * kD3d12Chunk;
+        std::uint8_t* ob = out + static_cast<std::size_t>(blk) * 292u;
+        float s_ax[64], s_v[64];
+        std::uint32_t s_i[64];
+        for (std::uint32_t tid = 0; tid < 64u; ++tid) {
+            float ax = 0.0f, v = 0.0f;
+            std::uint32_t idx = 4u * tid;
+            for (std::uint32_t j = 0; j < 4u; ++j) {
+                const float a = std::fabs(xb[4u * tid + j]);
+                if (a > ax) {
+                    ax = a;
+                    v = xb[4u * tid + j];
+                    idx = 4u * tid + j;
+                }
+            }
+            s_ax[tid] = ax;
+            s_v[tid] = v;
+            s_i[tid] = idx;
+        }
+        for (std::uint32_t stride = 32u; stride > 0u; stride >>= 1u)
+            for (std::uint32_t tid = 0; tid < stride; ++tid) {
+                const float o = s_ax[tid + stride];
+                if (o > s_ax[tid] || (o == s_ax[tid] && s_i[tid + stride] < s_i[tid])) {
+                    s_ax[tid] = o;
+                    s_v[tid] = s_v[tid + stride];
+                    s_i[tid] = s_i[tid + stride];
+                }
+            }
+        float d = 0.0f;
+        std::int8_t qs[256] = {};
+        if (s_ax[0] != 0.0f) {
+            const float v = s_v[0];
+            const float ais = d3d12_div_rn(127u, v);
+            const float iscale = v > 0.0f ? -ais : ais;
+            const float dm = d3d12_div_rn(1u, ais);
+            d = v > 0.0f ? -dm : dm;
+            for (int j = 0; j < 256; ++j) {
+                const float p = iscale * xb[j];
+                qs[j] =
+                    static_cast<std::int8_t>(std::min(127, static_cast<int>(std::nearbyint(p))));
+            }
+        }
+        std::memcpy(ob, &d, 4);
+        std::memcpy(ob + 4, qs, 256);
+        for (int j = 0; j < 16; ++j) {
+            int sum = 0;
+            for (int i = 0; i < 16; ++i)
+                sum += qs[16 * j + i];
+            const std::int16_t s16 = static_cast<std::int16_t>(sum);
+            std::memcpy(ob + 260 + 2 * j, &s16, 2);
+        }
+    }
+}
+
 // --- Selftest CSV ---
 
 const char* d3d12_selftest_csv_header() {
@@ -383,6 +520,9 @@ void run_d3d12_memprobe(const std::function<void(const std::string&)>& emit) {
         #include "ggml-alloc.h"
         #include "ggml-backend-impl.h"
         #include "ggml-backend.h"
+        #include "ggml_d3d12_elt_binary_dxil.h"
+        #include "ggml_d3d12_elt_quant_q8_k_dxil.h"
+        #include "ggml_d3d12_elt_rms_norm_dxil.h"
         #include "ggml_d3d12_get_rows_q6_k_dxil.h"
         #include "ggml_d3d12_mmv_iq3_s_t128_dxil.h"
         #include "ggml_d3d12_mmv_iq3_s_t64_dxil.h"
@@ -401,6 +541,7 @@ namespace {
 using d3d12c::ComPtr;
 
 enum Pso { kPsoQ40 = 0, kPsoQ4K = 1, kPsoQ6K = 2, kPsoIq3S = 3, kPsoCount = 4 };
+enum Elt { kEltBinary = 0, kEltRmsNorm = 1, kEltQuantQ8K = 2, kEltCount = 3 };
 
 int pso_for(ggml_type t) {
     switch (t) {
@@ -426,6 +567,10 @@ struct Gpu {
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12PipelineState> pso[kPsoCount][2]; // [type][0 = 64 threads, 1 = 128]
     ComPtr<ID3D12PipelineState> pso_get_rows;      // Q6_K
+    // shaders/ggml_d3d12_elt.hlsl; without them (elt_ok false) those ops and
+    // the q8_K quantization run on the CPU inside graph_compute.
+    ComPtr<ID3D12PipelineState> pso_elt[kEltCount];
+    bool elt_ok = false;
     ComPtr<ID3D12QueryHeap> ts;
     ComPtr<ID3D12Resource> ts_rb;
     ComPtr<ID3D12Resource> staging;  // weight upload ring (kStagingBytes)
@@ -443,7 +588,8 @@ struct Gpu {
     double last_gpu_ms = 0.0;
     // Per-backend-lifetime counters, logged when the backend is freed.
     std::uint64_t n_calls = 0;
-    std::uint64_t n_dispatches = 0; // MUL_MAT + GET_ROWS
+    std::uint64_t n_dispatches = 0;
+    std::uint64_t n_submits = 0;
     double wall_ms = 0.0;
     double gpu_ms = 0.0;
     std::mutex mu;
@@ -458,20 +604,22 @@ struct Gpu {
 constexpr UINT64 kStagingBytes = 8ull << 20;
 
 ComPtr<ID3D12RootSignature> make_root_sig(ID3D12Device* device, std::string* err) {
-    D3D12_ROOT_PARAMETER p[4] = {};
+    // b0 constants, t0 weights, u0 output, u1 activations, u2 / u3 (elt: b or
+    // norm weight, fused-MUL output).
+    D3D12_ROOT_PARAMETER p[6] = {};
     p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     p[0].Constants.ShaderRegister = 0;
     p[0].Constants.Num32BitValues = 8;
-    p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; // t0 weights
+    p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
     p[1].Descriptor.ShaderRegister = 0;
-    p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; // u0 output
-    p[2].Descriptor.ShaderRegister = 0;
-    p[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; // u1 activations
-    p[3].Descriptor.ShaderRegister = 1;
+    for (UINT i = 0; i < 4; ++i) {
+        p[2 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        p[2 + i].Descriptor.ShaderRegister = i;
+    }
     for (auto& q : p)
         q.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     D3D12_ROOT_SIGNATURE_DESC desc = {};
-    desc.NumParameters = 4;
+    desc.NumParameters = 6;
     desc.pParameters = p;
     auto serialize = d3d12_dyn::SerializeRootSignature();
     if (!serialize) {
@@ -559,6 +707,27 @@ bool init_gpu(Gpu& g) {
         if (FAILED(hr)) {
             err = d3d12c::hr_message("CreateComputePipelineState", hr);
             return false;
+        }
+    }
+    {
+        const void* eb[kEltCount] = {kGgmlD3d12EltBinaryDxil, kGgmlD3d12EltRmsNormDxil,
+                                     kGgmlD3d12EltQuantQ8KDxil};
+        const size_t es[kEltCount] = {kGgmlD3d12EltBinaryDxilSize, kGgmlD3d12EltRmsNormDxilSize,
+                                      kGgmlD3d12EltQuantQ8KDxilSize};
+        g.elt_ok = true;
+        for (int i = 0; i < kEltCount && g.elt_ok; ++i) {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
+            pd.pRootSignature = g.root.Get();
+            pd.CS.pShaderBytecode = eb[i];
+            pd.CS.BytecodeLength = es[i];
+            hr = g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.pso_elt[i]));
+            if (FAILED(hr)) {
+                // The matmuls still run; the ops between them go back to the CPU.
+                log_output("[xllama] d3d12: " +
+                           d3d12c::hr_message("CreateComputePipelineState (elt)", hr) +
+                           " — elementwise ops stay on the CPU\n");
+                g.elt_ok = false;
+            }
         }
     }
     if (SUCCEEDED(g.queue->GetTimestampFrequency(&g.ts_freq)) && g.ts_freq > 0) {
@@ -977,12 +1146,13 @@ void backend_free(ggml_backend_t b) {
         std::lock_guard<std::mutex> lock(g.mu);
         char msg[256];
         std::snprintf(msg, sizeof(msg),
-                      "[xllama] d3d12: %llu graph_compute calls, %llu dispatches, %.1f ms wall "
-                      "(%.1f ms GPU)\n",
+                      "[xllama] d3d12: %llu graph_compute calls, %llu submits, %llu dispatches, "
+                      "%.1f ms wall (%.1f ms GPU)\n",
                       static_cast<unsigned long long>(g.n_calls),
+                      static_cast<unsigned long long>(g.n_submits),
                       static_cast<unsigned long long>(g.n_dispatches), g.wall_ms, g.gpu_ms);
         log_output(msg);
-        g.n_calls = g.n_dispatches = 0;
+        g.n_calls = g.n_submits = g.n_dispatches = 0;
         g.wall_ms = g.gpu_ms = 0.0;
     }
     delete b;
@@ -1022,59 +1192,126 @@ const ggml_tensor* base_of(const ggml_tensor* t) {
     return t;
 }
 
-// One dispatch: a MUL_MAT (u1 = its quantized input) or a GET_ROWS (u1 = its
-// row ids), both staged in g.xq.
-struct Op {
-    const ggml_tensor* node;
-    std::size_t xq_off;   // staged input in g.xq
-    std::uint32_t xq_row; // bytes per quantized column (MUL_MAT)
+// Host address range [lo, hi) a dispatch reads or writes.
+struct Rng {
+    std::uintptr_t lo = 0, hi = 0;
 };
+
+Rng rng_of(const ggml_tensor* t) {
+    const auto lo = reinterpret_cast<std::uintptr_t>(t->data);
+    return {lo, lo + ggml_nbytes(t)};
+}
+
+bool overlaps(const Rng& a, const Rng& b) {
+    return a.lo < b.hi && b.lo < a.hi;
+}
+
+bool any_overlap(const std::vector<Rng>& v, const Rng& r) {
+    for (const Rng& x : v)
+        if (overlaps(x, r))
+            return true;
+    return false;
+}
+
+// An operand of the elementwise kernels: f32 rows in D3D12_Host, addressed
+// with 32-bit byte offsets from the tensor start.
+bool elt_operand(const ggml_tensor* t) {
+    return t && t->buffer && t->buffer->buft == &kHostBuft && t->type == GGML_TYPE_F32 &&
+           t->nb[0] == sizeof(float) && t->nb[1] % sizeof(float) == 0 &&
+           ggml_nbytes(t) <= 0xffffffffull;
+}
+
+// Each element is read and written by one thread, so an output may be one of
+// the inputs exactly (an in-place op) or lie apart from it — not partly over it.
+bool elt_rows(const ggml_tensor* t) {
+    return d3d12_elt_rows_supported(t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
+}
+
+bool same_or_apart(const ggml_tensor* d, const ggml_tensor* s) {
+    if (d->data == s->data && d->nb[1] == s->nb[1])
+        return true;
+    return !overlaps(rng_of(d), rng_of(s));
+}
+
+// CPU versions of the elementwise kernels, for operands the GPU path refuses.
+float* row_f32(const ggml_tensor* t, std::int64_t r) {
+    return reinterpret_cast<float*>(static_cast<char*>(t->data) + r * t->nb[1]);
+}
+
+void cpu_binary(const ggml_tensor* d, int kind) {
+    const ggml_tensor* a = d->src[0];
+    const ggml_tensor* b = d->src[1];
+    GGML_ASSERT(d->ne[2] == 1 && d->ne[3] == 1 && b->ne[2] == 1 && b->ne[3] == 1);
+    for (std::int64_t r = 0; r < d->ne[1]; ++r) {
+        const float* pa = row_f32(a, r);
+        const float* pb = row_f32(b, b->ne[1] == 1 ? 0 : r);
+        float* pd = row_f32(d, r);
+        for (std::int64_t i = 0; i < d->ne[0]; ++i) {
+            const float x = pa[i], y = pb[i];
+            pd[i] = kind == 0 ? x + y : kind == 1 ? x * y : x / (1.0f + std::exp(-x)) * y;
+        }
+    }
+}
+
+void cpu_rms_norm(const ggml_tensor* d, float eps) {
+    const ggml_tensor* a = d->src[0];
+    GGML_ASSERT(d->ne[2] == 1 && d->ne[3] == 1 && ggml_are_same_shape(d, a));
+    for (std::int64_t r = 0; r < d->ne[1]; ++r) {
+        const float* pa = row_f32(a, r);
+        double sum = 0.0; // as ggml-cpu
+        for (std::int64_t i = 0; i < d->ne[0]; ++i)
+            sum += static_cast<double>(pa[i] * pa[i]);
+        const float mean = static_cast<float>(sum / static_cast<double>(d->ne[0]));
+        const float scale = 1.0f / std::sqrt(mean + eps);
+        float* pd = row_f32(d, r);
+        for (std::int64_t i = 0; i < d->ne[0]; ++i)
+            pd[i] = pa[i] * scale;
+    }
+}
+
+// One recorded command: a dispatch, or a UAV barrier (pso null). Root
+// parameters left 0 are bound to u[0]; the kernel does not read them.
+struct Op {
+    ID3D12PipelineState* pso = nullptr;
+    std::uint32_t c[8] = {};
+    D3D12_GPU_VIRTUAL_ADDRESS t0 = 0;
+    D3D12_GPU_VIRTUAL_ADDRESS u[4] = {};
+    UINT gx = 0, gy = 0;
+};
+
+void set_c(Op& op, std::initializer_list<std::uint64_t> c) {
+    std::size_t i = 0;
+    for (const std::uint64_t v : c)
+        op.c[i++] = static_cast<std::uint32_t>(v);
+}
 
 // Record and run one submission. Caller holds g.mu.
 bool submit_ops(Gpu& g, const std::vector<Op>& ops) {
     const bool ts = g.ts && g.ts_rb;
+    std::uint64_t n = 0;
     const bool ran = run_now(g, [&](ID3D12GraphicsCommandList* cl) {
         cl->SetComputeRootSignature(g.root.Get());
         if (ts)
             cl->EndQuery(g.ts.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
-        const D3D12_GPU_VIRTUAL_ADDRESS xq_va = g.xq->GetGPUVirtualAddress();
+        ID3D12PipelineState* bound = nullptr;
         for (const Op& op : ops) {
-            const ggml_tensor* node = op.node;
-            const ggml_tensor* w = node->src[0];
-            if (node->op == GGML_OP_GET_ROWS) {
-                const std::uint32_t c[8] = {static_cast<std::uint32_t>(node->ne[1]),
-                                            static_cast<std::uint32_t>(w->ne[0]),
-                                            static_cast<std::uint32_t>(w->ne[0] / kD3d12Chunk),
-                                            static_cast<std::uint32_t>(w->nb[1]),
-                                            0,
-                                            static_cast<std::uint32_t>(node->nb[1] / sizeof(float)),
-                                            0,
-                                            0};
-                cl->SetPipelineState(g.pso_get_rows.Get());
-                cl->SetComputeRoot32BitConstants(0, 8, c, 0);
-                cl->SetComputeRootShaderResourceView(1, tensor_va(w));
-                cl->SetComputeRootUnorderedAccessView(2, tensor_va(node));
-                cl->SetComputeRootUnorderedAccessView(3, xq_va + op.xq_off);
-                cl->Dispatch(static_cast<UINT>(w->ne[0] / kD3d12Chunk),
-                             static_cast<UINT>(node->ne[1]), 1);
+            if (!op.pso) {
+                D3D12_RESOURCE_BARRIER b = {};
+                b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                b.UAV.pResource = nullptr; // every UAV access
+                cl->ResourceBarrier(1, &b);
                 continue;
             }
-            const D3d12Dispatch d = d3d12_mm_dispatch(node->ne[0], node->ne[1]);
-            const std::uint32_t c[8] = {static_cast<std::uint32_t>(w->ne[1]),
-                                        static_cast<std::uint32_t>(w->ne[0]),
-                                        static_cast<std::uint32_t>(w->ne[0] / kD3d12Chunk),
-                                        static_cast<std::uint32_t>(w->nb[1]),
-                                        op.xq_row,
-                                        static_cast<std::uint32_t>(node->nb[1] / sizeof(float)),
-                                        0,
-                                        0};
-            const int wide = d3d12_mm_threads(w->ne[0]) == kD3d12MmvThreadsLong ? 1 : 0;
-            cl->SetPipelineState(g.pso[pso_for(w->type)][wide].Get());
-            cl->SetComputeRoot32BitConstants(0, 8, c, 0);
-            cl->SetComputeRootShaderResourceView(1, tensor_va(w));
-            cl->SetComputeRootUnorderedAccessView(2, tensor_va(node));
-            cl->SetComputeRootUnorderedAccessView(3, xq_va + op.xq_off);
-            cl->Dispatch(d.groups_x, d.groups_y, 1);
+            if (op.pso != bound) {
+                cl->SetPipelineState(op.pso);
+                bound = op.pso;
+            }
+            cl->SetComputeRoot32BitConstants(0, 8, op.c, 0);
+            cl->SetComputeRootShaderResourceView(1, op.t0 ? op.t0 : op.u[0]);
+            for (UINT i = 0; i < 4; ++i)
+                cl->SetComputeRootUnorderedAccessView(2 + i, op.u[i] ? op.u[i] : op.u[0]);
+            cl->Dispatch(op.gx, op.gy, 1);
+            ++n;
         }
         if (ts) {
             cl->EndQuery(g.ts.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
@@ -1093,21 +1330,26 @@ bool submit_ops(Gpu& g, const std::vector<Op>& ops) {
             g.ts_rb->Unmap(0, nullptr);
         }
     }
-    g.n_dispatches += ops.size();
+    g.n_dispatches += n;
+    ++g.n_submits;
     return true;
 }
 
 ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
     Gpu& g = gpu();
-    std::vector<const ggml_tensor*> mm;
+    std::vector<ggml_tensor*> nodes;
     for (int i = 0; i < ggml_graph_n_nodes(cgraph); ++i) {
-        const ggml_tensor* node = ggml_graph_node(cgraph, i);
+        ggml_tensor* node = ggml_graph_node(cgraph, i);
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0)
             continue;
         switch (node->op) {
         case GGML_OP_MUL_MAT:
         case GGML_OP_GET_ROWS:
-            mm.push_back(node);
+        case GGML_OP_ADD:
+        case GGML_OP_MUL:
+        case GGML_OP_GLU:
+        case GGML_OP_RMS_NORM:
+            nodes.push_back(node);
             break;
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
@@ -1119,91 +1361,251 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
             GGML_ABORT("d3d12: unsupported op %s", ggml_op_desc(node));
         }
     }
-    if (mm.empty())
+    if (nodes.empty())
         return GGML_STATUS_SUCCESS;
 
     std::lock_guard<std::mutex> lock(g.mu);
     const auto t0 = std::chrono::steady_clock::now();
     g.last_gpu_ms = 0.0;
-    // Activations are quantized on the CPU before the GPU reads them, so a
-    // matmul whose input another matmul of the same batch produces (a LoRA
-    // chain) waits for that batch. Matmuls sharing an input (q/k/v, gate/up)
-    // share one quantized copy.
+    // The split's ops go into one submission. Dispatches run back to back, so
+    // a UAV barrier goes in front of one that reads what another wrote since
+    // the last barrier, or writes what one read or wrote (the graph allocator
+    // reuses memory). CPU work — quantizing a Q4_0 input, staging row ids, an
+    // op whose operands the GPU path refuses — happens now, before the GPU
+    // runs, so it first runs the submission when that writes what it reads.
+    // Matmuls sharing an input share one quantized copy.
     std::vector<Op> ops;
-    std::vector<const ggml_tensor*> produced; // outputs of `ops`
+    std::vector<Rng> bar_r, bar_w, batch_w;
     struct Quantized {
         const void* data;
+        std::size_t nb1;
         ggml_type type;
         std::size_t off;
         std::uint32_t row;
         int ncols;
+        Rng src;
     };
     std::vector<Quantized> done;
     std::size_t used = 0;
     auto flush = [&]() -> bool {
-        if (ops.empty())
-            return true;
-        const bool ok = submit_ops(g, ops);
+        const bool ok = ops.empty() || submit_ops(g, ops);
         ops.clear();
-        produced.clear();
+        bar_r.clear();
+        bar_w.clear();
+        batch_w.clear();
         done.clear();
         used = 0;
         return ok;
     };
-    for (const ggml_tensor* node : mm) {
-        const ggml_tensor* w = node->src[0];
-        const ggml_tensor* x = node->src[1];
-        GGML_ASSERT(w->buffer && w->buffer->buft == &kWeightsBuft);
-        GGML_ASSERT(x->buffer && ggml_backend_buffer_is_host(x->buffer));
+    auto record = [&](const Op& op, std::initializer_list<Rng> reads,
+                      std::initializer_list<Rng> writes) {
+        bool hazard = false;
+        for (const Rng& r : reads)
+            hazard = hazard || any_overlap(bar_w, r);
+        for (const Rng& w : writes)
+            hazard = hazard || any_overlap(bar_w, w) || any_overlap(bar_r, w);
+        if (hazard) {
+            ops.push_back(Op{});
+            bar_r.clear();
+            bar_w.clear();
+        }
+        ops.push_back(op);
+        bar_r.insert(bar_r.end(), reads.begin(), reads.end());
+        bar_w.insert(bar_w.end(), writes.begin(), writes.end());
+        batch_w.insert(batch_w.end(), writes.begin(), writes.end());
+        // A quantized copy of memory this op overwrites is stale.
+        done.erase(std::remove_if(done.begin(), done.end(),
+                                  [&](const Quantized& q) {
+                                      for (const Rng& w : writes)
+                                          if (overlaps(q.src, w))
+                                              return true;
+                                      return false;
+                                  }),
+                   done.end());
+    };
+    // Scratch in g.xq; offsets stay 256-byte aligned for root UAV addresses.
+    auto reserve = [&](std::size_t bytes, std::size_t* off) -> bool {
+        const std::size_t aligned = (bytes + 255) & ~std::size_t(255);
+        if (used + aligned > g.xq_bytes && !flush())
+            return false;
+        if (!ensure_xq(g, used + aligned))
+            return false;
+        *off = used;
+        used += aligned;
+        return true;
+    };
+    auto xq_va = [&](std::size_t off) { return g.xq->GetGPUVirtualAddress() + off; };
+    auto xq_rng = [&](std::size_t off, std::size_t bytes) {
+        const auto lo = reinterpret_cast<std::uintptr_t>(g.xq_ptr + off);
+        return Rng{lo, lo + bytes};
+    };
+
+    for (std::size_t i = 0; i < nodes.size(); ++i) {
+        ggml_tensor* node = nodes[i];
         GGML_ASSERT(node->buffer && is_ours(node->buffer->buft));
         if (ggml_nelements(node) == 0)
             continue; // a ubatch without output rows: nothing to compute
-        if (node->op == GGML_OP_GET_ROWS) {
+        const ggml_tensor* a = node->src[0];
+        const ggml_tensor* b = node->src[1];
+        switch (node->op) {
+        case GGML_OP_GET_ROWS: {
+            GGML_ASSERT(a->buffer && a->buffer->buft == &kWeightsBuft);
+            GGML_ASSERT(b->buffer && ggml_backend_buffer_is_host(b->buffer));
             // Row ids are tiny: stage them next to the quantized activations.
-            const std::size_t bytes = static_cast<std::size_t>(x->ne[0]) * sizeof(std::int32_t);
-            if (used + bytes > g.xq_bytes && !flush())
+            const std::size_t bytes = static_cast<std::size_t>(b->ne[0]) * sizeof(std::int32_t);
+            std::size_t off = 0;
+            if (any_overlap(batch_w, rng_of(b)) && !flush())
                 return GGML_STATUS_FAILED;
-            if (!ensure_xq(g, used + bytes))
+            if (!reserve(bytes, &off))
                 return GGML_STATUS_FAILED;
-            std::memcpy(g.xq_ptr + used, x->data, bytes);
+            std::memcpy(g.xq_ptr + off, b->data, bytes);
             // The kernel does not bound-check rows; ggml-cpu asserts the same.
-            const auto* ids = reinterpret_cast<const std::int32_t*>(g.xq_ptr + used);
-            for (std::int64_t i = 0; i < x->ne[0]; ++i)
-                GGML_ASSERT(ids[i] >= 0 && ids[i] < w->ne[1]);
-            ops.push_back({node, used, 0});
-            produced.push_back(base_of(node));
-            used += (bytes + 255) & ~std::size_t(255);
-            continue;
+            const auto* ids = reinterpret_cast<const std::int32_t*>(g.xq_ptr + off);
+            for (std::int64_t j = 0; j < b->ne[0]; ++j)
+                GGML_ASSERT(ids[j] >= 0 && ids[j] < a->ne[1]);
+            Op op;
+            op.pso = g.pso_get_rows.Get();
+            set_c(op,
+                  {static_cast<std::uint64_t>(node->ne[1]), static_cast<std::uint64_t>(a->ne[0]),
+                   static_cast<std::uint64_t>(a->ne[0] / kD3d12Chunk), a->nb[1], 0,
+                   node->nb[1] / sizeof(float)});
+            op.t0 = tensor_va(a);
+            op.u[0] = tensor_va(node);
+            op.u[1] = xq_va(off);
+            op.gx = static_cast<UINT>(a->ne[0] / kD3d12Chunk);
+            op.gy = static_cast<UINT>(node->ne[1]);
+            record(op, {xq_rng(off, bytes)}, {rng_of(node)});
+            break;
         }
-        const ggml_tensor* xb = base_of(x);
-        for (const ggml_tensor* p : produced)
-            if (p == xb) {
+        case GGML_OP_MUL_MAT: {
+            const ggml_tensor* w = a;
+            const ggml_tensor* x = b;
+            GGML_ASSERT(w->buffer && w->buffer->buft == &kWeightsBuft);
+            GGML_ASSERT(x->buffer && ggml_backend_buffer_is_host(x->buffer));
+            const ggml_type at = d3d12_activation_type(w->type);
+            const int k = static_cast<int>(x->ne[0]);
+            const int ncols = static_cast<int>(x->ne[1]);
+            const std::uint32_t row = static_cast<std::uint32_t>(ggml_row_size(at, k));
+            const std::size_t bytes = static_cast<std::size_t>(row) * ncols;
+            std::size_t off = SIZE_MAX;
+            for (const Quantized& q : done)
+                if (q.data == x->data && q.nb1 == x->nb[1] && q.type == at && q.row == row &&
+                    q.ncols >= ncols)
+                    off = q.off;
+            if (off == SIZE_MAX) {
+                const Rng xr = rng_of(x);
+                // q8_K on the GPU; q8_0 (Q4_0 weights) on the CPU.
+                const bool gpu_q = g.elt_ok && at == GGML_TYPE_Q8_K && elt_operand(x) &&
+                                   ncols <= static_cast<int>(kD3d12MaxGroups);
+                if (!gpu_q && any_overlap(batch_w, xr) && !flush())
+                    return GGML_STATUS_FAILED;
+                if (!reserve(bytes, &off))
+                    return GGML_STATUS_FAILED;
+                if (gpu_q) {
+                    Op q;
+                    q.pso = g.pso_elt[kEltQuantQ8K].Get();
+                    set_c(q, {static_cast<std::uint64_t>(k / kD3d12Chunk), x->nb[1] / sizeof(float),
+                              row});
+                    q.u[0] = xq_va(off);
+                    q.u[1] = tensor_va(x);
+                    q.gx = static_cast<UINT>(k / kD3d12Chunk);
+                    q.gy = static_cast<UINT>(ncols);
+                    record(q, {xr}, {xq_rng(off, bytes)});
+                } else {
+                    d3d12_quantize_activations(w->type, static_cast<const float*>(x->data),
+                                               x->nb[1] / sizeof(float), k, ncols, g.xq_ptr + off);
+                }
+                done.push_back({x->data, x->nb[1], at, off, row, ncols, xr});
+            }
+            const D3d12Dispatch d = d3d12_mm_dispatch(node->ne[0], node->ne[1]);
+            const int wide = d3d12_mm_threads(w->ne[0]) == kD3d12MmvThreadsLong ? 1 : 0;
+            Op m;
+            m.pso = g.pso[pso_for(w->type)][wide].Get();
+            set_c(m, {static_cast<std::uint64_t>(w->ne[1]), static_cast<std::uint64_t>(w->ne[0]),
+                      static_cast<std::uint64_t>(w->ne[0] / kD3d12Chunk), w->nb[1], row,
+                      node->nb[1] / sizeof(float)});
+            m.t0 = tensor_va(w);
+            m.u[0] = tensor_va(node);
+            m.u[1] = xq_va(off);
+            m.gx = d.groups_x;
+            m.gy = d.groups_y;
+            record(m, {xq_rng(off, bytes)}, {rng_of(node)});
+            break;
+        }
+        case GGML_OP_ADD:
+        case GGML_OP_MUL:
+        case GGML_OP_GLU: {
+            const int kind = node->op == GGML_OP_ADD ? 0 : node->op == GGML_OP_MUL ? 1 : 2;
+            // supports_op admits these shapes only: b is a's shape or one row.
+            GGML_ASSERT(ggml_are_same_shape(node, a) && b->ne[0] == node->ne[0] &&
+                        (b->ne[1] == 1 || b->ne[1] == node->ne[1]));
+            if (g.elt_ok && elt_rows(node) && elt_operand(node) && elt_operand(a) &&
+                elt_operand(b) && same_or_apart(node, a) && same_or_apart(node, b)) {
+                Op e;
+                e.pso = g.pso_elt[kEltBinary].Get();
+                set_c(e, {static_cast<std::uint64_t>(node->ne[0]),
+                          static_cast<std::uint64_t>(node->ne[1]), a->nb[1] / sizeof(float),
+                          b->ne[1] == 1 ? 0 : b->nb[1] / sizeof(float), node->nb[1] / sizeof(float),
+                          static_cast<std::uint64_t>(kind)});
+                e.u[0] = tensor_va(node);
+                e.u[1] = tensor_va(a);
+                e.u[2] = tensor_va(b);
+                e.gx = static_cast<UINT>((node->ne[0] + 255) / 256);
+                e.gy = static_cast<UINT>(node->ne[1]);
+                record(e, {rng_of(a), rng_of(b)}, {rng_of(node)});
+            } else {
+                GGML_ASSERT(ggml_backend_buffer_is_host(a->buffer) &&
+                            ggml_backend_buffer_is_host(b->buffer));
                 if (!flush())
                     return GGML_STATUS_FAILED;
-                break;
+                cpu_binary(node, kind);
             }
-        const ggml_type at = d3d12_activation_type(w->type);
-        const int k = static_cast<int>(x->ne[0]);
-        const int ncols = static_cast<int>(x->ne[1]);
-        const std::uint32_t row = static_cast<std::uint32_t>(ggml_row_size(at, k));
-        const Quantized* q = nullptr;
-        for (const Quantized& d : done)
-            if (d.data == x->data && d.type == at && d.row == row && d.ncols >= ncols)
-                q = &d;
-        if (!q) {
-            const std::size_t bytes = static_cast<std::size_t>(row) * ncols;
-            if (used + bytes > g.xq_bytes && !flush())
-                return GGML_STATUS_FAILED;
-            if (!ensure_xq(g, used + bytes))
-                return GGML_STATUS_FAILED;
-            d3d12_quantize_activations(w->type, static_cast<const float*>(x->data),
-                                       x->nb[1] / sizeof(float), k, ncols, g.xq_ptr + used);
-            done.push_back({x->data, at, used, row, ncols});
-            q = &done.back();
-            used += (bytes + 255) & ~std::size_t(255); // root UAV addresses stay aligned
+            break;
         }
-        ops.push_back({node, q->off, q->row});
-        produced.push_back(base_of(node));
+        case GGML_OP_RMS_NORM: {
+            float eps = 0.0f;
+            std::memcpy(&eps, node->op_params, sizeof(float));
+            std::uint32_t eps_bits = 0;
+            std::memcpy(&eps_bits, &eps, sizeof(eps_bits));
+            // build_norm's MUL by the norm weight right after it is fused: the
+            // kernel writes the norm, then the product.
+            ggml_tensor* m = i + 1 < nodes.size() ? nodes[i + 1] : nullptr;
+            const ggml_tensor* w = m ? m->src[1] : nullptr;
+            const bool fuse = m && m->op == GGML_OP_MUL && m->src[0] == node && w &&
+                              elt_operand(m) && elt_operand(w) && ggml_are_same_shape(m, node) &&
+                              ggml_nrows(w) == 1 && w->ne[0] == node->ne[0] &&
+                              same_or_apart(m, node) && same_or_apart(m, a) &&
+                              !overlaps(rng_of(m), rng_of(w));
+            if (g.elt_ok && elt_rows(node) && elt_operand(node) && elt_operand(a) &&
+                same_or_apart(node, a)) {
+                Op e;
+                e.pso = g.pso_elt[kEltRmsNorm].Get();
+                set_c(e, {static_cast<std::uint64_t>(node->ne[0]), a->nb[1] / sizeof(float),
+                          node->nb[1] / sizeof(float), eps_bits, fuse ? 1u : 0u,
+                          fuse ? m->nb[1] / sizeof(float) : 0u});
+                e.u[0] = tensor_va(node);
+                e.u[1] = tensor_va(a);
+                e.gx = static_cast<UINT>(node->ne[1]);
+                e.gy = 1;
+                if (fuse) {
+                    e.u[2] = tensor_va(w);
+                    e.u[3] = tensor_va(m);
+                    record(e, {rng_of(a), rng_of(w)}, {rng_of(node), rng_of(m)});
+                    ++i; // the MUL is done
+                } else {
+                    record(e, {rng_of(a)}, {rng_of(node)});
+                }
+            } else {
+                GGML_ASSERT(ggml_backend_buffer_is_host(a->buffer));
+                if (!flush())
+                    return GGML_STATUS_FAILED;
+                cpu_rms_norm(node, eps);
+            }
+            break;
+        }
+        default:
+            GGML_ABORT("d3d12: unsupported op %s", ggml_op_desc(node));
+        }
     }
     if (!flush())
         return GGML_STATUS_FAILED;
@@ -1245,7 +1647,8 @@ const char* dev_name(ggml_backend_dev_t) {
     return "D3D12";
 }
 const char* dev_description(ggml_backend_dev_t) {
-    return "xllama D3D12 compute (Q4_0/Q4_K/Q6_K/IQ3_S matmul, Q6_K get_rows)";
+    return "xllama D3D12 compute (Q4_0/Q4_K/Q6_K/IQ3_S matmul, Q6_K get_rows, f32 "
+           "add/mul/rms_norm/swiglu, q8_K quant)";
 }
 void dev_memory(ggml_backend_dev_t, size_t* free, size_t* total) {
     *free = *total = 0;
@@ -1282,6 +1685,33 @@ ggml_backend_t dev_init_backend(ggml_backend_dev_t dev, const char*) {
 }
 ggml_backend_buffer_type_t dev_buffer_type(ggml_backend_dev_t) {
     return &kHostBuft;
+}
+
+// An f32 operand of the elementwise kernels as supports_op sees it: activations
+// have no buffer yet; anything already placed must be in D3D12_Host.
+bool elt_f32(const ggml_tensor* t) {
+    return t->type == GGML_TYPE_F32 && t->nb[0] == sizeof(float) && t->nb[1] % sizeof(float) == 0 &&
+           (!t->buffer || t->buffer->buft == &kHostBuft);
+}
+
+// Whether t is computed from a D3D12 matmul or get_rows within `depth`
+// elementwise ops. Only those elementwise ops move to the GPU: the ones fed by
+// CPU ops (the embedding lookup, the MoE experts, the last layer's row
+// selection) stay with them instead of adding a CPU -> GPU -> CPU round trip.
+bool fed_by_d3d12(const ggml_tensor* t, int depth = 2) {
+    while (t) {
+        t = base_of(t);
+        if ((t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_GET_ROWS) && t->src[0] &&
+            t->src[0]->buffer && t->src[0]->buffer->buft == &kWeightsBuft)
+            return true;
+        if (depth-- <= 0)
+            return false;
+        if (t->op != GGML_OP_ADD && t->op != GGML_OP_MUL && t->op != GGML_OP_RMS_NORM &&
+            t->op != GGML_OP_GLU)
+            return false;
+        t = t->src[0];
+    }
+    return false;
 }
 
 bool dev_supports_op(ggml_backend_dev_t, const ggml_tensor* op) {
@@ -1347,6 +1777,32 @@ bool dev_supports_op(ggml_backend_dev_t, const ggml_tensor* op) {
         d.src1_contiguous = ggml_is_contiguous(ids);
         d.src0_in_weight_buffer = w->buffer && w->buffer->buft == &kWeightsBuft;
         return d3d12_get_rows_supported(d);
+    }
+    case GGML_OP_ADD:
+    case GGML_OP_MUL:
+    case GGML_OP_GLU:
+    case GGML_OP_RMS_NORM: {
+        const ggml_tensor* a = op->src[0];
+        const ggml_tensor* b = op->src[1];
+        if (!gpu().elt_ok || !elt_f32(op) || !elt_f32(a) || !elt_rows(op) ||
+            !ggml_are_same_shape(op, a))
+            return false;
+        switch (op->op) {
+        case GGML_OP_ADD: // the residual adds after o_proj and ffn_down
+            return b && elt_f32(b) && ggml_are_same_shape(op, b) && fed_by_d3d12(a);
+        case GGML_OP_MUL:
+            // A norm by its weight. The weight is checked by name and buffer,
+            // not by what feeds src0: the loader probes it with a dummy src0,
+            // and a norm weight in D3D12_Host lets the norm join the matmuls.
+            return b && b->buffer && elt_f32(b) && d3d12_norm_weight_name(b->name) &&
+                   ggml_nrows(b) == 1 && b->ne[0] == op->ne[0];
+        case GGML_OP_GLU:
+            return ggml_get_glu_op(op) == GGML_GLU_OP_SWIGLU && b && elt_f32(b) &&
+                   op->op_params[1] == 0 /* not swapped */ && ggml_are_same_shape(op, b) &&
+                   fed_by_d3d12(a);
+        default: // RMS_NORM
+            return fed_by_d3d12(a);
+        }
     }
     default:
         return false;
