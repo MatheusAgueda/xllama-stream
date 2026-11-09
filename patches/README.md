@@ -143,6 +143,16 @@ the patch also marks it `TENSOR_NOT_REQUIRED` in `qwen35` and `qwen35moe`. A
 missing MTP tensor then loads as null, the same result a skipped one gives. With
 MTP on, the tensors are still required.
 
+`0007-qwen35moe-shared-expert-first.patch` (applies after 0004): `qwen35moe`
+built the shared expert after the routed experts, so its three matmuls sat after
+the routed experts' CPU tail (weights, sums) and took two D3D12 submissions of
+their own per layer. Measured on 2026-11-09 with the 35B: 80 of ~203 submissions
+per decoded token were the shared expert (`ffn_gate .. ffn_up` and `ffn_shexp`),
+~8 ms of a 108 ms token. The patch builds the shared FFN first and expands it, so
+its matmuls follow the output projection and the post-attention norm in node
+order and join that submission. Only the order changes; the results stay the
+same.
+
 ## Applying
 
 ```bash

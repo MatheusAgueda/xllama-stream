@@ -2036,12 +2036,15 @@ bool dev_supports_op(ggml_backend_dev_t, const ggml_tensor* op) {
         const ggml_tensor* a = op->src[0];
         const ggml_tensor* b = op->src[1];
         if (op->op == GGML_OP_GLU && a && gpu().elt_ok && glu_rows(op) && !elt_rows(op)) {
-            // The routed experts' SwiGLU, between two MUL_MAT_IDs on the GPU.
+            // A SwiGLU narrower than kD3d12EltMinRow: the routed experts' between two
+            // MUL_MAT_IDs, or a shared expert's (n_ff_shexp 512 on Qwen3.6-35B-A3B)
+            // between its D3D12 matmuls, which kept the shared FFN in two submissions.
             const ggml_tensor* src = base_of(a);
             return ggml_get_glu_op(op) == GGML_GLU_OP_SWIGLU && b && elt_f32(op) && elt_f32(a) &&
                    elt_f32(b) && op->op_params[1] == 0 && ggml_are_same_shape(op, a) &&
-                   ggml_are_same_shape(op, b) && src->op == GGML_OP_MUL_MAT_ID &&
-                   in_expert_cache(src->src[0]);
+                   ggml_are_same_shape(op, b) &&
+                   ((src->op == GGML_OP_MUL_MAT_ID && in_expert_cache(src->src[0])) ||
+                    fed_by_d3d12(a, 0));
         }
         if (!gpu().elt_ok || !elt_f32(op) || !elt_f32(a) || !elt_rows(op) ||
             !ggml_are_same_shape(op, a))
