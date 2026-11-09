@@ -245,15 +245,18 @@ int env_int(const char* name, int def) {
     return v && *v ? std::atoi(v) : def;
 }
 
-// One bench run: a swap ratio, a prefetch width and the largest expert-major
-// ubatch (-1 = the cache's default).
+// One bench run: a swap ratio, a prefetch width (ahead: from the previous
+// layer, LLAMA_EXPERT_PREFETCH_AHEAD) and the largest expert-major ubatch (-1 =
+// the cache's default).
 struct BenchCfg {
     float swap = 0.0f;
     int pf = -1;
+    bool ahead = false;
     int em = -1;
 };
 
-// "ratio[:k[:em]],..." with empty fields for the default, e.g. "0,0:8,0::512".
+// "ratio[:k[a][:em]],..." with empty fields for the default, e.g.
+// "0,0:8,0:8a,0::512".
 std::vector<BenchCfg> env_configs(const char* name, const char* def) {
     const char* v = std::getenv(name);
     const std::string s = v && *v ? v : def;
@@ -274,6 +277,10 @@ std::vector<BenchCfg> env_configs(const char* name, const char* def) {
                 const long k = std::strtol(at, &end, 10);
                 if (end != at)
                     *f = static_cast<int>(k);
+                if (f == &c.pf && *end == 'a') {
+                    c.ahead = true;
+                    ++end;
+                }
             }
             out.push_back(c);
         }
@@ -362,6 +369,7 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
     // ahead (pre-gating prefetch, 2 predicted experts per token): its reads change
     // which experts are resident, never the routing.
     long long prefetched = 0;
+    long long prefetched_ahead = 0;
     const Case cases[] = {{2, 0}, {3, 0}, {2, 1}, {3, 1}};
     for (const Case& c : cases) {
         CAPTURE(c.slots);
@@ -458,6 +466,30 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
         }
         CHECK(whole.tokens == cached.tokens);
 
+        // Prefetch ahead (LLAMA_EXPERT_PREFETCH_AHEAD=1): layer il+1's experts
+        // predicted from layer il's post-attention residual and queued right after
+        // layer il's load op. Still only residency changes, never the routing.
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            log.final_line.clear();
+        }
+        set_prefetch(2);
+        set_env_k("LLAMA_EXPERT_PREFETCH_AHEAD", 1);
+        const EcRun ahead = run_greedy(path, c.slots, 512, c.used, 24);
+        set_env_k("LLAMA_EXPERT_PREFETCH_AHEAD", -1);
+        set_prefetch(-1);
+        REQUIRE(ahead.ok);
+        CHECK(ahead.n_ubatch == cached.n_ubatch);
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            MESSAGE(log.final_line);
+            CHECK(prefetched_of(log.final_line) >= 0);
+            CHECK(log.final_line.find(", ahead") != std::string::npos);
+            CHECK(swaps_of(log.final_line) == 0);
+            prefetched_ahead += prefetched_of(log.final_line);
+        }
+        CHECK(ahead.tokens == cached.tokens);
+
         // Cache-aware routing: a resident expert stands in for a missing one
         // with at least half its probability, so the same run reads less.
         {
@@ -507,9 +539,13 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
         CHECK(max_abs_diff(plain.logits, full.logits) <= 1e-4f);
         REQUIRE(whole.logits.size() == full.logits.size());
         CHECK(max_abs_diff(whole.logits, full.logits) <= 1e-4f);
+        REQUIRE(ahead.logits.size() == full.logits.size());
+        CHECK(max_abs_diff(ahead.logits, full.logits) <= 1e-4f);
     }
-    // The predictions really read ahead somewhere (layers 1+ of each case).
+    // The predictions really read ahead somewhere (layers 1+ of each case), in
+    // both placements.
     CHECK(prefetched > 0);
+    CHECK(prefetched_ahead > 0);
 
     // As many slots as experts: no cache, no ubatch cap, no stats line.
     {
@@ -590,12 +626,13 @@ TEST_CASE(
 }
 
 // A measurement, not a check (the hyphen keeps it out of "expert cache*"): per
-// config (swap ratio[:prefetch width[:largest expert-major ubatch]]), prefill
-// and decode speed and the cache's final stats; for every config after the
-// first, the top-1 agreement and the mean KL against the first config's greedy
-// run, teacher-forced on its tokens so a diverging continuation cannot hide or
-// inflate the difference. Prefetch never changes the routing: "0" against "0:8"
-// must agree 100% with KL 0; expert-major ("0::512") only changes the summation
+// config (swap ratio[:prefetch width, "a" for ahead[:largest expert-major
+// ubatch]]), prefill and decode speed and the cache's final stats; for every
+// config after the first, the top-1 agreement and the mean KL against the first
+// config's greedy run, teacher-forced on its tokens so a diverging continuation
+// cannot hide or inflate the difference. Prefetch never changes the routing: "0"
+// against "0:8" or "0:8a" must agree 100% with KL 0; expert-major ("0::512")
+// only changes the summation
 // order. Env: XLLAMA_EC_BENCH_SLOTS (32), _SWAPS ("0,0:8,0.7,0.7:8"), _TOKENS
 // (64), _THREADS (4), _LONG (1: a fourth prompt of ~350 tokens, where
 // expert-major prefill pays off), _TRACE (path: the first config's routing,
@@ -655,8 +692,8 @@ TEST_CASE("expert-cache bench (opt-in: XLLAMA_EC_BENCH_MODEL)") {
         char label[64];
         int at = std::snprintf(label, sizeof(label), "ratio %.2f", cfg.swap);
         if (cfg.pf >= 0)
-            at += std::snprintf(label + at, sizeof(label) - static_cast<size_t>(at), " pf %d",
-                                cfg.pf);
+            at += std::snprintf(label + at, sizeof(label) - static_cast<size_t>(at), " pf %d%s",
+                                cfg.pf, cfg.ahead ? " ahead" : "");
         if (cfg.em >= 0)
             std::snprintf(label + at, sizeof(label) - static_cast<size_t>(at), " em %d", cfg.em);
         CAPTURE(label);
@@ -671,10 +708,12 @@ TEST_CASE("expert-cache bench (opt-in: XLLAMA_EC_BENCH_MODEL)") {
         mp.n_expert_slots = slots;
         mp.expert_swap_ratio = cfg.swap;
         set_prefetch(cfg.pf);
+        set_env_k("LLAMA_EXPERT_PREFETCH_AHEAD", cfg.ahead ? 1 : -1);
         set_expert_major(cfg.em);
         auto t_load = std::chrono::steady_clock::now();
         llama_model* model = llama_model_load_from_file(path, mp);
         set_prefetch(-1);
+        set_env_k("LLAMA_EXPERT_PREFETCH_AHEAD", -1);
         set_expert_major(-1);
         REQUIRE(model);
         const double load_s = seconds_since(t_load);

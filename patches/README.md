@@ -100,6 +100,19 @@ decoded slower (1.54 → 1.16 tok/s exact, 2.62 → 1.35 with swap 0.7), hence o
 by default; worth an A/B where compute dominates the reads. The stats line adds
 prefetch reads, how many the plan used, dropped reads and the time the plan
 waited; `llama_model` stops the I/O threads before freeing the buffers.
+On the console (35B, D3D12, 256-token decode) k = 2 lost too: 94.0 against
+85.6 ms/token, with 2468 of 2853 prefetch jobs dropped before a thread reached
+them and about 78 more dispatches per token. The window from the op to the plan
+is the attention alone, and the op, a CPU custom op between GPU nodes, costs
+each layer an extra GPU→CPU→GPU switch. Prefetch ahead (env
+`LLAMA_EXPERT_PREFETCH_AHEAD=1`, with k > 0) moves both: the router of layer
+il+1, through il+1's pre-FFN norm, runs on layer il's post-attention residual,
+and il+1's fourth op takes il's load op as an
+extra source it does not read, expanded right after it in `build_moe_ffn`. It
+lands in the CPU split that already holds il's plan and load, after them: no
+switch of its own, no contention with il's reads, and its reads overlap il's
+expert matmuls and il+1's attention. The prediction is one layer older, so less
+exact; the stats line ends its prefetch part with `, ahead`.
 Expert-major ubatches (env `LLAMA_EXPERT_MAJOR` = the largest one, 0 = off, the
 default; `n_ubatch` is then capped at the larger of the two): a ubatch with
 more tokens than `N / n_expert_used` (a prompt) does not go through the plan
@@ -141,12 +154,13 @@ resident, with prefetch on (it must read ahead somewhere) and off, that
 buffered whole reads give the same tokens and logits bit for bit as the
 unbuffered split ones (which must happen on Linux), that prefetch with whole
 jobs gives the same tokens as with parts and logits within 1e-4 of the fully
-resident model, that a
+resident model, that prefetch ahead does too (and must read ahead somewhere),
+that a
 swap ratio of 0.5 reads less, and that expert-major prompts (with and without
 experts resident from earlier tokens, and with every slot free so the decode
 starts from the experts the prompt kept) give the same tokens and logits
 (`.github/workflows/expert-cache-host.yml`); its opt-in "expert-cache bench"
-measures speed, hit rate, top-1 agreement and KL per `ratio[:k[:em]]` config
+measures speed, hit rate, top-1 agreement and KL per `ratio[:k[a][:em]]` config
 on the 35B and keeps the routing trace (`.github/workflows/expert-cache-bench.yml`).
 
 `0005-graph-order-shared-input-projections.patch` (applies after 0004): the D3D12 backend runs only the matmuls, so every
