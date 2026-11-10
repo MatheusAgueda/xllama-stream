@@ -1596,7 +1596,10 @@ bool ensure_xq(Gpu& g, std::size_t bytes) {
                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "D3D12_Xq", &err);
     void* p = nullptr;
     if (!g.xq || FAILED(g.xq->Map(0, nullptr, &p))) {
-        log_output("[xllama] d3d12: q8 activation scratch allocation failed: " + err + "\n");
+        char rbuf[48];
+        std::snprintf(rbuf, sizeof(rbuf), " removed_reason=0x%08lx",
+                      static_cast<unsigned long>(g.device->GetDeviceRemovedReason()));
+        log_output("[xllama] d3d12: q8 activation scratch allocation failed: " + err + rbuf + "\n");
         g.xq.Reset();
         return false;
     }
@@ -1696,6 +1699,16 @@ bool ssm_operand(const ggml_tensor* t) {
 // validate q f32, k/v/mask f16, positions i32, idx i32/i64), 32-bit offsets.
 bool attn_operand(const ggml_tensor* t) {
     return t && t->buffer && t->buffer->buft == &kHostBuft && ggml_nbytes(t) <= 0xffffffffull;
+}
+
+// XLLAMA_ATTN_OPS bitmask (rope=1, set_rows=2, flash_attn=4; default 7) picks
+// which attention ops the backend claims, to bisect a device fault on hardware.
+bool attn_op_enabled(int bit) {
+    static const int mask = [] {
+        const char* s = std::getenv("XLLAMA_ATTN_OPS");
+        return s && *s ? std::atoi(s) : 7;
+    }();
+    return (mask & bit) != 0;
 }
 
 // The output of a one-thread-per-element kernel may be its input exactly (an
@@ -3059,7 +3072,7 @@ bool dev_supports_op(ggml_backend_dev_t, const ggml_tensor* op) {
     }
     case GGML_OP_ROPE: {
         D3d12AttnRopePlan p;
-        if (!gpu().attn_ok || !d3d12_attn_rope_plan(op, &p))
+        if (!attn_op_enabled(1) || !gpu().attn_ok || !d3d12_attn_rope_plan(op, &p))
             return false;
         if (!attn_operand(op) || !attn_operand(op->src[0]) || !attn_operand(op->src[1]))
             return false;
@@ -3067,12 +3080,12 @@ bool dev_supports_op(ggml_backend_dev_t, const ggml_tensor* op) {
     }
     case GGML_OP_SET_ROWS: {
         D3d12AttnSetRowsPlan p;
-        return gpu().attn_ok && d3d12_attn_set_rows_plan(op, &p) && attn_operand(op) &&
-               attn_operand(op->src[0]) && attn_operand(op->src[1]);
+        return attn_op_enabled(2) && gpu().attn_ok && d3d12_attn_set_rows_plan(op, &p) &&
+               attn_operand(op) && attn_operand(op->src[0]) && attn_operand(op->src[1]);
     }
     case GGML_OP_FLASH_ATTN_EXT: {
         D3d12AttnFaPlan p;
-        if (!gpu().attn_ok || !d3d12_attn_fa_plan(op, &p))
+        if (!attn_op_enabled(4) || !gpu().attn_ok || !d3d12_attn_fa_plan(op, &p))
             return false;
         if (!attn_operand(op) || !attn_operand(op->src[0]) || !attn_operand(op->src[1]) ||
             !attn_operand(op->src[2]))
