@@ -269,7 +269,13 @@ inline void apply_gguf_gpu_context(int applied_layers, llama_context_params& cpa
     // where they cannot run). Set on every context so a CPU reload clears it.
     set_env_int("LLAMA_RS_ON_DEVICE", applied_layers > 0 ? 1 : 0);
     if (applied_layers > 0) {
-        cparams.offload_kqv = false;
+        // XLLAMA_KV_ON_GPU=1 (per-model manifest env) puts the KV cache in the
+        // device buffer (D3D12_Host) so rope / set_rows / flash-attn can be
+        // scheduled on the backend (ggml_d3d12.cpp attn kernels); default keeps
+        // the proven CPU attention.
+        const char* kv_gpu = std::getenv("XLLAMA_KV_ON_GPU");
+        cparams.offload_kqv = kv_gpu && kv_gpu[0] == '1';
+        log_output(std::string("[xllama] offload_kqv=") + (cparams.offload_kqv ? "1" : "0") + "\n");
         if (cparams.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO)
             cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
         if (outputs_max > 0)
