@@ -590,6 +590,11 @@ void run_d3d12_memprobe(const std::function<void(const std::string&)>& emit) {
         #include "ggml-backend-impl.h"
         #include "ggml-backend.h"
         #include "ggml-impl.h"
+        #include "ggml_d3d12_attn_emu.h"
+        #include "ggml_d3d12_attn_fa_dxil.h"
+        #include "ggml_d3d12_attn_fa_reduce_dxil.h"
+        #include "ggml_d3d12_attn_rope_dxil.h"
+        #include "ggml_d3d12_attn_set_rows_dxil.h"
         #include "ggml_d3d12_elt_binary_dxil.h"
         #include "ggml_d3d12_elt_quant_q8_k_dxil.h"
         #include "ggml_d3d12_elt_rms_norm_dxil.h"
@@ -642,6 +647,8 @@ enum Elt { kEltBinary = 0, kEltRmsNorm = 1, kEltQuantQ8K = 2, kEltCount = 3 };
 enum Moe { kMoeCombine = 0, kMoeTail = 1, kMoeCount = 2 };
 // shaders/ggml_d3d12_ssm.hlsl, KERNEL 1..5 (ggml_d3d12_ssm_emu.h).
 enum Ssm { kSsmUnary = 0, kSsmCopy = 1, kSsmGetRows = 2, kSsmConv = 3, kSsmGdn = 4, kSsmCount = 5 };
+// shaders/ggml_d3d12_attn.hlsl, KERNEL 1..4 (ggml_d3d12_attn_emu.h).
+enum Attn { kAttnRope = 0, kAttnSetRows = 1, kAttnFa = 2, kAttnFaReduce = 3, kAttnCount = 4 };
 // Root constants: the 8 every kernel reads, then MUL_MAT_ID's 5
 // (shaders/ggml_d3d12_mmid_iq4_xs.hlsl).
 constexpr UINT kOpConstants = 13;
@@ -690,6 +697,10 @@ struct Gpu {
     // state copies); without them those stay on the CPU.
     ComPtr<ID3D12PipelineState> pso_ssm[kSsmCount];
     bool ssm_ok = false;
+    // shaders/ggml_d3d12_attn.hlsl: rope, the KV-cache set_rows, flash attention
+    // and its chunk reduce; without them the attention ops stay on the CPU.
+    ComPtr<ID3D12PipelineState> pso_attn[kAttnCount];
+    bool attn_ok = false;
     ComPtr<ID3D12QueryHeap> ts;
     ComPtr<ID3D12Resource> ts_rb;
     // XLLAMA_D3D12_PROFILE (read when a backend is created): a timestamp after
@@ -933,6 +944,26 @@ bool init_gpu(Gpu& g) {
                            d3d12c::hr_message("CreateComputePipelineState (ssm)", hr) +
                            " — the linear-attention ops stay on the CPU\n");
                 g.ssm_ok = false;
+            }
+        }
+    }
+    {
+        const void* ab[kAttnCount] = {kGgmlD3d12AttnRopeDxil, kGgmlD3d12AttnSetRowsDxil,
+                                      kGgmlD3d12AttnFaDxil, kGgmlD3d12AttnFaReduceDxil};
+        const size_t as[kAttnCount] = {kGgmlD3d12AttnRopeDxilSize, kGgmlD3d12AttnSetRowsDxilSize,
+                                       kGgmlD3d12AttnFaDxilSize, kGgmlD3d12AttnFaReduceDxilSize};
+        g.attn_ok = true;
+        for (int i = 0; i < kAttnCount && g.attn_ok; ++i) {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
+            pd.pRootSignature = g.root.Get();
+            pd.CS.pShaderBytecode = ab[i];
+            pd.CS.BytecodeLength = as[i];
+            hr = g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.pso_attn[i]));
+            if (FAILED(hr)) {
+                log_output("[xllama] d3d12: " +
+                           d3d12c::hr_message("CreateComputePipelineState (attn)", hr) +
+                           " — attention stays on the CPU\n");
+                g.attn_ok = false;
             }
         }
     }
@@ -1661,6 +1692,12 @@ bool ssm_operand(const ggml_tensor* t) {
            ggml_nbytes(t) <= 0xffffffffull;
 }
 
+// An operand of the attention kernels: in D3D12_Host, any type (the plan funcs
+// validate q f32, k/v/mask f16, positions i32, idx i32/i64), 32-bit offsets.
+bool attn_operand(const ggml_tensor* t) {
+    return t && t->buffer && t->buffer->buft == &kHostBuft && ggml_nbytes(t) <= 0xffffffffull;
+}
+
 // The output of a one-thread-per-element kernel may be its input exactly (an
 // in-place op) or lie apart from it.
 bool ssm_same_or_apart(const ggml_tensor* d, const ggml_tensor* s) {
@@ -2052,6 +2089,9 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
         case GGML_OP_CONCAT:
         case GGML_OP_SSM_CONV:
         case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_ROPE:
+        case GGML_OP_SET_ROWS:
+        case GGML_OP_FLASH_ATTN_EXT:
             nodes.push_back(node);
             node_idx.push_back(i);
             break;
@@ -2553,6 +2593,115 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
                    {rng_of(node)});
             break;
         }
+        case GGML_OP_ROPE: {
+            D3d12AttnRopePlan p;
+            GGML_ASSERT(d3d12_attn_rope_plan(node, &p));
+            const bool gpu_ok = g.attn_ok && attn_operand(node) && attn_operand(p.src) &&
+                                attn_operand(p.pos) && (!p.ff || attn_operand(p.ff));
+            if (!gpu_ok) {
+                if (!flush())
+                    return GGML_STATUS_FAILED;
+                d3d12_attn_rope_emulate(p.params, p.groups_x,
+                                        static_cast<const float*>(p.src->data),
+                                        static_cast<const std::int32_t*>(p.pos->data),
+                                        p.ff ? static_cast<const float*>(p.ff->data) : nullptr,
+                                        static_cast<float*>(node->data));
+                break;
+            }
+            Op op;
+            op.pso = g.pso_attn[kAttnRope].Get();
+            std::memcpy(op.c, &p.params, sizeof(p.params));
+            op.u[0] = tensor_va(node);
+            op.u[1] = tensor_va(p.src);
+            op.u[2] = tensor_va(p.pos);
+            if (p.ff)
+                op.t0 = tensor_va(p.ff);
+            op.gx = p.groups_x;
+            op.gy = 1;
+            record(op, {rng_of(p.src), rng_of(p.pos), rng_of(p.ff ? p.ff : p.src)}, {rng_of(node)});
+            break;
+        }
+        case GGML_OP_SET_ROWS: {
+            D3d12AttnSetRowsPlan p;
+            GGML_ASSERT(d3d12_attn_set_rows_plan(node, &p));
+            const bool gpu_ok =
+                g.attn_ok && attn_operand(node) && attn_operand(p.src) && attn_operand(p.idx);
+            if (!gpu_ok) {
+                if (!flush())
+                    return GGML_STATUS_FAILED;
+                d3d12_attn_set_rows_emulate(
+                    p.params, p.groups_x, p.groups_y, static_cast<const float*>(p.src->data),
+                    static_cast<const std::uint32_t*>(p.idx->data), node->data);
+                break;
+            }
+            Op op;
+            op.pso = g.pso_attn[kAttnSetRows].Get();
+            std::memcpy(op.c, &p.params, sizeof(p.params));
+            op.u[0] = tensor_va(node);
+            op.u[1] = tensor_va(p.src);
+            op.u[2] = tensor_va(p.idx);
+            op.gx = p.groups_x;
+            op.gy = p.groups_y;
+            record(op, {rng_of(p.src), rng_of(p.idx)}, {rng_of(node)});
+            break;
+        }
+        case GGML_OP_FLASH_ATTN_EXT: {
+            D3d12AttnFaPlan p;
+            GGML_ASSERT(d3d12_attn_fa_plan(node, &p));
+            bool gpu_ok = g.attn_ok && attn_operand(node) && attn_operand(p.q) &&
+                          attn_operand(p.k) && attn_operand(p.v) &&
+                          (!p.mask || attn_operand(p.mask));
+            const std::size_t sbytes = static_cast<std::size_t>(p.scratch_floats) * sizeof(float);
+            std::size_t soff = 0;
+            if (gpu_ok && p.scratch_floats && !reserve(sbytes, &soff))
+                gpu_ok = false;
+            if (!gpu_ok) {
+                if (!flush())
+                    return GGML_STATUS_FAILED;
+                std::vector<float> scratch(p.scratch_floats);
+                d3d12_attn_fa_emulate(
+                    p.params, p.groups_x, p.groups_y, p.groups_z,
+                    static_cast<const float*>(p.q->data),
+                    static_cast<const std::uint16_t*>(p.k->data),
+                    static_cast<const std::uint16_t*>(p.v->data),
+                    p.mask ? static_cast<const std::uint16_t*>(p.mask->data) : nullptr,
+                    scratch.empty() ? nullptr : scratch.data(), static_cast<float*>(node->data));
+                if (p.scratch_floats)
+                    d3d12_attn_fa_reduce_emulate(p.reduce, p.reduce_groups_x, p.reduce_groups_y,
+                                                 scratch.data(), static_cast<float*>(node->data));
+                break;
+            }
+            Op fa;
+            fa.pso = g.pso_attn[kAttnFa].Get();
+            std::memcpy(fa.c, &p.params, sizeof(p.params));
+            fa.u[0] = tensor_va(node);
+            fa.u[1] = tensor_va(p.q);
+            fa.t0 = tensor_va(p.k);
+            fa.t1 = tensor_va(p.v);
+            if (p.mask)
+                fa.u[2] = tensor_va(p.mask);
+            if (p.scratch_floats)
+                fa.u[3] = xq_va(soff);
+            fa.gx = p.groups_x;
+            fa.gy = p.groups_y;
+            fa.gz = p.groups_z;
+            if (p.scratch_floats) {
+                record(fa, {rng_of(p.q), rng_of(p.k), rng_of(p.v), rng_of(p.mask ? p.mask : p.q)},
+                       {xq_rng(soff, sbytes)});
+                Op rd;
+                rd.pso = g.pso_attn[kAttnFaReduce].Get();
+                std::memcpy(rd.c, &p.reduce, sizeof(p.reduce));
+                rd.u[0] = tensor_va(node);
+                rd.u[1] = xq_va(soff);
+                rd.gx = p.reduce_groups_x;
+                rd.gy = p.reduce_groups_y;
+                record(rd, {xq_rng(soff, sbytes)}, {rng_of(node)});
+            } else {
+                record(fa, {rng_of(p.q), rng_of(p.k), rng_of(p.v), rng_of(p.mask ? p.mask : p.q)},
+                       {rng_of(node)});
+            }
+            break;
+        }
         case GGML_OP_ADD:
         case GGML_OP_MUL:
         case GGML_OP_GLU: {
@@ -2907,6 +3056,28 @@ bool dev_supports_op(ggml_backend_dev_t, const ggml_tensor* op) {
             if (!ssm_f32(t))
                 return false;
         return true;
+    }
+    case GGML_OP_ROPE: {
+        D3d12AttnRopePlan p;
+        if (!gpu().attn_ok || !d3d12_attn_rope_plan(op, &p))
+            return false;
+        if (!attn_operand(op) || !attn_operand(op->src[0]) || !attn_operand(op->src[1]))
+            return false;
+        return !op->src[2] || attn_operand(op->src[2]);
+    }
+    case GGML_OP_SET_ROWS: {
+        D3d12AttnSetRowsPlan p;
+        return gpu().attn_ok && d3d12_attn_set_rows_plan(op, &p) && attn_operand(op) &&
+               attn_operand(op->src[0]) && attn_operand(op->src[1]);
+    }
+    case GGML_OP_FLASH_ATTN_EXT: {
+        D3d12AttnFaPlan p;
+        if (!gpu().attn_ok || !d3d12_attn_fa_plan(op, &p))
+            return false;
+        if (!attn_operand(op) || !attn_operand(op->src[0]) || !attn_operand(op->src[1]) ||
+            !attn_operand(op->src[2]))
+            return false;
+        return !op->src[3] || attn_operand(op->src[3]);
     }
     case GGML_OP_MUL_MAT_ID: {
         // The routed experts of a MoE layer, read in place from the expert
