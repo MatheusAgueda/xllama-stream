@@ -1,13 +1,14 @@
 // Copyright (c) 2024 Gianluca Mazza
 // SPDX-License-Identifier: MIT
 //
-// MUL_MAT_ID on the d3d12 backend (shaders/ggml_d3d12_mmid_iq4_xs.hlsl): the
-// kernel's constants and grid from a GGML_OP_MUL_MAT_ID node, its activation
-// layout, and a host emulation of the kernel (tests compare it with ggml's CPU
-// mul_mat_id; a selftest can compare it with the GPU).
+// MUL_MAT_ID on the d3d12 backend (shaders/ggml_d3d12_mmid_{iq4_xs,iq3_s}.hlsl):
+// the kernels' constants and grid from a GGML_OP_MUL_MAT_ID node, their
+// activation layout, and a host emulation of each (tests compare it with ggml's
+// CPU mul_mat_id; a selftest can compare it with the GPU). Both kernels share
+// the constants, grid and thread layout; only the expert block differs.
 //
 // The node: dst[:, i, t] = as[:, :, ids[i, t]] x src1[:, i % ne11, t], with
-//   as   = the experts, IQ4_XS [K, N, n_as] (with the expert cache: the
+//   as   = the experts, IQ4_XS or IQ3_S [K, N, n_as] (with the expert cache: the
 //          resident slots, and ids the slot ids)
 //   src1 = the activations, F32 [K, ne11, T]; ne11 = 1 for gate/up (one
 //          column per token), n_ids for down (one per expert)
@@ -61,7 +62,12 @@ struct D3d12MmidPlan {
     std::size_t ids_bytes = 0;  // Ids (t1) from ids->data
 };
 
-// false when the kernel does not run dst: weights not IQ4_XS, shapes outside
+// The expert types with a MUL_MAT_ID kernel.
+inline bool d3d12_mmid_type_supported(ggml_type t) {
+    return t == GGML_TYPE_IQ4_XS || t == GGML_TYPE_IQ3_S;
+}
+
+// false when no kernel runs dst: weights neither IQ4_XS nor IQ3_S, shapes outside
 // ggml_mul_mat_id's 3-d case, ne11 neither 1 nor n_ids, a grid past
 // kD3d12MaxGroups or an offset past 32 bits.
 inline bool d3d12_mmid_plan(const ggml_tensor* dst, D3d12MmidPlan* plan) {
@@ -70,7 +76,7 @@ inline bool d3d12_mmid_plan(const ggml_tensor* dst, D3d12MmidPlan* plan) {
     const ggml_tensor* as = dst->src[0];
     const ggml_tensor* b = dst->src[1];
     const ggml_tensor* ids = dst->src[2];
-    if (!as || !b || !ids || as->type != GGML_TYPE_IQ4_XS || b->type != GGML_TYPE_F32 ||
+    if (!as || !b || !ids || !d3d12_mmid_type_supported(as->type) || b->type != GGML_TYPE_F32 ||
         ids->type != GGML_TYPE_I32 || dst->type != GGML_TYPE_F32)
         return false;
     const std::int64_t k = as->ne[0], n = as->ne[1], n_as = as->ne[2];
@@ -144,40 +150,101 @@ inline void d3d12_mmid_quantize_activations(const ggml_tensor* dst, const void* 
         }
 }
 
-// The kernel on the host: per group and thread the same blocks in the same
-// order, the same float operations and the same tree reduction as the HLSL.
-// w, ids and xq are the t0, t1 and u1 buffers, y the u0 buffer (rows past n
-// are never written). threads is the blob's NUM_THREADS (64 or 128).
-inline void d3d12_mmid_iq4_xs_emulate(const D3d12MmidParams& p, std::uint32_t groups_x,
-                                      std::uint32_t groups_y, std::uint32_t threads,
-                                      const std::uint8_t* w, const std::uint8_t* ids,
-                                      const std::uint8_t* xq, float* y) {
+namespace d3d12_mmid_detail {
+
+inline constexpr std::uint32_t kIq3sGrid[512] = {
+#include "../../shaders/ggml_d3d12_iq3s_grid.inc"
+};
+
+inline std::uint32_t ld16(const std::uint8_t* at) {
+    std::uint16_t v;
+    std::memcpy(&v, at, 2);
+    return v;
+}
+
+inline std::uint32_t ld32(const std::uint8_t* at) {
+    std::uint32_t v;
+    std::memcpy(&v, at, 4);
+    return v;
+}
+
+// One thread's integer sum for one row and one 256-element chunk, already
+// times the sub-block scale, and the block's d: the kernels' acc +=
+// (d * dy) * (float)(ls * sumi). bb is the weight block, qx the q8_K quants.
+inline std::int32_t block_lsumi(ggml_type t, const std::uint8_t* bb, std::uint32_t itid,
+                                const std::int8_t* qx, float* d) {
+    *d = ggml_fp16_to_fp32(static_cast<ggml_fp16_t>(ld16(bb)));
+    if (t == GGML_TYPE_IQ3_S) { // ggml_d3d12_mmid_iq3_s.hlsl
+        const std::uint32_t ib32 = itid >> 1, h = itid & 1u, e = 32u * ib32 + 16u * h;
+        const std::uint32_t qs = ld32(bb + 2u + 8u * ib32 + 4u * h);
+        const std::uint32_t hb = (bb[66u + ib32] >> (4u * h)) & 0xFu;
+        const std::uint32_t sg = ld16(bb + 74u + 4u * ib32 + 2u * h);
+        const std::int32_t ls =
+            2 * static_cast<std::int32_t>((bb[106u + (ib32 >> 1)] >> (4u * (ib32 & 1u))) & 0xFu) +
+            1;
+        std::int32_t sumi = 0;
+        for (std::uint32_t k = 0; k < 4; ++k) {
+            const std::uint32_t g = kIq3sGrid[((qs >> (8u * k)) & 0xFFu) | (((hb >> k) & 1u) << 8)];
+            const std::uint32_t s4 = (sg >> (4u * k)) & 0xFu;
+            for (std::uint32_t j = 0; j < 4; ++j) {
+                const std::int32_t mag = static_cast<std::int32_t>((g >> (8u * j)) & 0xFFu);
+                sumi += (((s4 >> j) & 1u) ? -mag : mag) * qx[e + 4u * k + j];
+            }
+        }
+        return ls * sumi;
+    }
+    // IQ4_XS, ggml_d3d12_mmid_iq4_xs.hlsl
     static constexpr std::int32_t kv[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
                                             1,    13,   25,  38,  53,  69,  89,  113};
+    const std::uint32_t ib = itid >> 1, h = itid & 1u, e_lo = 32u * ib + 8u * h;
+    const std::uint32_t hdr0 = ld32(bb), hdr1 = ld32(bb + 4);
+    const std::uint32_t qa = ld32(bb + 8u + 16u * ib + 8u * h);
+    const std::uint32_t qb = ld32(bb + 12u + 16u * ib + 8u * h);
+    const std::int32_t ls = static_cast<std::int32_t>(((hdr1 >> (4u * ib)) & 0xFu) |
+                                                      (((hdr0 >> (16u + 2u * ib)) & 3u) << 4)) -
+                            32;
+    std::int32_t sumi = 0;
+    for (std::uint32_t i = 0; i < 4; ++i) {
+        const std::uint32_t s = 8u * i;
+        sumi += kv[(qa >> s) & 0xFu] * qx[e_lo + i] + kv[(qb >> s) & 0xFu] * qx[e_lo + 4 + i] +
+                kv[(qa >> (s + 4u)) & 0xFu] * qx[e_lo + 16 + i] +
+                kv[(qb >> (s + 4u)) & 0xFu] * qx[e_lo + 20 + i];
+    }
+    return ls * sumi;
+}
+
+} // namespace d3d12_mmid_detail
+
+// The kernel for expert type t on the host: per group and thread the same
+// blocks in the same order, the same float operations and the same tree
+// reduction as the HLSL. w, ids and xq are the t0, t1 and u1 buffers, y the u0
+// buffer (rows past n are never written). threads is the blob's NUM_THREADS
+// (64 or 128).
+inline void d3d12_mmid_emulate(ggml_type t, const D3d12MmidParams& p, std::uint32_t groups_x,
+                               std::uint32_t groups_y, std::uint32_t threads, const std::uint8_t* w,
+                               const std::uint8_t* ids, const std::uint8_t* xq, float* y) {
     constexpr std::uint32_t rows = kD3d12MmvRows;
+    if (!d3d12_mmid_type_supported(t))
+        return;
     if (threads != static_cast<std::uint32_t>(kD3d12MmvThreadsShort) &&
         threads != static_cast<std::uint32_t>(kD3d12MmvThreadsLong))
         return;
     if (p.n == 0 || p.n_ids == 0)
         return;
-    auto ld32 = [](const std::uint8_t* at) {
-        std::uint32_t v;
-        std::memcpy(&v, at, 4);
-        return v;
-    };
+    const std::uint32_t block_bytes = static_cast<std::uint32_t>(ggml_type_size(t));
     const std::uint32_t in_flight = threads / 16u;
     float red[rows][kD3d12MmvThreadsLong];
     for (std::uint32_t gy = 0; gy < groups_y; ++gy) {
         const std::uint32_t token = gy / p.n_ids;
         const std::uint32_t slot_i = gy - token * p.n_ids;
-        const std::uint32_t wb = ld32(ids + token * p.ids_stride + 4u * slot_i) * p.expert_stride;
+        const std::uint32_t wb =
+            d3d12_mmid_detail::ld32(ids + token * p.ids_stride + 4u * slot_i) * p.expert_stride;
         const std::uint32_t xc = token * p.x_stride + slot_i * p.x_col_stride;
         const std::uint32_t ybase = token * p.y_stride + slot_i * p.y_expert_stride;
         for (std::uint32_t gx = 0; gx < groups_x; ++gx) {
             const std::uint32_t row0 = gx * rows;
             for (std::uint32_t tid = 0; tid < threads; ++tid) {
-                const std::uint32_t itid = tid & 15u, ib = itid >> 1, h = itid & 1u;
-                const std::uint32_t e_lo = 32u * ib + 8u * h;
+                const std::uint32_t itid = tid & 15u;
                 float acc[rows] = {};
                 for (std::uint32_t blk = tid >> 4; blk < p.nchunk; blk += in_flight) {
                     const std::uint8_t* xb = xq + xc + blk * 292u;
@@ -186,33 +253,19 @@ inline void d3d12_mmid_iq4_xs_emulate(const D3d12MmidParams& p, std::uint32_t gr
                     const auto* qx = reinterpret_cast<const std::int8_t*>(xb + 4);
                     for (std::uint32_t r = 0; r < rows; ++r) {
                         const std::uint32_t row = std::min(row0 + r, p.n - 1u);
-                        const std::uint8_t* bb = w + wb + row * p.w_row_bytes + blk * 136u;
-                        const std::uint32_t hdr0 = ld32(bb), hdr1 = ld32(bb + 4);
-                        const std::uint32_t qa = ld32(bb + 8u + 16u * ib + 8u * h);
-                        const std::uint32_t qb = ld32(bb + 12u + 16u * ib + 8u * h);
-                        const float d = ggml_fp16_to_fp32(static_cast<ggml_fp16_t>(hdr0 & 0xffffu));
-                        const std::int32_t ls =
-                            static_cast<std::int32_t>(((hdr1 >> (4u * ib)) & 0xFu) |
-                                                      (((hdr0 >> (16u + 2u * ib)) & 3u) << 4)) -
-                            32;
-                        std::int32_t sumi = 0;
-                        for (std::uint32_t i = 0; i < 4; ++i) {
-                            const std::uint32_t s = 8u * i;
-                            sumi += kv[(qa >> s) & 0xFu] * qx[e_lo + i] +
-                                    kv[(qb >> s) & 0xFu] * qx[e_lo + 4 + i] +
-                                    kv[(qa >> (s + 4u)) & 0xFu] * qx[e_lo + 16 + i] +
-                                    kv[(qb >> (s + 4u)) & 0xFu] * qx[e_lo + 20 + i];
-                        }
-                        acc[r] += (d * dy) * static_cast<float>(ls * sumi);
+                        float d;
+                        const std::int32_t lsumi = d3d12_mmid_detail::block_lsumi(
+                            t, w + wb + row * p.w_row_bytes + blk * block_bytes, itid, qx, &d);
+                        acc[r] += (d * dy) * static_cast<float>(lsumi);
                     }
                 }
                 for (std::uint32_t r = 0; r < rows; ++r)
                     red[r][tid] = acc[r];
             }
             for (std::uint32_t stride = threads / 2u; stride > 0u; stride >>= 1u)
-                for (std::uint32_t t = 0; t < stride; ++t)
+                for (std::uint32_t t2 = 0; t2 < stride; ++t2)
                     for (std::uint32_t r = 0; r < rows; ++r)
-                        red[r][t] += red[r][t + stride];
+                        red[r][t2] += red[r][t2 + stride];
             for (std::uint32_t r = 0; r < rows; ++r)
                 if (row0 + r < p.n)
                     y[ybase + row0 + r] = red[r][0];

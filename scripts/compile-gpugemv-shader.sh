@@ -8,13 +8,13 @@
 #   shaders/gpugemv_q4k_dot4.hlsl   → gpugemv_q4k_dot4_dxil.h   (H6.3 int8 dot, cs_6_4)
 #   shaders/ggml_d3d12_mmv_{q4_0,q4_k,q5_k,q6_k,iq3_s,iq4_xs,f32}.hlsl → ggml_d3d12_mmv_*_t{64,128}_dxil.h (cs_6_4)
 #     (D2 backend; one blob per thread-group width, -D NUM_THREADS)
-#   shaders/ggml_d3d12_mmid_iq4_xs.hlsl → ggml_d3d12_mmid_iq4_xs_t{64,128}_dxil.h (cs_6_4, MUL_MAT_ID)
+#   shaders/ggml_d3d12_mmid_{iq4_xs,iq3_s}.hlsl → ggml_d3d12_mmid_*_t{64,128}_dxil.h (cs_6_4, MUL_MAT_ID)
 #   shaders/ggml_d3d12_get_rows_q6_k.hlsl → ggml_d3d12_get_rows_q6_k_dxil.h (cs_6_4)
 #   shaders/ggml_d3d12_elt.hlsl → ggml_d3d12_elt_{binary,rms_norm,quant_q8_k}_dxil.h (cs_6_4, -D KERNEL)
 #   shaders/ggml_d3d12_moe.hlsl → ggml_d3d12_moe_{combine,tail}_dxil.h (cs_6_4, -D KERNEL)
 #   shaders/ggml_d3d12_ssm.hlsl → ggml_d3d12_ssm_{unary,copy,get_rows,conv,gdn}_dxil.h (cs_6_4, -D KERNEL)
 #
-# Usage: compile-gpugemv-shader.sh [naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q5_k|mmv_q6_k|mmv_iq3_s|mmv_iq4_xs|mmv_f32|mmid_iq4_xs|get_rows_q6_k|elt|moe|ssm ...]
+# Usage: compile-gpugemv-shader.sh [naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q5_k|mmv_q6_k|mmv_iq3_s|mmv_iq4_xs|mmv_f32|mmid_iq4_xs|mmid_iq3_s|get_rows_q6_k|elt|moe|ssm ...]
 #        (default: all)
 # A different dxc release emits different bytes: regenerate only the targets
 # you changed so measured blobs stay the ones the CSVs were recorded with.
@@ -104,13 +104,14 @@ compile_target() {
 				-D "NUM_THREADS=${w}"
 		done
 		;;
-	mmid_iq4_xs)
-		local w
+	mmid_iq4_xs | mmid_iq3_s)
+		local t="${1#mmid_}" w sym
 		for w in 64 128; do
-			compile_one "$ROOT/shaders/ggml_d3d12_mmid_iq4_xs.hlsl" \
-				"$ROOT/shaders/generated/ggml_d3d12_mmid_iq4_xs_t${w}_dxil.h" \
-				"shaders/ggml_d3d12_mmid_iq4_xs.hlsl -D NUM_THREADS=${w}" \
-				"kGgmlD3d12MmidIq4XsT${w}Dxil" cs_6_4 -D "NUM_THREADS=${w}"
+			sym="kGgmlD3d12Mmid$(echo "$t" | sed -e 's/_\(.\)/\U\1/g' -e 's/^./\U&/')T${w}Dxil"
+			compile_one "$ROOT/shaders/ggml_d3d12_mmid_${t}.hlsl" \
+				"$ROOT/shaders/generated/ggml_d3d12_mmid_${t}_t${w}_dxil.h" \
+				"shaders/ggml_d3d12_mmid_${t}.hlsl -D NUM_THREADS=${w}" "$sym" cs_6_4 \
+				-D "NUM_THREADS=${w}"
 		done
 		;;
 	get_rows_q6_k) compile_one "$ROOT/shaders/ggml_d3d12_get_rows_q6_k.hlsl" \
@@ -147,14 +148,14 @@ compile_target() {
 		done
 		;;
 	*)
-		echo "unknown target: $1 (naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q5_k|mmv_q6_k|mmv_iq3_s|mmv_iq4_xs|mmv_f32|mmid_iq4_xs|get_rows_q6_k|elt|moe|ssm)" >&2
+		echo "unknown target: $1 (naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q5_k|mmv_q6_k|mmv_iq3_s|mmv_iq4_xs|mmv_f32|mmid_iq4_xs|mmid_iq3_s|get_rows_q6_k|elt|moe|ssm)" >&2
 		exit 2
 		;;
 	esac
 }
 
 if [[ $# -eq 0 ]]; then
-	set -- naive wave32 rows dot4 mmv_q4_0 mmv_q4_k mmv_q5_k mmv_q6_k mmv_iq3_s mmv_iq4_xs mmv_f32 mmid_iq4_xs get_rows_q6_k elt moe ssm
+	set -- naive wave32 rows dot4 mmv_q4_0 mmv_q4_k mmv_q5_k mmv_q6_k mmv_iq3_s mmv_iq4_xs mmv_f32 mmid_iq4_xs mmid_iq3_s get_rows_q6_k elt moe ssm
 fi
 for target in "$@"; do
 	compile_target "$target"

@@ -37,8 +37,8 @@ struct MmidGraph {
     }
 };
 
-// ggml_mul_mat_id(as, b, ids) with random IQ4_XS experts (any block bytes are
-// a valid IQ4_XS block once d is a finite half), random activations and
+// ggml_mul_mat_id(as, b, ids) with random IQ4_XS or IQ3_S experts (any block
+// bytes are a valid block of either once d is a finite half), random activations and
 // distinct experts per token; the ids view's unused columns hold other valid
 // experts, so reading them changes the result. no_alloc builds shapes only.
 void build(MmidGraph& g, const MmidCase& c, ggml_type wtype, bool no_alloc) {
@@ -62,7 +62,8 @@ void build(MmidGraph& g, const MmidCase& c, ggml_type wtype, bool no_alloc) {
 
     std::mt19937 rng(1234u + static_cast<unsigned>(c.k + c.n * 3 + c.n_as * 5 + c.n_tok));
     auto* wb = static_cast<std::uint8_t*>(as->data);
-    for (std::size_t i = 0; i < w_bytes; i += 4) { // IQ4_XS rows are 4-byte multiples
+    REQUIRE(w_bytes % 4 == 0); // IQ4_XS rows, and IQ3_S rows of an even block count
+    for (std::size_t i = 0; i < w_bytes; i += 4) {
         const std::uint32_t v = rng();
         std::memcpy(wb + i, &v, sizeof(v));
     }
@@ -95,10 +96,10 @@ struct MmidRun {
 
 // The emulated kernel on the plan's constants against ggml's CPU mul_mat_id,
 // which quantizes src1 with the same from_float and sums with vec_dot.
-MmidRun run(const MmidCase& c) {
+MmidRun run(const MmidCase& c, ggml_type wtype) {
     MmidRun r;
     MmidGraph g;
-    build(g, c, GGML_TYPE_IQ4_XS, false);
+    build(g, c, wtype, false);
     r.planned = d3d12_mmid_plan(g.out, &r.plan);
     if (!r.planned)
         return r;
@@ -118,9 +119,9 @@ MmidRun run(const MmidCase& c) {
     for (int bi = 0; bi < 2; ++bi) {
         constexpr std::size_t kTail = 16;
         std::vector<float> y(n_out + kTail, -7.f);
-        d3d12_mmid_iq4_xs_emulate(r.plan.params, r.plan.groups_x, r.plan.groups_y, blobs[bi],
-                                  static_cast<const std::uint8_t*>(as->data),
-                                  static_cast<const std::uint8_t*>(ids->data), xq.data(), y.data());
+        d3d12_mmid_emulate(wtype, r.plan.params, r.plan.groups_x, r.plan.groups_y, blobs[bi],
+                           static_cast<const std::uint8_t*>(as->data),
+                           static_cast<const std::uint8_t*>(ids->data), xq.data(), y.data());
         double max_ref = 0.0, max_diff = 0.0;
         for (std::size_t i = 0; i < n_out; ++i) {
             max_ref = std::max(max_ref, std::fabs(static_cast<double>(ref[i])));
@@ -177,6 +178,28 @@ TEST_CASE("ggml_d3d12 mmid: constants from a MUL_MAT_ID node") {
         CHECK(p.groups_y == 16);
         CHECK(p.x_bytes == 2u * 8 * 2 * 292);
     }
+    // Qwen3.6-35B-A3B i1-IQ3_S: 110-byte blocks, gate/up rows 880 B and down
+    // rows 220 B, both 450560 B per expert.
+    {
+        MmidGraph g;
+        build(g, {2048, 512, 41, 8, 1, 3, 256}, GGML_TYPE_IQ3_S, true);
+        D3d12MmidPlan p;
+        REQUIRE(d3d12_mmid_plan(g.out, &p));
+        CHECK(p.params.w_row_bytes == 8 * 110);
+        CHECK(p.params.expert_stride == 450560);
+        CHECK(p.params.x_stride == 8 * 292);
+        CHECK(p.groups_x == 128);
+        CHECK(p.groups_y == 24);
+    }
+    {
+        MmidGraph g;
+        build(g, {512, 2048, 41, 8, 8, 2, 8}, GGML_TYPE_IQ3_S, true);
+        D3d12MmidPlan p;
+        REQUIRE(d3d12_mmid_plan(g.out, &p));
+        CHECK(p.params.w_row_bytes == 2 * 110);
+        CHECK(p.params.expert_stride == 450560);
+        CHECK(p.params.x_col_stride == 2 * 292);
+    }
 }
 
 TEST_CASE("ggml_d3d12 mmid: nodes the kernel does not take") {
@@ -185,6 +208,11 @@ TEST_CASE("ggml_d3d12 mmid: nodes the kernel does not take") {
     {
         MmidGraph g; // other expert type
         build(g, {2048, 512, 41, 8, 1, 1, 8}, GGML_TYPE_Q4_K, true);
+        CHECK_FALSE(d3d12_mmid_plan(g.out, &p));
+    }
+    {
+        MmidGraph g; // IQ3_S rows of one block (110 B) are not 4-byte multiples
+        build(g, {256, 512, 41, 8, 1, 1, 8}, GGML_TYPE_IQ3_S, true);
         CHECK_FALSE(d3d12_mmid_plan(g.out, &p));
     }
     {
@@ -222,15 +250,17 @@ TEST_CASE("ggml_d3d12 mmid: kernel emulation matches ggml's CPU mul_mat_id") {
         // K = 4096 (16 chunks), 4 ids per token, shared columns.
         {4096, 13, 9, 4, 1, 3, 4},
     };
-    for (const auto& c : cases) {
-        CAPTURE(c.k);
-        CAPTURE(c.n);
-        CAPTURE(c.ne11);
-        CAPTURE(c.n_tok);
-        const MmidRun r = run(c);
-        REQUIRE(r.planned);
-        CHECK(r.rel_err[0] <= kD3d12SelftestRelTol);
-        CHECK(r.rel_err[1] <= kD3d12SelftestRelTol);
-        CHECK(r.tail_untouched);
-    }
+    for (const ggml_type wtype : {GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S})
+        for (const auto& c : cases) {
+            CAPTURE(ggml_type_name(wtype));
+            CAPTURE(c.k);
+            CAPTURE(c.n);
+            CAPTURE(c.ne11);
+            CAPTURE(c.n_tok);
+            const MmidRun r = run(c, wtype);
+            REQUIRE(r.planned);
+            CHECK(r.rel_err[0] <= kD3d12SelftestRelTol);
+            CHECK(r.rel_err[1] <= kD3d12SelftestRelTol);
+            CHECK(r.tail_untouched);
+        }
 }

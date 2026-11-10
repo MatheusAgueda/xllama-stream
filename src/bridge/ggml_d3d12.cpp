@@ -595,6 +595,8 @@ void run_d3d12_memprobe(const std::function<void(const std::string&)>& emit) {
         #include "ggml_d3d12_elt_rms_norm_dxil.h"
         #include "ggml_d3d12_get_rows_q6_k_dxil.h"
         #include "ggml_d3d12_mmid_emu.h"
+        #include "ggml_d3d12_mmid_iq3_s_t128_dxil.h"
+        #include "ggml_d3d12_mmid_iq3_s_t64_dxil.h"
         #include "ggml_d3d12_mmid_iq4_xs_t128_dxil.h"
         #include "ggml_d3d12_mmid_iq4_xs_t64_dxil.h"
         #include "ggml_d3d12_mmv_f32_t128_dxil.h"
@@ -643,8 +645,14 @@ enum Moe { kMoeCombine = 0, kMoeTail = 1, kMoeCount = 2 };
 // shaders/ggml_d3d12_ssm.hlsl, KERNEL 1..5 (ggml_d3d12_ssm_emu.h).
 enum Ssm { kSsmUnary = 0, kSsmCopy = 1, kSsmGetRows = 2, kSsmConv = 3, kSsmGdn = 4, kSsmCount = 5 };
 // Root constants: the 8 every kernel reads, then MUL_MAT_ID's 5
-// (shaders/ggml_d3d12_mmid_iq4_xs.hlsl).
+// (shaders/ggml_d3d12_mmid_{iq4_xs,iq3_s}.hlsl).
 constexpr UINT kOpConstants = 13;
+// MUL_MAT_ID kernels by expert type (d3d12_mmid_type_supported).
+enum Mmid { kMmidIq4Xs = 0, kMmidIq3S = 1, kMmidCount = 2 };
+
+int mmid_for(ggml_type t) {
+    return t == GGML_TYPE_IQ4_XS ? kMmidIq4Xs : t == GGML_TYPE_IQ3_S ? kMmidIq3S : -1;
+}
 
 int pso_for(ggml_type t) {
     switch (t) {
@@ -676,8 +684,9 @@ struct Gpu {
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12PipelineState> pso[kPsoCount][2]; // [type][0 = 64 threads, 1 = 128]
     ComPtr<ID3D12PipelineState> pso_get_rows;      // Q6_K
-    // MUL_MAT_ID, IQ4_XS experts in an EXPERT_CACHE buffer this device claims.
-    ComPtr<ID3D12PipelineState> pso_mmid[2];
+    // MUL_MAT_ID, IQ4_XS or IQ3_S experts in an EXPERT_CACHE buffer this device
+    // claims: [Mmid][0 = 64 threads, 1 = 128].
+    ComPtr<ID3D12PipelineState> pso_mmid[kMmidCount][2];
     // shaders/ggml_d3d12_elt.hlsl; without them (elt_ok false) those ops and
     // the q8_K quantization run on the CPU inside graph_compute.
     ComPtr<ID3D12PipelineState> pso_elt[kEltCount];
@@ -861,19 +870,23 @@ bool init_gpu(Gpu& g) {
         }
     }
     {
-        const void* mb[2] = {kGgmlD3d12MmidIq4XsT64Dxil, kGgmlD3d12MmidIq4XsT128Dxil};
-        const size_t ms[2] = {kGgmlD3d12MmidIq4XsT64DxilSize, kGgmlD3d12MmidIq4XsT128DxilSize};
-        for (int wd = 0; wd < 2; ++wd) {
-            D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
-            pd.pRootSignature = g.root.Get();
-            pd.CS.pShaderBytecode = mb[wd];
-            pd.CS.BytecodeLength = ms[wd];
-            hr = g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.pso_mmid[wd]));
-            if (FAILED(hr)) {
-                err = d3d12c::hr_message("CreateComputePipelineState (mmid)", hr);
-                return false;
+        const void* mb[kMmidCount][2] = {{kGgmlD3d12MmidIq4XsT64Dxil, kGgmlD3d12MmidIq4XsT128Dxil},
+                                         {kGgmlD3d12MmidIq3ST64Dxil, kGgmlD3d12MmidIq3ST128Dxil}};
+        const size_t ms[kMmidCount][2] = {
+            {kGgmlD3d12MmidIq4XsT64DxilSize, kGgmlD3d12MmidIq4XsT128DxilSize},
+            {kGgmlD3d12MmidIq3ST64DxilSize, kGgmlD3d12MmidIq3ST128DxilSize}};
+        for (int mk = 0; mk < kMmidCount; ++mk)
+            for (int wd = 0; wd < 2; ++wd) {
+                D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
+                pd.pRootSignature = g.root.Get();
+                pd.CS.pShaderBytecode = mb[mk][wd];
+                pd.CS.BytecodeLength = ms[mk][wd];
+                hr = g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.pso_mmid[mk][wd]));
+                if (FAILED(hr)) {
+                    err = d3d12c::hr_message("CreateComputePipelineState (mmid)", hr);
+                    return false;
+                }
             }
-        }
     }
     {
         const void* eb[kEltCount] = {kGgmlD3d12EltBinaryDxil, kGgmlD3d12EltRmsNormDxil,
@@ -1463,9 +1476,12 @@ std::string pso_name(const Gpu& g, const ID3D12PipelineState* p) {
                 return std::string("mmv ") + kTypes[i] + (wd ? " t128" : " t64");
     if (g.pso_get_rows.Get() == p)
         return "get_rows q6_K";
-    for (int wd = 0; wd < 2; ++wd)
-        if (g.pso_mmid[wd].Get() == p)
-            return wd ? "mmid iq4_xs t128" : "mmid iq4_xs t64";
+    static const char* const kMmids[] = {"iq4_xs", "iq3_s"};
+    static_assert(static_cast<int>(std::size(kMmids)) == kMmidCount, "a name per mmid kernel");
+    for (int mk = 0; mk < kMmidCount; ++mk)
+        for (int wd = 0; wd < 2; ++wd)
+            if (g.pso_mmid[mk][wd].Get() == p)
+                return std::string("mmid ") + kMmids[mk] + (wd ? " t128" : " t64");
     for (int i = 0; i < kEltCount; ++i)
         if (g.pso_elt[i].Get() == p)
             return kElts[i];
@@ -2412,7 +2428,8 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
                 d3d12_mmid_quantize_activations(node, x->data, g.xq_ptr + xoff);
             }
             Op m;
-            m.pso = g.pso_mmid[plan.threads == kD3d12MmvThreadsLong ? 1 : 0].Get();
+            m.pso =
+                g.pso_mmid[mmid_for(a->type)][plan.threads == kD3d12MmvThreadsLong ? 1 : 0].Get();
             static_assert(sizeof(plan.params) == sizeof(m.c), "13 root constants");
             std::memcpy(m.c, &plan.params, sizeof(m.c));
             m.t0 = tensor_va(a);
@@ -2914,7 +2931,9 @@ bool dev_supports_op(ggml_backend_dev_t, const ggml_tensor* op) {
         D3d12MmidPlan plan;
         const ggml_tensor* x = op->src[1];
         const ggml_tensor* ids = op->src[2];
-        return gpu().pso_mmid[0] && in_expert_cache(op->src[0]) && d3d12_mmid_plan(op, &plan) &&
+        const int mk = mmid_for(op->src[0]->type);
+        return mk >= 0 && gpu().pso_mmid[mk][0] && in_expert_cache(op->src[0]) &&
+               d3d12_mmid_plan(op, &plan) &&
                static_cast<std::uint64_t>(x->ne[1]) * x->ne[2] <= kD3d12MaxGroups &&
                (!x->buffer || ggml_backend_buffer_is_host(x->buffer)) &&
                (!ids->buffer || ggml_backend_buffer_is_host(ids->buffer));
@@ -2978,7 +2997,7 @@ bool dev_supports_op(ggml_backend_dev_t, const ggml_tensor* op) {
     }
 }
 bool dev_supports_buft(ggml_backend_dev_t, ggml_backend_buffer_type_t buft) {
-    return is_ours(buft) || (is_expert_cache(buft) && gpu().pso_mmid[0]);
+    return is_ours(buft) || (is_expert_cache(buft) && gpu().pso_mmid[kMmidIq4Xs][0]);
 }
 
 const ggml_backend_device_i kDeviceIface = {
@@ -3528,14 +3547,15 @@ ggml_backend_buffer_t selftest_expert_cache_alloc(ggml_backend_buffer_type_t buf
     return alloc_buf(buft, size, true);
 }
 
-// MUL_MAT_ID over IQ4_XS expert slots (Qwen3.6-35B-A3B's routed experts):
-// ne11 = 1 is gate/up (one activation per token), ne11 = n_ids is down (one
-// per expert). Reference: the CPU backend's q8_K from_float and vec_dot.
-D3d12SelftestRow run_mmid_case(ggml_backend_t backend, int n, int k, int ne11, int n_tok) {
+// MUL_MAT_ID over IQ4_XS or IQ3_S expert slots (Qwen3.6-35B-A3B's routed
+// experts): ne11 = 1 is gate/up (one activation per token), ne11 = n_ids is
+// down (one per expert). Reference: the CPU backend's q8_K from_float and vec_dot.
+D3d12SelftestRow run_mmid_case(ggml_backend_t backend, ggml_type wtype, int n, int k, int ne11,
+                               int n_tok) {
     constexpr int kSlots = 12;
     constexpr int kIds = 8;
     D3d12SelftestRow row;
-    row.type = "mmid_iq4_xs";
+    row.type = std::string("mmid_") + ggml_type_name(wtype);
     row.n = n;
     row.k = k;
     row.ncols = kIds * n_tok;
@@ -3547,7 +3567,7 @@ D3d12SelftestRow run_mmid_case(ggml_backend_t backend, int n, int k, int ne11, i
     ggml_context* ctx_w = ggml_init(ip);
     ggml_context* ctx_x = ggml_init(ip);
     ggml_context* ctx_g = ggml_init(ip);
-    ggml_tensor* as = ggml_new_tensor_3d(ctx_w, GGML_TYPE_IQ4_XS, k, n, kSlots);
+    ggml_tensor* as = ggml_new_tensor_3d(ctx_w, wtype, k, n, kSlots);
     ggml_tensor* x = ggml_new_tensor_3d(ctx_x, GGML_TYPE_F32, k, ne11, n_tok);
     ggml_tensor* ids = ggml_new_tensor_2d(ctx_x, GGML_TYPE_I32, kIds, n_tok);
     ggml_backend_buffer_t wbuf =
@@ -3582,8 +3602,8 @@ D3d12SelftestRow run_mmid_case(ggml_backend_t backend, int n, int k, int ne11, i
     for (float& v : wf)
         v = uni(rng);
     std::vector<std::uint8_t> q(ggml_nbytes(as));
-    ggml_quantize_chunk(GGML_TYPE_IQ4_XS, wf.data(), q.data(), 0,
-                        static_cast<std::int64_t>(n) * kSlots, k, nullptr);
+    ggml_quantize_chunk(wtype, wf.data(), q.data(), 0, static_cast<std::int64_t>(n) * kSlots, k,
+                        nullptr);
     ggml_backend_tensor_set(as, q.data(), 0, q.size());
     std::vector<float> xf(static_cast<std::size_t>(k) * ne11 * n_tok);
     for (float& v : xf)
@@ -3626,7 +3646,7 @@ D3d12SelftestRow run_mmid_case(ggml_backend_t backend, int n, int k, int ne11, i
     std::vector<float> yf(static_cast<std::size_t>(n) * kIds * n_tok);
     ggml_backend_tensor_get(y, yf.data(), 0, yf.size() * sizeof(float));
     ggml_cpu_init();
-    const auto* wt = ggml_get_type_traits_cpu(GGML_TYPE_IQ4_XS);
+    const auto* wt = ggml_get_type_traits_cpu(wtype);
     std::vector<std::uint8_t> xq(ggml_row_size(wt->vec_dot_type, k));
     double max_ref = 0.0, max_diff = 0.0;
     for (int t = 0; t < n_tok; ++t)
@@ -4058,14 +4078,15 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
         out->push_back(run_case(backend, sc));
     out->push_back(run_get_rows_case(backend, 151936, 2048)); // Coder-3B tied token_embd
     out->push_back(run_get_rows_case(backend, 65536, 1024));  // LFM2.5-350M
-    if (gpu().pso_mmid[0]) {
-        // Qwen3.6-35B-A3B experts: gate/up 2048 -> 512, down 512 -> 2048;
-        // one token (decode) and five (a prefill ubatch, both blobs).
-        out->push_back(run_mmid_case(backend, 512, 2048, 1, 1));
-        out->push_back(run_mmid_case(backend, 2048, 512, 8, 1));
-        out->push_back(run_mmid_case(backend, 512, 2048, 1, 5));
-        out->push_back(run_mmid_case(backend, 2048, 512, 8, 5));
-    }
+    // Qwen3.6-35B-A3B experts (i1-IQ4_XS and i1-IQ3_S): gate/up 2048 -> 512,
+    // down 512 -> 2048; one token (decode) and five (a prefill ubatch, both blobs).
+    for (const ggml_type wtype : {GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S})
+        if (gpu().pso_mmid[mmid_for(wtype)][0]) {
+            out->push_back(run_mmid_case(backend, wtype, 512, 2048, 1, 1));
+            out->push_back(run_mmid_case(backend, wtype, 2048, 512, 8, 1));
+            out->push_back(run_mmid_case(backend, wtype, 512, 2048, 1, 5));
+            out->push_back(run_mmid_case(backend, wtype, 2048, 512, 8, 5));
+        }
     if (gpu().moe_ok) {
         // Qwen3.6-35B-A3B: n_embd 2048, 8 routed experts; decode and a prefill ubatch.
         out->push_back(run_moe_case(backend, -1, 2048, 8, 1));
