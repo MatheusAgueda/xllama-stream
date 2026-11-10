@@ -1,0 +1,131 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -20,6 +20,9 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <algorithm>
++#include <map>
++#include <mutex>
++#include <string>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -1799,9 +1802,69 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+     return true;
+ }
+ 
++// xllama patch 0011: GGML_SCHED_PROFILE (set, not "0") times every split, its
++// input copies and its compute until the backend is idle, keyed by backend and
++// first..last node name (layer suffix dropped); ggml_backend_sched_free logs
++// the totals. It synchronizes each split, so async backends lose overlap.
++struct ggml_sched_prof_stat {
++    uint64_t n = 0;
++    int64_t  copy_us = 0;
++    int64_t  comp_us = 0;
++};
++static std::mutex g_sched_prof_mu;
++static std::unordered_map<const void *, std::map<std::string, ggml_sched_prof_stat>> g_sched_prof;
++
++// read per graph, not cached: the host may set it per model before a context
++static bool ggml_sched_prof_on() {
++    const char * v = getenv("GGML_SCHED_PROFILE");
++    return v != nullptr && strcmp(v, "0") != 0;
++}
++
++static std::string ggml_sched_prof_name(const struct ggml_tensor * t) {
++    std::string s = t->name[0] ? t->name : ggml_op_desc(t);
++    const size_t paren = s.find(" (");
++    if (paren != std::string::npos) {
++        s.resize(paren);
++    }
++    const size_t dash = s.rfind('-');
++    if (dash != std::string::npos && dash + 1 < s.size() &&
++            s.find_first_not_of("0123456789", dash + 1) == std::string::npos) {
++        s.resize(dash);
++    }
++    return s;
++}
++
++static void ggml_sched_prof_print(ggml_backend_sched_t sched) {
++    std::map<std::string, ggml_sched_prof_stat> m;
++    {
++        std::lock_guard<std::mutex> lock(g_sched_prof_mu);
++        auto it = g_sched_prof.find(sched);
++        if (it == g_sched_prof.end()) {
++            return;
++        }
++        m.swap(it->second);
++        g_sched_prof.erase(it);
++    }
++    std::vector<std::pair<std::string, ggml_sched_prof_stat>> v(m.begin(), m.end());
++    std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) {
++        return a.second.copy_us + a.second.comp_us > b.second.copy_us + b.second.comp_us;
++    });
++    int64_t tot = 0;
++    for (const auto & e : v) {
++        tot += e.second.copy_us + e.second.comp_us;
++    }
++    GGML_LOG_INFO("sched profile: %zu split kinds, %.1f ms\n", v.size(), tot / 1000.0);
++    for (size_t i = 0; i < v.size() && i < 40; i++) {
++        const auto & e = v[i];
++        GGML_LOG_INFO("sched split: %8llu x %9.1f ms (copy %7.1f) %s\n", (unsigned long long) e.second.n,
++                (e.second.copy_us + e.second.comp_us) / 1000.0, e.second.copy_us / 1000.0, e.first.c_str());
++    }
++}
++
+ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+     GGML_ASSERT(sched);
+     struct ggml_backend_sched_split * splits = sched->splits;
++    const bool prof = ggml_sched_prof_on();
+ 
+     ggml_tensor * prev_ids_tensor = nullptr;
+     std::vector<int32_t> ids;
+@@ -1813,6 +1876,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         struct ggml_backend_sched_split * split = &splits[split_id];
+         int split_backend_id = split->backend_id;
+         ggml_backend_t split_backend = sched->backends[split_backend_id];
++        const int64_t prof_t0 = prof ? ggml_time_us() : 0;
++        int64_t prof_t1 = 0;
+ 
+         // ensure the previous split's async work has completed before we start
+         // this split, the allocator may have reused buffer regions across splits
+@@ -1951,6 +2016,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             }
+         }
+ 
++        if (prof) {
++            prof_t1 = ggml_time_us();
++        }
++
+         if (!sched->callback_eval) {
+             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+             if (ec != GGML_STATUS_SUCCESS) {
+@@ -1990,6 +2059,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             }
+         }
+ 
++        if (prof && split->graph.n_nodes > 0) {
++            ggml_backend_synchronize(split_backend);
++            const int64_t t2 = ggml_time_us();
++            std::string key = std::string(ggml_backend_name(split_backend)) + " " +
++                    ggml_sched_prof_name(split->graph.nodes[0]) + " .. " +
++                    ggml_sched_prof_name(split->graph.nodes[split->graph.n_nodes - 1]);
++            std::lock_guard<std::mutex> lock(g_sched_prof_mu);
++            ggml_sched_prof_stat & st = g_sched_prof[sched][key];
++            st.n++;
++            st.copy_us += prof_t1 - prof_t0;
++            st.comp_us += t2 - prof_t1;
++        }
++
+         // record the event of this split
+         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+@@ -2077,6 +2159,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+     if (sched == NULL) {
+         return;
+     }
++    ggml_sched_prof_print(sched);
+     for (int b = 0; b < sched->n_backends; b++) {
+         for (int c = 0; c < sched->n_copies; c++) {
+             ggml_backend_event_free(sched->events[b][c]);

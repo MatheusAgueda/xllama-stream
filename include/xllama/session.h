@@ -14,6 +14,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace xllama {
@@ -64,6 +65,32 @@ struct SessionParams {
     // the title's RAM budget loads and decodes reading only the experts each
     // token routes to. Forces the CPU (no d3d12 layers). apply_gguf_residency.
     bool stream_weights = false;
+
+    // GGUF only (llama.cpp patch 0004): keep this many experts per MoE layer in
+    // the heap and read the others from the model file when the router picks
+    // them, so a MoE larger than the title's memory runs from a fixed-size cache
+    // rather than a mapping the AppContainer caps. 0 = off. The expert matmuls
+    // run on the CPU; n_gpu_layers still offloads the rest of each layer. Takes
+    // precedence over stream_weights. apply_gguf_residency.
+    int expert_slots = 0;
+    // With expert_slots: cache-aware routing, (0, 1]. A resident expert just
+    // outside a token's top-k replaces a missing one when its router score is at
+    // least this fraction of the missing one's. 0 = exact routing.
+    float expert_swap = 0.0f;
+    // With expert_slots: predicted experts per token read ahead
+    // (LLAMA_EXPERT_PREFETCH, 0..64), and the largest prompt ubatch run
+    // expert-major, each expert read once (LLAMA_EXPERT_MAJOR). 0 = off.
+    int expert_prefetch = 0;
+    int expert_major = 0;
+    // With expert_prefetch: predict each layer's experts one layer earlier, so
+    // the reads overlap a whole layer (LLAMA_EXPERT_PREFETCH_AHEAD).
+    bool expert_prefetch_ahead = false;
+    // Tuning variables put in the process environment for the load (catalogue
+    // "env"), which llama.cpp's patches and xllama read there: e.g.
+    // LLAMA_EXPERT_PREFETCH_PRIO, XLLAMA_CPU_POLL. LLAMA_*, GGML_* and XLLAMA_*
+    // names only, sorted by name; a listed name wins over the value xllama would
+    // set itself.
+    std::vector<std::pair<std::string, std::string>> env;
 };
 
 struct GenerateParams {

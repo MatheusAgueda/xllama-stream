@@ -120,9 +120,10 @@ struct ChatFormat {
     bool strip_thinking_content = false;
 
     // Full multi-turn prompt ending with the assistant generation header +
-    // gen_suffix. gen_suffix is appended ONLY to the final (trailing) assistant
-    // header, never to completed history turns. History turns are complete
-    // (user + assistant) exchanges.
+    // gen_suffix. Completed history assistant turns carry gen_suffix too, ahead
+    // of their text: the turn was generated after it, so the next full render
+    // extends the resident KV instead of diverging at the suffix. History turns
+    // are complete (user + assistant) exchanges.
     std::string render_prompt(const std::string& system, const std::vector<ChatTurn>& history,
                               const std::string& final_user) const;
 

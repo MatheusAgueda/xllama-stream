@@ -13,14 +13,21 @@
 #include "xllama/platform.h"
 #include "xllama/speculative.h"
 
+#include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace xllama {
 
 // llama/ggml log lines worth keeping in xllama.log on every GGUF load, CPU or
-// d3d12: placement and buffer sizes, graph splits, and every warning or error.
+// d3d12: placement and buffer sizes, graph splits, the expert cache's hit/read
+// stats (patch 0004, "expert cache (running|final)"), the scheduler's per-split
+// profile (patch 0011, GGML_SCHED_PROFILE: "sched profile" / "sched split"), and
+// every warning or error.
 // Before this was installed for all loads, a CPU-only load's warnings went to
 // llama's default stderr logger, which UWP never shows (found in a community
 // fork, SamirCharleston/xllama). Runs on llama.cpp's threads through a C
@@ -30,7 +37,9 @@ inline void llama_bridge_log(ggml_log_level level, const char* text, void*) noex
         return;
     const bool keep = level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR ||
                       std::strstr(text, "buffer size") || std::strstr(text, "offload") ||
-                      std::strstr(text, "graph splits") || std::strstr(text, "D3D12");
+                      std::strstr(text, "graph splits") || std::strstr(text, "splits = ") ||
+                      std::strstr(text, "D3D12") || std::strstr(text, "expert cache (") ||
+                      std::strstr(text, "sched profile") || std::strstr(text, "sched split");
     if (!keep)
         return;
     try {
@@ -80,7 +89,82 @@ inline bool gguf_embedding_info(const std::string& path, ggml_type* embd_type, b
 // repack copy, so pages are read from storage on first touch and the memory
 // manager can drop them again: a MoE larger than the title's RAM budget loads
 // and each token reads only the experts it routes to.
-inline void apply_gguf_residency(bool stream, llama_model_params& mparams) {
+// expert_slots > 0 (llama.cpp patch 0004, wins over stream): the weights are
+// read into the heap except the MoE experts, of which only expert_slots per
+// layer stay resident; the others are read from the file when routed to. The
+// heap is fixed-size, unlike a mapping, which the AppContainer caps per process.
+// expert_swap > 0: cache-aware routing (llama_model_params::expert_swap_ratio).
+// expert_prefetch / expert_major / expert_prefetch_ahead: the cache reads them
+// from the environment when the model loads (LLAMA_EXPERT_PREFETCH,
+// LLAMA_EXPERT_MAJOR, LLAMA_EXPERT_PREFETCH_AHEAD); set every load so a reload
+// with other values takes them.
+inline void put_env(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value); // "" removes it
+#else
+    if (*value)
+        setenv(name, value, 1);
+    else
+        unsetenv(name);
+#endif
+}
+
+// The catalogue "env" of the current load (SessionParams::env): a name it lists
+// wins over the value set_env_int would put, and the next load unsets it.
+struct EnvOverrides {
+    std::mutex mtx;
+    std::vector<std::pair<std::string, std::string>> vars;
+};
+inline EnvOverrides& env_overrides() {
+    static EnvOverrides o;
+    return o;
+}
+
+inline void apply_env_overrides(const std::vector<std::pair<std::string, std::string>>& env) {
+    auto& o = env_overrides();
+    std::lock_guard<std::mutex> lock(o.mtx);
+    for (const auto& kv : o.vars)
+        put_env(kv.first.c_str(), "");
+    o.vars = env;
+    for (const auto& kv : env) {
+        put_env(kv.first.c_str(), kv.second.c_str());
+        log_output("[xllama] env " + kv.first + "=" + kv.second + "\n");
+    }
+}
+
+inline void set_env_int(const char* name, int v) {
+    auto& o = env_overrides();
+    std::lock_guard<std::mutex> lock(o.mtx);
+    for (const auto& kv : o.vars)
+        if (kv.first == name)
+            return;
+    put_env(name, std::to_string(v).c_str());
+}
+
+inline void apply_gguf_residency(bool stream, llama_model_params& mparams, int expert_slots = 0,
+                                 float expert_swap = 0.0f, int expert_prefetch = 0,
+                                 int expert_major = 0, bool expert_prefetch_ahead = false) {
+    if (expert_slots > 0) {
+#ifdef LLAMA_HAS_EXPERT_SLOTS
+        mparams.load_mode = LLAMA_LOAD_MODE_NONE;
+        mparams.n_expert_slots = static_cast<uint32_t>(expert_slots);
+        mparams.expert_swap_ratio = expert_swap;
+        set_env_int("LLAMA_EXPERT_PREFETCH", expert_prefetch);
+        set_env_int("LLAMA_EXPERT_MAJOR", expert_major);
+        set_env_int("LLAMA_EXPERT_PREFETCH_AHEAD", expert_prefetch_ahead ? 1 : 0);
+        log_output("[xllama] gguf weights: heap, expert cache of " + std::to_string(expert_slots) +
+                   " experts per layer, swap ratio " + std::to_string(expert_swap) + ", prefetch " +
+                   std::to_string(expert_prefetch) + (expert_prefetch_ahead ? " ahead" : "") +
+                   ", expert-major " + std::to_string(expert_major) + "\n");
+        return;
+#else
+        (void)expert_swap;
+        (void)expert_prefetch;
+        (void)expert_major;
+        (void)expert_prefetch_ahead;
+        log_output("[xllama] gguf expert cache: this llama.cpp lacks patch 0004, ignored\n");
+#endif
+    }
     if (stream) {
         mparams.load_mode = LLAMA_LOAD_MODE_MMAP;
         mparams.use_extra_bufts = false;
@@ -125,14 +209,31 @@ inline int apply_gguf_gpu_layers(int requested, llama_model_params& mparams,
     // one copy: the duplicate finds the original in the same buffer context.
     ggml_type embd_type = GGML_TYPE_COUNT;
     bool has_output = true;
-    if (gguf_embedding_info(model_path, &embd_type, &has_output) &&
-        d3d12_place_tied_embedding(embd_type, has_output)) {
-        static llama_model_tensor_buft_override embd_on_gpu[] = {{"^token_embd\\.weight$", nullptr},
-                                                                 {nullptr, nullptr}};
-        embd_on_gpu[0].buft = ggml_d3d12_weights_buft();
-        mparams.tensor_buft_overrides = embd_on_gpu;
+    static llama_model_tensor_buft_override overrides[4] = {};
+    int n_overrides = 0;
+    const bool have_info = gguf_embedding_info(model_path, &embd_type, &has_output);
+    if (have_info && d3d12_place_tied_embedding(embd_type, has_output)) {
+        overrides[n_overrides++] = {"^token_embd\\.weight$", ggml_d3d12_weights_buft()};
         log_output("[xllama] gguf gpu layers: tied token_embd in D3D12_Weights\n");
     }
+    // n_gpu_layers >= 1 always offloads output.weight first, and on a large
+    // vocabulary it is the single biggest tensor (Qwen3.5: 248K x 4096 Q6_K =
+    // 796 MiB, over what one Series X allocation takes). Knob: keep it on the CPU.
+    if (have_info && has_output && gguf_output_on_cpu()) {
+        overrides[n_overrides++] = {"^output\\.weight$", ggml_backend_cpu_buffer_type()};
+        log_output("[xllama] gguf gpu layers: output.weight kept on the CPU\n");
+    }
+    // The small f32 weights of the linear-attention layers (qwen35 / qwen35moe:
+    // conv kernel, A, dt bias, gated-norm weight; ~4 MiB on the 35B) go to
+    // D3D12_Host, which both the delta-net kernels and the CPU read: a layer's
+    // whole chain can then run in one D3D12 split, and the CPU still runs any op
+    // the device declines. An override skips llama.cpp's supports_op probe,
+    // which these ops' other operands (activations) would fail at load time.
+    overrides[n_overrides++] = {"^blk\\.[0-9]+\\.ssm_(a|dt\\.bias|norm\\.weight|conv1d\\.weight)$",
+                                ggml_backend_dev_buffer_type(d3d12[0])};
+    overrides[n_overrides] = {nullptr, nullptr};
+    if (n_overrides > 0)
+        mparams.tensor_buft_overrides = overrides;
     log_gguf_ws("after d3d12 init");
     log_output("[xllama] gguf gpu layers: " + std::to_string(requested) + " on D3D12\n");
     return requested;
@@ -162,8 +263,19 @@ inline uint32_t gguf_gpu_outputs_max(bool embeddings, bool prompt_lookup) {
 // the pages it touches (#309).
 inline void apply_gguf_gpu_context(int applied_layers, llama_context_params& cparams,
                                    uint32_t outputs_max) {
+    // The recurrent states of linear-attention layers (qwen35 / qwen35moe) go
+    // to the device buffer, CPU-visible D3D12_Host, which the delta-net kernels
+    // read and write in place (llama.cpp patch 0010; the CPU uses it as well
+    // where they cannot run). Set on every context so a CPU reload clears it.
+    set_env_int("LLAMA_RS_ON_DEVICE", applied_layers > 0 ? 1 : 0);
     if (applied_layers > 0) {
-        cparams.offload_kqv = false;
+        // XLLAMA_KV_ON_GPU=1 (per-model manifest env) puts the KV cache in the
+        // device buffer (D3D12_Host) so rope / set_rows / flash-attn can be
+        // scheduled on the backend (ggml_d3d12.cpp attn kernels); default keeps
+        // the proven CPU attention.
+        const char* kv_gpu = std::getenv("XLLAMA_KV_ON_GPU");
+        cparams.offload_kqv = kv_gpu && kv_gpu[0] == '1';
+        log_output(std::string("[xllama] offload_kqv=") + (cparams.offload_kqv ? "1" : "0") + "\n");
         if (cparams.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO)
             cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
         if (outputs_max > 0)
@@ -192,11 +304,15 @@ class GgufCpuThreadpools {
             return;
         if (!tp_) {
             ggml_threadpool_params p = ggml_threadpool_params_default(n_threads);
+            tune(p);
             tp_ = ggml_threadpool_new(&p);
             if (n_threads_batch > 0 && n_threads_batch != n_threads) {
                 ggml_threadpool_params pb = ggml_threadpool_params_default(n_threads_batch);
+                tune(pb);
                 tp_batch_ = ggml_threadpool_new(&pb);
             }
+            log_output("[xllama] cpu threadpool: " + std::to_string(n_threads) + " threads, poll " +
+                       std::to_string(p.poll) + ", prio " + std::to_string(int(p.prio)) + "\n");
         }
         if (tp_)
             llama_attach_threadpool(ctx, tp_, tp_batch_ ? tp_batch_ : tp_);
@@ -211,6 +327,16 @@ class GgufCpuThreadpools {
     }
 
   private:
+    // XLLAMA_CPU_POLL (0..100, ggml's default 50): how long the workers spin
+    // before sleeping between graphs; XLLAMA_CPU_PRIO (-1..3, GGML_SCHED_PRIO_*).
+    // Both from the catalogue "env".
+    static void tune(ggml_threadpool_params& p) {
+        if (const char* s = std::getenv("XLLAMA_CPU_POLL"); s && *s)
+            p.poll = static_cast<uint32_t>(std::clamp(std::atoi(s), 0, 100));
+        if (const char* s = std::getenv("XLLAMA_CPU_PRIO"); s && *s)
+            p.prio = static_cast<ggml_sched_priority>(std::clamp(std::atoi(s), -1, 3));
+    }
+
     ggml_threadpool_t tp_ = nullptr;
     ggml_threadpool_t tp_batch_ = nullptr;
 };

@@ -160,6 +160,14 @@ void run_kv_bench(const std::string& model_name, const std::string& sys, const s
 } // namespace
 
 int gguf_gpu_layers_knob() {
+    #ifdef XLLAMA_USE_LLAMA
+    // Placement knobs that only matter when layers go to D3D12, refreshed at
+    // the same point as the layer count so a session reload picks them up.
+    const int max_mib = read_local_int("d3d12_max_buf_mib.txt", 0);
+    ::xllama::ggml_d3d12_set_weights_max_buffer(
+        max_mib > 0 ? static_cast<std::size_t>(max_mib) << 20 : 0);
+    ::xllama::gguf_set_output_on_cpu(read_local_int("gguf_output_cpu.txt", 0) != 0);
+    #endif
     return read_local_int("gguf_gpu_layers.txt", ::xllama::kGgufGpuLayersKnobAbsent);
 }
 #endif // XLLAMA_UWP
@@ -682,7 +690,7 @@ void run_gpustep(bool inproc) {
 
 void run_d3d12_selftest() {
 #if defined(XLLAMA_UWP) && defined(XLLAMA_USE_LLAMA)
-    log_output("[xllama] d3d12be: backend selftest (Q4_0/Q4_K/Q6_K vs ggml dequant)\n");
+    log_output("[xllama] d3d12be: backend selftest (Q4_0/Q4_K/Q5_K/Q6_K/IQ3_S/IQ4_XS vs ggml)\n");
     std::vector<::xllama::D3d12SelftestRow> rows;
     ::xllama::run_d3d12_selftest(&rows);
     const std::string csv = resolve_local_path("d3d12be-result.csv");
@@ -717,6 +725,35 @@ void run_d3d12_selftest() {
     log_output(lb);
 #elif defined(XLLAMA_UWP)
     log_output("[xllama] d3d12be: this package has no llama.cpp backend\n");
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// run_gpumem (gpumem.flag, headless): where GPU memory comes from on this
+// console. Each line is written and flushed as it is produced, like ramceil.
+// ---------------------------------------------------------------------------
+
+void run_gpumem() {
+#if defined(XLLAMA_UWP) && defined(XLLAMA_USE_LLAMA)
+    log_output("[xllama] gpumem: probing D3D12 allocation ceilings\n");
+    FILE* fp = _wfopen(utf8_to_wstring(resolve_local_path("gpumem-result.txt")).c_str(), L"w");
+    ::xllama::run_d3d12_memprobe([fp](const std::string& line) {
+        log_output("[xllama] gpumem: " + line + "\n");
+        if (fp) {
+            fputs((line + "\n").c_str(), fp);
+            fflush(fp);
+        }
+    });
+    if (fp)
+        fclose(fp);
+    FILE* done =
+        _wfopen(utf8_to_wstring(resolve_local_path("gpumem-result.txt.done")).c_str(), L"w");
+    if (done) {
+        fputs("done\n", done);
+        fclose(done);
+    }
+#elif defined(XLLAMA_UWP)
+    log_output("[xllama] gpumem: this package has no llama.cpp backend\n");
 #endif
 }
 

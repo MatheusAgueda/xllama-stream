@@ -7,10 +7,12 @@
 
 #include "ggml-cpu.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include <string>
 #include <vector>
@@ -82,10 +84,19 @@ TEST_CASE("ggml_d3d12: weight types") {
     CHECK(d3d12_weight_type_supported(GGML_TYPE_Q4_0));
     CHECK(d3d12_weight_type_supported(GGML_TYPE_Q4_K));
     CHECK(d3d12_weight_type_supported(GGML_TYPE_Q6_K));
-    CHECK_FALSE(d3d12_weight_type_supported(GGML_TYPE_Q5_K));
+    CHECK(d3d12_weight_type_supported(GGML_TYPE_IQ3_S));
+    CHECK(d3d12_activation_type(GGML_TYPE_IQ3_S) == GGML_TYPE_Q8_K);
+    CHECK(d3d12_weight_type_supported(GGML_TYPE_IQ4_XS));
+    CHECK(d3d12_activation_type(GGML_TYPE_IQ4_XS) == GGML_TYPE_Q8_K);
+    CHECK(d3d12_weight_type_supported(GGML_TYPE_Q5_K));
+    CHECK(d3d12_activation_type(GGML_TYPE_Q5_K) == GGML_TYPE_Q8_K);
+    CHECK_FALSE(d3d12_weight_type_supported(GGML_TYPE_IQ3_XXS));
+    CHECK_FALSE(d3d12_weight_type_supported(GGML_TYPE_IQ4_NL));
     CHECK_FALSE(d3d12_weight_type_supported(GGML_TYPE_Q8_0));
     CHECK_FALSE(d3d12_weight_type_supported(GGML_TYPE_F16));
-    CHECK_FALSE(d3d12_weight_type_supported(GGML_TYPE_F32));
+    // F32 (MoE routers): the kernel reads the f32 activations themselves.
+    CHECK(d3d12_weight_type_supported(GGML_TYPE_F32));
+    CHECK(d3d12_activation_type(GGML_TYPE_F32) == GGML_TYPE_F32);
 }
 
 TEST_CASE("ggml_d3d12: supports_op rules for MUL_MAT") {
@@ -182,6 +193,22 @@ TEST_CASE("ggml_d3d12: kernel emulation matches the CPU backend (q8 activations)
         // Coder-3B ffn_down width: 43 super-blocks, 9030-byte rows.
         {GGML_TYPE_Q6_K, 3, 11008},
         {GGML_TYPE_Q4_0, 5, 2304},
+        {GGML_TYPE_IQ3_S, 13, 1024},
+        // 9 super-blocks: 990-byte rows, odd rows start 2-byte aligned.
+        {GGML_TYPE_IQ3_S, 6, 2304},
+        // Qwen3.5-9B ffn_down width: 48 super-blocks, 128 threads.
+        {GGML_TYPE_IQ3_S, 3, 12288},
+        // Qwen3.6-35B-A3B dense projections: IQ4_XS (136-byte blocks) and
+        // Q5_K (176-byte blocks), both 4-byte aligned at every row.
+        {GGML_TYPE_IQ4_XS, 13, 1024},
+        {GGML_TYPE_IQ4_XS, 6, 2304},
+        {GGML_TYPE_IQ4_XS, 3, 4096},
+        {GGML_TYPE_Q5_K, 13, 1024},
+        {GGML_TYPE_Q5_K, 6, 2304},
+        {GGML_TYPE_Q5_K, 3, 4096},
+        // Qwen3.6-35B-A3B router and shared expert gate: f32 weights and activations.
+        {GGML_TYPE_F32, 13, 1024},
+        {GGML_TYPE_F32, 3, 2048},
     };
     for (const auto& c : cases) {
         CAPTURE(ggml_type_name(c.t));
@@ -190,6 +217,7 @@ TEST_CASE("ggml_d3d12: kernel emulation matches the CPU backend (q8 activations)
         CHECK(emulate_rel_err(c.t, c.n, c.k, 7, 12, 3) <= kD3d12SelftestRelTol);
     }
     CHECK(ggml_row_size(GGML_TYPE_Q6_K, 11008) % 4 == 2); // the case the ld32 trick covers
+    CHECK(ggml_row_size(GGML_TYPE_IQ3_S, 2304) % 4 == 2);
 }
 
 TEST_CASE("ggml_d3d12: selftest CSV and non-Windows behaviour") {
@@ -328,6 +356,172 @@ TEST_CASE("ggml_d3d12: GET_ROWS rules and tied-embedding placement") {
 #if !defined(_WIN32)
     CHECK(ggml_d3d12_weights_buft() == nullptr);
 #endif
+}
+
+TEST_CASE("ggml_d3d12: elementwise ops — row shape and norm-weight rules") {
+    CHECK(d3d12_elt_rows_supported(4096, 1, 1, 1));
+    CHECK(d3d12_elt_rows_supported(1024, 512, 1, 1));
+    CHECK(d3d12_elt_rows_supported(std::int64_t(1) << 20, 256, 1, 1)); // 2^28 floats
+    CHECK_FALSE(d3d12_elt_rows_supported(std::int64_t(1) << 20, 257, 1, 1));
+    CHECK_FALSE(d3d12_elt_rows_supported(1023, 1, 1, 1)); // q/k/ssm norms stay on the CPU
+    CHECK_FALSE(d3d12_elt_rows_supported(4096, 0, 1, 1));
+    CHECK_FALSE(d3d12_elt_rows_supported(4096, 65536, 1, 1));
+    CHECK_FALSE(d3d12_elt_rows_supported(4096, 1, 2, 1));
+    CHECK_FALSE(d3d12_elt_rows_supported(4096, 1, 1, 2));
+    CHECK_FALSE(d3d12_elt_rows_supported(256 * 65536, 1, 1, 1)); // 65536 groups per row
+
+    for (const char* n : {"blk.0.attn_norm.weight", "blk.31.post_attention_norm.weight",
+                          "blk.7.ffn_norm.weight", "output_norm.weight"}) {
+        CAPTURE(n);
+        CHECK(d3d12_norm_weight_name(n));
+    }
+    for (const char* n :
+         {"", "blk.0.attn_q_norm.weight", "blk.0.attn_k_norm.weight", "blk.3.ssm_norm.weight",
+          "blk..attn_norm.weight", "blk.x.attn_norm.weight", "blk.0.attn_norm.bias",
+          "blk.0.attn_norm.weight.1", "output_norm.bias", "token_embd_norm.weight",
+          "blk.0.post_ffw_norm.weight", "attn_norm.weight"}) {
+        CAPTURE(n);
+        CHECK_FALSE(d3d12_norm_weight_name(n));
+    }
+    CHECK_FALSE(d3d12_norm_weight_name(nullptr));
+}
+
+TEST_CASE("ggml_d3d12: div_rn equals IEEE division (the q8_K kernel's scales)") {
+    auto from_bits = [](std::uint32_t u) {
+        float f;
+        std::memcpy(&f, &u, sizeof(f));
+        return f;
+    };
+    std::mt19937 rng(11u);
+    std::uniform_int_distribution<std::uint32_t> mant(0u, 0x7fffffu);
+    std::uniform_int_distribution<int> expo(-40, 40);
+    int bad127 = 0, bad1 = 0;
+    for (int i = 0; i < 200000; ++i) {
+        const std::uint32_t sign = (i & 1) ? 0x80000000u : 0u;
+        const float b =
+            from_bits(sign | (static_cast<std::uint32_t>(127 + expo(rng)) << 23) | mant(rng));
+        const volatile float ab = std::fabs(b);
+        bad127 += d3d12_div_rn(127u, b) != 127.0f / ab ? 1 : 0;
+        bad1 += d3d12_div_rn(1u, b) != 1.0f / ab ? 1 : 0;
+    }
+    CHECK(bad127 == 0);
+    CHECK(bad1 == 0);
+    for (const float b : {1.0f, 127.0f, 0.5f, 3.0f, 9.0f, 1.0000001f, 0.99999994f, 1e-30f, 1e30f}) {
+        CAPTURE(b);
+        const volatile float vb = b;
+        CHECK(d3d12_div_rn(127u, b) == 127.0f / vb);
+        CHECK(d3d12_div_rn(1u, -b) == 1.0f / vb);
+    }
+}
+
+TEST_CASE("ggml_d3d12: q8_K kernel emulation equals ggml's quantize_row_q8_K") {
+    ggml_cpu_init();
+    const auto* q8k = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+    REQUIRE(q8k->from_float != nullptr);
+    constexpr int kBlocks = 96;
+    constexpr int k = 256 * kBlocks;
+    constexpr std::size_t kBlock = 292; // float d, int8 qs[256], int16 bsums[16]
+    std::mt19937 rng(5u);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::uniform_int_distribution<int> ex(-20, 20);
+    std::vector<float> x(k);
+    for (int b = 0; b < kBlocks; ++b) {
+        const float s = b == 1 || b == 2 ? 0.1f : std::ldexp(1.0f, ex(rng)); // 1, 2: |x| < 7
+        for (int j = 0; j < 256; ++j)
+            x[256 * b + j] = nd(rng) * s;
+    }
+    std::fill(x.begin(), x.begin() + 256, 0.0f); // block 0: all zero
+    x[256 + 17] = -9.f;                          // block 1: |max| tie across threads,
+    x[256 + 200] = 9.f;                          //   the lower index wins (d > 0)
+    x[512 + 5] = 7.f;                            // block 2: tie within a thread
+    x[512 + 6] = -7.f;
+    float* b3 = x.data() + 768; // block 3: iscale = -1 exactly, halves round to even
+    for (int j = 0; j < 256; ++j)
+        b3[j] = 0.25f * static_cast<float>(j % 7);
+    b3[0] = 127.f;
+    b3[1] = 2.5f;
+    b3[2] = 3.5f;
+    b3[3] = -0.5f;
+    b3[4] = -126.5f;
+
+    std::vector<std::uint8_t> got(kBlock * kBlocks + 16, 0xa5), ref(kBlock * kBlocks, 0);
+    d3d12_quant_q8k_emulate(x.data(), k, got.data());
+    q8k->from_float(x.data(), ref.data(), k);
+    for (std::size_t p = kBlock * kBlocks; p < got.size(); ++p)
+        CHECK(got[p] == 0xa5);
+
+    int ambiguous = 0;
+    for (int b = 0; b < kBlocks; ++b) {
+        CAPTURE(b);
+        const std::uint8_t* g = got.data() + kBlock * b;
+        const std::uint8_t* r = ref.data() + kBlock * b;
+        float gd, rd;
+        std::memcpy(&gd, g, 4);
+        std::memcpy(&rd, r, 4);
+        CHECK(std::memcmp(g, r, 4) == 0); // d bit for bit
+        // CPU max and iscale as quantize_row_q8_K_ref computes them.
+        float amax = 0.f, max = 0.f;
+        for (int j = 0; j < 256; ++j)
+            if (std::fabs(x[256 * b + j]) > amax) {
+                amax = std::fabs(x[256 * b + j]);
+                max = x[256 * b + j];
+            }
+        const float iscale = amax != 0.f ? -127.f / max : 0.f;
+        bool group_ok[16];
+        for (bool& ok : group_ok)
+            ok = true;
+        for (int j = 0; j < 256; ++j) {
+            const auto gq = static_cast<std::int8_t>(g[4 + j]);
+            const auto rq = static_cast<std::int8_t>(r[4 + j]);
+            if (gq == rq)
+                continue;
+            // A CPU that fuses iscale*x + 12582912 into one FMA rounds the
+            // exact product: it may differ only next to a .5 boundary.
+            const double p = std::fabs(static_cast<double>(iscale) * x[256 * b + j]);
+            const bool near_half = std::fabs(p - std::floor(p) - 0.5) < 1e-3 && b != 3;
+            CAPTURE(j);
+            CHECK(near_half);
+            CHECK(std::abs(gq - rq) == 1);
+            group_ok[j / 16] = false;
+            ++ambiguous;
+        }
+        if (amax == 0.f) {
+            CHECK(gd == 0.f);
+            continue; // the reference leaves bsums unset
+        }
+        for (int s = 0; s < 16; ++s)
+            if (group_ok[s]) {
+                CAPTURE(s);
+                CHECK(std::memcmp(g + 260 + 2 * s, r + 260 + 2 * s, 2) == 0);
+            }
+    }
+    CHECK(ambiguous < 20);
+
+    // The hand-checked cases.
+    float d1, d2, d3;
+    std::memcpy(&d1, got.data() + kBlock, 4);
+    std::memcpy(&d2, got.data() + 2 * kBlock, 4);
+    std::memcpy(&d3, got.data() + 3 * kBlock, 4);
+    CHECK(d1 > 0.f); // max = -9 (index 17), not +9
+    CHECK(static_cast<std::int8_t>(got[kBlock + 4 + 17]) == -127);
+    CHECK(static_cast<std::int8_t>(got[kBlock + 4 + 200]) == 127);
+    CHECK(d2 < 0.f); // max = +7 (index 5), not -7
+    CHECK(d3 == -1.f);
+    const std::uint8_t* q3 = got.data() + 3 * kBlock + 4;
+    CHECK(static_cast<std::int8_t>(q3[0]) == -127);
+    CHECK(static_cast<std::int8_t>(q3[1]) == -2);  // -2.5
+    CHECK(static_cast<std::int8_t>(q3[2]) == -4);  // -3.5
+    CHECK(static_cast<std::int8_t>(q3[3]) == 0);   // 0.5
+    CHECK(static_cast<std::int8_t>(q3[4]) == 126); // 126.5
+    for (int j = 0; j < 256; ++j)
+        CHECK(got[3 * kBlock + 4 + j] == ref[3 * kBlock + 4 + j]);
+
+    // Malformed calls write nothing.
+    std::vector<std::uint8_t> untouched(kBlock, 0x5a);
+    d3d12_quant_q8k_emulate(x.data(), 255, untouched.data());
+    d3d12_quant_q8k_emulate(x.data(), 0, untouched.data());
+    for (const std::uint8_t v : untouched)
+        CHECK(v == 0x5a);
 }
 
 TEST_CASE("llama_gpu: token_embd type and tie read from the GGUF header") {

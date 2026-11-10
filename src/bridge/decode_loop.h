@@ -52,8 +52,11 @@ namespace xllama {
 // coding session's trimmer ceiling is 3846, so a long paste used to kill the
 // process. This is the LOGICAL batch only; the physical ubatch stays at the #172
 // optimum of 512, which is what every published prefill rate was measured on.
+//
+// |progress_base| is what earlier calls of the same prefill already fed, so a
+// prefill split at recurrent checkpoints (#170c) reports one running count.
 inline bool prefill_chunked(llama_context* ctx, const llama_token* tokens, int n_tokens,
-                            InferenceWatchdog* wd = nullptr) {
+                            InferenceWatchdog* wd = nullptr, int progress_base = 0) {
     const int n_batch = std::max(1, static_cast<int>(llama_n_batch(ctx)));
     for (int off = 0; off < n_tokens; off += n_batch) {
         if (wd && wd->aborted())
@@ -63,7 +66,7 @@ inline bool prefill_chunked(llama_context* ctx, const llama_token* tokens, int n
         if (llama_decode(ctx, batch) != 0)
             return false;
         if (wd)
-            wd->note_prefill_chunk(off + chunk);
+            wd->note_prefill_chunk(progress_base + off + chunk);
     }
     return true;
 }
@@ -133,6 +136,9 @@ struct DecodeLoopResult {
     // batch. Callers must treat the generation as failed and drop the KV —
     // continuing would desync history from cells (hybrid/LFM caches).
     bool rewind_failed = false;
+    // Wall time of the classic path's llama_decode calls and of sampling.
+    double decode_ms = 0.0;
+    double sample_ms = 0.0;
 };
 
 namespace detail {
@@ -267,7 +273,11 @@ inline bool classic_step(const DecodeLoopParams& p, llama_token token, std::stri
         log_output("[xllama] stop sequence after " + std::to_string(out.n_generated) + " tokens\n");
         return false;
     }
-    if (!decode_one(p.ctx, token)) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool decoded = decode_one(p.ctx, token);
+    out.decode_ms +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (!decoded) {
         log_output("[xllama] decode failed at token, stopping generation\n");
         decode_ok = false;
         return false;
@@ -308,8 +318,12 @@ inline DecodeLoopResult decode_loop(const DecodeLoopParams& p, std::string& outp
         if (p.watchdog && p.watchdog->aborted())
             break;
 
+        const auto ts0 = std::chrono::steady_clock::now();
         llama_token token =
             p.grammar ? detail::sample_with_grammar(p) : llama_sampler_sample(p.sampler, p.ctx, -1);
+        out.sample_ms +=
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts0)
+                .count();
         if (detail::stops_at_eog(p, token)) {
             log_output("[xllama] EOG after " + std::to_string(out.n_generated) + " tokens\n");
             break;

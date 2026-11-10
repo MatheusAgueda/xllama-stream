@@ -61,6 +61,92 @@ TEST_CASE("resolve_session_params: one resolver for every surface (ADR 0007)") {
     CatalogueLoad os = ort;
     os.stream = true;
     CHECK_FALSE(resolve_session_params("smollm2", os, "D:\\m\\smollm2", -1).stream_weights);
+
+    // An expert-cached GGUF keeps its experts in the CPU cache, so the rest of
+    // its layers may go to d3d12, even with "stream" set (the cache wins); a
+    // negative count is off.
+    CatalogueLoad ec = g;
+    ec.expert_slots = 32;
+    ec.stream = true;
+    const auto ect = resolve_session_params("moe", ec, "D:\\m\\moe", 16);
+    CHECK(ect.expert_slots == 32);
+    CHECK(ect.n_gpu_layers == 16);
+    CHECK(resolve_session_params("moe", ec, "D:\\m\\moe", -1).n_gpu_layers == 32);
+    CHECK(a.expert_slots == 0);
+    ec.expert_slots = -4;
+    CHECK(resolve_session_params("moe", ec, "D:\\m\\moe", -1).expert_slots == 0);
+    CHECK(resolve_session_params("moe", ec, "D:\\m\\moe", 16).n_gpu_layers == 0); // stream again
+    os.expert_slots = 32;
+    CHECK(resolve_session_params("smollm2", os, "D:\\m\\smollm2", -1).expert_slots == 0);
+
+    // The swap ratio needs the cache and lies in (0, 1].
+    CatalogueLoad sw = g;
+    sw.expert_slots = 32;
+    sw.expert_swap = 0.5f;
+    CHECK(resolve_session_params("moe", sw, "D:\\m\\moe", -1).expert_swap == 0.5f);
+    sw.expert_swap = 1.5f;
+    CHECK(resolve_session_params("moe", sw, "D:\\m\\moe", -1).expert_swap == 0.0f);
+    sw.expert_swap = -0.5f;
+    CHECK(resolve_session_params("moe", sw, "D:\\m\\moe", -1).expert_swap == 0.0f);
+    sw.expert_swap = 0.5f;
+    sw.expert_slots = 0;
+    CHECK(resolve_session_params("moe", sw, "D:\\m\\moe", -1).expert_swap == 0.0f);
+
+    // Prefetch and expert-major need the cache; prefetch is capped at 64.
+    CatalogueLoad pf = g;
+    pf.expert_slots = 32;
+    pf.expert_prefetch = 8;
+    pf.expert_major = 256;
+    CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).expert_prefetch == 8);
+    CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).expert_major == 256);
+    pf.expert_prefetch = 500;
+    pf.expert_major = -3;
+    CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).expert_prefetch == 64);
+    CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).expert_major == 0);
+    pf.expert_slots = 0;
+    pf.expert_prefetch = 8;
+    CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).expert_prefetch == 0);
+
+    // Prefetch-ahead needs the prefetch (and so the cache).
+    pf.expert_slots = 32;
+    pf.expert_prefetch_ahead = true;
+    CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).expert_prefetch_ahead);
+    pf.expert_prefetch = 0;
+    CHECK_FALSE(resolve_session_params("moe", pf, "D:\\m\\moe", -1).expert_prefetch_ahead);
+    pf.expert_prefetch = 8;
+    pf.expert_slots = 0;
+    CHECK_FALSE(resolve_session_params("moe", pf, "D:\\m\\moe", -1).expert_prefetch_ahead);
+
+    // n_ubatch: 0 keeps llama.cpp's default, the rest is clamped to [32, 2048].
+    CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).n_ubatch == 0);
+    pf.n_ubatch = 1024;
+    CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).n_ubatch == 1024);
+    pf.n_ubatch = 9;
+    CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).n_ubatch == 32);
+    pf.n_ubatch = 100000;
+    CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).n_ubatch == 2048);
+}
+
+TEST_CASE("catalogue env: tuning names only, sorted, the last repeat wins") {
+    CatalogueLoad g;
+    g.found = true;
+    g.gguf = true;
+    g.env = {{"XLLAMA_CPU_POLL", "0"},  {"LLAMA_EXPERT_PREFETCH_PRIO", "0"},
+             {"PATH", "C:\\evil"},      {"llama_lower", "1"},
+             {"GGML_SCHED", "1"},       {"LLAMA_", "1"},
+             {"XLLAMA_CPU_POLL", "20"}, {"LLAMA_BAD-NAME", "1"},
+             {"XLLAMAX", "1"},          {"LLAMA_NUL", std::string("a\0b", 3)}};
+    const auto sp = resolve_session_params("moe", g, "D:\\m\\moe", -1);
+    const std::vector<std::pair<std::string, std::string>> want = {
+        {"GGML_SCHED", "1"},
+        {"LLAMA_", "1"},
+        {"LLAMA_EXPERT_PREFETCH_PRIO", "0"},
+        {"XLLAMA_CPU_POLL", "20"}};
+    CHECK(sp.env == want);
+
+    // ORT GenAI models do not read it.
+    g.gguf = false;
+    CHECK(resolve_session_params("m", g, "D:\\m", -1).env.empty());
 }
 
 TEST_CASE("same_load: an adapter, context or GPU split is a different model in RAM") {
@@ -74,7 +160,7 @@ TEST_CASE("same_load: an adapter, context or GPU split is a different model in R
     other.n_threads = 6; // a tuning knob, not the load
     other.n_batch = 256;
     CHECK(same_load(base, other));
-    for (int field = 0; field < 6; ++field) {
+    for (int field = 0; field < 12; ++field) {
         auto changed = base;
         switch (field) {
         case 0:
@@ -94,6 +180,24 @@ TEST_CASE("same_load: an adapter, context or GPU split is a different model in R
             break;
         case 5:
             changed.stream_weights = true; // mapped vs heap: a different load
+            break;
+        case 6:
+            changed.expert_slots = 32; // a different set of weights in RAM
+            break;
+        case 7:
+            changed.expert_swap = 0.5f; // the cache is built at load with its routing
+            break;
+        case 8:
+            changed.expert_prefetch = 8; // read from the environment at load
+            break;
+        case 9:
+            changed.expert_major = 256;
+            break;
+        case 10:
+            changed.expert_prefetch_ahead = true;
+            break;
+        case 11:
+            changed.env = {{"XLLAMA_CPU_POLL", "0"}}; // read at load
             break;
         }
         CHECK_MESSAGE(!same_load(base, changed), field);

@@ -1,0 +1,2371 @@
+diff --git a/include/llama.h b/include/llama.h
+index 9bca8ee..05e9154 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -38,6 +38,9 @@
+ 
+ #define LLAMA_TOKEN_NULL -1
+ 
++// llama_model_params::n_expert_slots and expert_swap_ratio exist (xllama patch 0004-expert-cache)
++#define LLAMA_HAS_EXPERT_SLOTS 1
++
+ #define LLAMA_FILE_MAGIC_GGLA 0x67676c61u // 'ggla'
+ #define LLAMA_FILE_MAGIC_GGSN 0x6767736eu // 'ggsn'
+ #define LLAMA_FILE_MAGIC_GGSQ 0x67677371u // 'ggsq'
+@@ -346,6 +349,16 @@ extern "C" {
+         // override key-value pairs of the model meta data
+         const struct llama_model_kv_override * kv_overrides;
+ 
++        // MoE models larger than memory: keep only this many experts per layer resident and read the
++        // others from the model file when the router picks them (0 = off; the experts are computed on
++        // the CPU, caps n_ubatch) (xllama patch 0004; LLAMA_HAS_EXPERT_SLOTS)
++        uint32_t n_expert_slots;
++
++        // with n_expert_slots: a resident expert outside a token's top-k replaces a missing one inside
++        // it when its router score is at least this fraction of the missing one's (0 = off, exact
++        // routing; trades output fidelity for fewer reads)
++        float expert_swap_ratio;
++
+         // Keep the booleans together to avoid misalignment during copy-by-value.
+         bool vocab_only;      // only load the vocabulary, no weights
+         bool check_tensors;   // validate model tensor data
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index afdaddc..58cc0c8 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -17,6 +17,7 @@ set(LLAMA_CORE_SOURCES
+     llama-context.cpp
+     llama-cparams.cpp
+     llama-grammar.cpp
++    llama-expert-cache.cpp
+     llama-graph.cpp
+     llama-hparams.cpp
+     llama-impl.cpp
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 07b4c61..6557247 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-context.h"
++#include "llama-expert-cache.h"
+ 
+ #include "ggml.h"
+ #include "llama-arch.h"
+@@ -249,6 +250,17 @@ llama_context::llama_context(
+ 
+     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+ 
++    // every expert a ubatch routes to must fit in the expert cache slots at once, unless it runs
++    // expert-major (LLAMA_EXPERT_MAJOR)
++    if (model.expert_cache) {
++        const uint32_t n_ubatch_max = std::max(llama_expert_cache_max_ubatch(*model.expert_cache),
++                                               llama_expert_cache_expert_major(*model.expert_cache));
++        if (cparams.n_ubatch > n_ubatch_max) {
++            LLAMA_LOG_INFO("%s: expert cache: n_ubatch %u -> %u\n", __func__, cparams.n_ubatch, n_ubatch_max);
++            cparams.n_ubatch = n_ubatch_max;
++        }
++    }
++
+     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
+     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
+             cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
+diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
+new file mode 100644
+index 0000000..76862f9
+--- /dev/null
++++ b/src/llama-expert-cache.cpp
+@@ -0,0 +1,1716 @@
++#include "llama-expert-cache.h"
++
++#include "llama-impl.h"
++
++#include "../ggml/src/ggml-backend-impl.h"
++
++#ifndef GGML_BACKEND_DL
++#    include "ggml-cpu.h" // expert-major ubatches call the CPU kernels of the expert types directly
++#endif
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <cerrno>
++#include <cinttypes>
++#include <cmath>
++#include <condition_variable>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <deque>
++#include <mutex>
++#include <stdexcept>
++#include <thread>
++#include <unordered_map>
++#include <utility>
++#include <vector>
++
++#if defined(_WIN32)
++#    ifndef WIN32_LEAN_AND_MEAN
++#        define WIN32_LEAN_AND_MEAN
++#    endif
++#    ifndef NOMINMAX
++#        define NOMINMAX
++#    endif
++#    include <windows.h>
++#    include <io.h>
++#else
++#    include <fcntl.h>
++#    include <unistd.h>
++#endif
++
++#if !defined(GGML_BACKEND_DL) && (defined(__x86_64__) || defined(_M_X64))
++#    include <immintrin.h> // ec_copy_stream
++#endif
++
++namespace {
++
++// unbuffered reads (FILE_FLAG_NO_BUFFERING, O_DIRECT): the disk writes into the slot, with no copy
++// through the OS file cache and no read-ahead. Offsets, sizes and addresses are multiples of
++// EC_DIRECT_ALIGN (512-byte and 4 KiB sectors alike); a read that is not aligned goes through the
++// thread's staging buffer. A thread whose handle cannot read this way reads buffered.
++static constexpr size_t EC_DIRECT_ALIGN = 4096;
++
++struct ec_direct {
++#if defined(_WIN32)
++    HANDLE h = INVALID_HANDLE_VALUE;
++#else
++    int fd = -1;
++#endif
++    int  state    = 0;    // 0 = not opened yet, 1 = open, -1 = buffered reads only
++    bool in_place = true; // aligned reads go straight to their destination
++    std::vector<char> stage;
++};
++
++struct ec_file {
++    std::string path;
++    bool direct = true; // try unbuffered reads first (LLAMA_EXPERT_DIRECT)
++    // one handle per compute thread: positional reads on separate file objects run in parallel
++    std::array<FILE *, GGML_MAX_N_THREADS> fp {};
++    std::array<ec_direct, GGML_MAX_N_THREADS> dio {};
++    std::atomic<uint64_t> n_direct   {0}; // unbuffered reads straight into their destination
++    std::atomic<uint64_t> n_staged   {0}; // unbuffered reads through the staging buffer
++    std::atomic<uint64_t> n_buffered {0};
++
++    ~ec_file() {
++        for (FILE * f : fp) {
++            if (f) {
++                fclose(f);
++            }
++        }
++        for (ec_direct & d : dio) {
++#if defined(_WIN32)
++            if (d.h != INVALID_HANDLE_VALUE) {
++                CloseHandle(d.h);
++            }
++#else
++            if (d.fd >= 0) {
++                close(d.fd);
++            }
++#endif
++        }
++    }
++};
++
++struct ec_layer;
++
++// expert-major matmul of one expert tensor: the (k + n_used*token) pairs of the ubatch grouped by
++// expert, the experts in the order the threads take them (most pairs first) and the next one
++struct ec_em {
++    llama_expert_cache * cache = nullptr;
++    ec_layer * layer  = nullptr;
++    size_t     tensor = 0; // index into llama_expert_cache::tensors
++    size_t     pos    = 0; // index into the layer's tensors
++    std::vector<int32_t> count; // expert -> pairs
++    std::vector<int32_t> first; // expert -> its first pair in pairs
++    std::vector<int32_t> pairs;
++    std::vector<int32_t> list;
++    std::atomic<int32_t> next {0};
++    std::atomic<int64_t> us   {0}; // slowest thread of the last matmul, not yet in em_us of the cache
++    std::atomic<int>     done {0}; // threads out of the matmul
++};
++
++struct ec_tensor {
++    ggml_tensor * t;
++    size_t  file;
++    size_t  offs;  // file offset of expert 0
++    int32_t layer;
++    std::unique_ptr<ec_em> em {};
++};
++
++enum ec_pf_state : int { EC_PF_QUEUED, EC_PF_RUNNING, EC_PF_DONE, EC_PF_CANCELLED };
++
++// one read of a prefetch round: expert into slot, which held old_expert (last used at old_used). Its
++// parts (every tensor whole, or each tensor's halves) are queued separately for the I/O threads; the
++// one that reads the last part marks the job done. gen tells this round's queue entries from those
++// an earlier round left behind for the same job
++struct ec_pf {
++    int32_t  slot       = -1;
++    int32_t  expert     = -1;
++    int32_t  old_expert = -1;
++    uint64_t old_used   = 0;
++    int32_t  parts      = 1;
++    int64_t  t_queue    = 0; // when the round was queued (us)
++    std::atomic<int>      state {EC_PF_DONE};
++    std::atomic<int32_t>  left  {0};
++    std::atomic<uint32_t> gen   {0};
++    std::atomic<int64_t>  t_start {0}; // when its first part was taken
++};
++
++struct ec_layer;
++
++// a prefetch queue entry: part of job i of layer L's round gen
++struct ec_pf_part {
++    ec_layer * L    = nullptr;
++    int32_t    i    = -1;
++    int32_t    part = 0;
++    uint32_t   gen  = 0;
++};
++
++struct ec_layer {
++    llama_expert_cache * cache = nullptr;
++    int32_t id = -1;
++    std::vector<size_t>   tensors;   // indices into llama_expert_cache::tensors
++    std::vector<int32_t>  slot_of;   // expert -> slot, -1 if not resident
++    std::vector<int32_t>  expert_of; // slot -> expert, -1 if empty
++    std::vector<uint64_t> used;      // slot -> tick of the last plan (or prefetch) that used it
++    std::vector<std::pair<int32_t, int32_t>> pending; // (slot, expert) read by the load op of this ubatch
++    std::atomic<int> load_done {0}; // threads out of the load op (the last one clears pending)
++    uint64_t tick = 0;
++    std::vector<int32_t> order; // select and prefetch op scratch
++    std::atomic<int64_t> load_us {0}; // slowest thread of the last load op, not yet in read_us
++
++    std::unique_ptr<ec_pf[]> pf;  // the current prefetch round, n_pf of n_slots jobs
++    int32_t n_pf = 0;
++    std::vector<uint64_t> seen;   // expert -> tick of the last prefetch that ranked it
++    std::vector<int32_t>  ranked; // prefetch scratch: each token's predicted experts, best first
++    std::vector<int32_t>  missing;
++    std::vector<int32_t>  helped; // settle scratch: the queued parts of a read the plan waits for
++    std::vector<float>    prob;   // prefetch scratch with a swap ratio: a token's unnormalized softmax
++
++    // expert-major round (one ubatch, every expert tensor of the layer): the missing experts whose
++    // reads go to a slot instead of a staging buffer (expert -> slot, -1, and the list of them), each
++    // tensor's progress (1 prepared, 2 computed) and the hash of the ubatch's ids
++    std::vector<int32_t> em_slot;
++    std::vector<int32_t> em_kept;
++    std::vector<uint8_t> em_state;
++    uint64_t em_hash = 0;
++    bool     em_open = false;
++};
++
++} // namespace
++
++struct llama_expert_cache {
++    uint32_t n_slots       = 0;
++    uint32_t n_expert_used = 1;
++    float    swap_ratio    = 0.0f;
++
++    ggml_backend_buffer_type buft {};
++    ggml_backend_buffer_type_t inner = nullptr; // a GPU device's host buft holding the slots, nullptr = CPU
++
++    std::vector<std::unique_ptr<ec_file>> files;
++    std::vector<ec_tensor> tensors;
++    std::unordered_map<const ggml_tensor *, size_t> tensor_idx;
++    std::unordered_map<int32_t, std::unique_ptr<ec_layer>> layers;
++    int32_t first_layer = INT32_MAX;
++
++    std::atomic<uint64_t> hits    {0};
++    std::atomic<uint64_t> misses  {0};
++    std::atomic<uint64_t> swaps   {0};
++    std::atomic<uint64_t> bytes   {0};
++    std::atomic<uint64_t> read_us {0}; // wall time of the load ops (their slowest thread)
++    uint64_t n_rounds = 0; // plans of first_layer, i.e. ubatches
++
++    bool io_direct = true; // unbuffered reads (LLAMA_EXPERT_DIRECT)
++    bool io_split  = true; // a load op's reads split over all its threads (LLAMA_EXPERT_SPLIT)
++
++    // pre-gating prefetch: pf_k predicted experts per token, read by I/O threads ahead of the plan.
++    // pf_ahead: layer il+1 is predicted from layer il's post-attention residual and queued right
++    // after il's load op, in the CPU split il already has (LLAMA_EXPERT_PREFETCH_AHEAD)
++    // pf_prio: the I/O threads' priority on Windows (LLAMA_EXPERT_PREFETCH_PRIO: 0 normal, 1 highest,
++    // 2 time critical): they sleep in their reads, but the graph's threads spin between ops and a
++    // read that completes waits for a core at normal priority. pf_help: a plan waiting for a read
++    // in flight reads its parts no I/O thread has taken (LLAMA_EXPERT_PREFETCH_HELP)
++    uint32_t pf_k     = 0;
++    bool     pf_ahead = false;
++    int      pf_prio  = 1;
++    bool     pf_help  = true;
++    std::atomic<int>      pf_prio_threads {0}; // I/O threads running at pf_prio
++    std::atomic<uint64_t> pf_reads     {0}; // experts read ahead
++    std::atomic<uint64_t> pf_used      {0}; // of those, used by the ubatch they were read for
++    std::atomic<uint64_t> pf_cancelled {0}; // dropped before their read started
++    std::atomic<uint64_t> pf_wait_us   {0}; // plans waiting for reads in flight
++    std::atomic<uint64_t> pf_waits     {0}; // reads in flight a plan waited for
++    std::atomic<uint64_t> pf_helped    {0}; // parts of those the waiting plan read itself
++    std::atomic<uint64_t> pf_lag_us    {0}; // experts read ahead: queued until their first part was taken
++    std::atomic<uint64_t> pf_run_us    {0}; //                    first part taken until read
++    std::mutex pf_mtx;
++    std::condition_variable pf_cv;
++    std::deque<ec_pf_part> pf_queue;
++    bool pf_stop = false;
++    std::vector<std::thread> pf_threads;
++
++    void pf_enqueue(ec_layer & L);
++    void pf_shutdown();
++
++    // expert-major ubatches, larger than the slots take, up to em_max tokens (0 = off): each expert
++    // tensor's matmul reads every expert the ubatch routes to once (unless resident, the slots are
++    // left as they are) and computes it for all its tokens
++    uint32_t em_max     = 0;
++    bool     em_checked = false; // em_max validated against the expert types (CPU kernels)
++    std::atomic<uint64_t> em_rounds {0}; // expert-major ubatches (of first_layer)
++    std::atomic<uint64_t> em_reads  {0}; // expert tensors read
++    std::atomic<uint64_t> em_hits   {0}; // expert tensors computed from their slot
++    std::atomic<uint64_t> em_kept   {0}; // experts read into a slot (resident for what follows)
++    std::atomic<uint64_t> em_bytes  {0};
++    std::atomic<uint64_t> em_us     {0}; // wall time of the expert-major matmuls (reads and compute)
++    std::vector<std::vector<uint8_t>> em_stage; // per compute thread: an expert read from the file, or rows of a resident one
++
++    void log_stats(const char * when) const {
++        const uint64_t h = hits.load();
++        const uint64_t m = misses.load();
++        uint64_t us = read_us.load();
++        uint64_t em_wall = em_us.load();
++        for (const auto & it : layers) {
++            us += (uint64_t) it.second->load_us.load();
++        }
++        for (const auto & T : tensors) {
++            if (T.em) {
++                em_wall += (uint64_t) T.em->us.load();
++            }
++        }
++        char pf[320] = "";
++        if (pf_k > 0) {
++            const uint64_t n = pf_reads.load();
++            char prio[32] = "";
++            if (pf_prio_threads.load() > 0) {
++                snprintf(prio, sizeof(prio), ", prio %d", pf_prio);
++            }
++            snprintf(pf, sizeof(pf), "; prefetch %" PRIu64 " read (%" PRIu64 " used), %" PRIu64 " dropped, %.0f ms waited for %" PRIu64 " (%" PRIu64 " parts read by the plan), %.2f ms queued + %.2f ms reading each%s%s%s",
++                    n, pf_used.load(), pf_cancelled.load(), pf_wait_us.load()/1000.0, pf_waits.load(), pf_helped.load(),
++                    n ? pf_lag_us.load()/1000.0/n : 0.0, n ? pf_run_us.load()/1000.0/n : 0.0,
++                    pf_ahead ? ", ahead" : "", pf_help ? ", help" : "", prio);
++        }
++        char em[192] = "";
++        if (em_rounds.load() > 0) {
++            snprintf(em, sizeof(em), "; expert-major %" PRIu64 " ubatches, %" PRIu64 " read (%.1f MiB), %" PRIu64 " resident, %" PRIu64 " kept, %.0f ms",
++                    em_rounds.load(), em_reads.load(), em_bytes.load()/1024.0/1024.0, em_hits.load(), em_kept.load(), em_wall/1000.0);
++        }
++        uint64_t n_direct = 0;
++        uint64_t n_staged = 0;
++        uint64_t n_buffered = 0;
++        for (const auto & f : files) {
++            n_direct   += f->n_direct.load();
++            n_staged   += f->n_staged.load();
++            n_buffered += f->n_buffered.load();
++        }
++        char io[128] = "";
++        snprintf(io, sizeof(io), "; reads %" PRIu64 " direct, %" PRIu64 " staged, %" PRIu64 " buffered%s",
++                n_direct, n_staged, n_buffered, io_split ? ", split" : "");
++        LLAMA_LOG_INFO("expert cache (%s): %u slots x %zu layers, %" PRIu64 " ubatches, %" PRIu64 " hits, %" PRIu64 " misses (%.1f%% hit), %" PRIu64 " swaps, %.1f MiB read in %.0f ms%s%s%s\n",
++                when, n_slots, layers.size(), n_rounds, h, m, h + m ? 100.0*h/(h + m) : 0.0, swaps.load(), bytes.load()/1024.0/1024.0, us/1000.0, pf, em, io);
++    }
++
++    ~llama_expert_cache() {
++        pf_shutdown();
++        if (n_rounds > 0 || em_rounds.load() > 0) {
++            log_stats("final");
++        }
++    }
++};
++
++//
++// buffer type: a CPU buffer whose expert tensors were shrunk to n_slots experts
++//
++
++static const char * ec_buft_get_name(ggml_backend_buffer_type_t buft) {
++    GGML_UNUSED(buft);
++    return "EXPERT_CACHE";
++}
++
++static ggml_backend_buffer_type_t ec_cpu_buft() {
++    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++    GGML_ASSERT(dev != nullptr && "expert cache needs the CPU backend");
++    return ggml_backend_dev_buffer_type(dev);
++}
++
++static ggml_backend_buffer_type_t ec_inner_buft(ggml_backend_buffer_type_t buft) {
++    const llama_expert_cache * cache = (const llama_expert_cache *) buft->context;
++    return cache->inner ? cache->inner : ec_cpu_buft();
++}
++
++static ggml_backend_buffer_t ec_buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
++    llama_expert_cache * cache = (llama_expert_cache *) buft->context;
++    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(ec_inner_buft(buft), size);
++    if (buf == nullptr && cache->inner != nullptr) {
++        // back to the CPU before any graph is scheduled: the GPU device stops claiming the type
++        LLAMA_LOG_WARN("expert cache: %s could not hold %.1f MiB, slots in CPU memory instead\n",
++                ggml_backend_buft_name(cache->inner), size/1024.0/1024.0);
++        cache->inner       = nullptr;
++        cache->buft.device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++        buf = ggml_backend_buft_alloc_buffer(ec_cpu_buft(), size);
++    }
++    if (buf) {
++        buf->buft = buft; // a host buffer (CPU or a GPU's) whose tensors are sized by this type
++    }
++    return buf;
++}
++
++static size_t ec_buft_get_alignment(ggml_backend_buffer_type_t buft) {
++    return std::max(ggml_backend_buft_get_alignment(ec_inner_buft(buft)), ggml_backend_buft_get_alignment(ec_cpu_buft()));
++}
++
++static size_t ec_buft_get_max_size(ggml_backend_buffer_type_t buft) {
++    return ggml_backend_buft_get_max_size(ec_inner_buft(buft));
++}
++
++static bool ec_buft_is_host(ggml_backend_buffer_type_t buft) {
++    GGML_UNUSED(buft);
++    return true;
++}
++
++static llama_expert_cache * ec_of_buft(ggml_backend_buffer_type_t buft) {
++    if (buft == nullptr || buft->iface.get_name != ec_buft_get_name) {
++        return nullptr;
++    }
++    return (llama_expert_cache *) buft->context;
++}
++
++static llama_expert_cache * ec_of(const ggml_tensor * t) {
++    if (t == nullptr || t->buffer == nullptr) {
++        return nullptr;
++    }
++    return ec_of_buft(ggml_backend_buffer_get_type(t->buffer));
++}
++
++//
++// positional read, safe to run from every compute thread at once
++//
++
++static bool ec_direct_open(const std::string & path, ec_direct & d) {
++#if defined(_WIN32) && defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x0602
++    // CreateFile2: the opener an AppContainer (UWP) may call, on the desktop too
++    const int nw = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
++    if (nw <= 0) {
++        return false;
++    }
++    std::wstring wpath((size_t) nw, L'\0');
++    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, &wpath[0], nw);
++    CREATEFILE2_EXTENDED_PARAMETERS p = {};
++    p.dwSize           = sizeof(p);
++    p.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
++    p.dwFileFlags      = FILE_FLAG_NO_BUFFERING | FILE_FLAG_RANDOM_ACCESS;
++    d.h = CreateFile2(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING, &p);
++    return d.h != INVALID_HANDLE_VALUE;
++#elif !defined(_WIN32) && defined(O_DIRECT)
++    d.fd = open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
++    return d.fd >= 0;
++#else
++    GGML_UNUSED(path);
++    GGML_UNUSED(d);
++    return false;
++#endif
++}
++
++static void ec_direct_close(ec_direct & d) {
++#if defined(_WIN32)
++    if (d.h != INVALID_HANDLE_VALUE) {
++        CloseHandle(d.h);
++        d.h = INVALID_HANDLE_VALUE;
++    }
++#else
++    if (d.fd >= 0) {
++        close(d.fd);
++        d.fd = -1;
++    }
++#endif
++    d.state = -1;
++    d.stage = std::vector<char>();
++}
++
++// unbuffered read of the aligned span [lo, lo + len) into buf, stopping once it holds [lo, end): the
++// span may run past the end of the file, where the read stops short
++static bool ec_direct_span(ec_direct & d, char * buf, size_t lo, size_t len, size_t end) {
++    size_t done = 0;
++    while (lo + done < end) {
++        const size_t want = std::min<size_t>(len - done, (size_t) 1 << 30);
++#if defined(_WIN32)
++        const uint64_t pos = (uint64_t) lo + done;
++        OVERLAPPED ov = {};
++        ov.Offset     = (DWORD) (pos & 0xFFFFFFFFu);
++        ov.OffsetHigh = (DWORD) (pos >> 32);
++        DWORD got = 0;
++        if (!ReadFile(d.h, buf + done, (DWORD) want, &got, &ov) || got == 0) {
++            return false;
++        }
++#else
++        const ssize_t got = pread(d.fd, buf + done, want, (off_t) (lo + done));
++        if (got < 0 && errno == EINTR) {
++            continue;
++        }
++        if (got <= 0) {
++            return false;
++        }
++#endif
++        done += (size_t) got;
++    }
++    return true;
++}
++
++// unbuffered read of [offs, offs + n) into dst: the aligned span around it, in place when it is the
++// span itself, else into the staging buffer and copied out. A failed read in place (memory the
++// device cannot write to) moves the thread to the staging buffer; a failed staged read (a file
++// system without O_DIRECT, a larger sector) to buffered reads: false, read it buffered
++static bool ec_read_direct(ec_file & f, int ith, void * dst, size_t n, size_t offs) {
++    ec_direct & d = f.dio[ith];
++    if (d.state == 0) {
++        d.state = ec_direct_open(f.path, d) ? 1 : -1;
++    }
++    if (d.state < 0) {
++        return false;
++    }
++
++    const size_t A  = EC_DIRECT_ALIGN;
++    const size_t lo = offs/A*A;
++    const size_t hi = (offs + n + A - 1)/A*A;
++    if (d.in_place && lo == offs && hi == offs + n && (uintptr_t) dst % A == 0) {
++        if (ec_direct_span(d, (char *) dst, lo, hi - lo, offs + n)) {
++            f.n_direct++;
++            return true;
++        }
++        d.in_place = false;
++    }
++
++    if (d.stage.size() < hi - lo + A) {
++        d.stage.resize(hi - lo + A);
++    }
++    char * buf = d.stage.data() + (A - (uintptr_t) d.stage.data() % A) % A;
++    if (!ec_direct_span(d, buf, lo, hi - lo, offs + n)) {
++        ec_direct_close(d);
++        return false;
++    }
++    memcpy(dst, buf + (offs - lo), n);
++    f.n_staged++;
++    return true;
++}
++
++static void ec_read(ec_file & f, int ith, void * dst, size_t n, size_t offs) {
++    if (f.direct && ec_read_direct(f, ith, dst, n, offs)) {
++        return;
++    }
++    f.n_buffered++;
++
++    FILE *& fp = f.fp[ith];
++    if (fp == nullptr) {
++#if defined(_WIN32)
++        fp = ggml_fopen(f.path.c_str(), "rbR"); // R: the CRT's FILE_FLAG_RANDOM_ACCESS, no read-ahead
++#else
++        fp = ggml_fopen(f.path.c_str(), "rb");
++#endif
++        if (fp == nullptr) {
++            GGML_ABORT("expert cache: cannot open %s: %s", f.path.c_str(), strerror(errno));
++        }
++    }
++
++    size_t done = 0;
++#if defined(_WIN32)
++    HANDLE h = (HANDLE) _get_osfhandle(_fileno(fp));
++    while (done < n) {
++        const uint64_t pos = (uint64_t) offs + done;
++        OVERLAPPED ov = {};
++        ov.Offset     = (DWORD) (pos & 0xFFFFFFFFu);
++        ov.OffsetHigh = (DWORD) (pos >> 32);
++        const DWORD want = (DWORD) std::min<size_t>(n - done, (size_t) 1 << 30);
++        DWORD got = 0;
++        if (!ReadFile(h, (char *) dst + done, want, &got, &ov) || got == 0) {
++            GGML_ABORT("expert cache: read of %zu bytes at %" PRIu64 " failed (error %lu)", (size_t) want, pos, (unsigned long) GetLastError());
++        }
++        done += got;
++    }
++#else
++    const int fd = fileno(fp);
++    while (done < n) {
++        const ssize_t got = pread(fd, (char *) dst + done, n - done, (off_t) (offs + done));
++        if (got < 0 && errno == EINTR) {
++            continue;
++        }
++        if (got <= 0) {
++            GGML_ABORT("expert cache: read of %zu bytes at %zu failed: %s", n - done, offs + done, got == 0 ? "end of file" : strerror(errno));
++        }
++        done += (size_t) got;
++    }
++#endif
++}
++
++// a read split in n_parts: each part aligned and of at least EC_LOAD_MIN_PART, so that more reads
++// are in flight at once (LLAMA_EXPERT_SPLIT=0: whole reads). Part p covers [p*size, min((p+1)*size, nb2))
++static constexpr size_t EC_LOAD_MIN_PART = 128*1024;
++
++static size_t ec_part_size(size_t nb2, size_t n_parts) {
++    const size_t per = (nb2 + n_parts - 1)/n_parts;
++    return std::max(EC_LOAD_MIN_PART, (per + EC_DIRECT_ALIGN - 1)/EC_DIRECT_ALIGN*EC_DIRECT_ALIGN);
++}
++
++//
++// pre-gating prefetch: I/O threads read the experts a layer is predicted to route to while the
++// graph computes the layer's attention; the layer's plan settles the round before it maps ids
++//
++
++// the I/O threads take file handles from the top of ec_file::fp, the compute threads from the bottom.
++// With split reads a job is 2 parts per tensor, so the 3 tensors of an expert are read 6 at a time
++// instead of one after another by one thread
++static constexpr int    EC_PF_THREADS  = 4;
++static constexpr size_t EC_PF_SUBPARTS = 2;
++
++// read part p of a running job (the whole expert when it has one part) with thread ith's file handles
++static void ec_pf_read(llama_expert_cache & C, const ec_layer & L, ec_pf & j, int32_t p, int ith) {
++    size_t bytes = 0;
++    if (j.parts == 1) {
++        for (size_t ti : L.tensors) {
++            const ec_tensor & T = C.tensors[ti];
++            const size_t nb2 = T.t->nb[2];
++            ec_read(*C.files[T.file], ith, (char *) T.t->data + (size_t) j.slot*nb2, nb2, T.offs + (size_t) j.expert*nb2);
++            bytes += nb2;
++        }
++    } else {
++        const ec_tensor & T = C.tensors[L.tensors[(size_t) p / EC_PF_SUBPARTS]];
++        const size_t nb2  = T.t->nb[2];
++        const size_t part = ec_part_size(nb2, EC_PF_SUBPARTS);
++        const size_t b    = ((size_t) p % EC_PF_SUBPARTS)*part;
++        if (b < nb2) {
++            const size_t n = std::min(part, nb2 - b);
++            ec_read(*C.files[T.file], ith, (char *) T.t->data + (size_t) j.slot*nb2 + b, n, T.offs + (size_t) j.expert*nb2 + b);
++            bytes = n;
++        }
++    }
++    C.bytes += bytes;
++    // the slot's data happens before the last part's release: the plan sees done, then the data
++    if (j.left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
++        const int64_t t_start = j.t_start.load(std::memory_order_relaxed);
++        C.pf_reads  += 1;
++        C.pf_lag_us += (uint64_t) std::max<int64_t>(0, t_start - j.t_queue);
++        C.pf_run_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_start);
++        j.state.store(EC_PF_DONE, std::memory_order_release);
++    }
++}
++
++static void ec_pf_worker(llama_expert_cache * C, int ith) {
++#if defined(_WIN32)
++    if (C->pf_prio > 0 && SetThreadPriority(GetCurrentThread(), C->pf_prio > 1 ? THREAD_PRIORITY_TIME_CRITICAL : THREAD_PRIORITY_HIGHEST)) {
++        C->pf_prio_threads++;
++    }
++#endif
++    for (;;) {
++        ec_pf_part e;
++        {
++            std::unique_lock<std::mutex> lock(C->pf_mtx);
++            C->pf_cv.wait(lock, [C] { return C->pf_stop || !C->pf_queue.empty(); });
++            if (C->pf_stop) {
++                return;
++            }
++            e = C->pf_queue.front();
++            C->pf_queue.pop_front();
++        }
++        // an entry of an earlier round (its job dropped, the job then reused) has an older gen and
++        // reads nothing. This round has one entry per part, so while this part is unread the job can
++        // be neither done nor reused: past the second check, j holds the round the entry was made for.
++        // The first part taken moves the job from queued to running (its start, published to the
++        // reader of the last part by the parts' fetch_sub); a job the plan dropped first (cancelled)
++        // is skipped
++        ec_pf & j = e.L->pf[e.i];
++        if (j.gen.load(std::memory_order_acquire) != e.gen) {
++            continue;
++        }
++        int st = EC_PF_QUEUED;
++        if (j.state.compare_exchange_strong(st, EC_PF_RUNNING, std::memory_order_acq_rel)) {
++            j.t_start.store(ggml_time_us(), std::memory_order_relaxed);
++        } else if (st != EC_PF_RUNNING) {
++            continue;
++        }
++        if (j.gen.load(std::memory_order_acquire) != e.gen) {
++            continue;
++        }
++        ec_pf_read(*C, *e.L, j, e.part, ith);
++    }
++}
++
++void llama_expert_cache::pf_enqueue(ec_layer & L) {
++    {
++        std::lock_guard<std::mutex> lock(pf_mtx);
++        if (pf_threads.empty()) {
++            for (int k = 0; k < EC_PF_THREADS; ++k) {
++                pf_threads.emplace_back(ec_pf_worker, this, GGML_MAX_N_THREADS - 1 - k);
++            }
++        }
++        // job-major, most likely expert first: it lands soonest, and the jobs no thread reached by
++        // the plan stay whole and can still be dropped
++        const int64_t now = ggml_time_us();
++        for (int32_t i = 0; i < L.n_pf; ++i) {
++            ec_pf & j = L.pf[i];
++            j.t_queue = now;
++            for (int32_t p = 0; p < j.parts; ++p) {
++                pf_queue.push_back({&L, i, p, j.gen.load(std::memory_order_relaxed)});
++            }
++        }
++    }
++    pf_cv.notify_all();
++}
++
++// a plan waiting for job i of its layer's round: the parts no I/O thread has taken are read here,
++// by the compute thread the plan runs on (thread 0's file handles: the graph's other threads wait
++// at its barrier), instead of waiting for an I/O thread to get a core. Each part is read once: it
++// is either still queued, and taken out of the queue under its lock, or taken by an I/O thread
++static void ec_pf_help(llama_expert_cache & C, ec_layer & L, int32_t i) {
++    ec_pf & j = L.pf[i];
++    const uint32_t gen = j.gen.load(std::memory_order_acquire);
++    L.helped.clear();
++    {
++        std::lock_guard<std::mutex> lock(C.pf_mtx);
++        for (auto it = C.pf_queue.begin(); it != C.pf_queue.end();) {
++            if (it->L == &L && it->i == i && it->gen == gen) {
++                L.helped.push_back(it->part);
++                it = C.pf_queue.erase(it);
++            } else {
++                ++it;
++            }
++        }
++    }
++    for (const int32_t p : L.helped) {
++        ec_pf_read(C, L, j, p, 0);
++    }
++    C.pf_helped += L.helped.size();
++}
++
++// end a layer's prefetch round: reads not started are dropped and their slots get the old expert
++// back (its data was never overwritten), reads in flight are waited for (pf_help: their parts
++// still queued read by the waiting thread); finished jobs stay listed (n_pf) for the plan's count
++// of the ones it uses
++static void ec_settle(ec_layer & L) {
++    llama_expert_cache & C = *L.cache;
++    int64_t  t0      = 0;
++    uint64_t dropped = 0;
++    uint64_t waits   = 0;
++    for (int32_t i = 0; i < L.n_pf; ++i) {
++        ec_pf & j = L.pf[i];
++        int st = EC_PF_QUEUED;
++        if (j.state.compare_exchange_strong(st, EC_PF_CANCELLED, std::memory_order_acq_rel)) {
++            L.slot_of[j.expert]  = -1;
++            L.expert_of[j.slot]  = j.old_expert;
++            if (j.old_expert >= 0) {
++                L.slot_of[j.old_expert] = j.slot;
++            }
++            L.used[j.slot] = j.old_used;
++            dropped++;
++            continue;
++        }
++        if (st != EC_PF_RUNNING) {
++            continue;
++        }
++        if (t0 == 0) {
++            t0 = ggml_time_us();
++        }
++        waits++;
++        if (C.pf_help && j.parts > 1) {
++            ec_pf_help(C, L, i);
++            st = j.state.load(std::memory_order_acquire);
++        }
++        while (st == EC_PF_RUNNING) {
++            std::this_thread::yield();
++            st = j.state.load(std::memory_order_acquire);
++        }
++    }
++    if (t0 != 0) {
++        C.pf_wait_us += (uint64_t) (ggml_time_us() - t0);
++        C.pf_waits   += waits;
++    }
++    if (dropped > 0) {
++        C.pf_cancelled += dropped;
++    }
++}
++
++// empty a slot given to an expert whose data did not reach it in every tensor (unless taken since)
++static void ec_evict(ec_layer & L, int32_t slot, int32_t expert) {
++    if (L.expert_of[slot] == expert) {
++        L.slot_of[expert] = -1;
++        L.expert_of[slot] = -1;
++        L.used[slot]      = 0;
++    }
++}
++
++// the slots a plan gave to missing experts whose load op never ran (a graph stopped by its abort
++// callback, which ggml checks between ops); the last thread of a load op clears the list
++static void ec_drop_unloaded(ec_layer & L) {
++    for (const auto & job : L.pending) {
++        ec_evict(L, job.first, job.second);
++    }
++    L.pending.clear();
++}
++
++// close a layer's expert-major round: the experts it read into slots stay resident if every expert
++// tensor of the layer computed the round, else their slots are emptied
++static void ec_em_end(ec_layer & L) {
++    if (!L.em_open) {
++        return;
++    }
++    bool whole = true;
++    for (uint8_t st : L.em_state) {
++        whole = whole && st == 2;
++    }
++    for (int32_t e : L.em_kept) {
++        if (!whole) {
++            ec_evict(L, L.em_slot[e], e);
++        }
++        L.em_slot[e] = -1;
++    }
++    L.em_kept.clear();
++    std::fill(L.em_state.begin(), L.em_state.end(), 0);
++    L.em_open = false;
++}
++
++void llama_expert_cache::pf_shutdown() {
++    for (auto & it : layers) {
++        ec_settle(*it.second);
++        it.second->n_pf = 0;
++    }
++    {
++        std::lock_guard<std::mutex> lock(pf_mtx);
++        pf_stop = true;
++        pf_queue.clear();
++    }
++    pf_cv.notify_all();
++    for (auto & t : pf_threads) {
++        t.join();
++    }
++    pf_threads.clear();
++}
++
++//
++// graph ops
++//
++
++static int32_t ec_id_at(const ggml_tensor * ids, int64_t i0, int64_t i1) {
++    return *(const int32_t *) ((const char *) ids->data + i0*ids->nb[0] + i1*ids->nb[1]);
++}
++
++// all experts by score s, best first (ties: lower id first)
++static void ec_rank(std::vector<int32_t> & order, const float * s) {
++    for (size_t e = 0; e < order.size(); ++e) {
++        order[e] = (int32_t) e;
++    }
++    std::sort(order.begin(), order.end(), [s](int32_t a, int32_t b) {
++        return s[a] > s[b] || (s[a] == s[b] && a < b);
++    });
++}
++
++// cache-aware routing of one token, order ranked by score s: resident experts outside the top
++// n_used take the place of missing ones inside it - the strongest resident for the weakest
++// missing - while the resident's score is at least ratio times the missing one's (a test on the
++// ratio of two scores: unnormalized probabilities give the same swaps); returns the swaps made
++static uint64_t ec_swap_missing(const ec_layer & L, std::vector<int32_t> & order, const float * s, int64_t n_used, float ratio) {
++    const int64_t n_expert = (int64_t) order.size();
++    uint64_t swaps = 0;
++    int64_t i = n_used; // next resident candidate outside the top-k, strongest first
++    for (int64_t j = n_used - 1; j >= 0; --j) { // missing experts inside it, weakest first
++        const int32_t m = order[j];
++        if (L.slot_of[m] >= 0) {
++            continue;
++        }
++        while (i < n_expert && L.slot_of[order[i]] < 0) {
++            i++;
++        }
++        if (i == n_expert) {
++            break;
++        }
++        const int32_t r = order[i];
++        if (!(s[r] > 0.0f) || s[r] < ratio*s[m]) {
++            break; // weaker candidates and stronger missing experts only from here
++        }
++        std::swap(order[j], order[i]);
++        i++;
++        swaps++;
++    }
++    return swaps;
++}
++
++// 1 thread: pre-gating prefetch of the layer's next plan. src = router logits [n_expert, n_tokens]
++// of an earlier residual. Without a swap ratio the prediction is each token's top pf_k (by logit:
++// no softmax needed); with one it is the routing ec_select would pick against the current
++// residency, n_expert_used per token with its stand-ins, so the residents a missing expert would
++// be swapped for are kept and a missing expert that would be swapped out is not read. Rank by
++// rank: the predicted resident experts are pinned, the missing ones among the first pf_k ranks
++// take the least recently used slots outside the prediction and are queued for the I/O threads,
++// best first; dst = unused
++static void ec_prefetch(ggml_tensor * dst, int ith, int nth, void * userdata) {
++    GGML_UNUSED(nth);
++    if (ith != 0) {
++        return;
++    }
++
++    ec_layer & L = *(ec_layer *) userdata;
++    llama_expert_cache & C = *L.cache;
++    const ggml_tensor * logits = dst->src[0];
++
++    const int32_t n_expert = (int32_t) L.slot_of.size();
++    const int32_t n_slots  = (int32_t) L.expert_of.size();
++    const int64_t n_tokens = logits->ne[1];
++    const int32_t k        = std::min<int32_t>((int32_t) C.pf_k, n_expert);
++    const bool    swap     = C.swap_ratio > 0.0f;
++    const int32_t w        = swap ? std::min<int32_t>((int32_t) C.n_expert_used, n_expert) : k; // predicted per token
++
++    // a round no plan settled (a graph stopped by its abort callback)
++    ec_settle(L);
++    L.n_pf = 0;
++    ec_drop_unloaded(L);
++    ec_em_end(L);
++    if (k <= 0 || w <= 0 || n_tokens <= 0) {
++        return;
++    }
++
++    std::vector<int32_t> & order = L.order;
++    order.resize((size_t) n_expert);
++    L.ranked.resize((size_t) (n_tokens*w));
++    if (swap) {
++        L.prob.resize((size_t) n_expert);
++    }
++    for (int64_t t = 0; t < n_tokens; ++t) {
++        const float * s = (const float *) ((const char *) logits->data + t*logits->nb[1]);
++        if (swap) {
++            float mx = -INFINITY;
++            for (int32_t e = 0; e < n_expert; ++e) {
++                mx = s[e] > mx ? s[e] : mx;
++            }
++            for (int32_t e = 0; e < n_expert; ++e) {
++                const float p = std::exp(s[e] - mx);
++                L.prob[e] = p == p ? p : 0.0f; // NaN (a NaN or infinite logit) ranks last
++            }
++            ec_rank(order, L.prob.data());
++            ec_swap_missing(L, order, L.prob.data(), w, C.swap_ratio);
++        } else {
++            for (int32_t e = 0; e < n_expert; ++e) {
++                order[e] = e;
++            }
++            std::partial_sort(order.begin(), order.begin() + k, order.end(), [s](int32_t a, int32_t b) {
++                return s[a] > s[b] || (s[a] == s[b] && a < b);
++            });
++        }
++        std::copy(order.begin(), order.begin() + w, L.ranked.begin() + t*w);
++    }
++
++    const uint64_t tick = ++L.tick;
++    L.missing.clear();
++    for (int32_t r = 0; r < w; ++r) {
++        for (int64_t t = 0; t < n_tokens; ++t) {
++            const int32_t e = L.ranked[t*w + r];
++            if (L.seen[e] == tick) {
++                continue;
++            }
++            L.seen[e] = tick;
++            const int32_t s = L.slot_of[e];
++            if (s >= 0) {
++                L.used[s] = tick;
++            } else if (r < k) {
++                L.missing.push_back(e);
++            }
++        }
++    }
++
++    // an evicted expert is never one of the predicted: the resident ones were all pinned first
++    for (const int32_t e : L.missing) {
++        int32_t victim = -1;
++        for (int32_t s = 0; s < n_slots; ++s) {
++            if (L.used[s] != tick && (victim < 0 || L.used[s] < L.used[victim])) {
++                victim = s;
++            }
++        }
++        if (victim < 0) {
++            break;
++        }
++        ec_pf & j = L.pf[L.n_pf++];
++        j.slot       = victim;
++        j.expert     = e;
++        j.old_expert = L.expert_of[victim];
++        j.old_used   = L.used[victim];
++        if (j.old_expert >= 0) {
++            L.slot_of[j.old_expert] = -1;
++        }
++        L.expert_of[victim] = e;
++        L.slot_of[e]        = victim;
++        L.used[victim]      = tick;
++        j.parts = C.io_split ? (int32_t) (L.tensors.size()*EC_PF_SUBPARTS) : 1;
++        j.left.store(j.parts, std::memory_order_relaxed);
++        j.gen.store(j.gen.load(std::memory_order_relaxed) + 1, std::memory_order_release);
++        j.state.store(EC_PF_QUEUED, std::memory_order_release);
++    }
++    if (L.n_pf > 0) {
++        C.pf_enqueue(L);
++    }
++}
++
++// 1 thread: each token's top-k by router score with resident experts standing in for missing ones
++// (ec_swap_missing, swap_ratio); dst = expert ids
++static void ec_select(ggml_tensor * dst, int ith, int nth, void * userdata) {
++    GGML_UNUSED(nth);
++    if (ith != 0) {
++        return;
++    }
++
++    ec_layer & L = *(ec_layer *) userdata;
++    llama_expert_cache & C = *L.cache;
++    const ggml_tensor * scores = dst->src[0];
++
++    const int64_t n_expert = scores->ne[0];
++    const int64_t n_tokens = scores->ne[1];
++    const int64_t n_used   = dst->ne[0];
++
++    std::vector<int32_t> & order = L.order;
++    order.resize((size_t) n_expert);
++
++    uint64_t swaps = 0;
++    for (int64_t t = 0; t < n_tokens; ++t) {
++        const float * s = (const float *) ((const char *) scores->data + t*scores->nb[1]);
++        ec_rank(order, s);
++        swaps += ec_swap_missing(L, order, s, n_used, C.swap_ratio);
++
++        int32_t * out = (int32_t *) ((char *) dst->data + t*dst->nb[1]);
++        for (int64_t k = 0; k < n_used; ++k) {
++            out[k] = order[k];
++        }
++    }
++    if (swaps > 0) {
++        C.swaps += swaps;
++    }
++}
++
++// 1 thread: LRU slot assignment for the experts of this ubatch; dst = slot ids
++static void ec_plan(ggml_tensor * dst, int ith, int nth, void * userdata) {
++    GGML_UNUSED(nth);
++    if (ith != 0) {
++        return;
++    }
++
++    ec_layer & L = *(ec_layer *) userdata;
++    llama_expert_cache & C = *L.cache;
++    const ggml_tensor * ids = dst->src[0];
++
++    const int64_t n_used   = ids->ne[0];
++    const int64_t n_tokens = ids->ne[1];
++    const int32_t n_expert = (int32_t) L.slot_of.size();
++    const int32_t n_slots  = (int32_t) L.expert_of.size();
++
++    // the prefetch round of this layer, if any: no read into its slots after this point
++    ec_settle(L);
++    ec_drop_unloaded(L);
++    ec_em_end(L);
++
++    const uint64_t tick    = ++L.tick;
++
++    C.read_us += (uint64_t) L.load_us.exchange(0);
++
++    // resident experts: pin them for this ubatch
++    uint64_t hits = 0;
++    for (int64_t i1 = 0; i1 < n_tokens; ++i1) {
++        for (int64_t i0 = 0; i0 < n_used; ++i0) {
++            const int32_t e = ec_id_at(ids, i0, i1);
++            GGML_ASSERT(e >= 0 && e < n_expert);
++            const int32_t s = L.slot_of[e];
++            if (s >= 0 && L.used[s] != tick) {
++                L.used[s] = tick;
++                hits++;
++            }
++        }
++    }
++
++    uint64_t pf_used = 0;
++    for (int32_t i = 0; i < L.n_pf; ++i) {
++        const ec_pf & j = L.pf[i];
++        if (j.state.load(std::memory_order_relaxed) == EC_PF_DONE && L.used[j.slot] == tick) {
++            pf_used++;
++        }
++    }
++    L.n_pf = 0;
++    if (pf_used > 0) {
++        C.pf_used += pf_used;
++    }
++
++    // missing experts: take the least recently used slot that this ubatch does not need
++    for (int64_t i1 = 0; i1 < n_tokens; ++i1) {
++        for (int64_t i0 = 0; i0 < n_used; ++i0) {
++            const int32_t e = ec_id_at(ids, i0, i1);
++            if (L.slot_of[e] >= 0) {
++                continue;
++            }
++            int32_t victim = -1;
++            for (int32_t s = 0; s < n_slots; ++s) {
++                if (L.used[s] != tick && (victim < 0 || L.used[s] < L.used[victim])) {
++                    victim = s;
++                }
++            }
++            if (victim < 0) {
++                GGML_ABORT("expert cache: layer %d needs more than %d experts in one ubatch - lower n_ubatch", L.id, n_slots);
++            }
++            if (L.expert_of[victim] >= 0) {
++                L.slot_of[L.expert_of[victim]] = -1;
++            }
++            L.expert_of[victim] = e;
++            L.slot_of[e]        = victim;
++            L.used[victim]      = tick;
++            L.pending.emplace_back(victim, e);
++        }
++    }
++
++    int32_t * out = (int32_t *) dst->data;
++    for (int64_t i1 = 0; i1 < n_tokens; ++i1) {
++        for (int64_t i0 = 0; i0 < n_used; ++i0) {
++            out[i1*n_used + i0] = L.slot_of[ec_id_at(ids, i0, i1)];
++        }
++    }
++
++    C.hits   += hits;
++    C.misses += L.pending.size();
++    if (L.id == C.first_layer && ++C.n_rounds % 64 == 0) {
++        C.log_stats("running");
++    }
++}
++
++// a decode ubatch misses about one expert per layer, one read per expert tensor: fewer reads than
++// threads. Each read is then split in parts (ec_part_size), so that every thread has one in flight
++
++// all threads: read the pending experts of every tensor of the layer into their slots; dst = slot ids
++static void ec_load(ggml_tensor * dst, int ith, int nth, void * userdata) {
++    ec_layer & L = *(ec_layer *) userdata;
++    llama_expert_cache & C = *L.cache;
++
++    const size_t n_t     = L.tensors.size();
++    const size_t n_reads = L.pending.size()*n_t;
++    const size_t n_parts = C.io_split && n_reads > 0 && n_reads < (size_t) nth ? ((size_t) nth + n_reads - 1)/n_reads : 1;
++    const size_t n_jobs  = n_reads*n_parts;
++
++    const int64_t t0 = (size_t) ith < n_jobs ? ggml_time_us() : 0;
++    size_t bytes = 0;
++    for (size_t j = ith; j < n_jobs; j += nth) {
++        const size_t r = j / n_parts;
++        const auto & job = L.pending[r / n_t];
++        const ec_tensor & T = C.tensors[L.tensors[r % n_t]];
++        const size_t nb2  = T.t->nb[2];
++        const size_t part = ec_part_size(nb2, n_parts);
++        const size_t b    = (j % n_parts)*part;
++        if (b >= nb2) {
++            continue;
++        }
++        const size_t n = std::min(part, nb2 - b);
++        ec_read(*C.files[T.file], ith, (char *) T.t->data + (size_t) job.first*nb2 + b, n, T.offs + (size_t) job.second*nb2 + b);
++        bytes += n;
++    }
++    if (bytes > 0) {
++        C.bytes += bytes;
++        // the threads start together after the graph barrier: the op lasts as long as the slowest
++        const int64_t dt = ggml_time_us() - t0;
++        int64_t prev = L.load_us.load();
++        while (prev < dt && !L.load_us.compare_exchange_weak(prev, dt)) {
++        }
++    }
++    // the reads are done: nothing left for a plan to undo
++    if (L.load_done.fetch_add(1, std::memory_order_acq_rel) + 1 == nth) {
++        L.load_done.store(0, std::memory_order_relaxed);
++        L.pending.clear();
++    }
++
++    if (ith == 0) {
++        memcpy(dst->data, dst->src[0]->data, ggml_nbytes(dst));
++    }
++}
++
++//
++// expert-major ubatches: more tokens than the slots take, so each expert tensor's matmul goes expert
++// by expert instead of through the slots. Every expert the ubatch routes to is computed for all its
++// tokens from its slot if resident, else from one read of it: one read per expert, layer and tensor
++// however many tokens use it. The missing experts with the most tokens are read into the least
++// recently used slots (the resident ones pinned) and stay resident for the ubatches that follow, the
++// others only into the thread's staging buffer. The CPU computes from the stage, never from a slot
++// (ec_em_mm). The activations are quantized for the expert type's CPU
++// dot product, as ggml's mul_mat_id does, so the result is the same up to the summation order.
++// Prefetch is off for these ubatches
++//
++
++#ifndef GGML_BACKEND_DL
++
++// pairs per pass over an expert's rows: their activations stay in L1 while each row is reused
++static constexpr int64_t EC_EM_CHUNK = 16;
++
++// bytes of a resident expert's rows copied to the stage at a time: they stay in L2 while every pair
++// of the expert reads them
++static constexpr size_t EC_EM_BLOCK = 64*1024;
++
++// memcpy, the source read with streaming loads (MOVNTDQA: a line per four loads on write-combined
++// memory, an ordinary load on write-back memory) and, with nt, the destination written with
++// streaming stores, fenced. Both 16-byte aligned, else a plain memcpy
++#if defined(__x86_64__) || defined(_M_X64)
++#    if defined(__GNUC__) || defined(__clang__)
++__attribute__((target("sse4.1")))
++#    endif
++static void ec_copy_stream(void * dst, const void * src, size_t n, bool nt) {
++    char       * d = (char *) dst;
++    const char * s = (const char *) src;
++    if ((((uintptr_t) d | (uintptr_t) s) & 15) == 0) {
++        const size_t n64 = n & ~(size_t) 63;
++        for (size_t i = 0; i < n64; i += 64) {
++            const __m128i x0 = _mm_stream_load_si128((__m128i *) (s + i));
++            const __m128i x1 = _mm_stream_load_si128((__m128i *) (s + i + 16));
++            const __m128i x2 = _mm_stream_load_si128((__m128i *) (s + i + 32));
++            const __m128i x3 = _mm_stream_load_si128((__m128i *) (s + i + 48));
++            if (nt) {
++                _mm_stream_si128((__m128i *) (d + i), x0);
++                _mm_stream_si128((__m128i *) (d + i + 16), x1);
++                _mm_stream_si128((__m128i *) (d + i + 32), x2);
++                _mm_stream_si128((__m128i *) (d + i + 48), x3);
++            } else {
++                _mm_store_si128((__m128i *) (d + i), x0);
++                _mm_store_si128((__m128i *) (d + i + 16), x1);
++                _mm_store_si128((__m128i *) (d + i + 32), x2);
++                _mm_store_si128((__m128i *) (d + i + 48), x3);
++            }
++        }
++        if (nt) {
++            _mm_sfence();
++        }
++        d += n64;
++        s += n64;
++        n -= n64;
++    }
++    memcpy(d, s, n);
++}
++#else
++static void ec_copy_stream(void * dst, const void * src, size_t n, bool) {
++    memcpy(dst, src, n);
++}
++#endif
++
++// the CPU traits of an expert type whose rows of k values the expert-major matmul can compute
++static const ggml_type_traits_cpu * ec_em_traits(ggml_type type, int64_t k) {
++    const ggml_type_traits_cpu * w = ggml_get_type_traits_cpu(type);
++    if (w == nullptr || w->vec_dot == nullptr) {
++        return nullptr;
++    }
++    const ggml_type_traits_cpu * a = ggml_get_type_traits_cpu(w->vec_dot_type);
++    if (a == nullptr || a->from_float == nullptr || k % ggml_blck_size(w->vec_dot_type) != 0) {
++        return nullptr;
++    }
++    return w;
++}
++
++// all threads: the activations b [k, ne11, n_tokens] (F32) quantized for the dot product of the
++// expert type, one row per (ne11 row, token); thread 0 also groups the ubatch's pairs by expert and,
++// for the first expert tensor of the layer, gives slots to missing experts. src = {b, ids}, dst =
++// the quantized rows
++static void ec_em_prep(ggml_tensor * dst, int ith, int nth, void * userdata) {
++    ec_em & E = *(ec_em *) userdata;
++    llama_expert_cache & C = *E.cache;
++    ec_layer & L = *E.layer;
++    const ggml_tensor * w   = C.tensors[E.tensor].t;
++    const ggml_tensor * b   = dst->src[0];
++    const ggml_tensor * ids = dst->src[1];
++
++    const ggml_type         vdt      = ggml_get_type_traits_cpu(w->type)->vec_dot_type;
++    const ggml_from_float_t quantize = ggml_get_type_traits_cpu(vdt)->from_float;
++    const int64_t k      = b->ne[0];
++    const size_t  qrs    = ggml_row_size(vdt, k);
++    const int64_t n_rows = b->ne[1]*b->ne[2];
++    for (int64_t i = ith; i < n_rows; i += nth) {
++        const int64_t i1 = i % b->ne[1];
++        const int64_t i2 = i / b->ne[1];
++        quantize((const float *) ((const char *) b->data + i1*b->nb[1] + i2*b->nb[2]), (char *) dst->data + i*qrs, k);
++    }
++    if (ith != 0) {
++        return;
++    }
++
++    // the matmul reads the resident slots: no prefetch read may still be writing one
++    ec_settle(L);
++    L.n_pf = 0;
++    ec_drop_unloaded(L);
++    C.em_us += (uint64_t) E.us.exchange(0);
++
++    const int64_t n_used   = ids->ne[0];
++    const int64_t n_tokens = ids->ne[1];
++    const int32_t n_expert = (int32_t) L.slot_of.size();
++    E.count.assign((size_t) n_expert, 0);
++    E.first.resize((size_t) n_expert);
++    E.pairs.resize((size_t) (n_used*n_tokens));
++    uint64_t h = 1469598103934665603ull ^ (uint64_t) n_tokens; // FNV-1a of the ids
++    for (int64_t i1 = 0; i1 < n_tokens; ++i1) {
++        for (int64_t i0 = 0; i0 < n_used; ++i0) {
++            const int32_t e = ec_id_at(ids, i0, i1);
++            GGML_ASSERT(e >= 0 && e < n_expert);
++            E.count[e]++;
++            h = (h ^ (uint64_t) (uint32_t) e) * 1099511628211ull;
++        }
++    }
++    E.list.clear();
++    int32_t at = 0;
++    for (int32_t e = 0; e < n_expert; ++e) {
++        E.first[e] = at;
++        at += E.count[e];
++        if (E.count[e] > 0) {
++            E.list.push_back(e);
++        }
++    }
++    for (int64_t i1 = 0; i1 < n_tokens; ++i1) {
++        for (int64_t i0 = 0; i0 < n_used; ++i0) {
++            E.pairs[E.first[ec_id_at(ids, i0, i1)]++] = (int32_t) (i0 + n_used*i1);
++        }
++    }
++    for (int32_t e = 0; e < n_expert; ++e) {
++        E.first[e] -= E.count[e];
++    }
++    // the busiest experts first, so the threads finish together
++    std::sort(E.list.begin(), E.list.end(), [&E](int32_t x, int32_t y) {
++        return E.count[x] > E.count[y] || (E.count[x] == E.count[y] && x < y);
++    });
++    E.next.store(0, std::memory_order_release);
++
++    // the ubatch's round in the layer, opened by the first of its expert tensors in the graph (a
++    // tensor prepared twice or other ids: a new ubatch). The missing experts with the most tokens
++    // take the least recently used slots, the ubatch's resident ones pinned: every expert tensor of
++    // the layer reads them there, and they stay resident if all of them computed the round
++    if (!L.em_open || L.em_state[E.pos] != 0 || L.em_hash != h) {
++        ec_em_end(L);
++        L.em_open = true;
++        L.em_hash = h;
++        const uint64_t tick    = ++L.tick;
++        const int32_t  n_slots = (int32_t) L.expert_of.size();
++        for (int32_t e : E.list) {
++            if (L.slot_of[e] >= 0) {
++                L.used[L.slot_of[e]] = tick;
++            }
++        }
++        for (int32_t e : E.list) {
++            if (L.slot_of[e] >= 0) {
++                continue;
++            }
++            int32_t victim = -1;
++            for (int32_t s = 0; s < n_slots; ++s) {
++                if (L.used[s] != tick && (victim < 0 || L.used[s] < L.used[victim])) {
++                    victim = s;
++                }
++            }
++            if (victim < 0) {
++                break;
++            }
++            if (L.expert_of[victim] >= 0) {
++                L.slot_of[L.expert_of[victim]] = -1;
++            }
++            L.expert_of[victim] = e;
++            L.slot_of[e]        = victim;
++            L.used[victim]      = tick;
++            L.em_slot[e]        = victim;
++            L.em_kept.push_back(e);
++        }
++        C.em_kept += L.em_kept.size();
++        if (L.id == C.first_layer) {
++            C.em_rounds++;
++        }
++    }
++    L.em_state[E.pos] = 1;
++}
++
++// all threads: dst [rows, n_used, n_tokens] (F32) = ggml_mul_mat_id(w, b, ids); the threads take the
++// experts one at a time, reading a missing one into their staging buffer (and from there into the
++// slot of the round). src = {the prep op}
++static void ec_em_mm(ggml_tensor * dst, int ith, int nth, void * userdata) {
++    const int64_t t0 = ggml_time_us();
++
++    ec_em & E = *(ec_em *) userdata;
++    llama_expert_cache & C = *E.cache;
++    ec_layer & L = *E.layer;
++    const ec_tensor & T = C.tensors[E.tensor];
++    const ggml_tensor * w = T.t;
++    const ggml_tensor * q = dst->src[0];
++    const int64_t ne11 = q->src[0]->ne[1]; // b: shape only, its data may already be reused
++
++    const ggml_type_traits_cpu * tr = ggml_get_type_traits_cpu(w->type);
++    const int64_t k      = w->ne[0];
++    const int64_t n_rows = w->ne[1];
++    const int64_t n_used = dst->ne[1];
++    const size_t  qrs    = ggml_row_size(tr->vec_dot_type, k);
++    const size_t  nb2    = w->nb[2];
++    const int32_t n_list = (int32_t) E.list.size();
++
++    uint64_t reads = 0;
++    uint64_t hits  = 0;
++    const char * src[EC_EM_CHUNK];
++    float      * out[EC_EM_CHUNK];
++    std::vector<uint8_t> & stage = C.em_stage[ith];
++    auto stage_buf = [&stage](size_t n) {
++        if (stage.size() < n + 64) {
++            stage.resize(n + 64);
++        }
++        return (char *) GGML_PAD((uintptr_t) stage.data(), 64);
++    };
++    const size_t  nb1 = w->nb[1];
++    const int64_t blk = std::max<int64_t>(1, (int64_t) (EC_EM_BLOCK/nb1)); // rows per copy of a resident expert
++    for (int32_t i = E.next.fetch_add(1); i < n_list; i = E.next.fetch_add(1)) {
++        const int32_t e = E.list[i];
++        const int32_t v = L.em_slot[e];
++        const int32_t s = L.slot_of[e];
++        const int32_t * pairs = E.pairs.data() + E.first[e];
++        const int64_t   n_p   = E.count[e];
++        // rows [r0, r1) of the expert's outputs, wd holding those rows
++        auto mm_rows = [&](const char * wd, int64_t r0, int64_t r1) {
++            for (int64_t c0 = 0; c0 < n_p; c0 += EC_EM_CHUNK) {
++                const int64_t n_c = std::min(n_p - c0, EC_EM_CHUNK);
++                for (int64_t j = 0; j < n_c; ++j) {
++                    const int64_t p  = pairs[c0 + j];
++                    const int64_t kk = p % n_used;
++                    const int64_t t  = p / n_used;
++                    src[j] = (const char *) q->data + (size_t) (kk % ne11 + ne11*t)*qrs;
++                    out[j] = (float *) ((char *) dst->data + kk*dst->nb[1] + t*dst->nb[2]);
++                }
++                for (int64_t r = r0; r < r1; ++r) {
++                    const char * row = wd + (size_t) (r - r0)*nb1;
++                    for (int64_t j = 0; j < n_c; ++j) {
++                        tr->vec_dot((int) k, out[j] + r, 0, row, 0, src[j], 0, 1);
++                    }
++                }
++            }
++        };
++        // the CPU never computes from a slot: a write-combined slot (XLLAMA_D3D12_WC_MIB) is uncached,
++        // each load a bus read. A read goes to the stage, then to the round's slot with streaming
++        // stores; a resident expert comes to the stage a block of rows at a time with streaming loads
++        if (v < 0 && s >= 0) {
++            const char * slot = (const char *) w->data + (size_t) s*nb2;
++            char       * buf  = stage_buf(std::min<size_t>(nb2, (size_t) blk*nb1));
++            for (int64_t r0 = 0; r0 < n_rows; r0 += blk) {
++                const int64_t r1 = std::min(n_rows, r0 + blk);
++                ec_copy_stream(buf, slot + (size_t) r0*nb1, (size_t) (r1 - r0)*nb1, false);
++                mm_rows(buf, r0, r1);
++            }
++            hits++;
++        } else {
++            char * buf = stage_buf(nb2);
++            ec_read(*C.files[T.file], ith, buf, nb2, T.offs + (size_t) e*nb2);
++            if (v >= 0) {
++                ec_copy_stream((char *) w->data + (size_t) v*nb2, buf, nb2, true);
++            }
++            mm_rows(buf, 0, n_rows);
++            reads++;
++        }
++    }
++
++    if (reads > 0) {
++        C.em_reads += reads;
++        C.em_bytes += reads*nb2;
++    }
++    if (hits > 0) {
++        C.em_hits += hits;
++    }
++    // the threads start together after the graph barrier: the op lasts as long as the slowest
++    const int64_t dt = ggml_time_us() - t0;
++    int64_t prev = E.us.load();
++    while (prev < dt && !E.us.compare_exchange_weak(prev, dt)) {
++    }
++    // the tensor's reads into the round's slots are done
++    if (E.done.fetch_add(1, std::memory_order_acq_rel) + 1 == nth) {
++        E.done.store(0, std::memory_order_relaxed);
++        L.em_state[E.pos] = 2;
++    }
++}
++
++#endif // GGML_BACKEND_DL
++
++// once per cache, before the first graph: expert-major ubatches need the CPU kernels of every expert
++// type (linked in, so not with GGML_BACKEND_DL); otherwise they are turned off
++static void ec_em_check(llama_expert_cache & C) {
++    if (C.em_checked) {
++        return;
++    }
++    C.em_checked = true;
++    if (C.em_max == 0 || C.tensors.empty()) {
++        return;
++    }
++#ifdef GGML_BACKEND_DL
++    LLAMA_LOG_WARN("expert cache: expert-major ubatches need the CPU backend linked in (GGML_BACKEND_DL), off\n");
++    C.em_max = 0;
++#else
++    ggml_cpu_init();
++    for (const ec_tensor & T : C.tensors) {
++        if (ec_em_traits(T.t->type, T.t->ne[0]) == nullptr) {
++            LLAMA_LOG_WARN("expert cache: no CPU dot product for %s (%s), expert-major ubatches off\n",
++                    ggml_get_name(T.t), ggml_type_name(T.t->type));
++            C.em_max = 0;
++            return;
++        }
++    }
++    for (size_t i = 0; i < C.tensors.size(); ++i) {
++        ec_tensor & T = C.tensors[i];
++        ec_layer  & L = *C.layers.at(T.layer);
++        T.em.reset(new ec_em());
++        T.em->cache  = &C;
++        T.em->layer  = &L;
++        T.em->tensor = i;
++        T.em->pos    = (size_t) (std::find(L.tensors.begin(), L.tensors.end(), i) - L.tensors.begin());
++        GGML_ASSERT(T.em->pos < L.tensors.size());
++        L.em_slot.assign(L.slot_of.size(), -1);
++        L.em_state.assign(L.tensors.size(), 0);
++    }
++    C.em_stage.resize(GGML_MAX_N_THREADS);
++#endif
++}
++
++//
++// API
++//
++
++std::shared_ptr<llama_expert_cache> llama_expert_cache_init(uint32_t n_slots, uint32_t n_expert_used, float swap_ratio) {
++    auto cache = std::make_shared<llama_expert_cache>();
++
++    cache->n_expert_used = std::max<uint32_t>(1, n_expert_used);
++    cache->n_slots       = std::max(n_slots, cache->n_expert_used);
++    cache->swap_ratio    = swap_ratio > 0.0f ? swap_ratio : 0.0f; // NaN and negatives: exact routing
++
++    // LLAMA_EXPERT_PREFETCH: predicted experts per token read ahead (0 = off, the default: its wrong
++    // guesses add reads, which costs more than it hides when the reads are the bottleneck)
++    const char * pf = getenv("LLAMA_EXPERT_PREFETCH");
++    cache->pf_k = pf != nullptr && *pf != '\0' ? (uint32_t) std::min(std::max(atoi(pf), 0), 64) : 0;
++    // LLAMA_EXPERT_PREFETCH_AHEAD=1: predict a layer one layer earlier (a longer window for the reads,
++    // no CPU split of its own, a less exact prediction)
++    const char * ahead = getenv("LLAMA_EXPERT_PREFETCH_AHEAD");
++    cache->pf_ahead = ahead != nullptr && *ahead != '\0' && atoi(ahead) != 0;
++    // LLAMA_EXPERT_PREFETCH_PRIO: the I/O threads' priority on Windows (0 normal, 1 highest - the
++    // default, 2 time critical); LLAMA_EXPERT_PREFETCH_HELP=0: a plan only waits for reads in flight
++    const char * prio = getenv("LLAMA_EXPERT_PREFETCH_PRIO");
++    cache->pf_prio = prio != nullptr && *prio != '\0' ? std::min(std::max(atoi(prio), 0), 2) : 1;
++    const char * help = getenv("LLAMA_EXPERT_PREFETCH_HELP");
++    cache->pf_help = help == nullptr || *help == '\0' || atoi(help) != 0;
++
++    // LLAMA_EXPERT_MAJOR: largest expert-major ubatch (0 = off, the default)
++    const char * em = getenv("LLAMA_EXPERT_MAJOR");
++    cache->em_max = em != nullptr && *em != '\0' ? (uint32_t) std::min(std::max(atoi(em), 0), 65536) : 0;
++
++    // LLAMA_EXPERT_DIRECT=0: buffered reads only; LLAMA_EXPERT_SPLIT=0: a load op reads whole tensors
++    const char * dio = getenv("LLAMA_EXPERT_DIRECT");
++    cache->io_direct = dio == nullptr || *dio == '\0' || atoi(dio) != 0;
++    const char * split = getenv("LLAMA_EXPERT_SPLIT");
++    cache->io_split = split == nullptr || *split == '\0' || atoi(split) != 0;
++
++    cache->buft = {
++        /* .iface = */ {
++            /* .get_name         = */ ec_buft_get_name,
++            /* .alloc_buffer     = */ ec_buft_alloc_buffer,
++            /* .alloc_buffer_n   = */ nullptr,
++            /* .get_alignment    = */ ec_buft_get_alignment,
++            /* .get_max_size     = */ ec_buft_get_max_size,
++            /* .get_alloc_size   = */ nullptr, // the tensors are shrunk, ggml_nbytes is their size
++            /* .get_alloc_size_n = */ nullptr,
++            /* .is_host          = */ ec_buft_is_host,
++        },
++        /* .device  = */ ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU),
++        /* .context = */ cache.get(),
++    };
++
++    return cache;
++}
++
++ggml_backend_buffer_type_t llama_expert_cache_buft(llama_expert_cache & cache) {
++    return &cache.buft;
++}
++
++bool llama_expert_cache_use_host_of(llama_expert_cache & cache, ggml_backend_dev_t dev) {
++    ggml_backend_buffer_type_t host = dev != nullptr ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
++    if (host == nullptr || !ggml_backend_buft_is_host(host)) {
++        return false;
++    }
++    // the device decides: it claims the type only if its kernels can read the slots in place
++    cache.inner       = host;
++    cache.buft.device = dev;
++    if (ggml_backend_dev_supports_buft(dev, &cache.buft)) {
++        return true;
++    }
++    cache.inner       = nullptr;
++    cache.buft.device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++    return false;
++}
++
++uint32_t llama_expert_cache_n_slots(const llama_expert_cache & cache) {
++    return cache.n_slots;
++}
++
++float llama_expert_cache_swap_ratio(const llama_expert_cache & cache) {
++    return cache.swap_ratio;
++}
++
++uint32_t llama_expert_cache_prefetch(const llama_expert_cache & cache) {
++    return cache.pf_k;
++}
++
++void llama_expert_cache_stop(llama_expert_cache & cache) {
++    cache.pf_shutdown();
++}
++
++uint32_t llama_expert_cache_max_ubatch(const llama_expert_cache & cache) {
++    return std::max<uint32_t>(1, cache.n_slots / cache.n_expert_used);
++}
++
++uint32_t llama_expert_cache_expert_major(llama_expert_cache & cache) {
++    ec_em_check(cache);
++    return cache.em_max;
++}
++
++bool llama_expert_cache_wants(ggml_backend_buffer_type_t buft, const ggml_tensor * t) {
++    const llama_expert_cache * cache = ec_of_buft(buft);
++    return cache != nullptr && t->ne[3] == 1 && t->ne[2] > (int64_t) cache->n_slots &&
++           t->nb[2] == t->nb[1]*(size_t) t->ne[1];
++}
++
++void llama_expert_cache_shrink(ggml_backend_buffer_type_t buft, ggml_tensor * t) {
++    if (!llama_expert_cache_wants(buft, t)) {
++        return;
++    }
++    t->ne[2] = ec_of_buft(buft)->n_slots;
++    t->nb[3] = t->nb[2]*(size_t) t->ne[2];
++}
++
++bool llama_expert_cache_has(const ggml_tensor * t) {
++    return ec_of(t) != nullptr;
++}
++
++void llama_expert_cache_bind(ggml_tensor * t, const std::string & path, size_t offs, int64_t n_expert) {
++    llama_expert_cache * cache = ec_of(t);
++    GGML_ASSERT(cache != nullptr);
++
++    if (path.empty()) {
++        throw std::runtime_error("expert cache: the model must be loaded from a file path");
++    }
++
++    int32_t il = -1;
++    if (sscanf(ggml_get_name(t), "blk.%d.", &il) != 1 || il < 0) {
++        throw std::runtime_error(std::string("expert cache: no layer in tensor name ") + ggml_get_name(t));
++    }
++    if (t->ne[3] != 1 || t->ne[2] != (int64_t) cache->n_slots || n_expert <= t->ne[2] ||
++            t->nb[2] != t->nb[1]*(size_t) t->ne[1]) {
++        throw std::runtime_error(std::string("expert cache: unsupported layout for ") + ggml_get_name(t));
++    }
++
++    size_t file = 0;
++    while (file < cache->files.size() && cache->files[file]->path != path) {
++        file++;
++    }
++    if (file == cache->files.size()) {
++        cache->files.emplace_back(new ec_file());
++        cache->files.back()->path   = path;
++        cache->files.back()->direct = cache->io_direct;
++    }
++
++    auto & slot = cache->layers[il];
++    if (!slot) {
++        slot.reset(new ec_layer());
++        slot->cache = cache;
++        slot->id    = il;
++        slot->slot_of.assign(n_expert, -1);
++        slot->expert_of.assign(cache->n_slots, -1);
++        slot->used.assign(cache->n_slots, 0);
++        slot->pf.reset(new ec_pf[cache->n_slots]);
++        slot->seen.assign(n_expert, 0);
++        cache->first_layer = std::min(cache->first_layer, il);
++    }
++    if ((int64_t) slot->slot_of.size() != n_expert) {
++        throw std::runtime_error(std::string("expert cache: expert count differs within the layer of ") + ggml_get_name(t));
++    }
++
++    cache->tensor_idx[t] = cache->tensors.size();
++    slot->tensors.push_back(cache->tensors.size());
++    cache->tensors.push_back({ t, file, offs, il });
++}
++
++// the cache layer of a bound expert tensor, nullptr otherwise
++static ec_layer * ec_layer_of(const ggml_tensor * w) {
++    llama_expert_cache * cache = ec_of(w);
++    if (cache == nullptr) {
++        return nullptr;
++    }
++    const auto it = cache->tensor_idx.find(w);
++    if (it == cache->tensor_idx.end()) {
++        // not bound: weights never loaded (memory-fit pass), nothing will be computed
++        return nullptr;
++    }
++    return cache->layers.at(cache->tensors[it->second].layer).get();
++}
++
++bool llama_expert_cache_is_expert_major(const ggml_tensor * w, int64_t n_tokens) {
++    ec_layer * layer = ec_layer_of(w);
++    if (layer == nullptr) {
++        return false;
++    }
++    llama_expert_cache & C = *layer->cache;
++    ec_em_check(C);
++    return C.em_max > 0 && n_tokens > (int64_t) llama_expert_cache_max_ubatch(C);
++}
++
++ggml_tensor * llama_expert_cache_build_mm_id(ggml_context * ctx, ggml_tensor * w, ggml_tensor * b, ggml_tensor * ids) {
++    ec_layer * layer = ec_layer_of(w);
++    GGML_ASSERT(layer != nullptr && llama_expert_cache_is_expert_major(w, ids->ne[1]));
++#ifdef GGML_BACKEND_DL
++    GGML_UNUSED(ctx);
++    GGML_UNUSED(b);
++    GGML_ABORT("expert cache: expert-major ubatches without the CPU backend linked in");
++#else
++    llama_expert_cache & C = *layer->cache;
++    ec_tensor & T = C.tensors[C.tensor_idx.at(w)];
++    // mul_mat_id's shapes: b's rows broadcast over the experts of a token, or one per expert
++    if (b->type != GGML_TYPE_F32 || b->nb[0] != sizeof(float) || b->ne[0] != w->ne[0] || b->ne[3] != 1 ||
++            ids->type != GGML_TYPE_I32 || ids->ne[1] != b->ne[2] || (b->ne[1] != 1 && b->ne[1] != ids->ne[0])) {
++        throw std::runtime_error(std::string("expert cache: unsupported expert-major matmul on ") + ggml_get_name(w));
++    }
++
++    const ggml_type vdt = ggml_get_type_traits_cpu(w->type)->vec_dot_type;
++    ggml_tensor * args[2] = { b, ids };
++    const int64_t n_q = (int64_t) ggml_row_size(vdt, b->ne[0])*b->ne[1]*b->ne[2];
++    ggml_tensor * q = ggml_custom_4d(ctx, GGML_TYPE_I8, n_q, 1, 1, 1, args, 2, ec_em_prep, GGML_N_TASKS_MAX, T.em.get());
++    ggml_format_name(q, "%s-em_act", ggml_get_name(w));
++
++    ggml_tensor * res = ggml_custom_4d(ctx, GGML_TYPE_F32, w->ne[1], ids->ne[0], ids->ne[1], 1, &q, 1, ec_em_mm, GGML_N_TASKS_MAX, T.em.get());
++    ggml_format_name(res, "%s-em", ggml_get_name(w));
++    return res;
++#endif
++}
++
++ggml_tensor * llama_expert_cache_build_select(ggml_context * ctx, ggml_tensor * w, ggml_tensor * scores, int64_t n_used) {
++    ec_layer * layer = ec_layer_of(w);
++    if (layer == nullptr || !(layer->cache->swap_ratio > 0.0f) || llama_expert_cache_is_expert_major(w, scores->ne[1])) {
++        return nullptr;
++    }
++    // one row of scores per token, one score per expert of the tensor
++    if (scores->type != GGML_TYPE_F32 || scores->nb[0] != sizeof(float) || scores->ne[2] != 1 || scores->ne[3] != 1 ||
++            scores->ne[0] != (int64_t) layer->slot_of.size() || n_used < 1 || n_used > scores->ne[0]) {
++        return nullptr;
++    }
++
++    ggml_tensor * sel = ggml_custom_4d(ctx, GGML_TYPE_I32, n_used, scores->ne[1], 1, 1, &scores, 1, ec_select, 1, layer);
++    ggml_format_name(sel, "ffn_moe_select-%d", layer->id);
++    return sel;
++}
++
++int llama_expert_cache_prefetch_mode(const ggml_tensor * w) {
++    const ec_layer * layer = ec_layer_of(w);
++    if (layer == nullptr || layer->cache->pf_k == 0) {
++        return 0;
++    }
++    return layer->cache->pf_ahead ? 2 : 1;
++}
++
++ggml_tensor * llama_expert_cache_build_prefetch(ggml_context * ctx, ggml_tensor * w, ggml_tensor * logits, ggml_tensor * after) {
++    ec_layer * layer = ec_layer_of(w);
++    if (layer == nullptr || layer->cache->pf_k == 0) {
++        return nullptr;
++    }
++    if (logits->type != GGML_TYPE_F32 || logits->nb[0] != sizeof(float) || logits->ne[2] != 1 || logits->ne[3] != 1 ||
++            logits->ne[0] != (int64_t) layer->slot_of.size()) {
++        return nullptr;
++    }
++
++    // after is only a source for the node order: ec_prefetch reads src[0]
++    ggml_tensor * srcs[2] = { logits, after };
++    ggml_tensor * pf = ggml_custom_4d(ctx, GGML_TYPE_I32, 1, 1, 1, 1, srcs, after != nullptr ? 2 : 1, ec_prefetch, 1, layer);
++    ggml_format_name(pf, "ffn_moe_prefetch-%d", layer->id);
++    return pf;
++}
++
++ggml_tensor * llama_expert_cache_build_ids(ggml_context * ctx, ggml_tensor * w, ggml_tensor * selected_experts) {
++    ec_layer * layer = ec_layer_of(w);
++    if (layer == nullptr || llama_expert_cache_is_expert_major(w, selected_experts->ne[1])) {
++        return nullptr;
++    }
++
++    GGML_ASSERT(selected_experts->type == GGML_TYPE_I32);
++
++    const int64_t n_used   = selected_experts->ne[0];
++    const int64_t n_tokens = selected_experts->ne[1];
++
++    ggml_tensor * plan = ggml_custom_4d(ctx, GGML_TYPE_I32, n_used, n_tokens, 1, 1, &selected_experts, 1, ec_plan, 1, layer);
++    ggml_format_name(plan, "ffn_moe_slot_plan-%d", layer->id);
++
++    ggml_tensor * slots = ggml_custom_4d(ctx, GGML_TYPE_I32, n_used, n_tokens, 1, 1, &plan, 1, ec_load, GGML_N_TASKS_MAX, layer);
++    ggml_format_name(slots, "ffn_moe_slots-%d", layer->id);
++
++    return slots;
++}
+diff --git a/src/llama-expert-cache.h b/src/llama-expert-cache.h
+new file mode 100644
+index 0000000..5f061f5
+--- /dev/null
++++ b/src/llama-expert-cache.h
+@@ -0,0 +1,108 @@
++#pragma once
++
++#include "ggml.h"
++#include "ggml-backend.h"
++
++#include <cstdint>
++#include <memory>
++#include <string>
++
++// Routed-expert cache for MoE models larger than memory (llama_model_params.n_expert_slots > 0).
++//
++// Every routed `*_exps.weight` tensor is created with n_slots experts instead of the n_expert of the
++// GGUF, so its buffer holds only the resident ones. The loader does not read these tensors; it
++// records where they live in the file. In build_moe_ffn two custom ops run before the expert matmuls
++// of each layer:
++//   plan (1 thread): map the router's expert ids to slots (LRU per layer) and list the misses
++//   load (all threads): read the missed experts with positional reads into their slots
++// The mul_mat_id ops take the slot ids; router weights, biases and scales keep the real ids.
++// With a swap ratio, a third op replaces the top-k: resident experts just outside a token's top-k
++// stand in for missing ones inside it (cache-aware routing, approximate).
++// Pre-gating prefetch (LLAMA_EXPERT_PREFETCH = k, 0 = off, the default): the layer's router applied
++// to its input residual predicts its routing before the attention; a fourth op queues the predicted
++// experts that are missing for background I/O threads, and the plan drops the reads not started and
++// waits for the running ones. Without a swap ratio routing is unchanged: the output stays exact.
++// With one, the prediction is the swapped routing: the residents that would stand in are kept and
++// only the experts still missing after the swaps are read. With LLAMA_EXPERT_PREFETCH_AHEAD=1 the
++// router of layer il+1 is applied to layer il's post-attention residual instead, and the fourth op
++// of il+1 runs right after the load op of il: its reads overlap il's expert matmuls and il+1's
++// attention, and it needs no CPU/GPU switch of its own.
++// Expert-major ubatches (LLAMA_EXPERT_MAJOR = largest one, 0 = off, the default): a ubatch with more
++// tokens than the slots take does not map them all to slots. Each expert tensor's matmul is two
++// custom ops (activations quantized for the CPU dot product of the expert type, then the experts one
++// at a time over the threads), computing every expert the ubatch routes to for all its tokens from
++// its slot if resident, else from one read of it: one read per expert, layer and tensor. The missing
++// experts with the most tokens are read into the least recently used slots and stay resident. For
++// prompts; those ubatches do not prefetch. Needs the CPU backend linked in.
++// The slots live in CPU memory and the expert matmuls run on the CPU (other layers may be
++// offloaded), unless a GPU device of the model claims the cache's buffer type with the slots in its
++// host buft (unified memory: the custom ops and the reads write them, its kernels read them in
++// place). One context per model at a time, n_ubatch <= max(n_slots / n_expert_used, expert-major).
++
++struct llama_expert_cache;
++
++std::shared_ptr<llama_expert_cache> llama_expert_cache_init(uint32_t n_slots, uint32_t n_expert_used, float swap_ratio);
++
++ggml_backend_buffer_type_t llama_expert_cache_buft(llama_expert_cache & cache);
++
++// before the model's tensors are created: put the slots in dev's host buft (is_host) if dev claims
++// the cache's buffer type - its supports_buft sees the type with device == dev and name
++// "EXPERT_CACHE" (buffers keep the host buft's iface and context; only buffer->buft is the cache's).
++// false (CPU slots) otherwise; an allocation the host buft refuses also falls back to the CPU
++bool llama_expert_cache_use_host_of(llama_expert_cache & cache, ggml_backend_dev_t dev);
++
++uint32_t llama_expert_cache_n_slots(const llama_expert_cache & cache);
++
++// 0 when routing is exact
++float llama_expert_cache_swap_ratio(const llama_expert_cache & cache);
++
++// predicted experts per token read ahead, 0 when prefetch is off
++uint32_t llama_expert_cache_prefetch(const llama_expert_cache & cache);
++
++// end every read in flight and stop the I/O threads, before the expert buffers are freed
++void llama_expert_cache_stop(llama_expert_cache & cache);
++
++// largest ubatch whose experts always fit in the slots
++uint32_t llama_expert_cache_max_ubatch(const llama_expert_cache & cache);
++
++// largest expert-major ubatch, 0 when off (also when an expert type has no CPU dot product)
++uint32_t llama_expert_cache_expert_major(llama_expert_cache & cache);
++
++// graph: true if w is cached and a ubatch of n_tokens runs expert-major (more than max_ubatch)
++bool llama_expert_cache_is_expert_major(const ggml_tensor * w, int64_t n_tokens);
++
++// graph: ggml_mul_mat_id(w, b, ids) with the expert ids, for an expert-major ubatch (b F32,
++// [w->ne[0], 1 or n_used, n_tokens]); throws if the shapes are not mul_mat_id's
++ggml_tensor * llama_expert_cache_build_mm_id(ggml_context * ctx, ggml_tensor * w, ggml_tensor * b, ggml_tensor * ids);
++
++// loader: buft is an expert-cache type and t (as in the GGUF) a stack of more experts than it keeps
++bool llama_expert_cache_wants(ggml_backend_buffer_type_t buft, const ggml_tensor * t);
++
++// loader: resize a tensor just created for buft to the n_slots experts its buffer will hold
++void llama_expert_cache_shrink(ggml_backend_buffer_type_t buft, ggml_tensor * t);
++
++// true if t lives in an expert-cache buffer
++bool llama_expert_cache_has(const ggml_tensor * t);
++
++// loader: t is read on demand from `path` (expert e at offs + e*nb[2], n_expert of them in the file)
++// instead of at load time
++void llama_expert_cache_bind(ggml_tensor * t, const std::string & path, size_t offs, int64_t n_expert);
++
++// graph: the n_used experts of each token from router scores [n_expert, n_tokens] (F32, positive
++// for probabilities), cache-aware; nullptr if w is not cached or the swap ratio is 0, in which case
++// the caller keeps its own top-k
++ggml_tensor * llama_expert_cache_build_select(ggml_context * ctx, ggml_tensor * w, ggml_tensor * scores, int64_t n_used);
++
++// graph: how the layer of w is prefetched: 0 = not (not cached or prefetch off), 1 = from its own
++// input residual during its attention, 2 = ahead, from the previous layer's post-attention residual
++int llama_expert_cache_prefetch_mode(const ggml_tensor * w);
++
++// graph: the prefetch op of w's layer from predicted router logits [n_expert, n_tokens] (F32), or
++// nullptr; nothing consumes it, the caller expands it where the reads should start. after (may be
++// nullptr) becomes a source it ignores, which orders it after that op (ahead: the previous layer's
++// load op, so the op joins that CPU split once the load is done)
++ggml_tensor * llama_expert_cache_build_prefetch(ggml_context * ctx, ggml_tensor * w, ggml_tensor * logits, ggml_tensor * after = nullptr);
++
++// graph: slot ids replacing `selected_experts` for the mul_mat_id ops on the experts of w's layer,
++// or nullptr if w is not cached or the ubatch runs expert-major
++ggml_tensor * llama_expert_cache_build_ids(ggml_context * ctx, ggml_tensor * w, ggml_tensor * selected_experts);
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 1112ad8..0aeb53b 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1,6 +1,7 @@
+ #include "llama-graph.h"
+ 
+ #include "llama-impl.h"
++#include "llama-expert-cache.h"
+ #include "llama-model.h"
+ #include "llama-batch.h"
+ #include "llama-cparams.h"
+@@ -1589,15 +1590,22 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
+           ggml_tensor * w,   // ggml_tensor * as
+           ggml_tensor * cur, // ggml_tensor * b
+           ggml_tensor * ids,
+-          ggml_tensor * w_s) const {
+-    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
++          ggml_tensor * w_s,
++          ggml_tensor * w_ids) const {
++    ggml_tensor * res = nullptr;
++    if (w_ids == nullptr && llama_expert_cache_is_expert_major(w, ids->ne[1])) {
++        // expert cache, a ubatch larger than the slots take: expert by expert on the CPU
++        res = llama_expert_cache_build_mm_id(ctx0, w, cur, ids);
++    } else {
++        res = ggml_mul_mat_id(ctx0, w, cur, w_ids ? w_ids : ids);
+ 
+-    if (prec_policy) {
+-        prec_policy->apply(res);
+-    }
++        if (prec_policy) {
++            prec_policy->apply(res);
++        }
+ 
+-    if (w->type == GGML_TYPE_NVFP4) {
+-        ggml_prec_set_acc(res, GGML_PREC_BF16);
++        if (w->type == GGML_TYPE_NVFP4) {
++            ggml_prec_set_acc(res, GGML_PREC_BF16);
++        }
+     }
+ 
+     if (w_s) {
+@@ -1997,6 +2005,40 @@ ggml_tensor * llm_graph_context::build_ffn(
+     return cur;
+ }
+ 
++ggml_tensor * llm_graph_context::build_moe_pregate(
++         ggml_tensor * resid,
++         ggml_tensor * norm_w,
++         ggml_tensor * gate_inp,
++         ggml_tensor * down_exps,
++                 int   il,
++                bool   ahead) const {
++    // layer 0 reads the embeddings: no measured prediction there; expert-major ubatches use no slots
++    if (il <= 0 || gate_inp == nullptr || down_exps == nullptr ||
++            llama_expert_cache_prefetch_mode(down_exps) != (ahead ? 2 : 1) ||
++            llama_expert_cache_is_expert_major(down_exps, resid->ne[1])) {
++        return nullptr;
++    }
++    // the RMS scaling does not change the top-k, but RMS norm + weight is the pair a GPU backend
++    // fuses, so an offloaded layer computes the prediction without leaving the GPU
++    ggml_tensor * x = norm_w ? build_norm(resid, norm_w, nullptr, LLM_NORM_RMS, il) : resid;
++    ggml_tensor * logits = ggml_mul_mat(ctx0, gate_inp, x); // [n_expert, n_tokens]
++    cb(logits, "ffn_moe_pregate", il);
++    ggml_build_forward_expand(gf, logits);
++    return logits;
++}
++
++void llm_graph_context::build_moe_prefetch(
++         ggml_tensor * logits,
++         ggml_tensor * down_exps) const {
++    if (logits == nullptr) {
++        return;
++    }
++    ggml_tensor * pf = llama_expert_cache_build_prefetch(ctx0, down_exps, logits);
++    if (pf != nullptr) {
++        ggml_build_forward_expand(gf, pf);
++    }
++}
++
+ ggml_tensor * llm_graph_context::build_moe_ffn(
+          ggml_tensor * cur,
+          ggml_tensor * gate_inp,
+@@ -2156,6 +2198,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+ 
+     // select experts
+     ggml_tensor * selected_experts = selected_experts_in;
++    if (selected_experts == nullptr && gating_op != LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT) {
++        // expert cache with a swap ratio: cache-aware top-k (the scores are probabilities here, not logits)
++        selected_experts = llama_expert_cache_build_select(ctx0, down_exps, selection_probs, n_expert_used);
++    }
+     if (selected_experts == nullptr) {
+         selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+         cb(selected_experts->src[0], "ffn_moe_argsort", il);
+@@ -2205,6 +2251,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     //call early so that topk-moe can be used
+     ggml_build_forward_expand(gf, weights);
+ 
++    // expert cache: the routed expert tensors hold a few slots; the matmuls take slot ids, everything else the expert ids
++    ggml_tensor * slot_ids = llama_expert_cache_build_ids(ctx0, down_exps, selected_experts);
++
++    // expert cache, prefetch ahead: the next layer's prefetch op right after this layer's load op, in
++    // its CPU split: the reads start once this layer's are done and overlap its expert matmuls
++    if (slot_ids != nullptr && moe_pf_logits != nullptr && moe_pf_w != nullptr) {
++        ggml_tensor * pf = llama_expert_cache_build_prefetch(ctx0, moe_pf_w, moe_pf_logits, slot_ids);
++        if (pf != nullptr) {
++            ggml_build_forward_expand(gf, pf);
++        }
++    }
++
+     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+ 
+     if (weight_before_ffn) {
+@@ -2219,7 +2277,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+ 
+     if (gate_up_exps) {
+         // merged gate_up path: one mul_mat_id, then split into gate and up views
+-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
++        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s, slot_ids); // [n_ff*2, n_expert_used, n_tokens]
+         cb(gate_up, "ffn_moe_gate_up", il);
+ 
+         if (up_exps_s) {
+@@ -2238,7 +2296,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         cb(up, "ffn_moe_up", il);
+     } else {
+         // separate gate and up path
+-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
++        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s, slot_ids); // [n_ff, n_expert_used, n_tokens]
+         cb(up, "ffn_moe_up", il);
+ 
+         if (up_exps_s) {
+@@ -2251,7 +2309,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         }
+ 
+         if (gate_exps) {
+-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
++            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s, slot_ids); // [n_ff, n_expert_used, n_tokens]
+             cb(cur, "ffn_moe_gate", il);
+         } else {
+             cur = up;
+@@ -2352,7 +2410,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             GGML_ABORT("fatal error");
+     }
+ 
+-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
++    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s, slot_ids); // [n_embd, n_expert_used, n_tokens]
+     if (arch == LLM_ARCH_MISTRAL4) {
+         // src1 can exceed F16 range
+         ggml_prec_set_src(experts, GGML_PREC_F32, 1);
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 5cf74c9..7eca20d 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1048,6 +1048,12 @@ struct llm_graph_context {
+     ggml_context * ctx0 = nullptr;
+     ggml_cgraph  * gf   = nullptr;
+ 
++    // expert cache, prefetch ahead (llama-expert-cache.h): the next layer's predicted router logits
++    // (build_moe_pregate with ahead) and its expert tensor, set by a model's graph around a layer's
++    // build_moe_ffn, which queues their prefetch right after the layer's load op
++    ggml_tensor * moe_pf_logits = nullptr;
++    ggml_tensor * moe_pf_w      = nullptr;
++
+     llm_graph_context(const llm_graph_params & params);
+     virtual ~llm_graph_context() = default;
+ 
+@@ -1068,11 +1074,13 @@ struct llm_graph_context {
+               ggml_tensor * w_s = nullptr) const;
+ 
+     // do mat_mul_id, while optionally apply lora and per-expert scale
++    // w_ids: ids into w when they differ from the expert ids (expert cache slots)
+     ggml_tensor * build_lora_mm_id(
+               ggml_tensor * w,   // ggml_tensor * as
+               ggml_tensor * cur, // ggml_tensor * b
+               ggml_tensor * ids,
+-              ggml_tensor * w_s = nullptr) const;
++              ggml_tensor * w_s = nullptr,
++              ggml_tensor * w_ids = nullptr) const;
+ 
+     ggml_tensor * build_norm(
+              ggml_tensor * cur,
+@@ -1121,6 +1129,24 @@ struct llm_graph_context {
+        llm_ffn_gate_type   type_gate,
+                      int   il) const;
+ 
++    // expert cache pre-gating (llama-expert-cache.h): the router of layer il on the layer's input
++    // residual through its pre-FFN norm (ahead: on the previous layer's post-attention residual);
++    // expanded at once so on an offloaded layer it joins the split of the matmuls before it;
++    // nullptr when il has no prefetch of that kind
++    ggml_tensor * build_moe_pregate(
++             ggml_tensor * resid,
++             ggml_tensor * norm_w,
++             ggml_tensor * gate_inp,
++             ggml_tensor * down_exps,
++                     int   il,
++                    bool   ahead = false) const;
++
++    // the prefetch op on those logits, expanded where the reads should start (after the layer's
++    // first matmuls: no extra CPU/GPU switch); no-op for nullptr
++    void build_moe_prefetch(
++             ggml_tensor * logits,
++             ggml_tensor * down_exps) const;
++
+     // build MoE FFN without bias tensors
+     ggml_tensor * build_moe_ffn(
+              ggml_tensor * cur,
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index e795d40..251f0a9 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-model-loader.h"
++#include "llama-expert-cache.h"
+ 
+ #include "ggml-alloc.h"
+ #include "ggml.h"
+@@ -577,6 +578,7 @@ llama_model_loader::llama_model_loader(
+         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+ 
+         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
++        file_paths.emplace_back(fname);
+         contexts.emplace_back(ctx);
+ 
+         // Save tensors data offset of the main file.
+@@ -645,6 +647,7 @@ llama_model_loader::llama_model_loader(
+                 }
+ 
+                 files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
++                file_paths.emplace_back(fname_split);
+                 contexts.emplace_back(ctx);
+ 
+                 // Save tensors data offset info of the shard.
+@@ -696,6 +699,7 @@ llama_model_loader::llama_model_loader(
+         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+ 
+         files.emplace_back(new llama_file(file));
++        file_paths.emplace_back();
+         contexts.emplace_back(ctx);
+ 
+         // Save tensors data offset info of the main file.
+@@ -1212,6 +1216,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+             return lazy_read::buft();
+         }
+ 
++        // routed experts read on demand need a file to read them from
++        if (expert_cache_buft && !files.empty() && op == GGML_OP_MUL_MAT_ID && tn.suffix != nullptr &&
++                strcmp(tn.suffix, "weight") == 0 && llama_expert_cache_wants(expert_cache_buft, t_meta)) {
++            return expert_cache_buft;
++        }
++
+         // select the buffer type for this tensor
+         const buft_list_t * buft_list;
+         switch (info.layer) {
+@@ -1379,6 +1389,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+ 
+     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
+     ggml_set_name(tensor, ggml_get_name(&t_meta));
++    llama_expert_cache_shrink(buft, tensor);
+ 
+     if (duplicated) {
+         size_data += ggml_nbytes(&t_meta);
+@@ -1636,6 +1647,13 @@ bool llama_model_loader::load_all_data(
+ 
+         size_t n_size = ggml_nbytes(cur);
+ 
++        // routed experts: the buffer holds only the cache slots, the experts are read when the router picks them
++        if (llama_expert_cache_has(cur)) {
++            llama_expert_cache_bind(cur, file_paths.at(weight->idx), weight->offs, weight->tensor->ne[2]);
++            size_done += ggml_nbytes(weight->tensor); // size_data counts the whole stack
++            continue;
++        }
++
+         const bool from_mapping = use_mmap || lazy.has(cur);
+ 
+         if (from_mapping) {
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index 9e51d0c..f36bdc1 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -117,7 +117,12 @@ struct llama_model_loader {
+         std::set<std::string>                  tensors;
+     } lazy;
+ 
++    // set by the caller before the create_tensor() calls: routed expert weights go to this buffer type
++    // and are bound to the expert cache instead of being read (llama-expert-cache.h)
++    ggml_backend_buffer_type_t expert_cache_buft = nullptr;
++
+     llama_files files;
++    std::vector<std::string> file_paths; // parallel to files, empty when opened from a FILE *
+     llama_ftype ftype;
+     llama_fver  fver;
+ 
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 97e0cee..b322acc 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -6,6 +6,7 @@
+ #include "llama-impl.h"
+ #include "llama-mmap.h"
+ #include "llama-cparams.h"
++#include "llama-expert-cache.h"
+ #include "llama-model-loader.h"
+ 
+ #include "llama-kv-cache.h"
+@@ -1287,6 +1288,9 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
+ }
+ 
+ llama_model::~llama_model() {
++    if (expert_cache) {
++        llama_expert_cache_stop(*expert_cache); // no prefetch read may land in a freed buffer
++    }
+     for (auto * lora : loras) {
+         delete lora;
+     }
+@@ -1550,6 +1554,33 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         pimpl->gpu_buft_list.emplace(dev.dev, std::move(buft_list));
+     }
+ 
++    // routed experts read on demand into a few resident slots per layer (llama-expert-cache.h)
++    expert_cache.reset();
++    ml.expert_cache_buft = nullptr;
++    if (params.n_expert_slots > 0 && hparams.n_expert > params.n_expert_slots) {
++        if (arch == LLM_ARCH_GRANITE_SWITCH) {
++            LLAMA_LOG_WARN("%s: expert cache not supported for %s, loading all experts\n", __func__, llm_arch_name(arch));
++        } else {
++            expert_cache = llama_expert_cache_init(params.n_expert_slots, hparams.n_expert_used_max(), params.expert_swap_ratio);
++            // unified memory: a GPU that claims the cache's type reads the slots in place
++            const char * slots_in = "CPU";
++            if (n_gpu_layers > 0) {
++                for (const auto & dev : devices) {
++                    const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev.dev);
++                    if ((type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) &&
++                            llama_expert_cache_use_host_of(*expert_cache, dev.dev)) {
++                        slots_in = ggml_backend_dev_name(dev.dev);
++                        break;
++                    }
++                }
++            }
++            ml.expert_cache_buft = llama_expert_cache_buft(*expert_cache);
++            LLAMA_LOG_INFO("%s: expert cache: %u of %u experts resident per layer, read from the model file on demand, swap ratio %.2f, prefetch %u, slots in %s memory\n",
++                __func__, llama_expert_cache_n_slots(*expert_cache), hparams.n_expert, llama_expert_cache_swap_ratio(*expert_cache),
++                llama_expert_cache_prefetch(*expert_cache), slots_in);
++        }
++    }
++
+     ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+     if (cpu_dev == nullptr) {
+         throw std::runtime_error(format("%s: no CPU backend found", __func__));
+@@ -2935,6 +2966,8 @@ llama_model_params llama_model_default_params() {
+         /*.progress_callback           =*/ nullptr,
+         /*.progress_callback_user_data =*/ nullptr,
+         /*.kv_overrides                =*/ nullptr,
++        /*.n_expert_slots              =*/ 0,
++        /*.expert_swap_ratio           =*/ 0.0f,
+         /*.vocab_only                  =*/ false,
+         /*.check_tensors               =*/ false,
+         /*.use_extra_bufts             =*/ true,
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 2243377..92a9ae7 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -743,6 +743,9 @@ struct llama_model {
+     // which tensors can be prefetched - driven by TENSOR_READ_LAZY
+     std::unordered_set<const ggml_tensor *> can_prefetch;
+ 
++    // routed experts kept in a few slots per layer (n_expert_slots > 0); declared before pimpl so it outlives the buffers
++    std::shared_ptr<struct llama_expert_cache> expert_cache;
++
+     // statically allocated context for assigning
+     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
+ 
+diff --git a/src/models/llama.cpp b/src/models/llama.cpp
+index 4bfebc8..de62dfd 100644
+--- a/src/models/llama.cpp
++++ b/src/models/llama.cpp
+@@ -134,6 +134,10 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
+                 LLM_NORM_RMS, il);
+         cb(cur, "attn_norm", il);
+ 
++        // expert cache: predict this layer's experts from its input, read them during the attention
++        ggml_tensor * pregate = build_moe_pregate(inpL, model.layers[il].ffn_norm,
++                model.layers[il].ffn_gate_inp, model.layers[il].ffn_down_exps, il);
++
+         // self-attention
+         {
+             // rope freq factors for llama3; may return nullptr for llama2 and other models
+@@ -171,6 +175,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
+                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+             cb(cur, "attn_out", il);
+         }
++        build_moe_prefetch(pregate, model.layers[il].ffn_down_exps);
+         if (il == n_layer - 1 && inp_out_ids) {
+             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
+             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+@@ -178,6 +183,15 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
+         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
+         cb(ffn_inp, "ffn_inp", il);
+ 
++        // expert cache, prefetch ahead: the next layer's experts predicted from this residual, read
++        // during this layer's expert matmuls and the next layer's attention (after its load op: a dense
++        // layer has none)
++        if (il + 1 < n_layer && model.layers[il].ffn_gate_inp != nullptr) {
++            moe_pf_w      = model.layers[il + 1].ffn_down_exps;
++            moe_pf_logits = build_moe_pregate(ffn_inp, model.layers[il + 1].ffn_norm,
++                    model.layers[il + 1].ffn_gate_inp, moe_pf_w, il + 1, true);
++        }
++
+         // feed-forward network (non-MoE)
+         if (model.layers[il].ffn_gate_inp == nullptr) {
+ 
+@@ -217,6 +231,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
+                     model.layers[il].ffn_down_exps_s);
+             cb(cur, "ffn_moe_out", il);
+         }
++        moe_pf_logits = nullptr;
+         cur = ggml_add(ctx0, cur, ffn_inp);
+         cb(cur, "ffn_out", il);
+ 
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index f0f917a..3686c0a 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -185,6 +185,10 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
+ 
+         ggml_build_forward_expand(gf, cur);
+ 
++        // expert cache: predict this layer's experts from its input, read them during the attention
++        ggml_tensor * pregate = build_moe_pregate(inpL, model.layers[il].attn_post_norm,
++                model.layers[il].ffn_gate_inp, model.layers[il].ffn_down_exps, il);
++
+         // Determine layer type and build appropriate attention mechanism
+         if (hparams.is_recr(il)) {
+             // Linear attention layer (gated delta net)
+@@ -193,6 +197,7 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
+             // Full attention layer
+             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
+         }
++        build_moe_prefetch(pregate, model.layers[il].ffn_down_exps);
+ 
+         if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
+             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
+@@ -206,6 +211,14 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
+         // Save the tensor before post-attention norm for residual connection
+         ggml_tensor * ffn_residual = cur;
+ 
++        // expert cache, prefetch ahead: the next layer's experts predicted from this residual, read
++        // during this layer's expert matmuls and the next layer's attention
++        if (il + 1 < n_layer) {
++            moe_pf_w      = model.layers[il + 1].ffn_down_exps;
++            moe_pf_logits = build_moe_pregate(ffn_residual, model.layers[il + 1].attn_post_norm,
++                    model.layers[il + 1].ffn_gate_inp, moe_pf_w, il + 1, true);
++        }
++
+         // Post-attention norm
+         ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
+         cb(attn_post_norm, "attn_post_norm", il);
+@@ -213,6 +226,7 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
+         // MOE FFN layer
+         cur = build_layer_ffn(attn_post_norm, il);
+         cb(cur, "ffn_out", il);
++        moe_pf_logits = nullptr;
+ 
+         // Residual connection for FFN - add to the tensor from before post_attention_layernorm
+         cur = ggml_add(ctx0, cur, ffn_residual);

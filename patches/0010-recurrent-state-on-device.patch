@@ -1,0 +1,25 @@
+diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include <algorithm>
+ #include <cassert>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <map>
+@@ -84,7 +85,12 @@
+ 
+         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+ 
+-        if (offload) {
++        // xllama patch 0010: LLAMA_RS_ON_DEVICE (set, not "0") puts the recurrent
++        // states on the layer's device even when the KV cache stays on the CPU
++        // (offload_kqv off), so a backend that runs the linear-attention ops reads
++        // and writes them in place instead of splitting each layer around them.
++        const char * rs_dev = getenv("LLAMA_RS_ON_DEVICE");
++        if (offload || (rs_dev && strcmp(rs_dev, "0") != 0)) {
+             auto * dev = model.dev_layer(i);
+             buft = ggml_backend_dev_buffer_type(dev);
+ 

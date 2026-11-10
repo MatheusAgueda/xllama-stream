@@ -486,6 +486,35 @@ class LlamaSession final : public Session {
     // not [0, kv_len) and the shift arithmetic below would lie.
     bool m_can_shift = false;
 
+    // #170c: a hybrid (or recurrent) cache refuses #170a's partial tail erase —
+    // the recurrent state has no per-token history — so every LAN-API turn,
+    // regenerate and edit re-prefilled from token 0. On the console (Qwen3.6
+    // 35B-A3B, Gated DeltaNet + attention) that was 48-53 tokens, 8-10 s, per
+    // request. Upstream's server answers with context checkpoints and so does
+    // this: snapshot only the recurrent half (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY,
+    // 63 MiB there whatever the prompt length) at the points a later prompt
+    // tends to diverge after, and when a rewind is refused restore the longest
+    // one inside the common prefix — the attention half then rewinds normally.
+    // A checkpoint names the history it absorbed, so its validity is a prefix
+    // compare against the new prompt, not bookkeeping across clears.
+    struct RsCheckpoint {
+        std::vector<llama_token> tokens; // the history the state absorbed
+        std::vector<uint8_t> state;      // llama_state_seq_get_data_ext, PARTIAL_ONLY
+    };
+    // 2 x 63 MiB on the console, whose heap has ~0.5 GB free with the model in.
+    static constexpr size_t kRsCheckpoints = 2;
+    // A turn's last 4 tokens are what the next request re-renders differently:
+    // Qwen's "<think>\n\n</think>\n\n" generation prompt is dropped from the
+    // history (upstream checkpoints at the same offset).
+    static constexpr size_t kRsCheckpointTail = 4;
+    // A divergence point is kept only when it spares at least this much prefill.
+    static constexpr size_t kRsCheckpointMinGain = 16;
+    std::vector<RsCheckpoint> m_rs_ckpts; // least recently used first
+    bool m_rs_ckpt_enabled = false;       // hybrid or recurrent memory (ensure_ctx)
+    // After a #169 shift the recurrent state still holds the evicted history, so
+    // a checkpoint taken then carries the approximation the resident cache
+    // already serves #170a's pure extensions with — no stricter, no looser.
+
     explicit LlamaSession(LlamaModelPtr model, LlamaAdapterLoraPtr adapter, float lora_scale,
                           int n_ctx, int n_threads, int n_batch, int n_ubatch, bool kv_q8,
                           bool prompt_lookup, int gpu_layers)
@@ -517,6 +546,18 @@ class LlamaSession final : public Session {
                 cparams.n_ubatch = static_cast<uint32_t>(m_n_ubatch);
             apply_gguf_gpu_context(m_gpu_layers, cparams,
                                    gguf_gpu_outputs_max(for_embedding, m_prompt_lookup));
+    #ifdef XLLAMA_UWP
+            // The session's decode loop asks for the same rows on the CPU, so
+            // the CPU path takes the cap too: the default reserve is n_ubatch
+            // logits rows, 512 x 248320 x 4 B = 529 MiB on Qwen3.5, which kept
+            // a 4.2 GB IQ3_M from getting a context under the Series X's
+            // 4.86 GB heap (2026-11-09).
+            if (m_gpu_layers <= 0) {
+                const uint32_t outputs_max = gguf_gpu_outputs_max(for_embedding, m_prompt_lookup);
+                if (outputs_max > 0)
+                    cparams.n_outputs_max = outputs_max;
+            }
+    #endif
             if (for_embedding) {
                 // Non-causal embedding graphs cannot split a sequence into
                 // physical micro-batches (llama.cpp asserts instead of failing).
@@ -567,6 +608,9 @@ class LlamaSession final : public Session {
                          (int)llama_model_n_swa(m_model.get()));
                 log_output(cb);
             }
+            m_rs_ckpt_enabled =
+                llama_model_is_hybrid(m_model.get()) || llama_model_is_recurrent(m_model.get());
+            m_rs_ckpts.clear();
             // Apply runtime LoRA after context exists (llama_set_adapters_lora is
             // context-scoped). Must re-apply if context is ever recreated.
             if (m_adapter) {
@@ -583,6 +627,86 @@ class LlamaSession final : public Session {
             }
         }
         return true;
+    }
+
+    // #170c: restore the longest checkpoint whose history is a prefix of
+    // tokens[0, limit) and erase the attention tail past it. Returns the
+    // restored length, 0 when none fits or the restore failed — then the
+    // recurrent half may be half-written and the caller must clear the cache.
+    size_t restore_rs_checkpoint(llama_context* ctx, const std::vector<llama_token>& tokens,
+                                 size_t limit) {
+        size_t best = m_rs_ckpts.size();
+        for (size_t i = 0; i < m_rs_ckpts.size(); ++i) {
+            const std::vector<llama_token>& h = m_rs_ckpts[i].tokens;
+            if (h.empty() || h.size() > limit ||
+                (best < m_rs_ckpts.size() && h.size() <= m_rs_ckpts[best].tokens.size()))
+                continue;
+            if (std::equal(h.begin(), h.end(), tokens.begin()))
+                best = i;
+        }
+        if (best == m_rs_ckpts.size())
+            return 0;
+        // Most recently used goes last; the restored state is the newest use.
+        std::rotate(m_rs_ckpts.begin() + best, m_rs_ckpts.begin() + best + 1, m_rs_ckpts.end());
+        const RsCheckpoint& ck = m_rs_ckpts.back();
+        const size_t n = ck.tokens.size();
+        if (llama_state_seq_set_data_ext(ctx, ck.state.data(), ck.state.size(), 0,
+                                         LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0)
+            return 0;
+        // The recurrent half now ends at n-1, so this erase is the attention
+        // tail only — the same one a pure-attention cache does in #170a.
+        if (!llama_memory_seq_rm(llama_get_memory(ctx), 0, static_cast<llama_pos>(n), -1))
+            return 0;
+        return n;
+    }
+
+    // #170c: snapshot the recurrent half after history[0, n). A checkpoint of
+    // the same history is only marked used (a restored turn re-reaches it); the
+    // least recently used one lends its buffer. An allocation failure drops the
+    // checkpoints, never the request.
+    void save_rs_checkpoint(llama_context* ctx, const llama_token* history, size_t n) {
+        for (size_t i = 0; i < m_rs_ckpts.size(); ++i) {
+            const std::vector<llama_token>& h = m_rs_ckpts[i].tokens;
+            if (h.size() == n && std::equal(h.begin(), h.end(), history)) {
+                std::rotate(m_rs_ckpts.begin() + i, m_rs_ckpts.begin() + i + 1, m_rs_ckpts.end());
+                return;
+            }
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        const size_t size =
+            llama_state_seq_get_size_ext(ctx, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (size == 0)
+            return;
+        RsCheckpoint ck;
+        if (m_rs_ckpts.size() >= kRsCheckpoints) {
+            ck = std::move(m_rs_ckpts.front());
+            m_rs_ckpts.erase(m_rs_ckpts.begin());
+        }
+        try {
+            ck.state.resize(size);
+            ck.tokens.assign(history, history + n);
+        } catch (const std::bad_alloc&) {
+            m_rs_ckpts.clear();
+            m_rs_ckpts.shrink_to_fit();
+            log_output("[xllama] session: KV checkpoint allocation failed — checkpoints "
+                       "dropped (#170c)\n");
+            return;
+        }
+        if (llama_state_seq_get_data_ext(ctx, ck.state.data(), size, 0,
+                                         LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != size) {
+            log_output("[xllama] session: KV checkpoint snapshot failed (#170c)\n");
+            return;
+        }
+        m_rs_ckpts.push_back(std::move(ck));
+        char cb[192];
+        snprintf(cb, sizeof(cb),
+                 "[xllama] session: KV checkpoint at %zu tokens — %.1f MiB in %.1f ms, %zu held "
+                 "(#170c)\n",
+                 n, (double)size / (1024.0 * 1024.0),
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                     .count(),
+                 m_rs_ckpts.size());
+        log_output(cb);
     }
 
     InferenceResult generate(const GenerateParams& gp) override {
@@ -635,6 +759,12 @@ class LlamaSession final : public Session {
         // diverges immediately and degrades to the old full clear.
         llama_memory_t mem = llama_get_memory(ctx);
         size_t kv_keep = 0;
+        // #170c: where a refused rewind diverged, snapped back to just after the
+        // last control token before it (a turn marker: <|im_start|>,
+        // <|start_header_id|>...). Calls sharing a system prompt diverge inside
+        // the user turn, each at its own word ("Which planet is" / "Which
+        // planet has"); the turn boundary is what the next one shares too.
+        size_t rs_common = 0;
         if (full_prompt) {
             const size_t max_keep = tokens.empty() ? 0 : tokens.size() - 1;
             while (kv_keep < m_kv_tokens.size() && kv_keep < max_keep &&
@@ -649,14 +779,29 @@ class LlamaSession final : public Session {
                 // clear + re-prefill instead.
                 if (kv_keep < m_kv_tokens.size() &&
                     !llama_memory_seq_rm(mem, 0, static_cast<llama_pos>(kv_keep), -1)) {
+                    rs_common = kv_keep;
+                    while (rs_common > 0 && !llama_vocab_is_control(vocab, tokens[rs_common - 1]))
+                        --rs_common;
+                    if (rs_common == 0)
+                        rs_common = kv_keep; // plain text: no turn marker to snap to
+                    const size_t restored = restore_rs_checkpoint(ctx, tokens, kv_keep);
                     char rb[256];
-                    snprintf(rb, sizeof(rb),
-                             "[xllama] session: KV rewind unsupported (hybrid cache) — "
-                             "full re-prefill (#170): common=%zu resident=%zu prompt=%zu\n",
-                             kv_keep, m_kv_tokens.size(), tokens.size());
+                    if (restored > 0) {
+                        snprintf(rb, sizeof(rb),
+                                 "[xllama] session: KV checkpoint restore — kept %zu of %zu "
+                                 "tokens (common=%zu resident=%zu) (#170c)\n",
+                                 restored, tokens.size(), kv_keep, m_kv_tokens.size());
+                        kv_keep = restored;
+                    } else {
+                        snprintf(rb, sizeof(rb),
+                                 "[xllama] session: KV rewind unsupported (hybrid cache) — "
+                                 "full re-prefill (#170): common=%zu resident=%zu prompt=%zu "
+                                 "checkpoints=%zu\n",
+                                 kv_keep, m_kv_tokens.size(), tokens.size(), m_rs_ckpts.size());
+                        llama_memory_clear(mem, true);
+                        kv_keep = 0;
+                    }
                     log_output(rb);
-                    llama_memory_clear(mem, true);
-                    kv_keep = 0;
                 } else {
                     char pb[128];
                     snprintf(pb, sizeof(pb),
@@ -771,7 +916,41 @@ class LlamaSession final : public Session {
         InferenceWatchdog wd(gp.progress(), gp.abort_flag);
         wd.enter_prefill(n_pf);
         const auto t_prefill0 = std::chrono::steady_clock::now();
-        if (!prefill_chunked(ctx, pf, n_pf, &wd)) {
+        // #170c: split the prefill where checkpoints go — positions in the
+        // history this prefill completes: the divergence point a refused
+        // rewind fell back from (the next prompt likely shares it: a system
+        // prompt, a fixed instruction) and the prompt end minus the re-rendered
+        // tail (the next API turn, a regenerate, an edit of the last message).
+        const size_t pf_begin = static_cast<size_t>(kv_len);
+        const size_t pf_end = pf_begin + static_cast<size_t>(n_pf);
+        std::vector<size_t> rs_at;
+        std::vector<llama_token> rs_history; // a continuation's resident + delta
+        if (m_rs_ckpt_enabled && (full_prompt || m_kv_tokens.size() == pf_begin)) {
+            if (rs_common >= pf_begin + kRsCheckpointMinGain &&
+                rs_common + kRsCheckpointTail < pf_end)
+                rs_at.push_back(rs_common);
+            if (pf_end > pf_begin + kRsCheckpointTail)
+                rs_at.push_back(pf_end - kRsCheckpointTail);
+            if (!full_prompt && !rs_at.empty()) {
+                rs_history = m_kv_tokens;
+                rs_history.insert(rs_history.end(), tokens.begin(), tokens.end());
+            }
+        }
+        const llama_token* rs_hist = full_prompt ? tokens.data() : rs_history.data();
+        bool prefilled = true;
+        int n_done = 0;
+        for (const size_t at : rs_at) {
+            const int seg = static_cast<int>(at - pf_begin) - n_done;
+            if (!prefill_chunked(ctx, pf + n_done, seg, &wd, n_done)) {
+                prefilled = false;
+                break;
+            }
+            n_done += seg;
+            save_rs_checkpoint(ctx, rs_hist, at);
+        }
+        if (prefilled)
+            prefilled = prefill_chunked(ctx, pf + n_done, n_pf - n_done, &wd, n_done);
+        if (!prefilled) {
             if (wd.stalled()) {
                 res.stalled = true;
                 res.error_msg = wd.stall_error();
@@ -907,6 +1086,14 @@ class LlamaSession final : public Session {
                  "drafted=%d spec_accept=%d\n",
                  n_generated, res.t_p_eval_ms, res.n_p_eval, gp.reuse_kv && !gp.reset_kv,
                  dlr.n_drafted, dlr.n_accepted);
+        log_output(log_buf);
+        // Where decode time goes: llama_decode vs sampling, and how often llama
+        // reused the previous compute graph instead of rebuilding and splitting it
+        // (the count is the context's, since it was created).
+        snprintf(log_buf, sizeof(log_buf),
+                 "[xllama] session decode: %.1f ms in llama_decode, %.1f ms sampling, "
+                 "graphs reused %d\n",
+                 dlr.decode_ms, dlr.sample_ms, llama_perf_context(m_ctx.get()).n_reused);
         log_output(log_buf);
 
         return res;
@@ -1296,9 +1483,12 @@ std::unique_ptr<Session> create_llama(const SessionParams& sp, std::string* err)
     }
 
     llama_model_params mparams = llama_model_default_params();
-    const int gpu_layers =
-        apply_gguf_gpu_layers(sp.stream_weights ? 0 : sp.n_gpu_layers, mparams, abs_path);
-    apply_gguf_residency(sp.stream_weights, mparams);
+    // the expert cache (which wins over stream) keeps the experts on the CPU itself
+    const bool cpu_only = sp.stream_weights && sp.expert_slots <= 0;
+    apply_env_overrides(sp.env); // first: the set_env_int below honour it
+    const int gpu_layers = apply_gguf_gpu_layers(cpu_only ? 0 : sp.n_gpu_layers, mparams, abs_path);
+    apply_gguf_residency(sp.stream_weights, mparams, sp.expert_slots, sp.expert_swap,
+                         sp.expert_prefetch, sp.expert_major, sp.expert_prefetch_ahead);
 
     install_llama_log();
     llama_model* raw_model = llama_model_load_from_file(abs_path.c_str(), mparams);

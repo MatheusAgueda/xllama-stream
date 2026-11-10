@@ -1,0 +1,100 @@
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 1112ad8..e242cfd 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1738,6 +1738,9 @@ llm_graph_qkv llm_graph_context::build_qkv(
+     } else {
+         // separate Q/K/V path
+         Qcur = build_lora_mm(layer.wq, cur, layer.wq_s);
++        // xllama patch 0005: append the projections that share an input back to back, so a
++        // GPU backend that leaves the elementwise ops on the CPU gets them in one split.
++        ggml_build_forward_expand(gf, Qcur);
+         if (reshape) {
+             cb(Qcur, "Qcur", il);
+         }
+@@ -1752,6 +1755,7 @@ llm_graph_qkv llm_graph_context::build_qkv(
+             cb(Qcur, "Qcur_clamped", il);
+         }
+         Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
++        ggml_build_forward_expand(gf, Kcur);
+         if (reshape) {
+             cb(Kcur, "Kcur", il);
+         }
+@@ -1766,6 +1770,7 @@ llm_graph_qkv llm_graph_context::build_qkv(
+             cb(Kcur, "Kcur_clamped", il);
+         }
+         Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
++        ggml_build_forward_expand(gf, Vcur);
+         if (reshape) {
+             cb(Vcur, "Vcur", il);
+         }
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index ab98744..d463714 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -245,10 +245,14 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
+     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
+ 
+     ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
++    // xllama patch 0005: append the projections that share an input back to back, so a
++    // GPU backend that leaves the elementwise ops on the CPU gets them in one split.
++    ggml_build_forward_expand(gf, qkv_mixed);
+     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
+     cb(qkv_mixed, "linear_attn_qkv_mixed", il);
+ 
+     ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
++    ggml_build_forward_expand(gf, z);
+     cb(z, "z", il);
+ 
+     return { qkv_mixed, z };
+@@ -370,6 +374,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
+     ggml_tensor * z         = qkvz.second;
+ 
+     ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
++    ggml_build_forward_expand(gf, beta);
+     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
+     cb(beta, "beta", il);
+ 
+@@ -377,6 +382,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
+     cb(beta, "beta_sigmoid", il);
+ 
+     ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
++    ggml_build_forward_expand(gf, alpha);
+     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
+     cb(alpha, "alpha", il);
+ 
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index f0f917a..626e135 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -255,10 +255,14 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35moe::graph::build_qkvz
+     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
+ 
+     ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
++    // xllama patch 0005: append the projections that share an input back to back, so a
++    // GPU backend that leaves the elementwise ops on the CPU gets them in one split.
++    ggml_build_forward_expand(gf, qkv_mixed);
+     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
+     cb(qkv_mixed, "linear_attn_qkv_mixed", il);
+ 
+     ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
++    ggml_build_forward_expand(gf, z);
+     cb(z, "z", il);
+ 
+     return { qkv_mixed, z };
+@@ -380,6 +384,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
+     ggml_tensor * z         = qkvz.second;
+ 
+     ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
++    ggml_build_forward_expand(gf, beta);
+     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
+     cb(beta, "beta", il);
+ 
+@@ -387,6 +392,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
+     cb(beta, "beta_sigmoid", il);
+ 
+     ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
++    ggml_build_forward_expand(gf, alpha);
+     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
+     cb(alpha, "alpha", il);
+ 

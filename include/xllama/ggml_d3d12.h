@@ -4,9 +4,9 @@
 // ggml backend "d3d12" — GGUF GPU decode D2 (docs/gguf-gpu-decode.md).
 //
 // A GPU-type ggml device, registered at runtime, that runs MUL_MAT with
-// Q4_0 / Q4_K / Q6_K weights and GET_ROWS from a Q6_K weight on our D3D12
-// compute shaders; matmul inputs are quantized to q8 on the CPU first, exactly
-// as the CPU backend does.
+// Q4_0 / Q4_K / Q6_K / IQ3_S weights, GET_ROWS from a Q6_K weight and the f32
+// adds, norms and SwiGLU between them on our D3D12 compute shaders; matmul
+// inputs are quantized to q8 the way the CPU backend does (q8_K on the GPU).
 // Two buffer types:
 //   D3D12_Weights  DEFAULT heap, holds matmul weights (exposed as an extra buft)
 //   D3D12_Host     CUSTOM WRITE_BACK heap, is_host — the device default buft, so
@@ -22,6 +22,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -123,6 +124,37 @@ void d3d12_get_rows_emulate(ggml_type t, const std::uint8_t* w, std::size_t w_ro
 // copy serves both the input lookup and the lm_head.
 bool d3d12_place_tied_embedding(ggml_type embd_type, bool has_output_weight);
 
+// --- f32 ops between the matmuls (shaders/ggml_d3d12_elt.hlsl) ---
+// A decoder layer's residual adds, RMS norms with their weight and SwiGLU run
+// on the GPU next to the matmuls around them, and matmul inputs are quantized
+// to q8_K there too, so a layer's output projection, FFN and the next layer's
+// input projections are one submission instead of four.
+
+// Narrower rows stay on the CPU: per-head q/k norms (head_dim 128-256) and the
+// small linear-attention ops sit between CPU ops, and moving them would only
+// add CPU <-> GPU switches.
+inline constexpr std::int64_t kD3d12EltMinRow = 1024;
+
+// Shape rule of every elementwise op: 2-D, rows of ne0 >= kD3d12EltMinRow
+// floats, one thread group per row (ne1 <= 65535).
+bool d3d12_elt_rows_supported(std::int64_t ne0, std::int64_t ne1, std::int64_t ne2,
+                              std::int64_t ne3);
+
+// The norm weights whose MUL the backend runs, by GGUF name: a layer's
+// attn_norm, post_attention_norm and ffn_norm, and output_norm. Their buft
+// probe then lands them in D3D12_Host (GPU- and CPU-visible).
+bool d3d12_norm_weight_name(const char* name);
+
+// Host emulation of the q8_K kernel (KERNEL 3): k floats (k % 256 == 0) to
+// k / 256 block_q8_K, with the shader's per-thread absmax and tree reduction.
+// Tests compare it with ggml's from_float (quantize_row_q8_K_ref) bit for bit.
+void d3d12_quant_q8k_emulate(const float* x, int k, std::uint8_t* out);
+
+// RN(n / |b|) for an integer 1 <= n < 2^24 and a normal float b, by integer
+// long division — the kernel's stand-in for fdiv (2.5 ULP on D3D), so its
+// scales equal the CPU's -127/max and 1/iscale bit for bit.
+float d3d12_div_rn(std::uint32_t n, float b);
+
 // The D3D12_Weights buffer type, for llama's tensor_buft_overrides. Null
 // until ggml_d3d12_register() succeeds (always on non-Windows).
 ggml_backend_buffer_type_t ggml_d3d12_weights_buft();
@@ -154,5 +186,20 @@ std::string format_d3d12_selftest_row(const D3d12SelftestRow& r, const char* hos
 // Windows: run every type x shape through the backend and append rows.
 // Non-Windows: one row with d3d12_ran=false.
 void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out);
+
+// Largest single D3D12_Weights buffer llama.cpp may ask for (0 = no limit).
+// Above it ggml splits a context's weights into several buffers; a tensor
+// larger than the limit still gets one buffer of its own.
+void ggml_d3d12_set_weights_max_buffer(std::size_t bytes);
+
+// Keep output.weight in a CPU buffer when layers go to D3D12 (UWP knob
+// LocalState\gguf_output_cpu.txt). Read by apply_gguf_gpu_layers.
+void gguf_set_output_on_cpu(bool on);
+bool gguf_output_on_cpu();
+
+// GPU memory probe (gpumem.flag): single-allocation ceilings per heap kind,
+// cumulative ceilings with and without the heap filled first, and a reserved
+// (tiled) buffer backed by 64 MiB heaps. One line per result through emit.
+void run_d3d12_memprobe(const std::function<void(const std::string&)>& emit);
 
 } // namespace xllama

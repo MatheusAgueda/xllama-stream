@@ -483,6 +483,14 @@ int __stdcall wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                 winrt::make<HeadlessView>(&run_gpustep_headless, "gpustep"));
             return 0; // not reached: CoreApplication::Exit terminates the process
         }
+        std::wstring gpumem_flag = flag_path_if_present(L"gpumem.flag");
+        if (!gpumem_flag.empty()) {
+            _wremove(gpumem_flag.c_str());
+            ::xllama::log_output("[xllama] gpumem.flag detected -> headless D3D12 memory probe\n");
+            winrt::Windows::ApplicationModel::Core::CoreApplication::Run(
+                winrt::make<HeadlessView>(&::xllama::bridge::run_gpumem, "gpumem"));
+            return 0; // not reached: CoreApplication::Exit terminates the process
+        }
         std::wstring ramceil_flag = flag_path_if_present(L"ramceil.flag");
         if (!ramceil_flag.empty()) {
             _wremove(ramceil_flag.c_str());

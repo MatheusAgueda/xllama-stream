@@ -38,11 +38,16 @@ add_executable(xllama-tests
     test_gpugemv.cpp
     test_gpustep.cpp
     test_ggml_d3d12.cpp
+    test_ggml_d3d12_attn.cpp
+    test_ggml_d3d12_mmid.cpp
+    test_ggml_d3d12_moe.cpp
+    test_ggml_d3d12_ssm.cpp
     test_ramceil.cpp
     test_model_provision.cpp
     test_model_file_plan.cpp
     test_model_write.cpp
     test_logit_parity.cpp
+    test_expert_cache.cpp
     test_training.cpp
     test_device_train.cpp
     test_json_utils.cpp

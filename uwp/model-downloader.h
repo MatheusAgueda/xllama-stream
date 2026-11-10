@@ -103,6 +103,25 @@ struct ManifestEntry {
     // "stream": true → the GGUF stays file-backed and is paged in from storage
     // (MoE larger than the RAM budget; CPU only). SessionParams::stream_weights.
     bool stream = false;
+    // "expert_slots": N → MoE experts read from the file on demand, N per layer
+    // kept in the heap (expert matmuls on the CPU, "gpu_layers" offloads the
+    // rest; wins over "stream"). SessionParams::expert_slots.
+    int expert_slots = 0;
+    // "expert_swap": (0, 1] → cache-aware routing with expert_slots, fewer reads
+    // for a small change in output. SessionParams::expert_swap.
+    double expert_swap = 0.0;
+    // "expert_prefetch" / "expert_major": with expert_slots, experts read ahead
+    // per token and the largest expert-major prompt ubatch (0 = off).
+    int expert_prefetch = 0;
+    int expert_major = 0;
+    // "expert_prefetch_ahead": with expert_prefetch, predict a layer early.
+    bool expert_prefetch_ahead = false;
+    // "n_ubatch": llama.cpp physical prefill chunk (0 = default 512). With
+    // expert_major, each expert is read once per ubatch: a larger one reads less.
+    int n_ubatch = 0;
+    // "env": {NAME: number | bool | string}, tuning variables set for the load
+    // (SessionParams::env); numbers as integers, booleans as 1 / 0.
+    std::vector<std::pair<std::wstring, std::wstring>> env;
 };
 
 // Load the model catalogue: InstalledPath\models\manifest.json (bundled) is

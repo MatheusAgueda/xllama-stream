@@ -303,6 +303,10 @@ IAsyncAction ModelDownloader::DownloadAsync(std::wstring hf_repo_url, std::wstri
 
         HttpBaseProtocolFilter filter;
         filter.AllowAutoRedirect(true);
+        // Multi-GB bodies must not be mirrored into INetCache: that doubled the
+        // disk a model needs and the cache sits on the small app volume.
+        filter.CacheControl().ReadBehavior(HttpCacheReadBehavior::NoCache);
+        filter.CacheControl().WriteBehavior(HttpCacheWriteBehavior::NoCache);
         HttpClient client(filter);
 
         // Default User-Agent is blocked by some CDNs; set something reasonable.
@@ -310,7 +314,7 @@ IAsyncAction ModelDownloader::DownloadAsync(std::wstring hf_repo_url, std::wstri
 
         uint64_t bytes_done = 0;
         constexpr uint32_t kBufSize = 256 * 1024; // 256 KB read buffer
-        constexpr int kMaxAttempts = 3;
+        constexpr int kMaxAttempts = 10;
         const std::filesystem::path local_dir_fs(local_dir);
 
         std::vector<PinCheck> decisions;
@@ -387,220 +391,181 @@ IAsyncAction ModelDownloader::DownloadAsync(std::wstring hf_repo_url, std::wstri
 
             std::wstring last_err;
             bool file_ok = false;
+            // Win32 file I/O (ACL-checked) rather than StorageFile: the model
+            // directory may sit outside the package (an Xbox's D:\DevelopmentFiles),
+            // where brokered StorageFolder access needs broadFileSystemAccess.
+            const std::filesystem::path target_path =
+                std::filesystem::path(local_dir_fs / f.filename).make_preferred();
+            const std::filesystem::path part_path(target_path.wstring() + L".part");
+            // Sizes are exact only when pinned by hash; unpinned sizes are hints.
+            const bool exact_size = !f.sha256.empty() && f.approx_bytes > 0;
+            const uint64_t bytes_file_start = bytes_done;
 
             for (int attempt = 1; attempt <= kMaxAttempts && !file_ok; ++attempt) {
                 if (attempt > 1) {
-                    const int backoff_s = 1 << (attempt - 2); // 1s, 2s
+                    const int backoff_s = attempt - 2 >= 5 ? 30 : (1 << (attempt - 2));
                     log_output(("[downloader] retry " + std::to_string(attempt) + "/" +
                                 std::to_string(kMaxAttempts) + " for " +
                                 ::xllama::wstring_to_utf8(f.filename) + " after " +
-                                std::to_string(backoff_s) + "s")
+                                std::to_string(backoff_s) + "s\n")
                                    .c_str());
                     co_await winrt::resume_after(std::chrono::seconds(backoff_s));
                 }
+                bytes_done = bytes_file_start;
 
-                // --- Send HTTP request --------------------------------------------
-                HttpRequestMessage req(HttpMethod::Get(), uri);
-                HttpResponseMessage resp{nullptr};
-                last_err.clear();
-                // co_await is illegal inside a catch block (MSVC C2304): flag the
-                // failure and await/report after the try/catch.
-                bool net_failed = false;
-                try {
-                    resp = co_await client.SendRequestAsync(
-                        req, HttpCompletionOption::ResponseHeadersRead);
-                } catch (...) {
-                    last_err = L"Network error downloading " + f.filename;
-                    net_failed = true;
+                // A staged .part resumes with a Range request; one already as large
+                // as its pinned size goes straight to verification.
+                std::error_code part_ec;
+                uint64_t have_part = 0;
+                if (std::filesystem::is_regular_file(part_path, part_ec))
+                    have_part = std::filesystem::file_size(part_path, part_ec);
+                if (part_ec)
+                    have_part = 0;
+                if (exact_size && have_part > f.approx_bytes) {
+                    std::filesystem::remove(part_path, part_ec);
+                    have_part = 0;
                 }
-                if (net_failed) {
-                    if (attempt < kMaxAttempts)
-                        continue;
-                    if (dispatcher)
-                        co_await winrt::resume_foreground(dispatcher);
-                    done(false, last_err);
-                    co_return;
-                }
+                const bool body_complete = exact_size && have_part == f.approx_bytes;
 
-                if (!resp.IsSuccessStatusCode()) {
-                    const int code = static_cast<int>(resp.StatusCode());
-                    last_err = L"HTTP " + std::to_wstring(code) + L" for " + f.filename;
-                    if (http_status_retryable(code) && attempt < kMaxAttempts)
-                        continue;
-                    if (dispatcher)
-                        co_await winrt::resume_foreground(dispatcher);
-                    done(false, last_err);
-                    co_return;
-                }
-
-                // --- Open target file ---------------------------------------------
-                // filename may carry a relative subpath (e.g. "unet/model.onnx");
-                // create intermediate folders as needed.
-                //
-                // Download into "<leaf>.part" and rename over the target only after
-                // the full body is written. ReplaceExisting directly on the live file
-                // truncated a good model.onnx first and secured bytes later — any
-                // mid-download failure (or a locked mmap'd model) left a corrupt
-                // 464 MB file that OgaCreateModel then failed to parse.
-                StorageFolder folder{nullptr};
-                StorageFile out_file{nullptr};
-                std::wstring leaf;
-                bool create_failed = false;
-                try {
-                    folder = co_await StorageFolder::GetFolderFromPathAsync(local_dir);
-                    leaf = f.filename;
-                    size_t sep;
-                    while ((sep = leaf.find_first_of(L"/\\")) != std::wstring::npos) {
-                        folder = co_await folder.CreateFolderAsync(
-                            winrt::hstring(leaf.substr(0, sep)),
-                            CreationCollisionOption::OpenIfExists);
-                        leaf = leaf.substr(sep + 1);
-                    }
-                    out_file = co_await folder.CreateFileAsync(
-                        winrt::hstring(leaf + L".part"), CreationCollisionOption::ReplaceExisting);
-                } catch (...) {
-                    last_err = L"Cannot create file " + f.filename + L" in " + local_dir;
-                    create_failed = true;
-                }
-                if (create_failed) {
-                    if (dispatcher)
-                        co_await winrt::resume_foreground(dispatcher);
-                    done(false, last_err);
-                    co_return;
-                }
-
-                IRandomAccessStream out_stream{nullptr};
-                bool open_failed = false;
-                try {
-                    out_stream = co_await out_file.OpenAsync(FileAccessMode::ReadWrite);
-                } catch (...) {
-                    last_err = L"Cannot open " + f.filename + L" for write";
-                    open_failed = true;
-                }
-                if (open_failed) {
-                    if (dispatcher)
-                        co_await winrt::resume_foreground(dispatcher);
-                    done(false, last_err);
-                    co_return;
-                }
-
-                // --- Stream response body to file in chunks -----------------------
-                auto content_stream = co_await resp.Content().ReadAsInputStreamAsync();
-                auto out_writer = DataWriter(out_stream.GetOutputStreamAt(0));
-                Buffer buf(kBufSize);
-
-                const uint64_t bytes_before = bytes_done;
-                bool read_failed = false;
-                for (;;) {
-                    IBuffer read_buf{nullptr};
+                if (!body_complete) {
+                    HttpRequestMessage req(HttpMethod::Get(), uri);
+                    if (have_part > 0)
+                        req.Headers().TryAppendWithoutValidation(
+                            L"Range", L"bytes=" + std::to_wstring(have_part) + L"-");
+                    HttpResponseMessage resp{nullptr};
+                    last_err.clear();
+                    // co_await is illegal inside a catch block (MSVC C2304).
+                    bool net_failed = false;
                     try {
-                        read_buf = co_await content_stream.ReadAsync(buf, kBufSize,
-                                                                     InputStreamOptions::Partial);
+                        resp = co_await client.SendRequestAsync(
+                            req, HttpCompletionOption::ResponseHeadersRead);
                     } catch (...) {
-                        last_err = L"Read error on " + f.filename;
+                        net_failed = true;
+                    }
+                    if (net_failed) {
+                        last_err = L"Network error downloading " + f.filename;
+                        continue;
+                    }
+                    const int code = static_cast<int>(resp.StatusCode());
+                    if (code == 416) {
+                        std::filesystem::remove(part_path, part_ec);
+                        last_err = L"HTTP 416 for " + f.filename + L" (restarting)";
+                        continue;
+                    }
+                    if (!resp.IsSuccessStatusCode()) {
+                        last_err = L"HTTP " + std::to_wstring(code) + L" for " + f.filename;
+                        if (http_status_retryable(code))
+                            continue;
+                        break;
+                    }
+                    const bool resume = have_part > 0 && code == 206;
+                    if (!resume)
+                        have_part = 0;
+                    std::filesystem::create_directories(part_path.parent_path(), part_ec);
+                    std::ofstream out(
+                        part_path, resume ? (std::ios::binary | std::ios::in | std::ios::out)
+                                          : (std::ios::binary | std::ios::out | std::ios::trunc));
+                    if (out && resume)
+                        out.seekp(static_cast<std::streamoff>(have_part));
+                    if (!out) {
+                        last_err = L"Cannot create file " + f.filename + L" in " + local_dir;
+                        break;
+                    }
+                    log_output(("[downloader] fetch " + ::xllama::wstring_to_utf8(f.filename) +
+                                (resume ? " resuming at " + std::to_string(have_part)
+                                        : std::string(" from 0")) +
+                                " (HTTP " + std::to_string(code) + ")\n")
+                                   .c_str());
+                    bytes_done = bytes_file_start + have_part;
+
+                    IInputStream content_stream{nullptr};
+                    bool read_failed = false;
+                    try {
+                        content_stream = co_await resp.Content().ReadAsInputStreamAsync();
+                    } catch (...) {
                         read_failed = true;
                     }
-                    if (read_failed)
+                    Buffer buf(kBufSize);
+                    bool write_failed = false;
+                    while (!read_failed) {
+                        IBuffer read_buf{nullptr};
+                        try {
+                            read_buf = co_await content_stream.ReadAsync(
+                                buf, kBufSize, InputStreamOptions::Partial);
+                        } catch (...) {
+                            read_failed = true;
+                        }
+                        if (read_failed || read_buf.Length() == 0)
+                            break;
+                        out.write(reinterpret_cast<const char*>(read_buf.data()),
+                                  static_cast<std::streamsize>(read_buf.Length()));
+                        if (!out) {
+                            write_failed = true;
+                            break;
+                        }
+                        bytes_done += read_buf.Length();
+                        if (bytes_done % (512 * 1024) < kBufSize) {
+                            auto snap_done = bytes_done;
+                            auto snap_total = total_bytes;
+                            if (dispatcher)
+                                co_await winrt::resume_foreground(dispatcher);
+                            on_progress(snap_done, snap_total);
+                            co_await resume_background();
+                        }
+                    }
+                    out.close();
+                    if (write_failed || out.fail()) {
+                        // Disk full or the target vanished: retrying cannot help.
+                        last_err = L"Write error on " + f.filename + L" (disk full?)";
                         break;
-
-                    if (read_buf.Length() == 0)
-                        break;
-
-                    out_writer.WriteBuffer(read_buf);
-                    co_await out_writer.StoreAsync();
-
-                    bytes_done += read_buf.Length();
-
-                    if (bytes_done % (512 * 1024) < kBufSize) {
-                        auto snap_done = bytes_done;
-                        auto snap_total = total_bytes;
-                        if (dispatcher)
-                            co_await winrt::resume_foreground(dispatcher);
-                        on_progress(snap_done, snap_total);
-                        co_await resume_background();
                     }
-                }
-
-                if (read_failed) {
-                    // Drop partial file; retry from scratch.
-                    try {
-                        co_await out_writer.FlushAsync();
-                    } catch (...) {
-                    }
-                    out_writer.DetachStream();
-                    out_stream = nullptr;
-                    bytes_done = bytes_before;
-                    try {
-                        co_await out_file.DeleteAsync();
-                    } catch (...) {
-                    }
-                    if (attempt < kMaxAttempts)
+                    if (read_failed) {
+                        // Keep the .part: the next attempt resumes from its end.
+                        last_err = L"Read error on " + f.filename;
                         continue;
-                    if (dispatcher)
-                        co_await winrt::resume_foreground(dispatcher);
-                    done(false, last_err);
-                    co_return;
+                    }
                 }
 
-                co_await out_writer.FlushAsync();
-                out_writer.DetachStream();
-                out_stream = nullptr;
+                std::error_code size_ec;
+                const uint64_t got = std::filesystem::file_size(part_path, size_ec);
+                if (size_ec || (exact_size && got < f.approx_bytes)) {
+                    last_err = L"Incomplete " + f.filename + L" (" +
+                               std::to_wstring(size_ec ? 0 : got) + L" bytes)";
+                    continue;
+                }
 
                 // Verify the complete staged file before replacing a usable target.
                 // Unavailable is a failure here: we just wrote the bytes.
-                if (!f.sha256.empty() && file_sha256_result(local_dir_fs / (f.filename + L".part"),
-                                                            f.sha256) != FileHashResult::Match) {
-                    last_err = L"SHA-256 mismatch for " + f.filename;
-                    try {
-                        co_await out_file.DeleteAsync();
-                    } catch (...) {
+                if (!f.sha256.empty()) {
+                    log_output(("[downloader] verifying " + ::xllama::wstring_to_utf8(f.filename) +
+                                " (" + std::to_string(got) + " bytes)\n")
+                                   .c_str());
+                    if (file_sha256_result(part_path, f.sha256) != FileHashResult::Match) {
+                        last_err = L"SHA-256 mismatch for " + f.filename;
+                        std::filesystem::remove(part_path, part_ec);
+                        break;
                     }
-                    if (dispatcher)
-                        co_await winrt::resume_foreground(dispatcher);
-                    done(false, last_err);
-                    co_return;
                 }
 
-                // Atomically promote the completed .part over the target. The old
-                // file is backed up before promotion. A locked target fails the
-                // rename here without having destroyed the existing model.
-                {
-                    const auto target = local_dir_fs / f.filename;
-                    const auto previous = std::filesystem::path(target.wstring() + L".previous");
-                    std::error_code backup_ec;
-                    if (std::filesystem::is_regular_file(target, backup_ec) &&
-                        !std::filesystem::copy_file(
-                            target, previous, std::filesystem::copy_options::overwrite_existing,
-                            backup_ec)) {
-                        last_err = L"Cannot back up " + f.filename;
-                        try {
-                            co_await out_file.DeleteAsync();
-                        } catch (...) {
-                        }
-                        if (dispatcher)
-                            co_await winrt::resume_foreground(dispatcher);
-                        done(false, last_err);
-                        co_return;
-                    }
+                // Promote the verified .part over the target; the old file is backed
+                // up first. A locked target fails the rename without destroying it
+                // and keeps the verified .part for the next pull.
+                std::error_code backup_ec;
+                const auto previous = std::filesystem::path(target_path.wstring() + L".previous");
+                if (std::filesystem::is_regular_file(target_path, backup_ec) &&
+                    !std::filesystem::copy_file(target_path, previous,
+                                                std::filesystem::copy_options::overwrite_existing,
+                                                backup_ec)) {
+                    last_err = L"Cannot back up " + f.filename;
+                    break;
                 }
-                bool rename_failed = false;
-                try {
-                    co_await out_file.RenameAsync(winrt::hstring(leaf),
-                                                  NameCollisionOption::ReplaceExisting);
-                } catch (...) {
+                std::error_code rename_ec;
+                std::filesystem::rename(part_path, target_path, rename_ec);
+                if (rename_ec) {
                     last_err = L"Cannot replace " + f.filename + L" (target in use?)";
-                    rename_failed = true;
+                    break;
                 }
-                if (rename_failed) {
-                    try {
-                        co_await out_file.DeleteAsync();
-                    } catch (...) {
-                    }
-                    if (dispatcher)
-                        co_await winrt::resume_foreground(dispatcher);
-                    done(false, last_err);
-                    co_return;
-                }
+                bytes_done = bytes_file_start + got;
 
                 log_output(("[downloader] " + ::xllama::wstring_to_utf8(f.filename) + " done (" +
                             std::to_string(bytes_done) + " bytes total so far)\n")
@@ -752,6 +717,33 @@ std::vector<ManifestEntry> parse_manifest(winrt::hstring const& text) {
         // 0 / absent → CPU; the operator knob still overrides (D3).
         e.gpu_layers = static_cast<int>(obj.GetNamedNumber(L"gpu_layers", 0));
         e.stream = obj.GetNamedBoolean(L"stream", false);
+        e.expert_slots = static_cast<int>(obj.GetNamedNumber(L"expert_slots", 0));
+        e.expert_swap = obj.GetNamedNumber(L"expert_swap", 0);
+        e.expert_prefetch = static_cast<int>(obj.GetNamedNumber(L"expert_prefetch", 0));
+        e.expert_major = static_cast<int>(obj.GetNamedNumber(L"expert_major", 0));
+        e.expert_prefetch_ahead = obj.GetNamedBoolean(L"expert_prefetch_ahead", false);
+        e.n_ubatch = static_cast<int>(obj.GetNamedNumber(L"n_ubatch", 0));
+        if (obj.HasKey(L"env") && obj.GetNamedValue(L"env").ValueType() ==
+                                      winrt::Windows::Data::Json::JsonValueType::Object) {
+            for (auto const& kv : obj.GetNamedObject(L"env")) {
+                auto const v = kv.Value();
+                std::wstring s;
+                switch (v.ValueType()) {
+                case winrt::Windows::Data::Json::JsonValueType::Number:
+                    s = std::to_wstring(static_cast<long long>(v.GetNumber()));
+                    break;
+                case winrt::Windows::Data::Json::JsonValueType::Boolean:
+                    s = v.GetBoolean() ? L"1" : L"0";
+                    break;
+                case winrt::Windows::Data::Json::JsonValueType::String:
+                    s = std::wstring(v.GetString());
+                    break;
+                default:
+                    continue;
+                }
+                e.env.emplace_back(std::wstring(kv.Key()), std::move(s));
+            }
+        }
         if (obj.HasKey(L"files")) {
             for (auto const& f : obj.GetNamedArray(L"files")) {
                 auto fo = f.GetObject();
@@ -914,6 +906,14 @@ SessionParams CatalogueSessionParams(const std::string& model) {
         c.n_ctx = entry->n_ctx;
         c.gpu_layers = entry->gpu_layers;
         c.stream = entry->stream;
+        c.expert_slots = entry->expert_slots;
+        c.expert_swap = static_cast<float>(entry->expert_swap);
+        c.expert_prefetch = entry->expert_prefetch;
+        c.expert_major = entry->expert_major;
+        c.expert_prefetch_ahead = entry->expert_prefetch_ahead;
+        c.n_ubatch = entry->n_ubatch;
+        for (const auto& kv : entry->env)
+            c.env.emplace_back(wstring_to_utf8(kv.first), wstring_to_utf8(kv.second));
         c.lora = wstring_to_utf8(entry->lora);
         c.lora_scale = static_cast<float>(entry->lora_scale);
     }

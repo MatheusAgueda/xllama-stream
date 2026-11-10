@@ -1,0 +1,87 @@
+name: expert-cache-host
+
+# Host check of llama.cpp patch 0004 (expert cache, patches/README.md): build
+# the patched tree for Linux (CPU; Debug and ASan) and decode a small MoE with
+# fewer resident experts per layer than it has, against the same model with
+# every expert in RAM (tests/test_expert_cache.cpp). build-linux.yml builds
+# llama.cpp unpatched, where that test compiles to nothing.
+
+on:
+  # A new workflow file is dispatchable only once it is on the default branch;
+  # until then a push touching the patch, the test or the plumbing runs it.
+  push:
+    # ec-bench carries the same commits for expert-cache-bench.yml only.
+    branches-ignore: [ec-bench]
+    paths:
+      - patches/**
+      - scripts/apply-uwp-patches.sh
+      - tests/test_expert_cache.cpp
+      - tests/test_session_spec.cpp
+      - include/xllama/session.h
+      - include/xllama/session_spec.h
+      - src/bridge/llama_gpu.h
+      - .github/workflows/expert-cache-host.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # 4 experts, 2 used per token, llama arch (build_moe_ffn), 39 MB.
+  EC_MODEL_URL: https://huggingface.co/ggml-org/stories15M_MOE/resolve/main/stories15M_MOE-Q8_0.gguf
+  EC_MODEL_SHA256: c7aa6863f9a4b3cdf19716e2c95622dcbd3bd06989324bf1ac8e60486ef8e881
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [linux-test, linux-asan]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential libcurl4-openssl-dev
+
+      - name: Apply the UWP llama.cpp patches
+        run: bash scripts/apply-uwp-patches.sh
+
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+
+      - name: Build the unit tests
+        run: cmake --build build/${{ matrix.preset }} --target xllama-tests -j"$(nproc)"
+
+      - name: Fetch the test MoE
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/moe.gguf" "$EC_MODEL_URL"
+          echo "$EC_MODEL_SHA256  $RUNNER_TEMP/moe.gguf" | sha256sum -c -
+
+      - name: Expert cache against the resident model
+        env:
+          XLLAMA_EC_TEST_MODEL: ${{ runner.temp }}/moe.gguf
+          # Memory errors in the cache's reads are the point; leak reports from
+          # the OpenMP runtime are not.
+          ASAN_OPTIONS: detect_leaks=0
+        run: |
+          out=$(./build/${{ matrix.preset }}/tests/xllama-tests --test-case='expert cache*' 2>&1) || {
+            echo "$out"; exit 1; }
+          echo "$out"
+          # doctest exits 0 when the filter matches nothing: require both cases
+          # ran (slot-mapped decode, expert-major prompts).
+          grep -Eq 'test cases: +2 \| +2 passed' <<<"$out"
+
+      - name: Session parameters (expert_slots plumbing)
+        run: |
+          ./build/${{ matrix.preset }}/tests/xllama-tests \
+            --test-case='resolve_session_params*,same_load*'

@@ -218,12 +218,125 @@ TEST_CASE("Session: KV prefix reuse collapses a repeated prefill (opt-in: XLLAMA
         REQUIRE(r_fresh.output_text.size() >= 5);
         REQUIRE(r_ext.output_text.size() >= 5);
         CHECK(r_ext.output_text.substr(0, 5) == r_fresh.output_text.substr(0, 5));
-    } else {
-        // Hybrid (LFM2): the divergent tail cannot be erased — seq_rm refuses —
-        // so the session must have degraded to a full clear + single-batch
-        // re-prefill, which is exactly a fresh session: byte-identical output.
+    } else if (r_ext.n_p_eval == sess->count_tokens(ext)) {
+        // Hybrid (LFM2, Qwen3.5) without a usable checkpoint: the divergent
+        // tail cannot be erased — seq_rm refuses — so the session degraded to a
+        // full clear + re-prefill, split where a fresh session splits it too
+        // (#170c): byte-identical output.
         CHECK(r_ext.output_text == r_fresh.output_text);
+    } else {
+        // Hybrid with a #170c checkpoint inside the common prefix: the restored
+        // state was prefilled in other batch shapes than the fresh session's,
+        // so the same near-tie caveat as the pure-attention rewind applies.
+        REQUIRE(r_fresh.output_text.size() >= 5);
+        REQUIRE(r_ext.output_text.size() >= 5);
+        CHECK(r_ext.output_text.substr(0, 5) == r_fresh.output_text.substr(0, 5));
     }
+}
+
+// The first characters two greedy runs must share when their prefixes were
+// prefilled in different batch shapes (see the near-tie note above).
+static void check_same_lead(const std::string& a, const std::string& b) {
+    const size_t n = std::min<size_t>(5, std::min(a.size(), b.size()));
+    REQUIRE(n >= 3);
+    CHECK(a.substr(0, n) == b.substr(0, n));
+}
+
+// #170c: a LAN-API turn re-sends the whole conversation with the previous
+// generation prompt re-rendered as history, so it diverges 4 tokens before the
+// previous prompt's end (Qwen drops "<think>\n\n</think>\n\n" from history). A
+// hybrid cache cannot erase that tail — before #170c it re-prefilled from token
+// 0 (8-10 s per turn on the console). The recurrent checkpoint at prompt end
+// minus 4 makes it prefill only the new turn, like a pure-attention rewind.
+// Opt-in — needs a real GGUF with a ChatML template:
+//   XLLAMA_TEST_MODEL=/path/to/model.gguf ./xllama-tests
+TEST_CASE("Session: an API turn prefills only the new turn (opt-in: XLLAMA_TEST_MODEL)") {
+    const char* model_env = std::getenv("XLLAMA_TEST_MODEL");
+    if (!model_env)
+        return;
+
+    xllama::SessionParams sp;
+    sp.model_path = model_env;
+    sp.n_ctx = 1024;
+    std::string err;
+    auto sess = xllama::Session::create(sp, &err);
+    REQUIRE_MESSAGE(sess, err);
+
+    auto mkgp = [](const std::string& p) {
+        xllama::GenerateParams gp;
+        gp.prompt = p;
+        gp.n_predict = 10;
+        gp.temperature = 0.0f;
+        return gp;
+    };
+    const std::string sys = "<|im_start|>system\nYou are a concise assistant.<|im_end|>\n";
+    const std::string gen = "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+    const std::string q1 = "<|im_start|>user\nName a colour.<|im_end|>\n";
+    const std::string turn1 = sys + q1 + gen;
+    const auto r1 = sess->generate(mkgp(turn1));
+    REQUIRE_MESSAGE(r1.success, r1.error_msg);
+    REQUIRE(!r1.output_text.empty());
+
+    const std::string turn2 = sys + q1 + "<|im_start|>assistant\n" + r1.output_text +
+                              "<|im_end|>\n<|im_start|>user\nAnd a fruit?<|im_end|>\n" + gen;
+    const int n1 = sess->count_tokens(turn1);
+    const int n2 = sess->count_tokens(turn2);
+    const auto r2 = sess->generate(mkgp(turn2));
+    REQUIRE_MESSAGE(r2.success, r2.error_msg);
+    CHECK(r2.n_prompt == n2);
+    // Everything up to the previous turn's "<|im_start|>assistant\n" stays.
+    CHECK(r2.n_p_eval <= n2 - (n1 - 4));
+
+    auto fresh = xllama::Session::create(sp, &err);
+    REQUIRE_MESSAGE(fresh, err);
+    const auto r2_fresh = fresh->generate(mkgp(turn2));
+    REQUIRE_MESSAGE(r2_fresh.success, r2_fresh.error_msg);
+    CHECK(r2_fresh.n_p_eval == n2);
+    check_same_lead(r2.output_text, r2_fresh.output_text);
+
+    // Regenerate: the same prompt again. The checkpoint at its end minus 4 holds
+    // exactly the state the first run had there, and the last 4 tokens go
+    // through in the same batch, so the output is byte-identical.
+    const auto r3 = sess->generate(mkgp(turn2));
+    REQUIRE_MESSAGE(r3.success, r3.error_msg);
+    CHECK(r3.n_p_eval <= 4);
+    CHECK(r3.output_text == r2.output_text);
+}
+
+// #170c: one-shot API calls that share a system prompt diverge right after it.
+// The divergence point of the first refused rewind becomes a checkpoint, so
+// the third call prefills only its own question.
+TEST_CASE("Session: one-shot calls reuse their shared system prompt (opt-in: XLLAMA_TEST_MODEL)") {
+    const char* model_env = std::getenv("XLLAMA_TEST_MODEL");
+    if (!model_env)
+        return;
+
+    xllama::SessionParams sp;
+    sp.model_path = model_env;
+    sp.n_ctx = 1024;
+    std::string err;
+    auto sess = xllama::Session::create(sp, &err);
+    REQUIRE_MESSAGE(sess, err);
+
+    auto call = [&](const std::string& question) {
+        xllama::GenerateParams gp;
+        gp.prompt = "<|im_start|>system\nYou answer questions about the solar system in one "
+                    "short sentence, with no preamble and no follow-up "
+                    "question.<|im_end|>\n<|im_start|>user\n" +
+                    question + "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+        gp.n_predict = 8;
+        gp.temperature = 0.0f;
+        return std::make_pair(sess->generate(gp), sess->count_tokens(gp.prompt));
+    };
+    const auto [r1, n1] = call("Which planet is largest?");
+    REQUIRE_MESSAGE(r1.success, r1.error_msg);
+    const auto [r2, n2] = call("Which planet is hottest?");
+    REQUIRE_MESSAGE(r2.success, r2.error_msg);
+    const auto [r3, n3] = call("Which planet has rings?");
+    REQUIRE_MESSAGE(r3.success, r3.error_msg);
+    // The system prompt alone is over 20 tokens; the third call prefills its
+    // question and the generation prompt only.
+    CHECK(r3.n_p_eval < n3 - 20);
 }
 
 // A prompt longer than the logical batch must be prefilled in chunks. This is
