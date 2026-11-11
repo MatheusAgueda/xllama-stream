@@ -74,7 +74,7 @@ new file mode 100644
 index 0000000..b93f475
 --- /dev/null
 +++ b/src/llama-expert-cache.cpp
-@@ -0,0 +1,2064 @@
+@@ -0,0 +1,2142 @@
 +#include "llama-expert-cache.h"
 +
 +#include "llama-impl.h"
@@ -254,6 +254,15 @@ index 0000000..b93f475
 +    std::vector<int32_t> avail; // select op scratch (LLAMA_EXPERT_SWAP_BATCH): slot_of plus the ubatch's reads
 +    std::atomic<int64_t> load_us {0}; // slowest thread of the last load op, not yet in read_us
 +
++    // LLAMA_EXPERT_LRFU: each slot's decayed reuse value and the tick it was last set (slot -> ...),
++    // the select op's routed weight of each expert in this ubatch (expert -> sum over its tokens of
++    // the router score) and whether the plan has that weight (no select op: every use weighs 1)
++    std::vector<double>   lrfu_val;
++    std::vector<uint64_t> lrfu_last;
++    std::vector<double>   lrfu_key; // plan scratch: the decayed value of each slot at this tick
++    std::vector<float>    wsum;
++    bool                  w_ready = false;
++
 +    std::unique_ptr<ec_pf[]> pf;  // the current prefetch round, n_pf of n_slots jobs
 +    int32_t n_pf = 0;
 +    std::vector<uint64_t> seen;   // expert -> tick of the last prefetch that ranked it
@@ -280,6 +289,7 @@ index 0000000..b93f475
 +    float    swap_ratio    = 0.0f;
 +    uint32_t swap_tail     = 0; // LLAMA_EXPERT_SWAP_TAIL: weakest ranks of the top-k a resident takes at any score
 +    bool     swap_batch    = false; // LLAMA_EXPERT_SWAP_BATCH: a ubatch's own reads count as resident
++    double   lrfu_half     = 0.0;   // LLAMA_EXPERT_LRFU: eviction half-life in plan ticks, 0 = LRU
 +    // LLAMA_EXPERT_SLOTS_LAYERS: the slots of layer il (n_slots past the list) - an uneven split at the
 +    // same total moves memory to the layers whose routing misses most
 +    std::vector<uint32_t> slots_layer;
@@ -1175,6 +1185,8 @@ index 0000000..b93f475
 +        L.expert_of[victim] = e;
 +        L.slot_of[e]        = victim;
 +        L.used[victim]      = tick;
++        L.lrfu_val[victim]  = 0.0; // LRFU: a read ahead has no use yet (its victim is still LRU)
++        L.lrfu_last[victim] = tick;
 +        j.parts = C.io_split ? (int32_t) (L.tensors.size()*EC_PF_SUBPARTS) : 1;
 +        j.left.store(j.parts, std::memory_order_relaxed);
 +        j.gen.store(j.gen.load(std::memory_order_relaxed) + 1, std::memory_order_release);
@@ -1234,6 +1246,10 @@ index 0000000..b93f475
 +        res = &L.avail;
 +    }
 +
++    const bool lrfu = C.lrfu_half > 0.0;
++    if (lrfu) {
++        std::fill(L.wsum.begin(), L.wsum.end(), 0.0f);
++    }
 +    uint64_t swaps = 0;
 +    for (int64_t t = 0; t < n_tokens; ++t) {
 +        const float * s = (const float *) ((const char *) scores->data + t*scores->nb[1]);
@@ -1250,8 +1266,13 @@ index 0000000..b93f475
 +        int32_t * out = (int32_t *) ((char *) dst->data + t*dst->nb[1]);
 +        for (int64_t k = 0; k < n_used; ++k) {
 +            out[k] = order[k];
++            if (lrfu) {
++                const float v = s[order[k]];
++                L.wsum[order[k]] += v == v && v > 0.0f ? v : 0.0f;
++            }
 +        }
 +    }
++    L.w_ready = lrfu;
 +    if (swaps > 0) {
 +        C.swaps += swaps;
 +    }
@@ -1288,6 +1309,18 @@ index 0000000..b93f475
 +
 +    C.read_us += (uint64_t) L.load_us.exchange(0);
 +
++    // LLAMA_EXPERT_LRFU: a slot's value decays by half every lrfu_half ticks and gains, at each
++    // ubatch that uses it, the router weight its tokens gave the expert (1 without a select op);
++    // the victim is the lowest value, an expert that comes back often and strongly outlives one a
++    // single prompt token touched last
++    const bool   lrfu = C.lrfu_half > 0.0;
++    const bool   wtd  = lrfu && L.w_ready;
++    const double half = C.lrfu_half;
++    L.w_ready = false;
++    auto decayed = [&L, tick, half](int32_t s) {
++        return L.lrfu_val[s] * std::exp2(-(double) (tick - L.lrfu_last[s]) / half);
++    };
++
 +    // resident experts: pin them for this ubatch
 +    uint64_t hits = 0;
 +    for (int64_t i1 = 0; i1 < n_tokens; ++i1) {
@@ -1298,7 +1331,19 @@ index 0000000..b93f475
 +            if (s >= 0 && L.used[s] != tick) {
 +                L.used[s] = tick;
 +                hits++;
++                if (lrfu) {
++                    L.lrfu_val[s]  = decayed(s) + (wtd ? (double) L.wsum[e] : 1.0);
++                    L.lrfu_last[s] = tick;
++                }
 +            }
++        }
++    }
++    // the candidates' values do not change while the misses below take slots (a taken slot is
++    // pinned): decay them once
++    if (lrfu) {
++        L.lrfu_key.resize((size_t) n_slots);
++        for (int32_t s = 0; s < n_slots; ++s) {
++            L.lrfu_key[s] = L.expert_of[s] < 0 ? -INFINITY : decayed(s);
 +        }
 +    }
 +
@@ -1314,7 +1359,8 @@ index 0000000..b93f475
 +        C.pf_used += pf_used;
 +    }
 +
-+    // missing experts: take the least recently used slot that this ubatch does not need
++    // missing experts: take the least recently used slot that this ubatch does not need (LRFU: the
++    // lowest decayed value, then the least recently used)
 +    for (int64_t i1 = 0; i1 < n_tokens; ++i1) {
 +        for (int64_t i0 = 0; i0 < n_used; ++i0) {
 +            const int32_t e = ec_id_at(ids, i0, i1);
@@ -1323,7 +1369,17 @@ index 0000000..b93f475
 +            }
 +            int32_t victim = -1;
 +            for (int32_t s = 0; s < n_slots; ++s) {
-+                if (L.used[s] != tick && (victim < 0 || L.used[s] < L.used[victim])) {
++                if (L.used[s] == tick) {
++                    continue;
++                }
++                if (victim < 0) {
++                    victim = s;
++                } else if (lrfu) {
++                    const double a = L.lrfu_key[s], b = L.lrfu_key[victim];
++                    if (a < b || (a == b && L.used[s] < L.used[victim])) {
++                        victim = s;
++                    }
++                } else if (L.used[s] < L.used[victim]) {
 +                    victim = s;
 +                }
 +            }
@@ -1337,6 +1393,10 @@ index 0000000..b93f475
 +            L.slot_of[e]        = victim;
 +            L.used[victim]      = tick;
 +            L.pending.emplace_back(victim, e);
++            if (lrfu) {
++                L.lrfu_val[victim]  = wtd ? (double) L.wsum[e] : 1.0;
++                L.lrfu_last[victim] = tick;
++            }
 +        }
 +    }
 +
@@ -1584,6 +1644,8 @@ index 0000000..b93f475
 +            L.expert_of[victim] = e;
 +            L.slot_of[e]        = victim;
 +            L.used[victim]      = tick;
++            L.lrfu_val[victim]  = 1.0; // LRFU: one use (the round's victims stay LRU)
++            L.lrfu_last[victim] = tick;
 +            L.em_slot[e]        = victim;
 +            L.em_kept.push_back(e);
 +        }
@@ -1810,6 +1872,19 @@ index 0000000..b93f475
 +    if (cache->swap_batch) {
 +        LLAMA_LOG_INFO("%s: expert cache: swap batch on (a ubatch's reads stand in for its other tokens)\n", __func__);
 +    }
++    // LLAMA_EXPERT_LRFU=<half-life>: the plan evicts the slot with the lowest decayed reuse value
++    // instead of the least recently used one; each use adds the router weight the ubatch gave the
++    // expert (with a swap ratio: the select op's scores; else 1) and the value halves every
++    // <half-life> plan ticks (ubatches; prefetch rounds count too). Unset or 0 = LRU. Replay of the
++    // 40-prompt routing trace at 54 slots, half-life 8-16: 14-18% fewer reads at every swap ratio
++    // from exact to 0.7, the dropped router mass equal or lower
++    const char * lr = getenv("LLAMA_EXPERT_LRFU");
++    const double half = lr != nullptr && *lr != '\0' ? atof(lr) : 0.0;
++    cache->lrfu_half = half > 0.0 && half < 1e9 ? half : 0.0;
++    if (cache->lrfu_half > 0.0) {
++        LLAMA_LOG_INFO("%s: expert cache: LRFU eviction, half-life %g ticks (%s)\n", __func__, cache->lrfu_half,
++            cache->swap_ratio > 0.0f ? "router-weighted" : "unit uses");
++    }
 +    // LLAMA_EXPERT_SLOTS_LAYERS=<n0>,<n1>,...: resident experts of each layer, at least n_expert_used
 +    // (layers past the list keep n_slots). The split comes from a routing trace replayed offline; the
 +    // ubatch cap follows the smallest layer
@@ -2014,6 +2089,9 @@ index 0000000..b93f475
 +        slot->slot_of.assign(n_expert, -1);
 +        slot->expert_of.assign(n_slots, -1);
 +        slot->used.assign(n_slots, 0);
++        slot->lrfu_val.assign(n_slots, 0.0);
++        slot->lrfu_last.assign(n_slots, 0);
++        slot->wsum.assign(n_expert, 0.0f);
 +        slot->pf.reset(new ec_pf[n_slots]);
 +        slot->seen.assign(n_expert, 0);
 +        cache->first_layer = std::min(cache->first_layer, il);

@@ -46,6 +46,7 @@ struct EcLog {
     std::mutex mtx;
     std::string final_line;
     std::string slots_line; // the LLAMA_EXPERT_SLOTS_LAYERS init line
+    std::string lrfu_line;  // the LLAMA_EXPERT_LRFU init line
 };
 
 void ec_log_cb(ggml_log_level, const char* text, void* user_data) {
@@ -55,6 +56,10 @@ void ec_log_cb(ggml_log_level, const char* text, void* user_data) {
     if (std::strstr(text, "slots per layer")) {
         std::lock_guard<std::mutex> lock(log->mtx);
         log->slots_line = text;
+    }
+    if (std::strstr(text, "LRFU eviction")) {
+        std::lock_guard<std::mutex> lock(log->mtx);
+        log->lrfu_line = text;
     }
     if (!std::strstr(text, "expert cache (final)"))
         return;
@@ -743,6 +748,53 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
         REQUIRE(batched.ok);
         CHECK(batched.n_ubatch == cached.n_ubatch);
         CHECK(batched.tokens.size() == swapped.tokens.size());
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            MESSAGE(log.final_line);
+            CHECK(misses_of(log.final_line) >= 0);
+            CHECK(misses_of(log.final_line) <= plain_misses);
+        }
+
+        // LRFU eviction (LLAMA_EXPERT_LRFU): only which expert leaves a slot
+        // changes, never the math. Exact routing, with unit uses (no select op)
+        // and router-weighted (a ratio above 1 runs the select op without
+        // swapping): same tokens as plain, and reads still happen. At 0.5 the run
+        // holds together.
+        set_env_s("LLAMA_EXPERT_LRFU", "8");
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            log.final_line.clear();
+            log.lrfu_line.clear();
+        }
+        const EcRun lrfu_unit = run_greedy(path, c.slots, 512, c.used, 24);
+        REQUIRE(lrfu_unit.ok);
+        CHECK(lrfu_unit.n_ubatch == cached.n_ubatch);
+        CHECK(lrfu_unit.tokens == plain.tokens);
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            MESSAGE(log.lrfu_line);
+            MESSAGE(log.final_line);
+            CHECK(log.lrfu_line.find("half-life 8 ticks (unit uses)") != std::string::npos);
+            CHECK(misses_of(log.final_line) > 0);
+            log.final_line.clear();
+            log.lrfu_line.clear();
+        }
+        const EcRun lrfu_exact = run_greedy(path, c.slots, 512, c.used, 24, 1000.0f);
+        REQUIRE(lrfu_exact.ok);
+        CHECK(lrfu_exact.tokens == plain.tokens);
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            MESSAGE(log.final_line);
+            CHECK(log.lrfu_line.find("(router-weighted)") != std::string::npos);
+            CHECK(swaps_of(log.final_line) == 0);
+            CHECK(misses_of(log.final_line) > 0);
+            log.final_line.clear();
+        }
+        const EcRun lrfu_swap = run_greedy(path, c.slots, 512, c.used, 24, 0.5f);
+        set_env_s("LLAMA_EXPERT_LRFU", nullptr);
+        REQUIRE(lrfu_swap.ok);
+        CHECK(lrfu_swap.n_ubatch == cached.n_ubatch);
+        CHECK(lrfu_swap.tokens.size() == swapped.tokens.size());
         {
             std::lock_guard<std::mutex> lock(log.mtx);
             MESSAGE(log.final_line);
