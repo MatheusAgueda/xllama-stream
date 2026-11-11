@@ -629,6 +629,7 @@ void run_d3d12_memprobe(const std::function<void(const std::string&)>& emit) {
         #include "ggml-backend.h"
         #include "ggml-impl.h"
         #include "ggml_d3d12_elt_binary_dxil.h"
+        #include "ggml_d3d12_elt_norm_quant_dxil.h"
         #include "ggml_d3d12_elt_quant_q8_k_dxil.h"
         #include "ggml_d3d12_elt_rms_norm_dxil.h"
         #include "ggml_d3d12_get_rows_q6_k_dxil.h"
@@ -678,7 +679,7 @@ enum Pso {
     kPsoF32 = 6,
     kPsoCount = 7
 };
-enum Elt { kEltBinary = 0, kEltRmsNorm = 1, kEltQuantQ8K = 2, kEltCount = 3 };
+enum Elt { kEltBinary = 0, kEltRmsNorm = 1, kEltQuantQ8K = 2, kEltNormQuant = 3, kEltCount = 4 };
 enum Moe { kMoeCombine = 0, kMoeTail = 1, kMoeCount = 2 };
 // shaders/ggml_d3d12_ssm.hlsl, KERNEL 1..5 (ggml_d3d12_ssm_emu.h).
 enum Ssm { kSsmUnary = 0, kSsmCopy = 1, kSsmGetRows = 2, kSsmConv = 3, kSsmGdn = 4, kSsmCount = 5 };
@@ -749,6 +750,12 @@ struct Gpu {
     // the q8_K quantization run on the CPU inside graph_compute.
     ComPtr<ID3D12PipelineState> pso_elt[kEltCount];
     bool elt_ok = false;
+    // KERNEL 4 for an rms_norm + weight whose product a q8_K matmul of the same
+    // call reads: kernels 2 and 3 as one dispatch, the same bytes (selftest
+    // normq). XLLAMA_D3D12_NORMQ=0 (read when a backend is created) keeps them
+    // apart; its pipeline failing leaves the other elementwise kernels on.
+    bool normq = true;
+    std::uint64_t n_normq = 0; // such dispatches recorded (a replayed plan records none)
     // shaders/ggml_d3d12_moe.hlsl: the routed experts' weighted sum and the
     // shared expert's gate + both residual adds, each one dispatch.
     ComPtr<ID3D12PipelineState> pso_moe[kMoeCount];
@@ -890,7 +897,7 @@ struct PsoSlot {
 std::vector<PsoSlot> pso_slots(Gpu& g) {
     static const char* const mmv[] = {"q4_0", "q4_k", "q6_k", "iq3_s", "iq4_xs", "q5_k", "f32"};
     static const char* const mmid[] = {"iq4_xs", "iq3_s"};
-    static const char* const elt[] = {"binary", "rms_norm", "quant_q8_k"};
+    static const char* const elt[] = {"binary", "rms_norm", "quant_q8_k", "norm_quant"};
     static const char* const moe[] = {"combine", "tail"};
     static const char* const ssm[] = {"unary", "copy", "get_rows", "conv", "gdn"};
     static_assert(
@@ -1113,9 +1120,10 @@ bool init_gpu(Gpu& g) {
     }
     {
         const void* eb[kEltCount] = {kGgmlD3d12EltBinaryDxil, kGgmlD3d12EltRmsNormDxil,
-                                     kGgmlD3d12EltQuantQ8KDxil};
+                                     kGgmlD3d12EltQuantQ8KDxil, kGgmlD3d12EltNormQuantDxil};
         const size_t es[kEltCount] = {kGgmlD3d12EltBinaryDxilSize, kGgmlD3d12EltRmsNormDxilSize,
-                                      kGgmlD3d12EltQuantQ8KDxilSize};
+                                      kGgmlD3d12EltQuantQ8KDxilSize,
+                                      kGgmlD3d12EltNormQuantDxilSize};
         g.elt_ok = true;
         for (int i = 0; i < kEltCount && g.elt_ok; ++i) {
             D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
@@ -1123,7 +1131,13 @@ bool init_gpu(Gpu& g) {
             pd.CS.pShaderBytecode = eb[i];
             pd.CS.BytecodeLength = es[i];
             hr = g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.pso_elt[i]));
-            if (FAILED(hr)) {
+            if (FAILED(hr) && i == kEltNormQuant) {
+                // Kernels 2 and 3 do its work as two dispatches.
+                log_output("[xllama] d3d12: " +
+                           d3d12c::hr_message("CreateComputePipelineState (norm_quant)", hr) +
+                           " — rms_norm and its q8_K copy stay two dispatches\n");
+                g.pso_elt[i].Reset();
+            } else if (FAILED(hr)) {
                 // The matmuls still run; the ops between them go back to the CPU.
                 log_output("[xllama] d3d12: " +
                            d3d12c::hr_message("CreateComputePipelineState (elt)", hr) +
@@ -1786,7 +1800,8 @@ bool in_expert_cache(const ggml_tensor* t) {
 // A pipeline's kernel, for the profile.
 std::string pso_name(const Gpu& g, const ID3D12PipelineState* p) {
     static const char* const kTypes[] = {"q4_0", "q4_K", "q6_K", "iq3_s", "iq4_xs", "q5_K", "f32"};
-    static const char* const kElts[] = {"elt binary", "elt rms_norm", "elt quant q8_K"};
+    static const char* const kElts[] = {"elt binary", "elt rms_norm", "elt quant q8_K",
+                                        "elt rms_norm+q8_K"};
     static const char* const kMoes[] = {"moe combine", "moe tail"};
     static const char* const kSsms[] = {"ssm unary", "ssm copy", "ssm get_rows", "ssm conv",
                                         "ssm gated delta net"};
@@ -1855,6 +1870,13 @@ void backend_free(ggml_backend_t b) {
                       static_cast<unsigned long long>(g.n_async),
                       static_cast<unsigned long long>(g.n_drain_waits), g.drain_ms);
         log_output(msg);
+        if (g.n_normq) {
+            std::snprintf(msg, sizeof(msg),
+                          "[xllama] d3d12: %llu rms_norm dispatches planned with their q8_K copy\n",
+                          static_cast<unsigned long long>(g.n_normq));
+            log_output(msg);
+            g.n_normq = 0;
+        }
         for (int op = 0; op < kHostSlots; ++op) {
             if (!g.host_op_n[op])
                 continue;
@@ -3026,6 +3048,18 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
         done.push_back({x->data, x->nb[1], at, *off, row, ncols, xr});
         return true;
     };
+    // Whether one of the 16 nodes from nodes[from] is a matmul that quantize()s
+    // t as q8_K (the vec_dot type of every weight but F32 and Q4_0).
+    auto q8k_reader = [&](const ggml_tensor* t, std::size_t from) {
+        for (std::size_t j = from; j < nodes.size() && j < from + 16; ++j) {
+            const ggml_tensor* c = nodes[j];
+            if ((c->op == GGML_OP_MUL_MAT || c->op == GGML_OP_MUL_MAT_ID) && c->src[0] &&
+                c->src[1] && c->src[1]->data == t->data && c->src[1]->nb[1] == t->nb[1] &&
+                d3d12_activation_type(c->src[0]->type) == GGML_TYPE_Q8_K)
+                return true;
+        }
+        return false;
+    };
     // A MoE layer's tail at nodes[i], a MUL (ggml_d3d12_moe_emu.h): the routed
     // experts' MUL by their weights with the n - 1 ADDs of its views as one
     // combine; else the shared expert's gate with the ADD to the routed experts
@@ -3556,7 +3590,35 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
                 if (fuse) {
                     e.u[2] = tensor_va(w);
                     e.u[3] = tensor_va(m);
-                    record(e, {rng_of(a), rng_of(w)}, {rng_of(node), rng_of(m)});
+                    // A q8_K matmul of this call reads the product (attn_norm ->
+                    // q/k/v, ffn_norm -> the shared expert): KERNEL 4 writes its
+                    // q8_K copy too, which quantize() then finds in `done`, so
+                    // kernel 3's dispatch and the barrier before it go.
+                    const int rows = static_cast<int>(flat_rows(node));
+                    const auto qrow = static_cast<std::uint32_t>(
+                        ggml_row_size(GGML_TYPE_Q8_K, node->ne[0]));
+                    const std::size_t qbytes = static_cast<std::size_t>(qrow) * rows;
+                    const bool nq = g.normq && g.pso_elt[kEltNormQuant] && elt_rows(node) &&
+                                    node->ne[0] % kD3d12Chunk == 0 && node->ne[0] <= 4096 &&
+                                    q8k_reader(m, i + 2);
+                    std::size_t qoff = 0;
+                    if (nq && !reserve(qbytes, &qoff)) // may flush: nothing of e is recorded yet
+                        return GGML_STATUS_FAILED;
+                    if (nq) {
+                        e.pso = g.pso_elt[kEltNormQuant].Get();
+                        set_c(e, {static_cast<std::uint64_t>(node->ne[0]), a->nb[1] / sizeof(float),
+                                  node->nb[1] / sizeof(float), eps_bits, m->nb[1] / sizeof(float),
+                                  qrow});
+                        e.u[4] = xq_va(qoff);
+                        record(e, {rng_of(a), rng_of(w)},
+                               {rng_of(node), rng_of(m), xq_rng(qoff, qbytes)});
+                        // After record, which drops the copies of what it writes.
+                        done.push_back(
+                            {m->data, m->nb[1], GGML_TYPE_Q8_K, qoff, qrow, rows, rng_of(m)});
+                        ++g.n_normq;
+                    } else {
+                        record(e, {rng_of(a), rng_of(w)}, {rng_of(node), rng_of(m)});
+                    }
                     ++i; // the MUL is done
                 } else {
                     record(e, {rng_of(a)}, {rng_of(node)});
@@ -3784,6 +3846,10 @@ ggml_backend_t dev_init_backend(ggml_backend_dev_t dev, const char*) {
                            : "[xllama] d3d12: split plans kept and checked against planning, never "
                              "replayed (XLLAMA_D3D12_PLANCACHE=2)\n");
         plan_cache().clear();
+        const char* nq = std::getenv("XLLAMA_D3D12_NORMQ");
+        g.normq = !(nq && *nq == '0');
+        if (!g.normq)
+            log_output("[xllama] d3d12: rms_norm and its q8_K copy kept apart (XLLAMA_D3D12_NORMQ=0)\n");
         const char* hp = std::getenv("XLLAMA_D3D12_HOSTPROF");
         g.host_prof = hp && *hp && *hp != '0';
         if (g.host_prof)
@@ -4997,6 +5063,145 @@ D3d12SelftestRow run_moe_case(ggml_backend_t backend, int mode, int ne0, int n, 
     return row;
 }
 
+// build_norm + a q8_K matmul (attn_norm -> wq): KERNEL 4 against kernels 2 and
+// 3 it replaces. The norm, the product and the matmul output must be the same
+// bytes both ways, with one dispatch less, and the matmul within the CPU
+// backend's tolerance. ties: entries of equal |x| and both signs (weight 1), so
+// the lowest-index absmax decides the block scale's sign.
+D3d12SelftestRow run_normq_case(ggml_backend_t backend, int k, int n, int ncols, bool ties) {
+    D3d12SelftestRow row;
+    row.type = ties ? "normq_ties" : "normq";
+    row.n = n;
+    row.k = k;
+    row.ncols = ncols;
+    Gpu& g = gpu();
+    if (!g.pso_elt[kEltNormQuant]) {
+        row.error = "no norm_quant pipeline";
+        return row;
+    }
+    ggml_init_params ip = {};
+    ip.mem_size = 8 * ggml_tensor_overhead() + ggml_graph_overhead();
+    ip.no_alloc = true;
+    ggml_context* ctx_w = ggml_init(ip);
+    ggml_context* ctx_x = ggml_init(ip);
+    ggml_context* ctx_g = ggml_init(ip);
+    const ggml_type wtype = GGML_TYPE_Q4_K;
+    ggml_tensor* w = ggml_new_tensor_2d(ctx_w, wtype, k, n);
+    ggml_tensor* x = ggml_new_tensor_2d(ctx_x, GGML_TYPE_F32, k, ncols);
+    ggml_tensor* nw = ggml_new_tensor_1d(ctx_x, GGML_TYPE_F32, k);
+    ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, &kWeightsBuft);
+    ggml_backend_buffer_t xbuf = ggml_backend_alloc_ctx_tensors_from_buft(ctx_x, &kHostBuft);
+    ggml_gallocr_t galloc = nullptr;
+    const bool normq0 = g.normq;
+    const int plan0 = g.plan_mode;
+    auto cleanup = [&] {
+        g.normq = normq0;
+        g.plan_mode = plan0;
+        if (galloc)
+            ggml_gallocr_free(galloc);
+        if (wbuf)
+            ggml_backend_buffer_free(wbuf);
+        if (xbuf)
+            ggml_backend_buffer_free(xbuf);
+        ggml_free(ctx_g);
+        ggml_free(ctx_x);
+        ggml_free(ctx_w);
+    };
+    if (!wbuf || !xbuf) {
+        row.error = "buffer allocation failed";
+        cleanup();
+        return row;
+    }
+    std::mt19937 rng(4242u + static_cast<unsigned>(k + n + ncols) + (ties ? 1u : 0u));
+    std::uniform_real_distribution<float> uni(-1.f, 1.f);
+    std::vector<float> wf(static_cast<std::size_t>(n) * k);
+    for (float& v : wf)
+        v = uni(rng);
+    std::vector<std::uint8_t> q(ggml_nbytes(w));
+    ggml_quantize_chunk(wtype, wf.data(), q.data(), 0, n, k, nullptr);
+    ggml_backend_tensor_set(w, q.data(), 0, q.size());
+    static const float kTie[] = {-1.f, -0.5f, 0.5f, 1.f};
+    std::vector<float> xf(static_cast<std::size_t>(k) * ncols), nf(k);
+    for (float& v : xf)
+        v = ties ? kTie[rng() & 3u] : uni(rng);
+    for (float& v : nf)
+        v = ties ? 1.f : uni(rng);
+    ggml_backend_tensor_set(x, xf.data(), 0, xf.size() * sizeof(float));
+    ggml_backend_tensor_set(nw, nf.data(), 0, nf.size() * sizeof(float));
+
+    ggml_tensor* nrm = ggml_rms_norm(ctx_g, x, 1e-6f);
+    ggml_tensor* m = ggml_mul(ctx_g, nrm, nw);
+    ggml_tensor* y = ggml_mul_mat(ctx_g, w, m);
+    ggml_set_output(nrm);
+    ggml_set_output(m);
+    ggml_cgraph* gf = ggml_new_graph(ctx_g);
+    ggml_build_forward_expand(gf, y);
+    galloc = ggml_gallocr_new(&kHostBuft);
+    if (!ggml_gallocr_alloc_graph(galloc, gf)) {
+        row.error = "graph allocation failed";
+        cleanup();
+        return row;
+    }
+    g.plan_mode = 0; // both runs planned: a kept plan would replay the first
+    struct Out {
+        std::vector<std::uint8_t> nrm, m, y;
+        std::uint64_t dispatches = 0, fused = 0;
+        bool ran = false;
+    };
+    auto run = [&](bool fuse) {
+        Out o;
+        g.normq = fuse;
+        const std::uint64_t d0 = g.n_dispatches, f0 = g.n_normq;
+        o.ran = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+        o.dispatches = g.n_dispatches - d0;
+        o.fused = g.n_normq - f0;
+        auto get = [](const ggml_tensor* t, std::vector<std::uint8_t>* v) {
+            v->resize(ggml_nbytes(t));
+            ggml_backend_tensor_get(t, v->data(), 0, v->size());
+        };
+        get(nrm, &o.nrm);
+        get(m, &o.m);
+        get(y, &o.y);
+        return o;
+    };
+    const Out apart = run(false);
+    const Out fused = run(true);
+    row.d3d12_ran = apart.ran && fused.ran;
+    if (!row.d3d12_ran) {
+        row.error = "graph_compute failed";
+        cleanup();
+        return row;
+    }
+    std::vector<double> ms;
+    for (int r = 0; r < kSelftestTimedRuns; ++r)
+        if (ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS)
+            ms.push_back(g.last_gpu_ms);
+    if (!ms.empty()) {
+        std::nth_element(ms.begin(), ms.begin() + ms.size() / 2, ms.end());
+        row.gpu_ms = ms[ms.size() / 2];
+    }
+    std::vector<float> mf(xf.size()), yf(static_cast<std::size_t>(n) * ncols);
+    std::memcpy(mf.data(), fused.m.data(), mf.size() * sizeof(float));
+    std::memcpy(yf.data(), fused.y.data(), yf.size() * sizeof(float));
+    row.rel_err = reference_rel_err(wtype, q, w->nb[1], mf, yf, n, k, ncols);
+    const bool same = apart.nrm == fused.nrm && apart.m == fused.m && apart.y == fused.y;
+    const bool one_less = fused.fused == 1 && apart.fused == 0 &&
+                          fused.dispatches + 1 == apart.dispatches;
+    row.ok = same && one_less && row.rel_err <= kD3d12SelftestRelTol;
+    if (!one_less)
+        row.error = "not fused: " + std::to_string(apart.dispatches) + " -> " +
+                    std::to_string(fused.dispatches) + " dispatches, " +
+                    std::to_string(fused.fused) + " norm_quant";
+    else if (!same)
+        row.error = std::string("fused bytes differ (") + (apart.nrm == fused.nrm ? "" : "norm ") +
+                    (apart.m == fused.m ? "" : "product ") + (apart.y == fused.y ? "" : "matmul") +
+                    ")";
+    else if (!row.ok)
+        row.error = "mismatch vs the CPU backend (q8 vec_dot)";
+    cleanup();
+    return row;
+}
+
 // The delta net's kernels at Qwen3.6-35B-A3B's decode shapes (one token),
 // on the GPU against their host emulations: the copies and get_rows bit for
 // bit, the rest within the emulation tests' tolerances. kind 0 SIGMOID [32]
@@ -5632,6 +5837,14 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
         out->push_back(run_moe_case(backend, 1, 2048, 1, 1));
         out->push_back(run_moe_case(backend, 2, 2048, 1, 1));
         out->push_back(run_moe_case(backend, 2, 2048, 1, 5));
+    }
+    if (gpu().elt_ok) {
+        // attn_norm -> q/k/v at n_embd 2048: decode, ties; 2 blocks (a part-empty
+        // pass) x 5 tokens; 16 blocks (four full passes).
+        out->push_back(run_normq_case(backend, 2048, 512, 1, false));
+        out->push_back(run_normq_case(backend, 2048, 512, 1, true));
+        out->push_back(run_normq_case(backend, 512, 256, 5, false));
+        out->push_back(run_normq_case(backend, 4096, 256, 1, false));
     }
     if (gpu().ssm_ok)
         for (int kind = 0; kind < 8; ++kind)
