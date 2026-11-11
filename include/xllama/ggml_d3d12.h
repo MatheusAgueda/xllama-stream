@@ -228,6 +228,11 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out);
 // larger than the limit still gets one buffer of its own.
 void ggml_d3d12_set_weights_max_buffer(std::size_t bytes);
 
+// llama's decode CPU threadpool (n_threads), for GPU routing's host side
+// (XLLAMA_D3D12_GPUROUTE): a miss's nodes run on the same, still spinning
+// workers as the CPU splits. Null before that pool is freed.
+void ggml_d3d12_set_host_threadpool(ggml_threadpool_t tp, int n_threads);
+
 // Keep output.weight in a CPU buffer when layers go to D3D12 (UWP knob
 // LocalState\gguf_output_cpu.txt). Read by apply_gguf_gpu_layers.
 void gguf_set_output_on_cpu(bool on);

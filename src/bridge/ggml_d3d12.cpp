@@ -597,6 +597,8 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
 
 void ggml_d3d12_set_weights_max_buffer(std::size_t) {}
 
+void ggml_d3d12_set_host_threadpool(ggml_threadpool_t, int) {}
+
 void run_d3d12_memprobe(const std::function<void(const std::string&)>& emit) {
     if (emit)
         emit("d3d12 unavailable on this platform");
@@ -808,8 +810,11 @@ struct Gpu {
     // XLLAMA_D3D12_GPUROUTE_SIG=0: the shared expert's gate sigmoid stays a
     // host op (the CPU's expf) instead of the route kernel's double exp.
     bool route_sig = true;
-    int route_io = 6;   // XLLAMA_D3D12_GPUROUTE_IO: CPU threads of a miss's reads
-    int route_poll = 0; // XLLAMA_D3D12_GPUROUTE_POLL: their threadpool's poll level
+    // XLLAMA_D3D12_GPUROUTE_SHARED=0: a miss's nodes on a threadpool of their
+    // own (route_io threads at poll route_poll) instead of llama's (HostCpu).
+    bool route_shared = true;
+    int route_io = 6;
+    int route_poll = 0;
     // A layer's record (shaders/ggml_d3d12_route.hlsl) per kRouteRec bytes and
     // the predicate, D3D12_Host buffers.
     ComPtr<ID3D12Resource> route_res;
@@ -2736,46 +2741,72 @@ bool ensure_route_bufs(Gpu& g) {
     return true;
 }
 
-// The CPU side of a miss: a ggml CPU backend on its own threadpool
-// (XLLAMA_D3D12_GPUROUTE_IO threads, which ec_load's reads split over), and
-// a graph the group's nodes are put in.
+// The CPU side of a miss: a ggml CPU backend and a graph the group's nodes are
+// put in. It computes on llama's decode threadpool once that one is published
+// (ggml_d3d12_set_host_threadpool): the workers still spin from the last CPU
+// split, so a miss starts at once and ec_load's reads split over them. A pool
+// of its own (XLLAMA_D3D12_GPUROUTE_IO threads, _POLL) instead fights the
+// spinning workers for the app's six cores: 107 ms per miss at poll 50, and at
+// poll 0 every CPU split wakes sleeping workers (attention 0.66 ms vs 0.11,
+// console 11/11). XLLAMA_D3D12_GPUROUTE_SHARED=0 keeps the pool of its own.
 struct HostCpu {
     ggml_backend_t be = nullptr;
-    ggml_threadpool_t tp = nullptr;
+    ggml_threadpool_t own = nullptr;
+    int own_n = 1;
+    ggml_threadpool_t shared = nullptr;
+    int shared_n = 0;
+    ggml_threadpool_t cur = nullptr; // the backend's
     ggml_context* ctx = nullptr;
     ggml_cgraph* gf = nullptr;
 };
+HostCpu g_host;
 constexpr std::size_t kHostGraph = 64;
 
+void host_use(HostCpu& h, ggml_threadpool_t tp, int n) {
+    if (tp == h.cur)
+        return;
+    ggml_backend_cpu_set_threadpool(h.be, tp);
+    ggml_backend_cpu_set_n_threads(h.be, std::max(n, 1));
+    h.cur = tp;
+}
+
 HostCpu* host_cpu(Gpu& g) {
-    static HostCpu h;
+    HostCpu& h = g_host;
     static bool tried = false;
     if (!tried) {
         tried = true;
         ggml_cpu_init();
-        const int n = std::clamp(g.route_io, 1, 64);
-        ggml_threadpool_params tpp = ggml_threadpool_params_default(n);
-        tpp.poll = static_cast<std::uint32_t>(std::clamp(g.route_poll, 0, 100));
+        h.own_n = std::clamp(g.route_io, 1, 64);
         h.be = ggml_backend_cpu_init();
-        h.tp = h.be ? ggml_threadpool_new(&tpp) : nullptr;
         ggml_init_params ip = {ggml_graph_overhead_custom(kHostGraph, false), nullptr, true};
-        h.ctx = h.tp ? ggml_init(ip) : nullptr;
+        h.ctx = h.be ? ggml_init(ip) : nullptr;
         h.gf = h.ctx ? ggml_new_graph_custom(h.ctx, kHostGraph, false) : nullptr;
-        if (h.gf) {
-            ggml_backend_cpu_set_threadpool(h.be, h.tp);
-            ggml_backend_cpu_set_n_threads(h.be, n);
-        } else {
+        if (!h.gf) {
             log_output("[xllama] d3d12: GPU routing's CPU backend failed\n");
             if (h.ctx)
                 ggml_free(h.ctx);
-            if (h.tp)
-                ggml_threadpool_free(h.tp);
             if (h.be)
                 ggml_backend_free(h.be);
-            h = HostCpu{};
+            h.be = nullptr;
+            h.ctx = nullptr;
         }
     }
     return h.gf ? &h : nullptr;
+}
+
+// The pool a miss computes on, picked per miss: llama's can come and go with
+// the model.
+void host_pool(Gpu& g, HostCpu& h) {
+    if (g.route_shared && h.shared) {
+        host_use(h, h.shared, h.shared_n);
+        return;
+    }
+    if (!h.own) {
+        ggml_threadpool_params tpp = ggml_threadpool_params_default(h.own_n);
+        tpp.poll = static_cast<std::uint32_t>(std::clamp(g.route_poll, 0, 100));
+        h.own = ggml_threadpool_new(&tpp);
+    }
+    host_use(h, h.own, h.own_n); // null: ggml-cpu's disposable pool per graph
 }
 
 // The nodes, in order, on the CPU (ggml-cpu's own kernels: the CPU's bits).
@@ -2783,6 +2814,7 @@ bool host_compute(Gpu& g, ggml_tensor* const* nodes, std::size_t n) {
     HostCpu* h = host_cpu(g);
     if (!h || n > kHostGraph)
         return false;
+    host_pool(g, *h);
     constexpr std::uint64_t kRouteTimed = 64;
     const auto t0 = std::chrono::steady_clock::now();
     bool ok = true;
@@ -4912,6 +4944,8 @@ ggml_backend_t dev_init_backend(ggml_backend_dev_t dev, const char*) {
         const bool route_want = grv && *grv && *grv != '0';
         const char* gsv = std::getenv("XLLAMA_D3D12_GPUROUTE_SIG");
         g.route_sig = !(gsv && *gsv == '0');
+        const char* gshv = std::getenv("XLLAMA_D3D12_GPUROUTE_SHARED");
+        g.route_shared = !(gshv && *gshv == '0');
         const char* giv = std::getenv("XLLAMA_D3D12_GPUROUTE_IO");
         g.route_io = std::clamp(giv && *giv ? std::atoi(giv) : 6, 1, 64);
         const char* gpv = std::getenv("XLLAMA_D3D12_GPUROUTE_POLL");
@@ -4930,8 +4964,11 @@ ggml_backend_t dev_init_backend(ggml_backend_dev_t dev, const char*) {
                            ? "[xllama] d3d12: MoE routing on the GPU, predicated on a miss "
                              "(XLLAMA_D3D12_GPUROUTE, sigmoid " +
                                  std::string(g.route_sig ? "on" : "off") + ", " +
-                                 std::to_string(g.route_io) + " CPU threads, poll " +
-                                 std::to_string(g.route_poll) + ")\n"
+                                 (g.route_shared
+                                      ? std::string("llama's CPU threadpool")
+                                      : std::to_string(g.route_io) + " CPU threads, poll " +
+                                            std::to_string(g.route_poll)) +
+                                 ")\n"
                            : "[xllama] d3d12: GPU routing off: " + std::string(off) + "\n");
         }
     }
@@ -5261,6 +5298,16 @@ ggml_backend_buffer_type_t ggml_d3d12_weights_buft() {
 
 void ggml_d3d12_set_weights_max_buffer(std::size_t bytes) {
     g_weights_max_buffer = bytes;
+}
+
+void ggml_d3d12_set_host_threadpool(ggml_threadpool_t tp, int n_threads) {
+    HostCpu& h = g_host;
+    const ggml_threadpool_t old = h.shared;
+    h.shared = tp;
+    h.shared_n = tp ? std::max(n_threads, 1) : 0;
+    // off the old pool now: it is freed before the next miss could switch
+    if (h.be && old && h.cur == old && tp != old)
+        host_use(h, h.own, h.own_n);
 }
 
 // --- Memory probe (gpumem.flag) ---
