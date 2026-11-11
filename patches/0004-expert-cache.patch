@@ -74,7 +74,7 @@ new file mode 100644
 index 0000000..b93f475
 --- /dev/null
 +++ b/src/llama-expert-cache.cpp
-@@ -0,0 +1,1933 @@
+@@ -0,0 +1,1948 @@
 +#include "llama-expert-cache.h"
 +
 +#include "llama-impl.h"
@@ -277,6 +277,7 @@ index 0000000..b93f475
 +    uint32_t n_slots       = 0;
 +    uint32_t n_expert_used = 1;
 +    float    swap_ratio    = 0.0f;
++    uint32_t swap_tail     = 0; // LLAMA_EXPERT_SWAP_TAIL: weakest ranks of the top-k a resident takes at any score
 +
 +    ggml_backend_buffer_type buft {};
 +    ggml_backend_buffer_type_t inner = nullptr; // a GPU device's host buft holding the slots, nullptr = CPU
@@ -1024,8 +1025,11 @@ index 0000000..b93f475
 +// cache-aware routing of one token, order ranked by score s: resident experts outside the top
 +// n_used take the place of missing ones inside it - the strongest resident for the weakest
 +// missing - while the resident's score is at least ratio times the missing one's (a test on the
-+// ratio of two scores: unnormalized probabilities give the same swaps); returns the swaps made
-+static uint64_t ec_swap_missing(const ec_layer & L, std::vector<int32_t> & order, const float * s, int64_t n_used, float ratio) {
++// ratio of two scores: unnormalized probabilities give the same swaps); in the weakest n_tail ranks
++// any resident with a positive score stands in (cache-conditional top-k: those ranks are computed
++// when free and never read); returns the swaps made
++static uint64_t ec_swap_missing(const ec_layer & L, std::vector<int32_t> & order, const float * s, int64_t n_used, float ratio,
++                                int64_t n_tail) {
 +    const int64_t n_expert = (int64_t) order.size();
 +    uint64_t swaps = 0;
 +    int64_t i = n_used; // next resident candidate outside the top-k, strongest first
@@ -1041,7 +1045,8 @@ index 0000000..b93f475
 +            break;
 +        }
 +        const int32_t r = order[i];
-+        if (!(s[r] > 0.0f) || s[r] < ratio*s[m]) {
++        const float rj = n_used - j <= n_tail ? 0.0f : ratio; // the tail ranks come first (j descends)
++        if (!(s[r] > 0.0f) || s[r] < rj*s[m]) {
 +            break; // weaker candidates and stronger missing experts only from here
 +        }
 +        std::swap(order[j], order[i]);
@@ -1103,7 +1108,7 @@ index 0000000..b93f475
 +                L.prob[e] = p == p ? p : 0.0f; // NaN (a NaN or infinite logit) ranks last
 +            }
 +            ec_rank(order, L.prob.data());
-+            ec_swap_missing(L, order, L.prob.data(), w, C.swap_ratio);
++            ec_swap_missing(L, order, L.prob.data(), w, C.swap_ratio, C.swap_tail);
 +        } else {
 +            for (int32_t e = 0; e < n_expert; ++e) {
 +                order[e] = e;
@@ -1188,7 +1193,7 @@ index 0000000..b93f475
 +    for (int64_t t = 0; t < n_tokens; ++t) {
 +        const float * s = (const float *) ((const char *) scores->data + t*scores->nb[1]);
 +        ec_rank(order, s);
-+        swaps += ec_swap_missing(L, order, s, n_used, C.swap_ratio);
++        swaps += ec_swap_missing(L, order, s, n_used, C.swap_ratio, C.swap_tail);
 +
 +        int32_t * out = (int32_t *) ((char *) dst->data + t*dst->nb[1]);
 +        for (int64_t k = 0; k < n_used; ++k) {
@@ -1730,6 +1735,16 @@ index 0000000..b93f475
 +    cache->n_expert_used = std::max<uint32_t>(1, n_expert_used);
 +    cache->n_slots       = std::max(n_slots, cache->n_expert_used);
 +    cache->swap_ratio    = swap_ratio > 0.0f ? swap_ratio : 0.0f; // NaN and negatives: exact routing
++    // LLAMA_EXPERT_SWAP_TAIL: the weakest N ranks of each token's top-k take any resident stand-in
++    // (0 = off, the default; at most n_expert_used - 1: the top rank keeps the ratio test). Only with a
++    // swap ratio, whose routing it changes
++    const char * tail = getenv("LLAMA_EXPERT_SWAP_TAIL");
++    cache->swap_tail = tail != nullptr && *tail != '\0' && cache->swap_ratio > 0.0f
++        ? (uint32_t) std::min<int64_t>(std::max(atoi(tail), 0), (int64_t) cache->n_expert_used - 1) : 0;
++    if (cache->swap_tail > 0) {
++        LLAMA_LOG_INFO("%s: expert cache: swap tail %u of %u ranks (a resident stands in at any score)\n",
++            __func__, cache->swap_tail, cache->n_expert_used);
++    }
 +
 +    // LLAMA_EXPERT_PREFETCH: predicted experts per token read ahead (0 = off, the default: its wrong
 +    // guesses add reads, which costs more than it hides when the reads are the bottleneck)

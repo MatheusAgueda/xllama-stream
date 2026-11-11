@@ -608,6 +608,28 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
             CHECK(misses_of(log.final_line) < plain_misses);
         }
 
+        // Swap tail (LLAMA_EXPERT_SWAP_TAIL): the weakest ranks of the top-k take
+        // any resident stand-in, the top rank keeps the ratio test (the knob is
+        // clamped to used - 1, a no-op at used 1). Same ubatches, the run holds
+        // together and still reads less than exact routing.
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            log.final_line.clear();
+        }
+        set_env_k("LLAMA_EXPERT_SWAP_TAIL", 64);
+        const EcRun tailed = run_greedy(path, c.slots, 512, c.used, 24, 0.5f);
+        set_env_k("LLAMA_EXPERT_SWAP_TAIL", -1);
+        REQUIRE(tailed.ok);
+        CHECK(tailed.n_ubatch == cached.n_ubatch);
+        CHECK(tailed.tokens.size() == swapped.tokens.size());
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            MESSAGE(log.final_line);
+            CHECK(swaps_of(log.final_line) > 0);
+            CHECK(misses_of(log.final_line) >= 0);
+            CHECK(misses_of(log.final_line) < plain_misses);
+        }
+
         // Both: the prefetch predicts the swapped routing (stand-ins kept, only
         // the experts still missing read ahead). Its reads change the residency
         // and so the routing; the run must hold together and report both.
