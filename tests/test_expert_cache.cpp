@@ -898,7 +898,9 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
             std::lock_guard<std::mutex> lock(log.mtx);
             MESSAGE(log.defer_line);
             MESSAGE(log.final_line);
-            CHECK(log.defer_line.find("deferred admission, 1 reads per layer in ubatches up to 512 tokens") != std::string::npos);
+            CHECK(log.defer_line.find(
+                      "deferred admission, 1 reads per layer in ubatches up to 512 tokens") !=
+                  std::string::npos);
             CHECK(swaps_of(log.final_line) == 0);
             const DeferStats d = deferred_of(log.final_line);
             CHECK(d.reads == 0);

@@ -674,7 +674,7 @@ namespace {
 struct GdnRoundTrip {
     ggml_tensor *s = nullptr, *s_copy = nullptr, *states = nullptr, *states_all = nullptr;
     ggml_tensor *gdn = nullptr, *new_state = nullptr, *cpy_dst = nullptr, *cpy = nullptr;
-    ggml_tensor *output = nullptr;
+    ggml_tensor* output = nullptr;
     ggml_cgraph* gf = nullptr;
     int gdn_idx = -1;
 };
@@ -706,21 +706,23 @@ GdnRoundTrip gdn_round_trip(ggml_context* ctx, std::mt19937* rng, int hv, int hk
     fill(beta, rng, 0.f, 1.f);
 
     r.states = ggml_reshape_2d(ctx, r.s, n, r.s->ne[1]);
-    ggml_build_forward_expand(r.gf, ggml_scale_inplace(ctx, ggml_view_1d(ctx, r.states, 0, 0), 0.f));
+    ggml_build_forward_expand(r.gf,
+                              ggml_scale_inplace(ctx, ggml_view_1d(ctx, r.states, 0, 0), 0.f));
     r.states_all = ggml_get_rows(ctx, r.states, r.s_copy);
-    ggml_tensor* out_states =
-        ggml_view_2d(ctx, r.states_all, n, 1, r.states_all->nb[1], 0);
+    ggml_tensor* out_states = ggml_view_2d(ctx, r.states_all, n, 1, r.states_all->nb[1], 0);
     ggml_build_forward_expand(r.gf, out_states);
-    ggml_tensor* extra = ggml_view_2d(ctx, r.states_all, n, 0, r.states_all->nb[1], r.states_all->nb[1]);
+    ggml_tensor* extra =
+        ggml_view_2d(ctx, r.states_all, n, 0, r.states_all->nb[1], r.states_all->nb[1]);
     ggml_build_forward_expand(
-        r.gf, ggml_cpy(ctx, extra, ggml_view_2d(ctx, r.s, n, 0, r.s->nb[1], (kv + 1) * r.s->nb[1])));
+        r.gf,
+        ggml_cpy(ctx, extra, ggml_view_2d(ctx, r.s, n, 0, r.s->nb[1], (kv + 1) * r.s->nb[1])));
     if (brk == GdnBreak::gather_reader)
         ggml_build_forward_expand(r.gf, ggml_scale(ctx, r.states_all, 2.f));
     ggml_tensor* state = ggml_reshape_4d(ctx, out_states, sv, sv, hv, 1);
     r.gdn = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, brk == GdnBreak::k2 ? 2 : 1);
     const std::size_t attn_bytes = ggml_row_size(f, sv * hv * T);
-    r.output = ggml_view_4d(ctx, r.gdn, sv, hv, T, 1, ggml_row_size(f, sv), ggml_row_size(f, sv * hv),
-                            attn_bytes, 0);
+    r.output = ggml_view_4d(ctx, r.gdn, sv, hv, T, 1, ggml_row_size(f, sv),
+                            ggml_row_size(f, sv * hv), attn_bytes, 0);
     r.new_state = ggml_view_4d(ctx, r.gdn, sv, sv, hv, 1, ggml_row_size(f, sv),
                                ggml_row_size(f, sv * sv), ggml_row_size(f, n), attn_bytes);
     if (brk == GdnBreak::cache_reader) { // after the op, before the CPY
@@ -772,9 +774,10 @@ TEST_CASE("ggml_d3d12 ssm: the delta net reads and writes the recurrent cache ro
         CAPTURE(cs.src_row);
         CAPTURE(cs.kv);
         Ctx c(32u << 20, false);
-        std::mt19937 rng(7u + static_cast<unsigned>(cs.hv * 11 + cs.T * 13 + cs.src_row * 3 + cs.kv));
-        GdnRoundTrip r =
-            gdn_round_trip(c.ctx, &rng, cs.hv, cs.hk, cs.T, cs.kda, cells, cs.src_row, cs.kv, GdnBreak::none);
+        std::mt19937 rng(7u +
+                         static_cast<unsigned>(cs.hv * 11 + cs.T * 13 + cs.src_row * 3 + cs.kv));
+        GdnRoundTrip r = gdn_round_trip(c.ctx, &rng, cs.hv, cs.hk, cs.T, cs.kda, cells, cs.src_row,
+                                        cs.kv, GdnBreak::none);
         REQUIRE(r.gdn_idx >= 0);
         const std::size_t n = static_cast<std::size_t>(r.s->ne[0]);
         const std::vector<float> before(fdata(r.s), fdata(r.s) + n * cells);
@@ -808,22 +811,25 @@ TEST_CASE("ggml_d3d12 ssm: the delta net reads and writes the recurrent cache ro
                 ++touched;
         CHECK(touched == 0);
         // Cache row kv holds the CPU's new state, every other row is as it was.
-        const double e_state = d3d12_ssm_max_err(cache.data() + cs.kv * n, fdata(r.s) + cs.kv * n, n);
+        const double e_state =
+            d3d12_ssm_max_err(cache.data() + cs.kv * n, fdata(r.s) + cs.kv * n, n);
         CAPTURE(e_state);
         CHECK(e_state <= 1e-4);
         for (int row = 0; row < cells; ++row) {
             if (row == cs.kv)
                 continue;
             CAPTURE(row);
-            CHECK(std::memcmp(cache.data() + row * n, before.data() + row * n, n * sizeof(float)) == 0);
-            CHECK(std::memcmp(fdata(r.s) + row * n, before.data() + row * n, n * sizeof(float)) == 0);
+            CHECK(std::memcmp(cache.data() + row * n, before.data() + row * n, n * sizeof(float)) ==
+                  0);
+            CHECK(std::memcmp(fdata(r.s) + row * n, before.data() + row * n, n * sizeof(float)) ==
+                  0);
         }
     }
 }
 
 TEST_CASE("ggml_d3d12 ssm: round trips the fused delta net does not take") {
-    const GdnBreak breaks[] = {GdnBreak::gather_reader, GdnBreak::cache_reader, GdnBreak::whole_reader,
-                               GdnBreak::k2};
+    const GdnBreak breaks[] = {GdnBreak::gather_reader, GdnBreak::cache_reader,
+                               GdnBreak::whole_reader, GdnBreak::k2};
     for (GdnBreak b : breaks) {
         CAPTURE(static_cast<int>(b));
         Ctx c(16u << 20, true);

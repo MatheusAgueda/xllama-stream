@@ -2650,7 +2650,7 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
                 op.gz = p.groups_z;
                 const auto lo = reinterpret_cast<std::uintptr_t>(node->data);
                 const Rng attn{lo, lo + static_cast<std::size_t>(kD3d12GdnSv) * p.params.h *
-                                           p.params.t * p.params.b * sizeof(float)};
+                                            p.params.t * p.params.b * sizeof(float)};
                 record(op,
                        {rng_of(p.q), rng_of(p.k), rng_of(p.v), rng_of(p.g), rng_of(p.beta),
                         fz->second.src},

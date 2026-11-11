@@ -681,7 +681,8 @@ bool d3d12_gdn_fuse_plan(ggml_cgraph* cgraph, int gdn_idx, const Uses& uses,
     const ggml_tensor* ids = g->src[1];
     if (!states || !ids || states->type != GGML_TYPE_F32 || states->ne[0] != n ||
         states->nb[0] != sizeof(float) || states->ne[2] != 1 || states->ne[3] != 1 ||
-        ids->type != GGML_TYPE_I32 || ggml_nelements(ids) != 1 || view_root(ids)->op != GGML_OP_NONE)
+        ids->type != GGML_TYPE_I32 || ggml_nelements(ids) != 1 ||
+        view_root(ids)->op != GGML_OP_NONE)
         return false;
     const ggml_tensor* cache = view_root(states);
     for (int i = g_idx + 1; i < gdn_idx; ++i) {
@@ -690,8 +691,8 @@ bool d3d12_gdn_fuse_plan(ggml_cgraph* cgraph, int gdn_idx, const Uses& uses,
             return false; // writes the cache after the GET_ROWS read it
     }
     // Every reader of the op is a VIEW: of the attention rows, or the new state.
-    const std::size_t attn_bytes = static_cast<std::size_t>(kD3d12GdnSv) * p.params.h *
-                                   p.params.t * sizeof(float);
+    const std::size_t attn_bytes =
+        static_cast<std::size_t>(kD3d12GdnSv) * p.params.h * p.params.t * sizeof(float);
     if (node->flags & GGML_TENSOR_FLAG_OUTPUT)
         return false;
     const ggml_tensor* v = nullptr;
