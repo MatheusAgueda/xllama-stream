@@ -13,10 +13,11 @@
 #   shaders/ggml_d3d12_elt.hlsl → ggml_d3d12_elt_{binary,rms_norm,quant_q8_k,norm_quant,bin_quant}_dxil.h (cs_6_4, -D KERNEL)
 #   shaders/ggml_d3d12_moe.hlsl → ggml_d3d12_moe_{combine,tail}_dxil.h (cs_6_4, -D KERNEL)
 #   shaders/ggml_d3d12_ssm.hlsl → ggml_d3d12_ssm_{unary,copy,get_rows,conv,gdn}_dxil.h (cs_6_4, -D KERNEL)
+#   shaders/ggml_d3d12_route.hlsl → ggml_d3d12_route_{route,emit}_dxil.h (cs_6_4, -D KERNEL, -Gis)
 #   variants: shaders/variants.txt → $VARIANTS_OUT/<tag>/<slot>.dxil, raw blobs
 #     for XLLAMA_D3D12_SHADER_DIR (default out: build/shader-variants)
 #
-# Usage: compile-gpugemv-shader.sh [naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q5_k|mmv_q6_k|mmv_iq3_s|mmv_iq4_xs|mmv_f32|mmid_iq4_xs|mmid_iq3_s|get_rows_q6_k|elt|moe|ssm|variants ...]
+# Usage: compile-gpugemv-shader.sh [naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q5_k|mmv_q6_k|mmv_iq3_s|mmv_iq4_xs|mmv_f32|mmid_iq4_xs|mmid_iq3_s|get_rows_q6_k|elt|moe|ssm|route|variants ...]
 #        (default: all headers, no variants)
 # A different dxc release emits different bytes: regenerate only the targets
 # you changed so measured blobs stay the ones the CSVs were recorded with.
@@ -149,6 +150,16 @@ compile_target() {
 				-D "KERNEL=${n}"
 		done
 		;;
+	route)
+		local k n name sym
+		for k in 1:route:Route 2:emit:Emit; do
+			IFS=: read -r n name sym <<<"$k"
+			compile_one "$ROOT/shaders/ggml_d3d12_route.hlsl" \
+				"$ROOT/shaders/generated/ggml_d3d12_route_${name}_dxil.h" \
+				"shaders/ggml_d3d12_route.hlsl -D KERNEL=${n} -Gis" "kGgmlD3d12Route${sym}Dxil" cs_6_4 \
+				-D "KERNEL=${n}" -Gis
+		done
+		;;
 	variants)
 		# shaders/variants.txt → $VARIANTS_OUT/<tag>/<slot>.dxil (raw, not headers)
 		local out="${VARIANTS_OUT:-$ROOT/build/shader-variants}" tag slot src rest
@@ -162,14 +173,14 @@ compile_target() {
 		done <"$ROOT/shaders/variants.txt"
 		;;
 	*)
-		echo "unknown target: $1 (naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q5_k|mmv_q6_k|mmv_iq3_s|mmv_iq4_xs|mmv_f32|mmid_iq4_xs|mmid_iq3_s|get_rows_q6_k|elt|moe|ssm|variants)" >&2
+		echo "unknown target: $1 (naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q5_k|mmv_q6_k|mmv_iq3_s|mmv_iq4_xs|mmv_f32|mmid_iq4_xs|mmid_iq3_s|get_rows_q6_k|elt|moe|ssm|route|variants)" >&2
 		exit 2
 		;;
 	esac
 }
 
 if [[ $# -eq 0 ]]; then
-	set -- naive wave32 rows dot4 mmv_q4_0 mmv_q4_k mmv_q5_k mmv_q6_k mmv_iq3_s mmv_iq4_xs mmv_f32 mmid_iq4_xs mmid_iq3_s get_rows_q6_k elt moe ssm
+	set -- naive wave32 rows dot4 mmv_q4_0 mmv_q4_k mmv_q5_k mmv_q6_k mmv_iq3_s mmv_iq4_xs mmv_f32 mmid_iq4_xs mmid_iq3_s get_rows_q6_k elt moe ssm route
 fi
 for target in "$@"; do
 	compile_target "$target"
