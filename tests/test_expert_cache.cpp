@@ -719,6 +719,37 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
             CHECK(misses_of(log.final_line) <= plain_misses);
         }
 
+        // Swap batch (LLAMA_EXPERT_SWAP_BATCH): in a multi-token ubatch the experts
+        // one token keeps count as resident for the others. A ratio above 1 still
+        // never swaps (exact routing, same tokens and misses as plain); at 0.5 the
+        // run holds together and never reads more than exact routing.
+        set_env_k("LLAMA_EXPERT_SWAP_BATCH", 1);
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            log.final_line.clear();
+        }
+        const EcRun batch_exact = run_greedy(path, c.slots, 512, c.used, 24, 1000.0f);
+        REQUIRE(batch_exact.ok);
+        CHECK(batch_exact.tokens == plain.tokens);
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            MESSAGE(log.final_line);
+            CHECK(swaps_of(log.final_line) == 0);
+            CHECK(misses_of(log.final_line) == plain_misses);
+            log.final_line.clear();
+        }
+        const EcRun batched = run_greedy(path, c.slots, 512, c.used, 24, 0.5f);
+        set_env_k("LLAMA_EXPERT_SWAP_BATCH", -1);
+        REQUIRE(batched.ok);
+        CHECK(batched.n_ubatch == cached.n_ubatch);
+        CHECK(batched.tokens.size() == swapped.tokens.size());
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            MESSAGE(log.final_line);
+            CHECK(misses_of(log.final_line) >= 0);
+            CHECK(misses_of(log.final_line) <= plain_misses);
+        }
+
         // Both: the prefetch predicts the swapped routing (stand-ins kept, only
         // the experts still missing read ahead). Its reads change the residency
         // and so the routing; the run must hold together and report both.

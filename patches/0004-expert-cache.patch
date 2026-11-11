@@ -74,7 +74,7 @@ new file mode 100644
 index 0000000..b93f475
 --- /dev/null
 +++ b/src/llama-expert-cache.cpp
-@@ -0,0 +1,2038 @@
+@@ -0,0 +1,2064 @@
 +#include "llama-expert-cache.h"
 +
 +#include "llama-impl.h"
@@ -251,6 +251,7 @@ index 0000000..b93f475
 +    std::atomic<int> load_done {0}; // threads out of the load op (the last one clears pending)
 +    uint64_t tick = 0;
 +    std::vector<int32_t> order; // select and prefetch op scratch
++    std::vector<int32_t> avail; // select op scratch (LLAMA_EXPERT_SWAP_BATCH): slot_of plus the ubatch's reads
 +    std::atomic<int64_t> load_us {0}; // slowest thread of the last load op, not yet in read_us
 +
 +    std::unique_ptr<ec_pf[]> pf;  // the current prefetch round, n_pf of n_slots jobs
@@ -278,6 +279,7 @@ index 0000000..b93f475
 +    uint32_t n_expert_used = 1;
 +    float    swap_ratio    = 0.0f;
 +    uint32_t swap_tail     = 0; // LLAMA_EXPERT_SWAP_TAIL: weakest ranks of the top-k a resident takes at any score
++    bool     swap_batch    = false; // LLAMA_EXPERT_SWAP_BATCH: a ubatch's own reads count as resident
 +    // LLAMA_EXPERT_SLOTS_LAYERS: the slots of layer il (n_slots past the list) - an uneven split at the
 +    // same total moves memory to the layers whose routing misses most
 +    std::vector<uint32_t> slots_layer;
@@ -1040,18 +1042,18 @@ index 0000000..b93f475
 +// missing - while the resident's score is at least ratio times the missing one's (a test on the
 +// ratio of two scores: unnormalized probabilities give the same swaps); in the weakest n_tail ranks
 +// any resident with a positive score stands in (cache-conditional top-k: those ranks are computed
-+// when free and never read); returns the swaps made
-+static uint64_t ec_swap_missing(const ec_layer & L, std::vector<int32_t> & order, const float * s, int64_t n_used, float ratio,
-+                                int64_t n_tail) {
++// when free and never read); res = expert -> resident (>= 0) or missing; returns the swaps made
++static uint64_t ec_swap_missing(const std::vector<int32_t> & res, std::vector<int32_t> & order, const float * s, int64_t n_used,
++                                float ratio, int64_t n_tail) {
 +    const int64_t n_expert = (int64_t) order.size();
 +    uint64_t swaps = 0;
 +    int64_t i = n_used; // next resident candidate outside the top-k, strongest first
 +    for (int64_t j = n_used - 1; j >= 0; --j) { // missing experts inside it, weakest first
 +        const int32_t m = order[j];
-+        if (L.slot_of[m] >= 0) {
++        if (res[m] >= 0) {
 +            continue;
 +        }
-+        while (i < n_expert && L.slot_of[order[i]] < 0) {
++        while (i < n_expert && res[order[i]] < 0) {
 +            i++;
 +        }
 +        if (i == n_expert) {
@@ -1121,7 +1123,7 @@ index 0000000..b93f475
 +                L.prob[e] = p == p ? p : 0.0f; // NaN (a NaN or infinite logit) ranks last
 +            }
 +            ec_rank(order, L.prob.data());
-+            ec_swap_missing(L, order, L.prob.data(), w, C.swap_ratio, C.swap_tail);
++            ec_swap_missing(L.slot_of, order, L.prob.data(), w, C.swap_ratio, C.swap_tail);
 +        } else {
 +            for (int32_t e = 0; e < n_expert; ++e) {
 +                order[e] = e;
@@ -1215,6 +1217,23 @@ index 0000000..b93f475
 +        put(head, sizeof(head));
 +    }
 +
++    // LLAMA_EXPERT_SWAP_BATCH: a missing expert that some token of a multi-token ubatch keeps is read
++    // for it anyway, so a first pass collects those and the real pass counts them as resident - the
++    // other tokens keep it instead of trading it for a weaker resident (same reads, truer routing)
++    const std::vector<int32_t> * res = &L.slot_of;
++    if (C.swap_batch && n_tokens > 1) {
++        L.avail = L.slot_of;
++        for (int64_t t = 0; t < n_tokens; ++t) {
++            const float * s = (const float *) ((const char *) scores->data + t*scores->nb[1]);
++            ec_rank(order, s);
++            ec_swap_missing(L.slot_of, order, s, n_used, C.swap_ratio, C.swap_tail);
++            for (int64_t k = 0; k < n_used; ++k) {
++                L.avail[order[k]] = std::max(L.avail[order[k]], 0);
++            }
++        }
++        res = &L.avail;
++    }
++
 +    uint64_t swaps = 0;
 +    for (int64_t t = 0; t < n_tokens; ++t) {
 +        const float * s = (const float *) ((const char *) scores->data + t*scores->nb[1]);
@@ -1226,7 +1245,7 @@ index 0000000..b93f475
 +        for (int64_t k = 0; k < n_tr; ++k) {
 +            put(&s[order[k]], sizeof(float));
 +        }
-+        swaps += ec_swap_missing(L, order, s, n_used, C.swap_ratio, C.swap_tail);
++        swaps += ec_swap_missing(*res, order, s, n_used, C.swap_ratio, C.swap_tail);
 +
 +        int32_t * out = (int32_t *) ((char *) dst->data + t*dst->nb[1]);
 +        for (int64_t k = 0; k < n_used; ++k) {
@@ -1783,6 +1802,13 @@ index 0000000..b93f475
 +    if (cache->swap_tail > 0) {
 +        LLAMA_LOG_INFO("%s: expert cache: swap tail %u of %u ranks (a resident stands in at any score)\n",
 +            __func__, cache->swap_tail, cache->n_expert_used);
++    }
++    // LLAMA_EXPERT_SWAP_BATCH=1: in a multi-token ubatch the experts read for one token count as
++    // resident for the others (off by default; the prefetch keeps predicting per token)
++    const char * sb = getenv("LLAMA_EXPERT_SWAP_BATCH");
++    cache->swap_batch = sb != nullptr && *sb != '\0' && atoi(sb) != 0 && cache->swap_ratio > 0.0f;
++    if (cache->swap_batch) {
++        LLAMA_LOG_INFO("%s: expert cache: swap batch on (a ubatch's reads stand in for its other tokens)\n", __func__);
 +    }
 +    // LLAMA_EXPERT_SLOTS_LAYERS=<n0>,<n1>,...: resident experts of each layer, at least n_expert_used
 +    // (layers past the list keep n_slots). The split comes from a routing trace replayed offline; the
