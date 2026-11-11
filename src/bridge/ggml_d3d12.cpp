@@ -713,6 +713,26 @@ int pso_for(ggml_type t) {
     }
 }
 
+// XLLAMA_D3D12_HOSTPROF slots past the ops: the path a node took, when that
+// path is not the op's own GPU recording.
+enum HostTag : int {
+    kTagCombine = GGML_OP_COUNT, // MoE combine: the experts' MUL and its ADDs
+    kTagTail1,                   // shared-expert gate MUL + the ADD
+    kTagTail2,                   // gate MUL + both ADDs
+    kTagGate,                    // gate MUL alone, on the GPU
+    kTagGateCpu,                 // gate MUL alone, on the CPU
+    kTagCpuBinary,               // ADD/MUL/GLU on the CPU
+    kTagCpuNorm,                 // RMS_NORM on the CPU
+    kHostSlots
+};
+const char* host_slot_name(int s) {
+    static const char* const kNames[] = {"MUL moe combine", "MUL moe tail+1", "MUL moe tail+2",
+                                         "MUL moe gate",    "MUL moe gate CPU", "binary CPU",
+                                         "RMS_NORM CPU"};
+    static_assert(sizeof(kNames) / sizeof(kNames[0]) == kHostSlots - GGML_OP_COUNT, "names");
+    return s < GGML_OP_COUNT ? ggml_op_name(static_cast<ggml_op>(s)) : kNames[s - GGML_OP_COUNT];
+}
+
 // Process-wide D3D12 state behind the ggml device. One queue, serialised.
 struct Gpu {
     ComPtr<ID3D12Device> device;
@@ -811,8 +831,8 @@ struct Gpu {
     // recording and waiting (hashing, matching a kept list, timestamps), and
     // the split bookkeeping after the last submission.
     double pre_ms = 0.0, gdn_ms = 0.0, cpuq_ms = 0.0, sub_ms = 0.0, post_ms = 0.0;
-    double host_op_ms[GGML_OP_COUNT] = {};
-    std::uint64_t host_op_n[GGML_OP_COUNT] = {};
+    double host_op_ms[kHostSlots] = {};
+    std::uint64_t host_op_n[kHostSlots] = {};
     double wall_ms = 0.0;
     double gpu_ms = 0.0;
     // Of wall_ms: recording + submitting the graph submissions, then waiting for
@@ -1807,13 +1827,13 @@ void backend_free(ggml_backend_t b) {
                       static_cast<unsigned long long>(g.n_async),
                       static_cast<unsigned long long>(g.n_drain_waits), g.drain_ms);
         log_output(msg);
-        for (int op = 0; op < GGML_OP_COUNT; ++op) {
+        for (int op = 0; op < kHostSlots; ++op) {
             if (!g.host_op_n[op])
                 continue;
             char line[192];
             std::snprintf(line, sizeof(line), "[xllama] d3d12 host op: %10llu x %9.1f ms  %s\n",
                           static_cast<unsigned long long>(g.host_op_n[op]), g.host_op_ms[op],
-                          ggml_op_name(static_cast<ggml_op>(op)));
+                          host_slot_name(op));
             log_output(line);
         }
         std::vector<
@@ -2653,6 +2673,7 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
     // nodes must follow it back to back, so nothing runs between them. Returns
     // how many nodes after nodes[i] it consumed, -1 when nodes[i] is none of
     // these, -2 on a failed flush.
+    int prof_op = -1; // XLLAMA_D3D12_HOSTPROF's slot for the node in turn (host_mark)
     auto moe = [&](std::size_t i) -> int {
         const ggml_tensor* first = nodes[i];
         const std::int64_t n_add = first->ne[1] - 1;
@@ -2678,6 +2699,7 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
                 c.gx = cp.groups_x;
                 c.gy = cp.groups_y;
                 record(c, {rng_of(cp.e), rng_of(cp.w)}, {rng_of(last)});
+                prof_op = kTagCombine;
                 return static_cast<int>(n_add);
             }
         }
@@ -2704,6 +2726,7 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
                                        static_cast<const float*>(tp.s->data),
                                        static_cast<const float*>(tp.g->data), nullptr, nullptr,
                                        static_cast<float*>(dst->data));
+                prof_op = kTagGateCpu;
                 return 0;
             }
             Op t;
@@ -2723,14 +2746,15 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
                    {rng_of(tp.s), rng_of(tp.g), rng_of(tp.m ? tp.m : tp.s),
                     rng_of(tp.q ? tp.q : tp.s)},
                    {rng_of(dst)});
+            prof_op = extra == 2 ? kTagTail2 : extra == 1 ? kTagTail1 : kTagGate;
             return extra;
         }
         return -1;
     };
 
     // XLLAMA_D3D12_HOSTPROF: the time from one node's turn to the next, less
-    // what submissions spent in between, goes to the first one's op.
-    int prof_op = -1;
+    // what submissions spent in between, goes to the first one's op (or the
+    // HostTag of the path it took, set as prof_op).
     auto prof_t = std::chrono::steady_clock::now();
     double prof_sub = g.rec_ms + g.wait_ms + g.sub_ms + g.cpuq_ms;
     auto host_mark = [&](int op) {
@@ -3130,6 +3154,7 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
                 if (!flush())
                     return GGML_STATUS_FAILED;
                 cpu_binary(node, kind);
+                prof_op = kTagCpuBinary;
             }
             break;
         }
@@ -3174,6 +3199,7 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
                 if (!flush())
                     return GGML_STATUS_FAILED;
                 cpu_rms_norm(node, eps);
+                prof_op = kTagCpuNorm;
             }
             break;
         }
