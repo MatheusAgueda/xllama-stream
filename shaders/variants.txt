@@ -1,0 +1,13 @@
+# Kernel variants for XLLAMA_D3D12_SHADER_DIR (src/bridge/ggml_d3d12.cpp
+# apply_shader_dir): compile-gpugemv-shader.sh variants writes each line to
+# <out>/<tag>/<slot>.dxil, a raw DXIL container the backend loads in place of
+# the built-in blob of that pipeline slot. A variant keeps the slot's root
+# signature, constants and grid, and the device selftest checks it against the
+# CPU before a model runs on it.
+# <tag> <slot> <source> [dxc args...]
+coop ggml_d3d12_mmv_iq3_s_t64 shaders/ggml_d3d12_mmv_iq3_s.hlsl -D NUM_THREADS=64 -D IQ3S_COOP=1
+coop ggml_d3d12_mmv_iq3_s_t128 shaders/ggml_d3d12_mmv_iq3_s.hlsl -D NUM_THREADS=128 -D IQ3S_COOP=1
+coop ggml_d3d12_mmid_iq3_s_t64 shaders/ggml_d3d12_mmid_iq3_s.hlsl -D NUM_THREADS=64 -D IQ3S_COOP=1
+coop ggml_d3d12_mmid_iq3_s_t128 shaders/ggml_d3d12_mmid_iq3_s.hlsl -D NUM_THREADS=128 -D IQ3S_COOP=1
+gdn8 ggml_d3d12_ssm_gdn shaders/ggml_d3d12_ssm.hlsl -D KERNEL=5 -D GDN_LANES=8
+gdn16 ggml_d3d12_ssm_gdn shaders/ggml_d3d12_ssm.hlsl -D KERNEL=5 -D GDN_LANES=16

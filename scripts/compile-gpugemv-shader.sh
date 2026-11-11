@@ -13,9 +13,11 @@
 #   shaders/ggml_d3d12_elt.hlsl → ggml_d3d12_elt_{binary,rms_norm,quant_q8_k}_dxil.h (cs_6_4, -D KERNEL)
 #   shaders/ggml_d3d12_moe.hlsl → ggml_d3d12_moe_{combine,tail}_dxil.h (cs_6_4, -D KERNEL)
 #   shaders/ggml_d3d12_ssm.hlsl → ggml_d3d12_ssm_{unary,copy,get_rows,conv,gdn}_dxil.h (cs_6_4, -D KERNEL)
+#   variants: shaders/variants.txt → $VARIANTS_OUT/<tag>/<slot>.dxil, raw blobs
+#     for XLLAMA_D3D12_SHADER_DIR (default out: build/shader-variants)
 #
-# Usage: compile-gpugemv-shader.sh [naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q5_k|mmv_q6_k|mmv_iq3_s|mmv_iq4_xs|mmv_f32|mmid_iq4_xs|mmid_iq3_s|get_rows_q6_k|elt|moe|ssm ...]
-#        (default: all)
+# Usage: compile-gpugemv-shader.sh [naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q5_k|mmv_q6_k|mmv_iq3_s|mmv_iq4_xs|mmv_f32|mmid_iq4_xs|mmid_iq3_s|get_rows_q6_k|elt|moe|ssm|variants ...]
+#        (default: all headers, no variants)
 # A different dxc release emits different bytes: regenerate only the targets
 # you changed so measured blobs stay the ones the CSVs were recorded with.
 set -euo pipefail
@@ -147,8 +149,20 @@ compile_target() {
 				-D "KERNEL=${n}"
 		done
 		;;
+	variants)
+		# shaders/variants.txt → $VARIANTS_OUT/<tag>/<slot>.dxil (raw, not headers)
+		local out="${VARIANTS_OUT:-$ROOT/build/shader-variants}" tag slot src rest
+		local -a args
+		while read -r tag slot src rest; do
+			[[ -z "$tag" || "$tag" == \#* ]] && continue
+			read -r -a args <<<"$rest"
+			mkdir -p "$out/$tag"
+			"$DXC" -T cs_6_4 -E CSMain "${args[@]}" -Fo "$out/$tag/$slot.dxil" "$ROOT/$src"
+			echo "wrote $out/$tag/$slot.dxil ($(wc -c <"$out/$tag/$slot.dxil") bytes) from $src ${args[*]}"
+		done <"$ROOT/shaders/variants.txt"
+		;;
 	*)
-		echo "unknown target: $1 (naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q5_k|mmv_q6_k|mmv_iq3_s|mmv_iq4_xs|mmv_f32|mmid_iq4_xs|mmid_iq3_s|get_rows_q6_k|elt|moe|ssm)" >&2
+		echo "unknown target: $1 (naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q5_k|mmv_q6_k|mmv_iq3_s|mmv_iq4_xs|mmv_f32|mmid_iq4_xs|mmid_iq3_s|get_rows_q6_k|elt|moe|ssm|variants)" >&2
 		exit 2
 		;;
 	esac

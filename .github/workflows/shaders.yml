@@ -9,7 +9,7 @@ on:
   # A new workflow file is dispatchable only once it is on the default branch;
   # until then a push touching the shaders runs it with the input defaults.
   push:
-    paths: [shaders/**.hlsl, shaders/**.hlsli, shaders/**.inc, .github/workflows/shaders.yml]
+    paths: [shaders/**.hlsl, shaders/**.hlsli, shaders/**.inc, shaders/variants.txt, scripts/compile-gpugemv-shader.sh, .github/workflows/shaders.yml]
   workflow_dispatch:
     inputs:
       targets:
@@ -85,4 +85,34 @@ jobs:
         with:
           name: dxil-headers
           path: shaders/generated/*.h
+          if-no-files-found: error
+
+      # shaders/variants.txt: raw blobs for XLLAMA_D3D12_SHADER_DIR, never committed
+      - name: Compile variants
+        env:
+          VARIANTS_OUT: ${{ runner.temp }}/variants
+        run: |
+          ./scripts/compile-gpugemv-shader.sh variants 2> "$RUNNER_TEMP/dxc_var.err" || {
+            cat "$RUNNER_TEMP/dxc_var.err"; exit 1; }
+          cat "$RUNNER_TEMP/dxc_var.err"
+          if grep -qi 'signing\|not be signed' "$RUNNER_TEMP/dxc_var.err"; then
+            echo "dxc could not sign the DXIL" >&2; exit 1
+          fi
+          python3 - "$VARIANTS_OUT" <<'PY'
+          import hashlib, sys
+          from pathlib import Path
+          files = sorted(Path(sys.argv[1]).rglob("*.dxil"))
+          if not files:
+              sys.exit("no variants compiled")
+          for f in files:
+              blob = f.read_bytes()
+              print(f.relative_to(sys.argv[1]), len(blob), "bytes", hashlib.sha256(blob).hexdigest()[:16])
+              if blob[:4] != b"DXBC" or not any(blob[4:20]):
+                  sys.exit(f"{f}: not a signed DXIL container")
+          PY
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dxil-variants
+          path: ${{ runner.temp }}/variants/
           if-no-files-found: error

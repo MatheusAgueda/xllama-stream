@@ -146,37 +146,56 @@ void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
 // state before it stores them and no lane loads another's, so t1 and u5 may
 // be the same row.
 // Grid (S_v / 32, H, B).
+// GDN_LANES (4 built in; 8 or 16 as XLLAMA_D3D12_SHADER_DIR variants) lanes per
+// row, each holding GDN_E = 32 / GDN_LANES float4 chunks: the same grid with
+// 2x or 4x the threads in flight for the same state bytes. A row's partials
+// add as a pairwise tree, so GDN_LANES 4 is the built-in kernel's sum.
 #define S_V 128u
+#ifndef GDN_LANES
+#define GDN_LANES 4
+#endif
+#define GDN_E (32u / GDN_LANES)
+#define GDN_THREADS (32 * GDN_LANES)
+#define GDN_SUM4(a, q) ((a[q] + a[q + 1u]) + (a[q + 2u] + a[q + 3u]))
+#if GDN_LANES == 4
+#define GDN_SUM(a, q) GDN_SUM4(a, q)
+#elif GDN_LANES == 8
+#define GDN_SUM(a, q) (GDN_SUM4(a, q) + GDN_SUM4(a, q + 4u))
+#elif GDN_LANES == 16
+#define GDN_SUM(a, q) ((GDN_SUM4(a, q) + GDN_SUM4(a, q + 4u)) + (GDN_SUM4(a, q + 8u) + GDN_SUM4(a, q + 12u)))
+#else
+#error GDN_LANES must be 4, 8 or 16
+#endif
 RWByteAddressBuffer U5 : register(u5);
-groupshared float red_k[128];
-groupshared float red_y[128];
+groupshared float red_k[GDN_THREADS];
+groupshared float red_y[GDN_THREADS];
 
-[numthreads(128, 1, 1)]
+[numthreads(GDN_THREADS, 1, 1)]
 void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
     const uint H = c0, T = c1, B = c2;
     const uint K = c3 & 0xffffu;
     const bool kda = ((c3 >> 16) & 1u) != 0u;
     const bool fused = ((c3 >> 17) & 1u) != 0u;
     const uint h = gid.y, s = gid.z;
-    const uint l = tid & 3u, q4 = tid & ~3u;
-    const uint j = gid.x * 32u + (tid >> 2u);
+    const uint l = tid & (GDN_LANES - 1u), q4 = tid & ~(GDN_LANES - 1u);
+    const uint j = gid.x * 32u + tid / GDN_LANES;
     const uint iq1 = h % (c4 & 0xffffu), ik1 = h % (c4 >> 16);
     const uint iq3 = s / (c5 & 0xffffu), ik3 = s / (c5 >> 16);
     const uint snap = S_V * S_V;
     const uint own = (s * H + h) * snap + j * S_V; // row j of this state in a snapshot
     const uint attn = S_V * H * T * B;
     const uint per_snap = snap * H * B;
-    precise float4 m[8];
-    [unroll] for (uint e = 0u; e < 8u; ++e)
-        m[e] = asfloat(T1.Load4(4u * (own + 4u * (l + 4u * e))));
+    precise float4 m[GDN_E];
+    [unroll] for (uint e = 0u; e < GDN_E; ++e)
+        m[e] = asfloat(T1.Load4(4u * (own + 4u * (l + GDN_LANES * e))));
     for (uint t = 0u; t < T; ++t) {
         const uint qb = iq3 * c7 + t * c6 + iq1 * S_V;
         const uint kb = ik3 * c9 + t * c8 + ik1 * S_V;
         const uint gb = (s * T + t) * H + h;
         precise float pk = 0.0f;
         if (kda) {
-            [unroll] for (uint e = 0u; e < 8u; ++e) {
-                const uint i = 4u * (l + 4u * e);
+            [unroll] for (uint e = 0u; e < GDN_E; ++e) {
+                const uint i = 4u * (l + GDN_LANES * e);
                 const float4 ge = exp(asfloat(U4.Load4(4u * (gb * S_V + i))));
                 const float4 kx = asfloat(U2.Load4(4u * (kb + i)));
                 m[e] = m[e] * ge;
@@ -187,8 +206,8 @@ void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
             }
         } else {
             const float ge = exp(asfloat(U4.Load(4u * gb)));
-            [unroll] for (uint e = 0u; e < 8u; ++e) {
-                const float4 kx = asfloat(U2.Load4(4u * (kb + 4u * (l + 4u * e))));
+            [unroll] for (uint e = 0u; e < GDN_E; ++e) {
+                const float4 kx = asfloat(U2.Load4(4u * (kb + 4u * (l + GDN_LANES * e))));
                 m[e] = m[e] * ge;
                 pk = pk + m[e].x * kx.x;
                 pk = pk + m[e].y * kx.y;
@@ -198,12 +217,12 @@ void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
         }
         red_k[tid] = pk;
         GroupMemoryBarrierWithGroupSync();
-        precise float sk = (red_k[q4] + red_k[q4 + 1u]) + (red_k[q4 + 2u] + red_k[q4 + 3u]);
+        precise float sk = GDN_SUM(red_k, q4);
         precise float dv = asfloat(U3.Load(4u * (s * c11 + t * c10 + h * S_V + j))) - sk;
         precise float d = dv * asfloat(T0.Load(4u * gb));
         precise float py = 0.0f;
-        [unroll] for (uint e = 0u; e < 8u; ++e) {
-            const uint i = 4u * (l + 4u * e);
+        [unroll] for (uint e = 0u; e < GDN_E; ++e) {
+            const uint i = 4u * (l + GDN_LANES * e);
             const float4 kx = asfloat(U2.Load4(4u * (kb + i)));
             const float4 qx = asfloat(U1.Load4(4u * (qb + i)));
             precise float4 kd = kx * d;
@@ -215,7 +234,7 @@ void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
         }
         red_y[tid] = py;
         GroupMemoryBarrierWithGroupSync();
-        precise float y = (red_y[q4] + red_y[q4 + 1u]) + (red_y[q4 + 2u] + red_y[q4 + 3u]);
+        precise float y = GDN_SUM(red_y, q4);
         if (l == 0u) {
             precise float ys = y * asfloat(c12);
             D.Store(4u * (gb * S_V + j), asuint(ys));
@@ -223,16 +242,16 @@ void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
         const uint slot = T - 1u - t;
         if (K > 1u && slot < K) {
             const uint ob = attn + slot * per_snap + own;
-            [unroll] for (uint e = 0u; e < 8u; ++e)
-                D.Store4(4u * (ob + 4u * (l + 4u * e)), asuint(m[e]));
+            [unroll] for (uint e = 0u; e < GDN_E; ++e)
+                D.Store4(4u * (ob + 4u * (l + GDN_LANES * e)), asuint(m[e]));
         }
     }
     if (fused) {
-        [unroll] for (uint e = 0u; e < 8u; ++e)
-            U5.Store4(4u * (own + 4u * (l + 4u * e)), asuint(m[e]));
+        [unroll] for (uint e = 0u; e < GDN_E; ++e)
+            U5.Store4(4u * (own + 4u * (l + GDN_LANES * e)), asuint(m[e]));
     } else if (K == 1u) {
-        [unroll] for (uint e = 0u; e < 8u; ++e)
-            D.Store4(4u * (attn + own + 4u * (l + 4u * e)), asuint(m[e]));
+        [unroll] for (uint e = 0u; e < GDN_E; ++e)
+            D.Store4(4u * (attn + own + 4u * (l + GDN_LANES * e)), asuint(m[e]));
     }
 }
 #endif
