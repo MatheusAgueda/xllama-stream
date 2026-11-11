@@ -456,6 +456,7 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
     long long prefetched = 0;
     long long prefetched_ahead = 0;
     long long helped = 0;
+    long long deferred_rounds = 0;
     const Case cases[] = {{2, 0}, {3, 0}, {2, 1}, {3, 1}};
     for (const Case& c : cases) {
         CAPTURE(c.slots);
@@ -915,8 +916,7 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
             CHECK(d.reads >= 0);
             CHECK(d.used >= 0);
             CHECK(d.used <= d.reads);
-            if (swaps_of(log.final_line) > 0)
-                CHECK(d.reads + d.dropped > 0);
+            deferred_rounds += std::max(d.reads, 0LL) + std::max(d.dropped, 0LL);
             CHECK(misses_of(log.final_line) <= plain_misses);
             log.final_line.clear();
             log.defer_line.clear();
@@ -985,6 +985,9 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
     // both placements.
     CHECK(prefetched > 0);
     CHECK(prefetched_ahead > 0);
+    // Deferred rounds need a slot the ubatch leaves free (not with 2 slots and
+    // 2 used): somewhere, their reads finished or were dropped.
+    CHECK(deferred_rounds > 0);
     // Whether a plan found a read in flight with parts still queued depends on
     // the runner's timing: reported, not checked.
     MESSAGE("prefetch parts read by waiting plans: " << helped);
