@@ -725,6 +725,21 @@ class LlamaSession final : public Session {
 
         const llama_vocab* vocab = llama_model_get_vocab(m_model.get());
 
+        // Scoring: a forced reply is checked before any prefill is paid for.
+        std::vector<llama_token> forced;
+        if (!gp.forced_tokens.empty()) {
+            const int n_vocab = llama_vocab_n_tokens(vocab);
+            forced.reserve(gp.forced_tokens.size());
+            for (const int32_t id : gp.forced_tokens) {
+                if (id < 0 || id >= n_vocab) {
+                    res.error_msg = "forced token " + std::to_string(id) +
+                                    " outside the vocabulary of " + std::to_string(n_vocab);
+                    return res;
+                }
+                forced.push_back(static_cast<llama_token>(id));
+            }
+        }
+
         // parse_special=true: every Session caller (chat UI, API endpoint, bench)
         // passes a TEMPLATED prompt, whose <|im_start|>/<|im_end|> markers must
         // become the special ids the model was trained on. As plain text the
@@ -1046,7 +1061,16 @@ class LlamaSession final : public Session {
         dlp.prompt_lookup = m_prompt_lookup;
         dlp.token_history = &m_kv_tokens;
         dlp.watchdog = &wd;
-        wd.enter_decode(n_predict_eff);
+        if (!forced.empty()) {
+            dlp.forced = &forced;
+            dlp.n_predict = std::min(n_predict_eff, static_cast<int>(forced.size()));
+            dlp.stop_sequences = nullptr;
+        }
+        if (gp.logprobs || !forced.empty()) {
+            res.logprobs.reserve(static_cast<size_t>(dlp.n_predict));
+            dlp.logprobs = &res.logprobs;
+        }
+        wd.enter_decode(dlp.n_predict);
         const DecodeLoopResult dlr = decode_loop(dlp, res.output_text);
         const int n_generated = dlr.n_generated;
         const bool stopped_by_seq = dlr.ended_with_stop;

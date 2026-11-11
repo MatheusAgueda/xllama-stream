@@ -720,16 +720,45 @@ void fill_sampling(JsonObject const& root, ::xllama::GenerateParams& gp) {
     }
 }
 
+// choices[0].logprobs for a scored reply: OpenAI's {"content": [{"token",
+// "logprob"}]} plus each token's id and argmax flag (an id list a later request
+// can force back as xllama_force_ids), and the reply's totals.
+JsonObject logprobs_json(const std::vector<::xllama::TokenLogprob>& lps) {
+    JsonArray content;
+    double sum = 0.0;
+    int argmax = 0;
+    for (const ::xllama::TokenLogprob& t : lps) {
+        JsonObject o;
+        o.Insert(L"token", JsonValue::CreateStringValue(winrt::to_hstring(t.piece)));
+        o.Insert(L"logprob", JsonValue::CreateNumberValue(t.logprob));
+        o.Insert(L"id", JsonValue::CreateNumberValue(t.id));
+        o.Insert(L"argmax", JsonValue::CreateBooleanValue(t.argmax));
+        o.Insert(L"top_logprobs", JsonArray{});
+        content.Append(o);
+        sum += t.logprob;
+        argmax += t.argmax ? 1 : 0;
+    }
+    JsonObject out;
+    out.Insert(L"content", content);
+    out.Insert(L"sum_logprob", JsonValue::CreateNumberValue(sum));
+    out.Insert(L"argmax_count", JsonValue::CreateNumberValue(argmax));
+    return out;
+}
+
 // One OpenAI chat.completion body. `message` is choices[0].message.
 std::string completion_json(const std::string& model, JsonObject const& message,
                             winrt::hstring const& finish_reason, int prompt_tokens,
-                            int completion_tokens, const char*& status) {
+                            int completion_tokens, const char*& status,
+                            const std::vector<::xllama::TokenLogprob>* logprobs = nullptr) {
     JsonObject choice;
     choice.Insert(L"index", JsonValue::CreateNumberValue(0));
     choice.Insert(L"message", message);
     // openai-python / LangChain deserialize into Pydantic models and choke when
     // logprobs is absent; emit it explicitly as null.
-    choice.Insert(L"logprobs", JsonValue::CreateNullValue());
+    if (logprobs != nullptr)
+        choice.Insert(L"logprobs", logprobs_json(*logprobs));
+    else
+        choice.Insert(L"logprobs", JsonValue::CreateNullValue());
     choice.Insert(L"finish_reason", JsonValue::CreateStringValue(finish_reason));
     JsonArray choices;
     choices.Append(choice);
@@ -972,6 +1001,33 @@ std::string handle_chat_locked(const std::string& body, const char*& status,
     // much room the reply asks for.
     gp.n_predict = n_predict;
 
+    // Scoring (research API): "logprobs": true reports each reply token's log
+    // probability; "xllama_force_ids": [ids] makes the reply those ids (a
+    // reference reply from an earlier call), scored under this load's knobs.
+    if (root.HasKey(L"logprobs") &&
+        root.GetNamedValue(L"logprobs").ValueType() == JsonValueType::Boolean)
+        gp.logprobs = root.GetNamedBoolean(L"logprobs");
+    if (root.HasKey(L"xllama_force_ids")) {
+        if (root.GetNamedValue(L"xllama_force_ids").ValueType() != JsonValueType::Array) {
+            status = "400 Bad Request";
+            return error_json("'xllama_force_ids' must be an array of token ids");
+        }
+        for (auto&& e : root.GetNamedArray(L"xllama_force_ids")) {
+            const double v = e.ValueType() == JsonValueType::Number ? e.GetNumber() : -1.0;
+            if (!(v >= 0.0 && v <= 2147483647.0) ||
+                v != static_cast<double>(static_cast<int64_t>(v))) {
+                status = "400 Bad Request";
+                return error_json("'xllama_force_ids' must hold whole non-negative numbers");
+            }
+            gp.forced_tokens.push_back(static_cast<int32_t>(v));
+        }
+        if (static_cast<int>(gp.forced_tokens.size()) > gp.n_predict) {
+            status = "400 Bad Request";
+            return error_json("max_tokens must cover the " +
+                              std::to_string(gp.forced_tokens.size()) + " forced ids");
+        }
+    }
+
     // Same budget as the chat UI, same primitive, same tokenizer: the oldest
     // messages[] entries are dropped until the prompt plus the requested reply fit
     // n_ctx (xllama::fit_prompt). Before this, a long conversation reached
@@ -1091,7 +1147,8 @@ std::string handle_chat_locked(const std::string& body, const char*& status,
     // stop-sequence match) does not capture — deduce it from the token count.
     const bool hit_cap = r.n_eval >= gp.n_predict;
     return completion_json(model, message, hit_cap ? L"length" : L"stop", r.n_prompt, r.n_eval,
-                           status);
+                           status,
+                           gp.logprobs || !gp.forced_tokens.empty() ? &r.logprobs : nullptr);
 }
 
 // The single model the server can currently serve: the resident one, else the

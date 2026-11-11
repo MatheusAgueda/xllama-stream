@@ -120,6 +120,15 @@ struct GenerateParams {
     // A tool template's own grammar (ADR 0005). Empty `gbnf` = unconstrained.
     GrammarSpec grammar;
 
+    // Scoring (llama.cpp sessions). logprobs: report every reply token's log
+    // probability under the raw logits (InferenceResult::logprobs). forced_tokens:
+    // the reply is these ids, decoded one by one in place of sampling — the same
+    // per-token decode a free reply runs, so a reference reply can be scored under
+    // other knobs (expert cache swaps, quantization). Stop sequences and drafting
+    // are off for a forced reply; it implies logprobs.
+    bool logprobs = false;
+    std::vector<int32_t> forced_tokens;
+
     // Continuous decoding / KV-cache reuse. Honored by BOTH backends now: the
     // ORT path (persistent generator) and the llama.cpp path (persistent
     // llama_context, KV cache retained across turns — turn-2 prefill 4.07×).

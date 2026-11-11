@@ -6,6 +6,7 @@
 
 #include "llama.h"
 #include "xllama/chat_prompt.h"        // apply_stop_sequences
+#include "xllama/inference_params.h"   // TokenLogprob
 #include "xllama/inference_progress.h" // prefill/decode progress + stall watchdog
 #include "xllama/platform.h"           // log_output
 #include "xllama/speculative.h"        // prompt_lookup_draft (#210)
@@ -123,6 +124,12 @@ struct DecodeLoopParams {
 
     // Optional stall watchdog / decode-progress logger. Shared with prefill.
     InferenceWatchdog* watchdog = nullptr;
+
+    // Scoring: forced = the reply's ids, decoded in order instead of sampled (the
+    // loop ends when they run out; EOG and stop sequences do not end it early);
+    // logprobs = one entry per reply token. Either turns drafting off.
+    const std::vector<llama_token>* forced = nullptr;
+    std::vector<TokenLogprob>* logprobs = nullptr;
 };
 
 struct DecodeLoopResult {
@@ -159,7 +166,7 @@ inline bool emit_token(const DecodeLoopParams& p, llama_token token, std::string
             std::fflush(stdout);
         }
     }
-    return p.stop_sequences && apply_stop_sequences(output_text, *p.stop_sequences);
+    return p.stop_sequences && !p.forced && apply_stop_sequences(output_text, *p.stop_sequences);
 }
 
 // One token through the chain, checked against the grammar the way llama-server
@@ -192,6 +199,30 @@ inline llama_token sample_with_grammar(const DecodeLoopParams& p) {
     llama_sampler_accept(p.grammar, id);
     llama_sampler_accept(p.sampler, id);
     return id;
+}
+
+// log p(token) from the logits the next sample reads (row -1), as log-softmax at
+// temperature 1: the model's own distribution, before any sampler stage.
+inline TokenLogprob token_logprob(const DecodeLoopParams& p, llama_token token) {
+    const float* logits = llama_get_logits_ith(p.ctx, -1);
+    const int n_vocab = llama_vocab_n_tokens(p.vocab);
+    int best = 0;
+    for (int i = 1; i < n_vocab; ++i)
+        if (logits[i] > logits[best])
+            best = i;
+    double sum = 0.0;
+    for (int i = 0; i < n_vocab; ++i)
+        sum += std::exp(static_cast<double>(logits[i]) - static_cast<double>(logits[best]));
+    TokenLogprob t;
+    t.id = token;
+    t.logprob = static_cast<float>(static_cast<double>(logits[token]) -
+                                   static_cast<double>(logits[best]) - std::log(sum));
+    t.argmax = token == best;
+    char buf[256] = {};
+    const int len = llama_token_to_piece(p.vocab, token, buf, sizeof(buf) - 1, 0, true);
+    if (len > 0)
+        t.piece.assign(buf, static_cast<size_t>(len));
+    return t;
 }
 
 // Record an accepted token in history / session bookkeeping.
@@ -309,25 +340,31 @@ inline bool classic_step(const DecodeLoopParams& p, llama_token token, std::stri
 // single-token decode of lead on this stack. Commit lead first, then speculate.
 inline DecodeLoopResult decode_loop(const DecodeLoopParams& p, std::string& output_text) {
     DecodeLoopResult out;
-    bool spec_enabled =
-        p.prompt_lookup && p.token_history != nullptr && p.spec_k > 0 && p.grammar == nullptr;
+    bool spec_enabled = p.prompt_lookup && p.token_history != nullptr && p.spec_k > 0 &&
+                        p.grammar == nullptr && p.forced == nullptr && p.logprobs == nullptr;
 
     while (out.n_generated < p.n_predict) {
         if (p.abort_flag && p.abort_flag->load())
             break;
         if (p.watchdog && p.watchdog->aborted())
             break;
+        if (p.forced && out.n_generated >= static_cast<int>(p.forced->size()))
+            break;
 
         const auto ts0 = std::chrono::steady_clock::now();
-        llama_token token =
-            p.grammar ? detail::sample_with_grammar(p) : llama_sampler_sample(p.sampler, p.ctx, -1);
+        llama_token token = p.forced    ? (*p.forced)[static_cast<size_t>(out.n_generated)]
+                            : p.grammar ? detail::sample_with_grammar(p)
+                                        : llama_sampler_sample(p.sampler, p.ctx, -1);
         out.sample_ms +=
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts0)
                 .count();
-        if (detail::stops_at_eog(p, token)) {
+        if (!p.forced && detail::stops_at_eog(p, token)) {
             log_output("[xllama] EOG after " + std::to_string(out.n_generated) + " tokens\n");
             break;
         }
+        // Before classic_step: its decode replaces the logits this token came from.
+        if (p.logprobs)
+            p.logprobs->push_back(detail::token_logprob(p, token));
 
         // Always commit the sampled token via the classic path first. Spec never
         // changes this step — that is what keeps greedy text identical.

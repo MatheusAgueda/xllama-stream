@@ -640,3 +640,70 @@ TEST_CASE("Session: divergent restored snapshot matches cold prefill (opt-in: XL
     std::error_code ec;
     std::filesystem::remove(path, ec);
 }
+
+// Scoring: a greedy reply with its log-probabilities, then the same ids forced
+// back on a cold session. The forced reply runs the same per-token decode with
+// only the sampling step replaced, so it must reproduce the reply, its ids and
+// its log-probabilities; a forced non-argmax id scores below the argmax.
+TEST_CASE("Session: a forced reply reproduces the greedy logprobs (opt-in: XLLAMA_TEST_MODEL)") {
+    const char* model = std::getenv("XLLAMA_TEST_MODEL");
+    if (!model)
+        return;
+    xllama::SessionParams sp;
+    sp.model_path = model;
+    sp.n_ctx = 512;
+    sp.n_threads = 2;
+    std::string error;
+    auto first = xllama::Session::create(sp, &error);
+    REQUIRE_MESSAGE(first, error);
+    xllama::GenerateParams gp;
+    gp.prompt = "<|im_start|>user\nCount from one to five in words.<|im_end|>\n"
+                "<|im_start|>assistant\n";
+    gp.n_predict = 16;
+    gp.temperature = 0;
+    gp.logprobs = true;
+    const auto greedy = first->generate(gp);
+    REQUIRE_MESSAGE(greedy.success, greedy.error_msg);
+    REQUIRE(greedy.n_eval > 1);
+    REQUIRE(greedy.logprobs.size() == static_cast<size_t>(greedy.n_eval));
+    for (const auto& t : greedy.logprobs) {
+        CHECK(t.logprob <= 0.0f);
+        CHECK(t.argmax);
+    }
+    first.reset();
+
+    auto cold = xllama::Session::create(sp, &error);
+    REQUIRE_MESSAGE(cold, error);
+    xllama::GenerateParams fp = gp;
+    fp.logprobs = false; // implied by forced_tokens
+    for (const auto& t : greedy.logprobs)
+        fp.forced_tokens.push_back(t.id);
+    fp.n_predict = static_cast<int>(fp.forced_tokens.size()) + 8; // the ids end it
+    const auto forced = cold->generate(fp);
+    REQUIRE_MESSAGE(forced.success, forced.error_msg);
+    CHECK(forced.n_eval == greedy.n_eval);
+    CHECK(forced.output_text == greedy.output_text);
+    REQUIRE(forced.logprobs.size() == greedy.logprobs.size());
+    for (size_t i = 0; i < forced.logprobs.size(); ++i) {
+        CAPTURE(i);
+        CHECK(forced.logprobs[i].id == greedy.logprobs[i].id);
+        CHECK(forced.logprobs[i].argmax);
+        CHECK(forced.logprobs[i].logprob ==
+              doctest::Approx(greedy.logprobs[i].logprob).epsilon(1e-4));
+    }
+
+    auto other = xllama::Session::create(sp, &error);
+    REQUIRE_MESSAGE(other, error);
+    xllama::GenerateParams op = gp;
+    op.forced_tokens = {greedy.logprobs[0].id + 1};
+    const auto off = other->generate(op);
+    REQUIRE_MESSAGE(off.success, off.error_msg);
+    REQUIRE(off.logprobs.size() == 1);
+    CHECK_FALSE(off.logprobs[0].argmax);
+    CHECK(off.logprobs[0].logprob < greedy.logprobs[0].logprob);
+
+    op.forced_tokens = {-1};
+    const auto bad = other->generate(op);
+    CHECK_FALSE(bad.success);
+    CHECK(bad.error_msg.find("outside the vocabulary") != std::string::npos);
+}
