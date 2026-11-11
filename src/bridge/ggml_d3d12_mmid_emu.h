@@ -15,9 +15,11 @@
 //   ids  = I32 [n_ids, T], often a view (nb1 > 4 * n_ids)
 //   dst  = F32 [N, n_ids, T]
 // X (u1) is src1's rows quantized to q8_K, row t * ne11 + c
-// (d3d12_mmid_quantize_activations). One thread group per (4 rows, token t,
-// id i): grid (ceil(N / 4), n_ids * T), the t64 or t128 blob by
-// d3d12_mm_threads(K) as for MUL_MAT. Offsets are 32-bit, as in the shader.
+// (d3d12_mmid_quantize_activations). One thread group per (R rows, token t,
+// id i): grid (ceil(N / R), n_ids * T), the t64 or t128 blob by
+// d3d12_mm_threads(K) as for MUL_MAT, R = d3d12_geom_rows(geometry): 4 for
+// IQ4_XS, whose kernel has no geometry, and for IQ3_S by the plan's request
+// (pad0, shaders/ggml_d3d12_geom.hlsli). Offsets are 32-bit, as in the shader.
 
 #pragma once
 
@@ -43,7 +45,7 @@ struct D3d12MmidParams {
     std::uint32_t w_row_bytes = 0; // as nb1
     std::uint32_t x_stride = 0;    // bytes between tokens in X
     std::uint32_t y_stride = 0;    // floats between tokens in Y (dst nb2 / 4)
-    std::uint32_t pad0 = 0;
+    std::uint32_t pad0 = 0;        // IQ3_S: d3d12_geom_pack(geometry)
     std::uint32_t pad1 = 0;
     std::uint32_t expert_stride = 0;   // bytes between experts in W (as nb2)
     std::uint32_t n_ids = 0;           // experts per token (ids ne0)
@@ -55,11 +57,12 @@ static_assert(sizeof(D3d12MmidParams) == 13 * sizeof(std::uint32_t), "13 root co
 
 struct D3d12MmidPlan {
     D3d12MmidParams params;
-    std::uint32_t groups_x = 0; // ceil(N / kD3d12MmvRows)
+    std::uint32_t groups_x = 0; // ceil(N / d3d12_geom_rows(geom))
     std::uint32_t groups_y = 0; // n_ids * T
     std::uint32_t threads = 0;  // d3d12_mm_threads(K): which blob
     std::size_t x_bytes = 0;    // X (u1), d3d12_mmid_quantize_activations
     std::size_t ids_bytes = 0;  // Ids (t1) from ids->data
+    D3d12Geom geom;             // IQ3_S only; {1, 1} otherwise
 };
 
 // The expert types with a MUL_MAT_ID kernel.
@@ -69,8 +72,10 @@ inline bool d3d12_mmid_type_supported(ggml_type t) {
 
 // false when no kernel runs dst: weights neither IQ4_XS nor IQ3_S, shapes outside
 // ggml_mul_mat_id's 3-d case, ne11 neither 1 nor n_ids, a grid past
-// kD3d12MaxGroups or an offset past 32 bits.
-inline bool d3d12_mmid_plan(const ggml_tensor* dst, D3d12MmidPlan* plan) {
+// kD3d12MaxGroups or an offset past 32 bits. req shapes IQ3_S groups
+// (d3d12_geom_for).
+inline bool d3d12_mmid_plan(const ggml_tensor* dst, D3d12MmidPlan* plan,
+                            const D3d12GeomReq& req = {}) {
     if (!dst || !plan || dst->op != GGML_OP_MUL_MAT_ID)
         return false;
     const ggml_tensor* as = dst->src[0];
@@ -99,8 +104,13 @@ inline bool d3d12_mmid_plan(const ggml_tensor* dst, D3d12MmidPlan* plan) {
     const std::uint64_t u32 = std::numeric_limits<std::uint32_t>::max();
     const std::uint64_t xq_row = ggml_row_size(d3d12_activation_type(as->type), k);
     const std::uint64_t x_stride = static_cast<std::uint64_t>(ne11) * xq_row;
-    const std::uint64_t groups_x = (static_cast<std::uint64_t>(n) + kD3d12MmvRows - 1) /
-                                   static_cast<std::uint64_t>(kD3d12MmvRows);
+    const std::uint32_t threads = static_cast<std::uint32_t>(d3d12_mm_threads(k));
+    const D3d12Geom geom =
+        as->type == GGML_TYPE_IQ3_S
+            ? d3d12_geom_for(req, static_cast<std::uint32_t>(k / kD3d12Chunk), threads)
+            : D3d12Geom{};
+    const std::uint64_t rows = d3d12_geom_rows(geom);
+    const std::uint64_t groups_x = (static_cast<std::uint64_t>(n) + rows - 1) / rows;
     const std::uint64_t groups_y = static_cast<std::uint64_t>(n_ids) * n_tok;
     const std::uint64_t w_end = static_cast<std::uint64_t>(n_as) * as->nb[2];
     const std::uint64_t ids_end = (n_tok - 1) * static_cast<std::uint64_t>(ids->nb[1]) +
@@ -120,6 +130,7 @@ inline bool d3d12_mmid_plan(const ggml_tensor* dst, D3d12MmidPlan* plan) {
     p.w_row_bytes = static_cast<std::uint32_t>(as->nb[1]);
     p.x_stride = static_cast<std::uint32_t>(x_stride);
     p.y_stride = static_cast<std::uint32_t>(dst->nb[2] / 4);
+    p.pad0 = as->type == GGML_TYPE_IQ3_S ? d3d12_geom_pack(geom) : 0u;
     p.expert_stride = static_cast<std::uint32_t>(as->nb[2]);
     p.n_ids = static_cast<std::uint32_t>(n_ids);
     p.ids_stride = static_cast<std::uint32_t>(ids->nb[1]);
@@ -127,7 +138,8 @@ inline bool d3d12_mmid_plan(const ggml_tensor* dst, D3d12MmidPlan* plan) {
     p.y_expert_stride = static_cast<std::uint32_t>(dst->nb[1] / 4);
     plan->groups_x = static_cast<std::uint32_t>(groups_x);
     plan->groups_y = static_cast<std::uint32_t>(groups_y);
-    plan->threads = static_cast<std::uint32_t>(d3d12_mm_threads(k));
+    plan->threads = threads;
+    plan->geom = geom;
     plan->x_bytes = static_cast<std::size_t>(x_end);
     plan->ids_bytes = static_cast<std::size_t>(ids_end);
     return true;
@@ -217,8 +229,9 @@ inline std::int32_t block_lsumi(ggml_type t, const std::uint8_t* bb, std::uint32
 
 // The kernel for expert type t on the host: per group and thread the same
 // blocks in the same order, the same float operations and the same tree
-// reduction as the HLSL. w, ids and xq are the t0, t1 and u1 buffers, y the u0
-// buffer (rows past n are never written). threads is the blob's NUM_THREADS
+// reduction as the HLSL, IQ3_S with the geometry in p.pad0
+// (ggml_d3d12_geom.hlsli). w, ids and xq are the t0, t1 and u1 buffers, y the
+// u0 buffer (rows past n are never written). threads is the blob's NUM_THREADS
 // (64 or 128).
 inline void d3d12_mmid_emulate(ggml_type t, const D3d12MmidParams& p, std::uint32_t groups_x,
                                std::uint32_t groups_y, std::uint32_t threads, const std::uint8_t* w,
@@ -233,6 +246,11 @@ inline void d3d12_mmid_emulate(ggml_type t, const D3d12MmidParams& p, std::uint3
         return;
     const std::uint32_t block_bytes = static_cast<std::uint32_t>(ggml_type_size(t));
     const std::uint32_t in_flight = threads / 16u;
+    const bool geo = t == GGML_TYPE_IQ3_S;
+    const std::uint32_t rsl = geo ? std::clamp(p.pad0 & 0xffu, 1u, in_flight) : 1u;
+    const std::uint32_t rt = geo ? std::max((p.pad0 >> 8) & 0xffu, 1u) : 1u;
+    const std::uint32_t cl = in_flight / rsl; // chunk lanes per row set
+    const std::uint32_t seg = cl * 16u;       // threads per row set
     float red[rows][kD3d12MmvThreadsLong];
     for (std::uint32_t gy = 0; gy < groups_y; ++gy) {
         const std::uint32_t token = gy / p.n_ids;
@@ -241,35 +259,40 @@ inline void d3d12_mmid_emulate(ggml_type t, const D3d12MmidParams& p, std::uint3
             d3d12_mmid_detail::ld32(ids + token * p.ids_stride + 4u * slot_i) * p.expert_stride;
         const std::uint32_t xc = token * p.x_stride + slot_i * p.x_col_stride;
         const std::uint32_t ybase = token * p.y_stride + slot_i * p.y_expert_stride;
-        for (std::uint32_t gx = 0; gx < groups_x; ++gx) {
-            const std::uint32_t row0 = gx * rows;
-            for (std::uint32_t tid = 0; tid < threads; ++tid) {
-                const std::uint32_t itid = tid & 15u;
-                float acc[rows] = {};
-                for (std::uint32_t blk = tid >> 4; blk < p.nchunk; blk += in_flight) {
-                    const std::uint8_t* xb = xq + xc + blk * 292u;
-                    float dy;
-                    std::memcpy(&dy, xb, 4);
-                    const auto* qx = reinterpret_cast<const std::int8_t*>(xb + 4);
-                    for (std::uint32_t r = 0; r < rows; ++r) {
-                        const std::uint32_t row = std::min(row0 + r, p.n - 1u);
-                        float d;
-                        const std::int32_t lsumi = d3d12_mmid_detail::block_lsumi(
-                            t, w + wb + row * p.w_row_bytes + blk * block_bytes, itid, qx, &d);
-                        acc[r] += (d * dy) * static_cast<float>(lsumi);
+        for (std::uint32_t gx = 0; gx < groups_x; ++gx)
+            for (std::uint32_t tile = 0; tile < rt; ++tile) {
+                for (std::uint32_t tid = 0; tid < threads; ++tid) {
+                    const std::uint32_t itid = tid & 15u;
+                    const std::uint32_t rs = (tid >> 4) / cl, ix = (tid >> 4) - rs * cl;
+                    const std::uint32_t row0 = ((gx * rt + tile) * rsl + rs) * rows;
+                    float acc[rows] = {};
+                    for (std::uint32_t blk = ix; blk < p.nchunk; blk += cl) {
+                        const std::uint8_t* xb = xq + xc + blk * 292u;
+                        float dy;
+                        std::memcpy(&dy, xb, 4);
+                        const auto* qx = reinterpret_cast<const std::int8_t*>(xb + 4);
+                        for (std::uint32_t r = 0; r < rows; ++r) {
+                            const std::uint32_t row = std::min(row0 + r, p.n - 1u);
+                            float d;
+                            const std::int32_t lsumi = d3d12_mmid_detail::block_lsumi(
+                                t, w + wb + row * p.w_row_bytes + blk * block_bytes, itid, qx, &d);
+                            acc[r] += (d * dy) * static_cast<float>(lsumi);
+                        }
                     }
-                }
-                for (std::uint32_t r = 0; r < rows; ++r)
-                    red[r][tid] = acc[r];
-            }
-            for (std::uint32_t stride = threads / 2u; stride > 0u; stride >>= 1u)
-                for (std::uint32_t t2 = 0; t2 < stride; ++t2)
                     for (std::uint32_t r = 0; r < rows; ++r)
-                        red[r][t2] += red[r][t2 + stride];
-            for (std::uint32_t r = 0; r < rows; ++r)
-                if (row0 + r < p.n)
-                    y[ybase + row0 + r] = red[r][0];
-        }
+                        red[r][tid] = acc[r];
+                }
+                for (std::uint32_t base = 0; base < threads; base += seg) {
+                    for (std::uint32_t stride = seg / 2u; stride > 0u; stride >>= 1u)
+                        for (std::uint32_t t2 = base; t2 < base + stride; ++t2)
+                            for (std::uint32_t r = 0; r < rows; ++r)
+                                red[r][t2] += red[r][t2 + stride];
+                    const std::uint32_t row0 = ((gx * rt + tile) * rsl + base / seg) * rows;
+                    for (std::uint32_t r = 0; r < rows; ++r)
+                        if (row0 + r < p.n)
+                            y[ybase + row0 + r] = red[r][base];
+                }
+            }
     }
 }
 

@@ -14,9 +14,11 @@
 // per index), four q8 dwords. Grid bytes are 1..15, never 0, so a byte-wise
 // two's-complement negate under the sign mask has no carry between lanes, and
 // the signed magnitudes go straight into dot4add_i8packed (the q8 side is never
-// negated: it can be -128).
+// negated: it can be -128). The group shape comes from pad0
+// (ggml_d3d12_geom.hlsli).
 
 #include "ggml_d3d12_common.hlsli"
+#include "ggml_d3d12_geom.hlsli"
 
 static const uint kIq3sGrid[512] = {
 #include "ggml_d3d12_iq3s_grid.inc"
@@ -40,43 +42,45 @@ void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
         grid[gi] = kIq3sGrid[gi];
     GroupMemoryBarrierWithGroupSync();
 
-    const uint row0 = gid.x * NUM_ROWS;
     const uint col = gid.y;
-    const uint ix = tid >> 4;
+    const Geom gm = geom_of(tid);
     const uint itid = tid & 15u;
     const uint ib32 = itid >> 1;
     const uint h = itid & 1u;
     const uint e = 32u * ib32 + 16u * h;
 
-    float acc[NUM_ROWS];
-    [unroll]
-    for (uint r = 0; r < NUM_ROWS; ++r)
-        acc[r] = 0.0;
-
-    for (uint blk = ix; blk < nchunk; blk += IN_FLIGHT) {
-        const uint xb = col * x_stride + blk * 292u;
-        const float dy = asfloat(X.Load(xb));
-        const uint4 xv = X.Load4(xb + 4u + e);
-
+    for (uint t = 0; t < gm.rt; ++t) {
+        const uint row0 = geom_row0(gm, gid.x, t);
+        float acc[NUM_ROWS];
         [unroll]
-        for (uint r = 0; r < NUM_ROWS; ++r) {
-            const uint row = min(row0 + r, n - 1u);
-            const uint bb = row * w_row_bytes + blk * 110u;
-            const float d = f16tof32(ld16(bb));
-            const uint qs = ld32(bb + 2u + 8u * ib32 + 4u * h);
-            const uint hb = (ld8(bb + 66u + ib32) >> (4u * h)) & 0xFu;
-            const uint sg = ld16(bb + 74u + 4u * ib32 + 2u * h);
-            const int ls = 2 * (int)((ld8(bb + 106u + (ib32 >> 1)) >> (4u * (ib32 & 1u))) & 0xFu) + 1;
-            const uint g0 = grid[(qs & 0xffu) | ((hb & 1u) << 8)];
-            const uint g1 = grid[((qs >> 8) & 0xffu) | (((hb >> 1) & 1u) << 8)];
-            const uint g2 = grid[((qs >> 16) & 0xffu) | (((hb >> 2) & 1u) << 8)];
-            const uint g3 = grid[(qs >> 24) | (((hb >> 3) & 1u) << 8)];
-            const int sumi = dot4(signed4(g0, sg & 0xFu), xv.x) +
-                             dot4(signed4(g1, (sg >> 4) & 0xFu), xv.y) +
-                             dot4(signed4(g2, (sg >> 8) & 0xFu), xv.z) +
-                             dot4(signed4(g3, (sg >> 12) & 0xFu), xv.w);
-            acc[r] += (d * dy) * (float)(ls * sumi);
+        for (uint r = 0; r < NUM_ROWS; ++r)
+            acc[r] = 0.0;
+
+        for (uint blk = gm.ix; blk < nchunk; blk += gm.cl) {
+            const uint xb = col * x_stride + blk * 292u;
+            const float dy = asfloat(X.Load(xb));
+            const uint4 xv = X.Load4(xb + 4u + e);
+
+            [unroll]
+            for (uint r = 0; r < NUM_ROWS; ++r) {
+                const uint row = min(row0 + r, n - 1u);
+                const uint bb = row * w_row_bytes + blk * 110u;
+                const float d = f16tof32(ld16(bb));
+                const uint qs = ld32(bb + 2u + 8u * ib32 + 4u * h);
+                const uint hb = (ld8(bb + 66u + ib32) >> (4u * h)) & 0xFu;
+                const uint sg = ld16(bb + 74u + 4u * ib32 + 2u * h);
+                const int ls = 2 * (int)((ld8(bb + 106u + (ib32 >> 1)) >> (4u * (ib32 & 1u))) & 0xFu) + 1;
+                const uint g0 = grid[(qs & 0xffu) | ((hb & 1u) << 8)];
+                const uint g1 = grid[((qs >> 8) & 0xffu) | (((hb >> 1) & 1u) << 8)];
+                const uint g2 = grid[((qs >> 16) & 0xffu) | (((hb >> 2) & 1u) << 8)];
+                const uint g3 = grid[(qs >> 24) | (((hb >> 3) & 1u) << 8)];
+                const int sumi = dot4(signed4(g0, sg & 0xFu), xv.x) +
+                                 dot4(signed4(g1, (sg >> 4) & 0xFu), xv.y) +
+                                 dot4(signed4(g2, (sg >> 8) & 0xFu), xv.z) +
+                                 dot4(signed4(g3, (sg >> 12) & 0xFu), xv.w);
+                acc[r] += (d * dy) * (float)(ls * sumi);
+            }
         }
+        reduce_store_geom(acc, tid, gm, row0, col * y_stride);
     }
-    reduce_store(acc, tid, row0, col);
 }

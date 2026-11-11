@@ -74,6 +74,42 @@ D3d12Dispatch d3d12_mm_dispatch(std::int64_t n, std::int64_t ncols);
 // kD3d12LongKChunks chunks, else 64 — measured both ways in D2a runs 1 and 2.
 int d3d12_mm_threads(std::int64_t k);
 
+// --- IQ3_S group geometry (shaders/ggml_d3d12_geom.hlsli) ---
+// The IQ3_S mmv and mmid kernels read their group shape from pad0 (constant 6):
+// rsl row sets side by side in the group's threads/16 chunk lanes and rt row
+// tiles the group walks in turn, so group gid.x covers rows
+// [gid.x * R, (gid.x + 1) * R) with R = kD3d12MmvRows * rsl * rt. rsl = rt = 1
+// is the plain layout (and pad0 = 0 reads as that). rsl > 1 puts the idle chunk
+// lanes of a short K (ffn_down_exps K = 512: 2 chunks, 4 lanes) on more rows; rt
+// > 1 spreads the group's 2 KiB grid preload over more rows.
+struct D3d12Geom {
+    std::uint32_t rsl = 1;
+    std::uint32_t rt = 1;
+};
+
+// What a backend asks for (XLLAMA_D3D12_IQ3S_RSL / _RT): rsl 0 = auto (the
+// idle lanes of a K shorter than the lanes, nothing else), rt as given.
+struct D3d12GeomReq {
+    std::uint32_t rsl = 1;
+    std::uint32_t rt = 1;
+};
+
+inline constexpr std::uint32_t kD3d12GeomMaxRt = 64;
+
+// The geometry for a matmul of nchunk chunks on a `threads`-wide blob: row sets
+// split the threads/16 chunk lanes, so rsl is a power of two <= threads/16 (the
+// shader clamps to the same bound; an XLLAMA_D3D12_SHADER_DIR blob of an IQ3_S
+// slot keeps this contract), rt is clamped to [1, kD3d12GeomMaxRt].
+D3d12Geom d3d12_geom_for(const D3d12GeomReq& req, std::uint32_t nchunk, std::uint32_t threads);
+inline std::uint32_t d3d12_geom_pack(const D3d12Geom& g) {
+    return (g.rsl & 0xffu) | ((g.rt & 0xffu) << 8);
+}
+inline std::uint32_t d3d12_geom_rows(const D3d12Geom& g) {
+    return static_cast<std::uint32_t>(kD3d12MmvRows) * g.rsl * g.rt;
+}
+// "auto", "0" or a count; anything else (or null) leaves `fallback`.
+std::uint32_t d3d12_geom_parse(const char* s, std::uint32_t fallback);
+
 // Activations go to the GPU the way the CPU backend feeds its own vec_dot:
 // quantized by ggml's from_float of the weight's vec_dot type (Q4_0 → q8_0,
 // Q4_K / Q6_K → q8_K), one row of ggml blocks per column. The kernels then

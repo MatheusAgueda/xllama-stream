@@ -12,6 +12,7 @@
     #include <algorithm>
     #include <cmath>
     #include <cstdio>
+    #include <cstdlib>
     #include <cstring>
     #include <ctime>
     #include <limits>
@@ -47,6 +48,38 @@ D3d12Dispatch d3d12_mm_dispatch(std::int64_t n, std::int64_t ncols) {
 
 int d3d12_mm_threads(std::int64_t k) {
     return k / kD3d12Chunk >= kD3d12LongKChunks ? kD3d12MmvThreadsLong : kD3d12MmvThreadsShort;
+}
+
+namespace {
+std::uint32_t floor_pow2(std::uint32_t v) {
+    std::uint32_t p = 1;
+    while (p * 2u <= v)
+        p *= 2u;
+    return p;
+}
+} // namespace
+
+D3d12Geom d3d12_geom_for(const D3d12GeomReq& req, std::uint32_t nchunk, std::uint32_t threads) {
+    D3d12Geom g;
+    const std::uint32_t lanes = std::max(threads / 16u, 1u);
+    std::uint32_t rsl = req.rsl;
+    if (rsl == 0) // auto: only the lanes a short K leaves idle
+        rsl = nchunk > 0 && nchunk < lanes ? lanes / nchunk : 1u;
+    g.rsl = std::min(floor_pow2(std::max(rsl, 1u)), floor_pow2(lanes));
+    g.rt = std::clamp(req.rt, 1u, kD3d12GeomMaxRt);
+    return g;
+}
+
+std::uint32_t d3d12_geom_parse(const char* s, std::uint32_t fallback) {
+    if (!s || !*s)
+        return fallback;
+    if (std::strcmp(s, "auto") == 0)
+        return 0;
+    char* end = nullptr;
+    const unsigned long v = std::strtoul(s, &end, 10);
+    if (end == s || *end != '\0' || v > 0xffu)
+        return fallback;
+    return static_cast<std::uint32_t>(v);
 }
 
 bool d3d12_mm_supported(const D3d12MatmulDesc& d) {
@@ -575,13 +608,16 @@ void run_d3d12_memprobe(const std::function<void(const std::string&)>& emit) {
 
         #include <chrono>
         #include <cstdint>
+        #include <cstdio>
         #include <cstdlib>
+        #include <iterator>
         #include <map>
         #include <mutex>
         #include <random>
         #include <tuple>
         #include <unordered_map>
         #include <unordered_set>
+        #include <vector>
 
         #include <dxgi1_4.h>
 
@@ -703,6 +739,17 @@ struct Gpu {
     // build_rs's GET_ROWS and the CPY back (d3d12_gdn_fuse_plan). Read when a
     // backend is created: XLLAMA_D3D12_SSM_FUSE=0 keeps both copies.
     bool gdn_fuse = true;
+    // IQ3_S group geometry asked for by XLLAMA_D3D12_IQ3S_RSL / _RT (read when a
+    // backend is created; d3d12_geom_for shapes each matmul from it).
+    D3d12GeomReq iq3s_geom;
+    // XLLAMA_D3D12_SHADER_DIR (read when a backend is created): <dir>\<name>.dxil
+    // replaces the built-in blob of that name (shaders/generated/<name>_dxil.h)
+    // for that backend; without the variable every slot is built-in again.
+    // Every pipeline ever bound stays alive in pso_keep, since a kept command
+    // list is matched by pipeline pointer and must never meet a reused address.
+    std::vector<ComPtr<ID3D12PipelineState>> pso_builtin; // pso_slots() order
+    std::vector<ComPtr<ID3D12PipelineState>> pso_keep;
+    std::unordered_map<const ID3D12PipelineState*, std::string> pso_over; // -> blob path
     ComPtr<ID3D12QueryHeap> ts;
     ComPtr<ID3D12Resource> ts_rb;
     // XLLAMA_D3D12_PROFILE (read when a backend is created): a timestamp after
@@ -750,6 +797,91 @@ struct Gpu {
     bool ok = false;
     std::string error;
 };
+
+// One replaceable pipeline: the base name of its built-in blob
+// (shaders/generated/<name>_dxil.h) and the Gpu field that binds it.
+struct PsoSlot {
+    std::string name;
+    ComPtr<ID3D12PipelineState>* pso;
+};
+
+std::vector<PsoSlot> pso_slots(Gpu& g) {
+    static const char* const mmv[] = {"q4_0", "q4_k", "q6_k", "iq3_s", "iq4_xs", "q5_k", "f32"};
+    static const char* const mmid[] = {"iq4_xs", "iq3_s"};
+    static const char* const elt[] = {"binary", "rms_norm", "quant_q8_k"};
+    static const char* const moe[] = {"combine", "tail"};
+    static const char* const ssm[] = {"unary", "copy", "get_rows", "conv", "gdn"};
+    static_assert(
+        std::size(mmv) == std::size_t{kPsoCount} && std::size(mmid) == std::size_t{kMmidCount} &&
+        std::size(elt) == std::size_t{kEltCount} && std::size(moe) == std::size_t{kMoeCount} &&
+        std::size(ssm) == std::size_t{kSsmCount});
+    static const char* const wide[2] = {"_t64", "_t128"};
+    std::vector<PsoSlot> s;
+    for (int i = 0; i < kPsoCount; ++i)
+        for (int wd = 0; wd < 2; ++wd)
+            s.push_back({std::string("ggml_d3d12_mmv_") + mmv[i] + wide[wd], &g.pso[i][wd]});
+    s.push_back({"ggml_d3d12_get_rows_q6_k", &g.pso_get_rows});
+    for (int i = 0; i < kMmidCount; ++i)
+        for (int wd = 0; wd < 2; ++wd)
+            s.push_back({std::string("ggml_d3d12_mmid_") + mmid[i] + wide[wd], &g.pso_mmid[i][wd]});
+    for (int i = 0; i < kEltCount; ++i)
+        s.push_back({std::string("ggml_d3d12_elt_") + elt[i], &g.pso_elt[i]});
+    for (int i = 0; i < kMoeCount; ++i)
+        s.push_back({std::string("ggml_d3d12_moe_") + moe[i], &g.pso_moe[i]});
+    for (int i = 0; i < kSsmCount; ++i)
+        s.push_back({std::string("ggml_d3d12_ssm_") + ssm[i], &g.pso_ssm[i]});
+    return s;
+}
+
+bool read_blob(const std::string& path, std::vector<char>* out) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f)
+        return false;
+    out->clear();
+    char buf[16384];
+    std::size_t got = 0;
+    while ((got = std::fread(buf, 1, sizeof(buf), f)) > 0)
+        out->insert(out->end(), buf, buf + got);
+    const bool ok = std::ferror(f) == 0 && !out->empty();
+    std::fclose(f);
+    return ok;
+}
+
+// XLLAMA_D3D12_SHADER_DIR: bind <dir>\<name>.dxil where the file is there and
+// builds, the built-in pipeline everywhere else (dir null or empty: all of
+// them). Caller holds g.mu. Returns the number of slots replaced.
+int apply_shader_dir(Gpu& g, const char* dir) {
+    const std::vector<PsoSlot> slots = pso_slots(g);
+    int replaced = 0;
+    for (std::size_t i = 0; i < slots.size() && i < g.pso_builtin.size(); ++i) {
+        *slots[i].pso = g.pso_builtin[i];
+        if (!dir || !*dir || !g.pso_builtin[i])
+            continue;
+        const std::string path = std::string(dir) + "\\" + slots[i].name + ".dxil";
+        std::vector<char> blob;
+        if (!read_blob(path, &blob))
+            continue;
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
+        pd.pRootSignature = g.root.Get();
+        pd.CS.pShaderBytecode = blob.data();
+        pd.CS.BytecodeLength = blob.size();
+        ComPtr<ID3D12PipelineState> pso;
+        const HRESULT hr = g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso));
+        if (FAILED(hr)) {
+            log_output("[xllama] d3d12: " + slots[i].name +
+                       ".dxil: " + d3d12c::hr_message("CreateComputePipelineState", hr) +
+                       " — built-in kernel kept\n");
+            continue;
+        }
+        g.pso_over[pso.Get()] = path;
+        g.pso_keep.push_back(pso);
+        *slots[i].pso = pso;
+        ++replaced;
+        log_output("[xllama] d3d12: " + slots[i].name + " <- " + path + " (" +
+                   std::to_string(blob.size()) + " B)\n");
+    }
+    return replaced;
+}
 
 // Weight upload / readback ring. Mapped for the process lifetime and counted in
 // its working set, so it stays small: 64 MiB each put the first GPU-layer
@@ -985,6 +1117,8 @@ bool init_gpu(Gpu& g) {
     if (FAILED(g.readback->Map(0, nullptr, &p)))
         return false;
     g.readback_ptr = static_cast<std::uint8_t*>(p);
+    for (const PsoSlot& s : pso_slots(g))
+        g.pso_builtin.push_back(*s.pso);
     return true;
 }
 
@@ -1502,6 +1636,8 @@ std::string pso_name(const Gpu& g, const ID3D12PipelineState* p) {
                       static_cast<int>(std::size(kMoes)) == kMoeCount &&
                       static_cast<int>(std::size(kSsms)) == kSsmCount,
                   "a name per kernel");
+    if (const auto it = g.pso_over.find(p); it != g.pso_over.end())
+        return it->second; // an XLLAMA_D3D12_SHADER_DIR blob, by its path
     for (int i = 0; i < kPsoCount; ++i)
         for (int wd = 0; wd < 2; ++wd)
             if (g.pso[i][wd].Get() == p)
@@ -2474,6 +2610,15 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
             m.u[1] = x_va;
             m.gx = d.groups_x;
             m.gy = d.groups_y;
+            if (w->type == GGML_TYPE_IQ3_S) { // pad0 = the group geometry (fewer, wider groups)
+                const D3d12Geom geo =
+                    d3d12_geom_for(g.iq3s_geom, static_cast<std::uint32_t>(w->ne[0] / kD3d12Chunk),
+                                   static_cast<std::uint32_t>(d3d12_mm_threads(w->ne[0])));
+                const std::uint64_t rows = d3d12_geom_rows(geo);
+                m.gx =
+                    static_cast<UINT>((static_cast<std::uint64_t>(node->ne[0]) + rows - 1) / rows);
+                m.c[6] = d3d12_geom_pack(geo);
+            }
             record(m, {xr}, {rng_of(node)});
             break;
         }
@@ -2481,7 +2626,7 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
             const ggml_tensor* x = b;
             const ggml_tensor* ids = node->src[2];
             D3d12MmidPlan plan;
-            GGML_ASSERT(in_expert_cache(a) && d3d12_mmid_plan(node, &plan));
+            GGML_ASSERT(in_expert_cache(a) && d3d12_mmid_plan(node, &plan, g.iq3s_geom));
             GGML_ASSERT(x->buffer && ggml_backend_buffer_is_host(x->buffer));
             GGML_ASSERT(ids->buffer && ggml_backend_buffer_is_host(ids->buffer));
             // Columns nb1 apart across tokens too: the one-dispatch q8_K path.
@@ -2892,6 +3037,16 @@ ggml_backend_t dev_init_backend(ggml_backend_dev_t dev, const char*) {
         g.gdn_fuse = !(f && *f == '0');
         if (!g.gdn_fuse)
             log_output("[xllama] d3d12: delta-net state copies kept (XLLAMA_D3D12_SSM_FUSE=0)\n");
+        g.iq3s_geom.rsl = d3d12_geom_parse(std::getenv("XLLAMA_D3D12_IQ3S_RSL"), 1);
+        g.iq3s_geom.rt = d3d12_geom_parse(std::getenv("XLLAMA_D3D12_IQ3S_RT"), 1);
+        if (g.iq3s_geom.rsl != 1 || g.iq3s_geom.rt != 1)
+            log_output("[xllama] d3d12: IQ3_S geometry rsl " +
+                       (g.iq3s_geom.rsl ? std::to_string(g.iq3s_geom.rsl) : std::string("auto")) +
+                       " rt " + std::to_string(g.iq3s_geom.rt) + " (XLLAMA_D3D12_IQ3S_RSL/_RT)\n");
+        const int replaced = apply_shader_dir(g, std::getenv("XLLAMA_D3D12_SHADER_DIR"));
+        if (replaced > 0)
+            log_output("[xllama] d3d12: " + std::to_string(replaced) +
+                       " kernel(s) from XLLAMA_D3D12_SHADER_DIR\n");
     }
     return new ggml_backend{backend_guid(), kBackendIface, dev, nullptr};
 }
@@ -4343,6 +4498,14 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
         {GGML_TYPE_IQ3_S, "iq3_s", 12288, 4096, 1},
         {GGML_TYPE_IQ3_S, "iq3_s", 4096, 12288, 1},
         {GGML_TYPE_IQ3_S, "iq3_s", 1024, 1024, 7},
+        // Qwen3.6-35B-A3B IQ3_S (the 1.7.12.53 kernel profile's mmv iq3_s grids):
+        // 4096 -> 2048 (t128), 2048 -> 512 and 512 -> 2048 (shared expert), plus
+        // wide rows and a tail no geometry divides (XLLAMA_D3D12_IQ3S_RSL / _RT).
+        {GGML_TYPE_IQ3_S, "iq3_s", 2048, 4096, 1},
+        {GGML_TYPE_IQ3_S, "iq3_s", 512, 2048, 1},
+        {GGML_TYPE_IQ3_S, "iq3_s", 2048, 512, 1},
+        {GGML_TYPE_IQ3_S, "iq3_s", 8192, 2048, 1},
+        {GGML_TYPE_IQ3_S, "iq3_s", 1030, 1024, 3},
         // Qwen3.6-35B-A3B IQ4_XS: attn_gate 2048->4096, ssm_out 4096->2048,
         // ffn_down_shexp 512->2048, ssm_alpha 2048->32; Q5_K attn_qkv and attn_v.
         {GGML_TYPE_IQ4_XS, "iq4_xs", 4096, 2048, 1},

@@ -91,16 +91,17 @@ struct MmidRun {
     bool planned = false;
     D3d12MmidPlan plan;
     double rel_err[2] = {1e9, 1e9}; // 64 and 128 threads
+    bool ran[2] = {false, false};   // a blob narrower than the plan's row sets is skipped
     bool tail_untouched = true;
 };
 
 // The emulated kernel on the plan's constants against ggml's CPU mul_mat_id,
 // which quantizes src1 with the same from_float and sums with vec_dot.
-MmidRun run(const MmidCase& c, ggml_type wtype) {
+MmidRun run(const MmidCase& c, ggml_type wtype, const D3d12GeomReq& req = {}) {
     MmidRun r;
     MmidGraph g;
     build(g, c, wtype, false);
-    r.planned = d3d12_mmid_plan(g.out, &r.plan);
+    r.planned = d3d12_mmid_plan(g.out, &r.plan, req);
     if (!r.planned)
         return r;
     ggml_cpu_init();
@@ -117,6 +118,9 @@ MmidRun run(const MmidCase& c, ggml_type wtype) {
     const std::uint32_t blobs[2] = {static_cast<std::uint32_t>(kD3d12MmvThreadsShort),
                                     static_cast<std::uint32_t>(kD3d12MmvThreadsLong)};
     for (int bi = 0; bi < 2; ++bi) {
+        if (blobs[bi] / 16u < r.plan.geom.rsl)
+            continue;
+        r.ran[bi] = true;
         constexpr std::size_t kTail = 16;
         std::vector<float> y(n_out + kTail, -7.f);
         d3d12_mmid_emulate(wtype, r.plan.params, r.plan.groups_x, r.plan.groups_y, blobs[bi],
@@ -263,4 +267,94 @@ TEST_CASE("ggml_d3d12 mmid: kernel emulation matches ggml's CPU mul_mat_id") {
             CHECK(r.rel_err[1] <= kD3d12SelftestRelTol);
             CHECK(r.tail_untouched);
         }
+}
+
+TEST_CASE("ggml_d3d12 mmid: IQ3_S group geometry") {
+    // The plan: auto fills only the lanes a short K leaves idle; requests clamp
+    // to a power of two within the blob's lanes; rt to [1, kD3d12GeomMaxRt].
+    struct PlanCase {
+        int k, n;
+        D3d12GeomReq req;
+        std::uint32_t rsl, rt, groups_x;
+    };
+    const PlanCase plans[] = {
+        {512, 2048, {0, 1}, 2, 1, 256},  // down: 2 chunks on 4 lanes
+        {2048, 512, {0, 1}, 1, 1, 128},  // gate/up: 8 chunks fill the lanes
+        {512, 2048, {16, 1}, 4, 1, 128}, // past the 64-thread blob's 4 lanes
+        {4096, 512, {16, 1}, 8, 1, 16},  // 128 threads: 8 lanes
+        {2048, 512, {3, 2}, 2, 2, 32},   // 3 -> 2
+        {2048, 512, {1, 100}, 1, 64, 2}, // rt clamped
+        {512, 2048, {0, 4}, 2, 4, 64},
+    };
+    for (const auto& pc : plans) {
+        CAPTURE(pc.k);
+        CAPTURE(pc.req.rsl);
+        CAPTURE(pc.req.rt);
+        MmidGraph g;
+        build(g, {pc.k, pc.n, 41, 8, pc.k == 512 ? 8 : 1, 1, 8}, GGML_TYPE_IQ3_S, true);
+        D3d12MmidPlan p;
+        REQUIRE(d3d12_mmid_plan(g.out, &p, pc.req));
+        CHECK(p.geom.rsl == pc.rsl);
+        CHECK(p.geom.rt == pc.rt);
+        CHECK(p.groups_x == pc.groups_x);
+        CHECK(p.params.pad0 == (pc.rsl | (pc.rt << 8)));
+    }
+    {
+        MmidGraph g; // IQ4_XS has no geometry: pad0 stays 0
+        build(g, {512, 2048, 41, 8, 8, 1, 8}, GGML_TYPE_IQ4_XS, true);
+        D3d12MmidPlan p;
+        REQUIRE(d3d12_mmid_plan(g.out, &p, {4, 3}));
+        CHECK(p.params.pad0 == 0);
+        CHECK(p.groups_x == 512);
+    }
+    // The emulated kernel under each geometry against the CPU: wide groups, tile
+    // loops and tails no geometry divides (37, 13 rows).
+    struct EmuCase {
+        MmidCase c;
+        D3d12GeomReq req;
+    };
+    const EmuCase emus[] = {
+        {{512, 2048, 41, 8, 8, 1, 8}, {0, 1}}, {{512, 2048, 41, 8, 8, 2, 8}, {0, 4}},
+        {{2048, 512, 41, 8, 1, 4, 8}, {4, 2}}, {{1024, 37, 11, 8, 8, 5, 16}, {2, 3}},
+        {{4096, 13, 9, 4, 1, 3, 4}, {8, 1}},   {{4096, 13, 9, 4, 1, 3, 4}, {2, 5}},
+    };
+    for (const auto& e : emus) {
+        CAPTURE(e.c.k);
+        CAPTURE(e.c.n);
+        CAPTURE(e.req.rsl);
+        CAPTURE(e.req.rt);
+        const MmidRun r = run(e.c, GGML_TYPE_IQ3_S, e.req);
+        REQUIRE(r.planned);
+        const int own = r.plan.threads == static_cast<std::uint32_t>(kD3d12MmvThreadsLong) ? 1 : 0;
+        REQUIRE(r.ran[own]);
+        for (int bi = 0; bi < 2; ++bi)
+            if (r.ran[bi])
+                CHECK(r.rel_err[bi] <= kD3d12SelftestRelTol);
+        CHECK(r.tail_untouched);
+    }
+}
+
+TEST_CASE("ggml_d3d12: IQ3_S geometry knobs") {
+    CHECK(d3d12_geom_parse(nullptr, 1) == 1);
+    CHECK(d3d12_geom_parse("", 1) == 1);
+    CHECK(d3d12_geom_parse("auto", 1) == 0);
+    CHECK(d3d12_geom_parse("0", 1) == 0);
+    CHECK(d3d12_geom_parse("4", 1) == 4);
+    CHECK(d3d12_geom_parse("255", 1) == 255);
+    CHECK(d3d12_geom_parse("256", 1) == 1);
+    CHECK(d3d12_geom_parse("4x", 1) == 1);
+    CHECK(d3d12_geom_parse("-2", 1) == 1);
+    const D3d12Geom one = d3d12_geom_for({}, 8, 64);
+    CHECK(one.rsl == 1);
+    CHECK(one.rt == 1);
+    CHECK(d3d12_geom_pack(one) == 0x101u);
+    CHECK(d3d12_geom_rows(one) == static_cast<std::uint32_t>(kD3d12MmvRows));
+    CHECK(d3d12_geom_for({0, 1}, 2, 64).rsl == 2);
+    CHECK(d3d12_geom_for({0, 1}, 1, 128).rsl == 8);
+    CHECK(d3d12_geom_for({0, 1}, 3, 64).rsl == 1); // 4 / 3 -> 1
+    CHECK(d3d12_geom_for({0, 1}, 16, 128).rsl == 1);
+    CHECK(d3d12_geom_for({6, 0}, 8, 128).rsl == 4);
+    CHECK(d3d12_geom_for({6, 0}, 8, 128).rt == 1);
+    CHECK(d3d12_geom_rows(d3d12_geom_for({2, 3}, 8, 64)) ==
+          static_cast<std::uint32_t>(kD3d12MmvRows) * 6u);
 }

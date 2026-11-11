@@ -359,6 +359,32 @@ static std::wstring flag_path_if_present(const wchar_t* name) {
     return {};
 }
 
+// A flag file's XLLAMA_*=VALUE lines become process environment before its
+// mode runs (d3d12be.flag: the backend knobs dev_init_backend reads, e.g.
+// XLLAMA_D3D12_IQ3S_RSL or XLLAMA_D3D12_SHADER_DIR). Other lines are ignored.
+static void apply_flag_env(const std::wstring& flag) {
+    FILE* f = _wfopen(flag.c_str(), L"rb");
+    if (!f)
+        return;
+    char line[1024];
+    while (std::fgets(line, sizeof(line), f)) {
+        std::string s(line);
+        if (s.rfind("\xEF\xBB\xBF", 0) == 0)
+            s.erase(0, 3);
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' '))
+            s.pop_back();
+        const std::size_t eq = s.find('=');
+        if (s.rfind("XLLAMA_", 0) != 0 || eq == std::string::npos)
+            continue;
+        const std::string name = s.substr(0, eq);
+        if (name.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_") != std::string::npos)
+            continue;
+        if (_putenv_s(name.c_str(), s.c_str() + eq + 1) == 0)
+            ::xllama::log_output("[xllama] flag env " + s + "\n");
+    }
+    std::fclose(f);
+}
+
 // Minimal IFrameworkView: activates the CoreWindow (satisfies the PLM
 // activation watchdog, dismisses the splash) without a swapchain/compositor,
 // so no D3D12 device exists in-process. Same pattern as the UWP DX12 template.
@@ -467,6 +493,7 @@ int __stdcall wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         }
         std::wstring d3d12be_flag = flag_path_if_present(L"d3d12be.flag");
         if (!d3d12be_flag.empty()) {
+            apply_flag_env(d3d12be_flag);
             _wremove(d3d12be_flag.c_str());
             ::xllama::log_output("[xllama] d3d12be.flag detected -> headless d3d12 backend "
                                  "selftest\n");
