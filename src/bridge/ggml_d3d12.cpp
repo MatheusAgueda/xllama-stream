@@ -656,6 +656,8 @@ void run_d3d12_memprobe(const std::function<void(const std::string&)>& emit) {
         #include "ggml_d3d12_moe_combine_dxil.h"
         #include "ggml_d3d12_moe_emu.h"
         #include "ggml_d3d12_moe_tail_dxil.h"
+        #include "ggml_d3d12_route_emit_dxil.h"
+        #include "ggml_d3d12_route_route_dxil.h"
         #include "ggml_d3d12_ssm_conv_dxil.h"
         #include "ggml_d3d12_ssm_copy_dxil.h"
         #include "ggml_d3d12_ssm_emu.h"
@@ -664,6 +666,23 @@ void run_d3d12_memprobe(const std::function<void(const std::string&)>& emit) {
         #include "ggml_d3d12_ssm_unary_dxil.h"
         #include "xllama/d3d12_dyn.h"
         #include "xllama/platform.h"
+
+// llama-expert-cache.h's GPU routing entry points (patch 0015), C linkage: the
+// same struct, its size checked by the callee.
+struct llama_ec_route_info {
+    std::int32_t size;
+    std::int32_t kind; // 0 not a cache op, 1 select, 2 plan, 3 load, 4 prefetch
+    std::int32_t layer;
+    std::int32_t n_expert;
+    std::int32_t n_slots;
+    std::int32_t swap_tail;
+    float swap_ratio;
+    std::int32_t plain;
+    const std::int32_t* slot_of;
+    const void* layer_id;
+};
+extern "C" int llama_ec_route_query(const ggml_tensor* node, llama_ec_route_info* out);
+extern "C" void llama_ec_route_prepare(const ggml_tensor* node);
 
 namespace xllama {
 namespace {
@@ -689,6 +708,9 @@ enum Elt {
     kEltCount = 5
 };
 enum Moe { kMoeCombine = 0, kMoeTail = 1, kMoeCount = 2 };
+// shaders/ggml_d3d12_route.hlsl: KERNEL 1 the router of a decode token (softmax,
+// the expert cache's swaps, weights, residency) and KERNEL 2 its outputs.
+enum Route { kRouteRoute = 0, kRouteEmit = 1, kRouteCount = 2 };
 // shaders/ggml_d3d12_ssm.hlsl, KERNEL 1..5 (ggml_d3d12_ssm_emu.h).
 enum Ssm { kSsmUnary = 0, kSsmCopy = 1, kSsmGetRows = 2, kSsmConv = 3, kSsmGdn = 4, kSsmCount = 5 };
 // Root constants: the 8 every kernel reads, then MUL_MAT_ID's 5
@@ -773,6 +795,34 @@ struct Gpu {
     // shared expert's gate + both residual adds, each one dispatch.
     ComPtr<ID3D12PipelineState> pso_moe[kMoeCount];
     bool moe_ok = false;
+    // GPU routing (XLLAMA_D3D12_GPUROUTE=1, read when a backend is created): a
+    // decode token's router softmax, the expert cache's cache-aware top-k, the
+    // weights and the slot ids run in shaders/ggml_d3d12_route.hlsl, so the
+    // layer needs no CPU split. Each layer's route writes a predicate when an
+    // expert is missing; everything after it is predicated off, the host runs
+    // that layer's routing and reads on the CPU and submits the rest again.
+    // route_ok = both pipelines and double + int64 shader ops.
+    ComPtr<ID3D12PipelineState> pso_route[kRouteCount];
+    bool route_ok = false;
+    bool route_on = false;
+    // XLLAMA_D3D12_GPUROUTE_SIG=0: the shared expert's gate sigmoid stays a
+    // host op (the CPU's expf) instead of the route kernel's double exp.
+    bool route_sig = true;
+    int route_io = 6;   // XLLAMA_D3D12_GPUROUTE_IO: CPU threads of a miss's reads
+    int route_poll = 0; // XLLAMA_D3D12_GPUROUTE_POLL: their threadpool's poll level
+    // A layer's record (shaders/ggml_d3d12_route.hlsl) per kRouteRec bytes and
+    // the predicate, D3D12_Host buffers.
+    ComPtr<ID3D12Resource> route_res;
+    std::uint8_t* route_ptr = nullptr;
+    D3D12_GPU_VIRTUAL_ADDRESS route_va = 0;
+    ComPtr<ID3D12Resource> pred_res;
+    std::uint8_t* pred_ptr = nullptr;
+    D3D12_GPU_VIRTUAL_ADDRESS pred_va = 0;
+    std::uint64_t n_route = 0, n_route_hit = 0, n_route_miss = 0, n_route_bad = 0;
+    std::uint64_t n_route_mis_ids = 0, n_route_mis_w = 0, n_route_mis_sig = 0;
+    std::uint64_t n_route_resub = 0, n_route_host = 0, n_route_swaps = 0;
+    std::uint64_t n_route_mis_slots = 0, n_route_mis_probs = 0;
+    double route_cpu_ms = 0.0, route_replay_ms = 0.0;
     // The linear-attention layers' ops (gated delta net, conv, the recurrent
     // state copies); without them those stay on the CPU.
     ComPtr<ID3D12PipelineState> pso_ssm[kSsmCount];
@@ -914,10 +964,11 @@ std::vector<PsoSlot> pso_slots(Gpu& g) {
                                       "bin_quant"};
     static const char* const moe[] = {"combine", "tail"};
     static const char* const ssm[] = {"unary", "copy", "get_rows", "conv", "gdn"};
+    static const char* const route[] = {"route", "emit"};
     static_assert(
         std::size(mmv) == std::size_t{kPsoCount} && std::size(mmid) == std::size_t{kMmidCount} &&
         std::size(elt) == std::size_t{kEltCount} && std::size(moe) == std::size_t{kMoeCount} &&
-        std::size(ssm) == std::size_t{kSsmCount});
+        std::size(ssm) == std::size_t{kSsmCount} && std::size(route) == std::size_t{kRouteCount});
     static const char* const wide[2] = {"_t64", "_t128"};
     std::vector<PsoSlot> s;
     for (int i = 0; i < kPsoCount; ++i)
@@ -935,6 +986,8 @@ std::vector<PsoSlot> pso_slots(Gpu& g) {
         s.push_back({std::string("ggml_d3d12_moe_") + moe[i], std::addressof(g.pso_moe[i])});
     for (int i = 0; i < kSsmCount; ++i)
         s.push_back({std::string("ggml_d3d12_ssm_") + ssm[i], std::addressof(g.pso_ssm[i])});
+    for (int i = 0; i < kRouteCount; ++i)
+        s.push_back({std::string("ggml_d3d12_route_") + route[i], std::addressof(g.pso_route[i])});
     return s;
 }
 
@@ -1180,6 +1233,31 @@ bool init_gpu(Gpu& g) {
                            d3d12c::hr_message("CreateComputePipelineState (moe)", hr) +
                            " — the MoE tail stays on the CPU\n");
                 g.moe_ok = false;
+            }
+        }
+    }
+    {
+        // the route kernel computes in double and splits 64-bit products
+        D3D12_FEATURE_DATA_D3D12_OPTIONS o0 = {};
+        D3D12_FEATURE_DATA_D3D12_OPTIONS1 o1 = {};
+        g.route_ok =
+            SUCCEEDED(g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &o0, sizeof(o0))) &&
+            o0.DoublePrecisionFloatShaderOps &&
+            SUCCEEDED(g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &o1, sizeof(o1))) &&
+            o1.Int64ShaderOps;
+        const void* rb[kRouteCount] = {kGgmlD3d12RouteRouteDxil, kGgmlD3d12RouteEmitDxil};
+        const size_t rs[kRouteCount] = {kGgmlD3d12RouteRouteDxilSize, kGgmlD3d12RouteEmitDxilSize};
+        for (int i = 0; i < kRouteCount && g.route_ok; ++i) {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
+            pd.pRootSignature = g.root.Get();
+            pd.CS.pShaderBytecode = rb[i];
+            pd.CS.BytecodeLength = rs[i];
+            hr = g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.pso_route[i]));
+            if (FAILED(hr)) {
+                log_output("[xllama] d3d12: " +
+                           d3d12c::hr_message("CreateComputePipelineState (route)", hr) +
+                           " — the MoE routing stays on the CPU\n");
+                g.route_ok = false;
             }
         }
     }
@@ -1938,6 +2016,32 @@ void backend_free(ggml_backend_t b) {
                           static_cast<unsigned long long>(s.n), s.ms, key.c_str());
             log_output(line);
         }
+        if (g.n_route) {
+            char rmsg[512];
+            std::snprintf(rmsg, sizeof(rmsg),
+                          "[xllama] d3d12 gpu route: %llu layers, %llu hit, %llu missed (%llu bad), "
+                          "%llu on the host, %llu resubmits, %llu swaps; %.1f ms host routing, "
+                          "%.1f ms replay; mismatches ids %llu slots %llu w %llu sig %llu probs "
+                          "%llu\n",
+                          static_cast<unsigned long long>(g.n_route),
+                          static_cast<unsigned long long>(g.n_route_hit),
+                          static_cast<unsigned long long>(g.n_route_miss),
+                          static_cast<unsigned long long>(g.n_route_bad),
+                          static_cast<unsigned long long>(g.n_route_host),
+                          static_cast<unsigned long long>(g.n_route_resub),
+                          static_cast<unsigned long long>(g.n_route_swaps), g.route_cpu_ms,
+                          g.route_replay_ms, static_cast<unsigned long long>(g.n_route_mis_ids),
+                          static_cast<unsigned long long>(g.n_route_mis_slots),
+                          static_cast<unsigned long long>(g.n_route_mis_w),
+                          static_cast<unsigned long long>(g.n_route_mis_sig),
+                          static_cast<unsigned long long>(g.n_route_mis_probs));
+            log_output(rmsg);
+        }
+        g.n_route = g.n_route_hit = g.n_route_miss = g.n_route_bad = g.n_route_host = 0;
+        g.n_route_resub = g.n_route_swaps = 0;
+        g.n_route_mis_ids = g.n_route_mis_slots = g.n_route_mis_w = g.n_route_mis_sig = 0;
+        g.n_route_mis_probs = 0;
+        g.route_cpu_ms = g.route_replay_ms = 0.0;
         g.n_calls = g.n_submits = g.n_dispatches = g.n_replays = g.n_barriers = g.n_gdn_fused = 0;
         g.n_async = g.n_drain_waits = 0;
         g.wall_ms = g.gpu_ms = g.rec_ms = g.wait_ms = g.drain_ms = 0.0;
@@ -2241,6 +2345,10 @@ struct Op {
     D3D12_GPU_VIRTUAL_ADDRESS t1 = 0;
     D3D12_GPU_VIRTUAL_ADDRESS u[6] = {}; // u[5]: only the kernels that read u5 set it
     UINT gx = 0, gy = 0, gz = 1;
+    // pso null and pred 1: a UAV barrier, then every later command of the list
+    // is predicated on g.pred_res (skipped while it is not zero, the value read
+    // here); the GPU routing's gate after a layer's route kernel.
+    std::uint32_t pred = 0;
 };
 
 void set_c(Op& op, std::initializer_list<std::uint64_t> c) {
@@ -2267,12 +2375,28 @@ std::uint64_t record_ops(Gpu& g, ID3D12GraphicsCommandList* cl, const std::vecto
     if (prof)
         cl->EndQuery(g.prof.Get(), D3D12_QUERY_TYPE_TIMESTAMP, stamps++);
     ID3D12PipelineState* bound = nullptr;
+    bool predicated = false;
     for (const Op& op : ops) {
         if (!op.pso) {
-            D3D12_RESOURCE_BARRIER b = {};
-            b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-            b.UAV.pResource = nullptr; // every UAV access
-            cl->ResourceBarrier(1, &b);
+            D3D12_RESOURCE_BARRIER b[2] = {};
+            b[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            b[0].UAV.pResource = nullptr; // every UAV access
+            if (!op.pred) {
+                cl->ResourceBarrier(1, b);
+                continue;
+            }
+            // barriers are never predicated, so the pair below always runs and
+            // the predicate is a UAV again for the next layer's route kernel
+            b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b[1].Transition.pResource = g.pred_res.Get();
+            b[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PREDICATION;
+            cl->ResourceBarrier(2, b);
+            cl->SetPredication(g.pred_res.Get(), 0, D3D12_PREDICATION_OP_NOT_EQUAL_ZERO);
+            std::swap(b[1].Transition.StateBefore, b[1].Transition.StateAfter);
+            cl->ResourceBarrier(1, &b[1]);
+            predicated = true;
             continue;
         }
         if (op.pso != bound) {
@@ -2292,6 +2416,8 @@ std::uint64_t record_ops(Gpu& g, ID3D12GraphicsCommandList* cl, const std::vecto
         if (prof && stamps < kProfStamps)
             cl->EndQuery(g.prof.Get(), D3D12_QUERY_TYPE_TIMESTAMP, stamps++);
     }
+    if (predicated)
+        cl->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
     if (ts) {
         cl->EndQuery(g.ts.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
         cl->ResolveQueryData(g.ts.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, g.ts_rb.Get(), 0);
@@ -2328,7 +2454,7 @@ bool same_op(const Op& a, const Op& b) {
     return a.pso == b.pso && std::equal(std::begin(a.c), std::end(a.c), std::begin(b.c)) &&
            a.t0 == b.t0 && a.t1 == b.t1 &&
            std::equal(std::begin(a.u), std::end(a.u), std::begin(b.u)) && a.gx == b.gx &&
-           a.gy == b.gy && a.gz == b.gz;
+           a.gy == b.gy && a.gz == b.gz && a.pred == b.pred;
 }
 
 std::uint64_t ops_hash(const std::vector<Op>& ops, bool ts, bool prof) {
@@ -2346,7 +2472,7 @@ std::uint64_t ops_hash(const std::vector<Op>& ops, bool ts, bool prof) {
         for (const D3D12_GPU_VIRTUAL_ADDRESS u : op.u)
             mix(u);
         mix((static_cast<std::uint64_t>(op.gx) << 32) | op.gy);
-        mix(op.gz);
+        mix((static_cast<std::uint64_t>(op.pred) << 32) | op.gz);
     }
     return h;
 }
@@ -2376,8 +2502,9 @@ struct ListHint {
     KeptList* k = nullptr;
     std::uint64_t gen = 0;
 };
-// The 35B decode graph has ~84 GPU submissions; prefill adds its own.
-constexpr std::size_t kMaxKeptLists = 256;
+// The 35B decode graph has ~84 GPU submissions; prefill adds its own; GPU
+// routing one more per layer (the rest of the graph after a miss).
+constexpr std::size_t kMaxKeptLists = 512;
 
 ListCache& list_cache() { // guarded by gpu().mu
     static ListCache c;
@@ -2471,6 +2598,600 @@ bool submit_ops(Gpu& g, const std::vector<Op>& ops, bool async = false,
     return true;
 }
 
+// --- GPU routing (XLLAMA_D3D12_GPUROUTE) ---
+// A MoE layer's routing — the softmax of the router logits, the expert
+// cache's top-k with resident experts standing in for missing ones
+// (ec_select), its slot plan (ec_plan) and reads (ec_load), the gathered and
+// normalised weights — ran on the CPU between two submissions: ~40 splits per
+// decode token of Qwen3.6-35B-A3B. Here the route kernel computes it from the
+// logits and a copy of the layer's expert -> slot map taken before the
+// submission, and the emit kernel writes the weights and slot ids, so the
+// layer's experts run in the same submission. A missing expert makes the
+// route kernel write the predicate: every command after the layer's gate is
+// skipped; the host replays the layers before it through the cache's own ops
+// (its LRU state stays the CPU's), runs the missing layer's routing and reads
+// on the CPU and submits the rest of the list again. The kernels follow the
+// CPU's operation order, double sums and IEEE rounding: the same bits
+// (selftest route_* rows, the counters at backend_free).
+constexpr std::size_t kRouteRec = 4096; // bytes per layer record
+constexpr std::size_t kRouteMax = 128;  // records per submission
+constexpr std::size_t kRecProbs = 0, kRecMirror = 1024, kRecIds = 2048, kRecSlots = 2112,
+                      kRecW = 2176, kRecState = 2240, kRecSwaps = 2244, kRecGate = 2248,
+                      kRecSig = 2252;
+constexpr std::int64_t kRouteMaxExpert = 256, kRouteMaxUsed = 16;
+
+// One layer's routing in a graph: S the softmax, C1..C3 the expert cache's
+// select, plan and load, W what the experts' outputs are weighted by, sig the
+// shared expert's gate sigmoid when the route kernel computes it too.
+struct RouteGrp {
+    ggml_tensor *S = nullptr, *C1 = nullptr, *C2 = nullptr, *C3 = nullptr, *W = nullptr,
+                *sig = nullptr;
+    const ggml_tensor *sig_src = nullptr, *logits = nullptr;
+    std::vector<ggml_tensor*> host; // what the CPU runs on a miss, in graph order
+    std::size_t slot = 0;           // its record in the submission
+    std::size_t pred_op = 0;        // its gate in the submission's ops
+    int n_expert = 0, n_used = 0, n_slots = 0;
+    float clamp_min = 0.0f, scale = 1.0f;
+    bool norm = false, scaled = false, plain = false;
+    std::uint32_t c[8] = {};
+};
+
+bool name_is(const ggml_tensor* t, const char* prefix) {
+    return std::strncmp(t->name, prefix, std::strlen(prefix)) == 0;
+}
+
+bool one_row(const ggml_tensor* t) {
+    return t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1;
+}
+
+// A node of a layer's routing in a one-token ubatch (decode). supports_op
+// takes it, so the scheduler keeps the routing on this backend; graph_compute
+// runs it as part of a group (route_match), else on the CPU.
+bool route_node(const ggml_tensor* t) {
+    switch (t->op) {
+    case GGML_OP_SOFT_MAX: {
+        const ggml_tensor* a = t->src[0];
+        float p[2] = {};
+        std::memcpy(p, t->op_params, sizeof(p)); // scale, max_bias
+        return name_is(t, "ffn_moe_probs-") && t->type == GGML_TYPE_F32 &&
+               ggml_is_contiguous(t) && one_row(t) && t->ne[0] % 8 == 0 && t->ne[0] >= 8 &&
+               t->ne[0] <= kRouteMaxExpert && a && a->type == GGML_TYPE_F32 && !t->src[1] &&
+               !t->src[2] && p[0] == 1.0f && p[1] == 0.0f;
+    }
+    case GGML_OP_CUSTOM: {
+        llama_ec_route_info ri{};
+        ri.size = sizeof(ri);
+        const int kind = llama_ec_route_query(t, &ri);
+        return kind >= 1 && kind <= 3 && t->type == GGML_TYPE_I32 && ggml_is_contiguous(t) &&
+               one_row(t) && t->ne[0] >= 1 && t->ne[0] <= kRouteMaxUsed;
+    }
+    case GGML_OP_GET_ROWS:
+        return name_is(t, "ffn_moe_weights-") && t->type == GGML_TYPE_F32 && t->ne[0] == 1 &&
+               t->ne[1] >= 1 && t->ne[1] <= kRouteMaxUsed && t->ne[2] == 1 && t->ne[3] == 1;
+    case GGML_OP_SUM_ROWS:
+        return name_is(t, "ffn_moe_weights_sum-") && t->type == GGML_TYPE_F32 &&
+               ggml_nelements(t) == 1;
+    case GGML_OP_CLAMP:
+        return name_is(t, "ffn_moe_weights_sum_clamped-") && t->type == GGML_TYPE_F32 &&
+               ggml_nelements(t) == 1;
+    case GGML_OP_DIV:
+        return name_is(t, "ffn_moe_weights_norm-") && t->type == GGML_TYPE_F32 &&
+               t->ne[0] <= kRouteMaxUsed && one_row(t);
+    case GGML_OP_SCALE:
+        return name_is(t, "ffn_moe_weights_scaled-") && t->type == GGML_TYPE_F32 &&
+               ggml_nelements(t) <= kRouteMaxUsed && t->ne[2] == 1 && t->ne[3] == 1 &&
+               (t->ne[0] == 1 || t->ne[1] == 1);
+    case GGML_OP_UNARY:
+        return ggml_get_unary_op(t) == GGML_UNARY_OP_SIGMOID &&
+               name_is(t, "shared_expert_gate_sigmoid-") && t->type == GGML_TYPE_F32 &&
+               ggml_nelements(t) == 1 && gpu().route_sig;
+    default:
+        return false;
+    }
+}
+
+// The records and the predicate, write-back D3D12_Host, once.
+bool ensure_route_bufs(Gpu& g) {
+    if (g.route_res && g.pred_res)
+        return true;
+    BufCtx rc, pc;
+    std::string err;
+    if (!create_host_res(g, kRouteRec * kRouteMax, false, &rc, &err) ||
+        !create_host_res(g, 256, false, &pc, &err)) {
+        log_output("[xllama] d3d12: GPU routing buffers failed, routing stays on the CPU: " + err +
+                   "\n");
+        return false;
+    }
+    std::memset(rc.host, 0, kRouteRec * kRouteMax);
+    std::memset(pc.host, 0, 256);
+    g.route_res = rc.res;
+    g.route_ptr = rc.host;
+    g.route_va = rc.va;
+    g.pred_res = pc.res;
+    g.pred_ptr = pc.host;
+    g.pred_va = pc.va;
+    return true;
+}
+
+// The CPU side of a miss: a ggml CPU backend on its own threadpool
+// (XLLAMA_D3D12_GPUROUTE_IO threads, which ec_load's reads split over), and
+// a graph the group's nodes are put in.
+struct HostCpu {
+    ggml_backend_t be = nullptr;
+    ggml_threadpool_t tp = nullptr;
+    ggml_context* ctx = nullptr;
+    ggml_cgraph* gf = nullptr;
+};
+constexpr std::size_t kHostGraph = 64;
+
+HostCpu* host_cpu(Gpu& g) {
+    static HostCpu h;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        ggml_cpu_init();
+        const int n = std::clamp(g.route_io, 1, 64);
+        ggml_threadpool_params tpp = ggml_threadpool_params_default(n);
+        tpp.poll = static_cast<std::uint32_t>(std::clamp(g.route_poll, 0, 100));
+        h.be = ggml_backend_cpu_init();
+        h.tp = h.be ? ggml_threadpool_new(&tpp) : nullptr;
+        ggml_init_params ip = {ggml_graph_overhead_custom(kHostGraph, false), nullptr, true};
+        h.ctx = h.tp ? ggml_init(ip) : nullptr;
+        h.gf = h.ctx ? ggml_new_graph_custom(h.ctx, kHostGraph, false) : nullptr;
+        if (h.gf) {
+            ggml_backend_cpu_set_threadpool(h.be, h.tp);
+            ggml_backend_cpu_set_n_threads(h.be, n);
+        } else {
+            log_output("[xllama] d3d12: GPU routing's CPU backend failed\n");
+            if (h.ctx)
+                ggml_free(h.ctx);
+            if (h.tp)
+                ggml_threadpool_free(h.tp);
+            if (h.be)
+                ggml_backend_free(h.be);
+            h = HostCpu{};
+        }
+    }
+    return h.gf ? &h : nullptr;
+}
+
+// The nodes, in order, on the CPU (ggml-cpu's own kernels: the CPU's bits).
+bool host_compute(Gpu& g, ggml_tensor* const* nodes, std::size_t n) {
+    HostCpu* h = host_cpu(g);
+    if (!h || n > kHostGraph)
+        return false;
+    const auto t0 = std::chrono::steady_clock::now();
+    ggml_graph_clear(h->gf);
+    for (std::size_t i = 0; i < n; ++i)
+        ggml_graph_add_node(h->gf, nodes[i]);
+    const bool ok = ggml_backend_graph_compute(h->be, h->gf) == GGML_STATUS_SUCCESS;
+    g.route_cpu_ms +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    return ok;
+}
+
+// An expert cache op on one thread, as ggml-cpu calls it (ggml_custom_4d).
+void call_custom(ggml_tensor* t) {
+    struct {
+        ggml_custom_op_t fun;
+        int n_tasks;
+        void* userdata;
+    } p;
+    static_assert(sizeof(p) <= sizeof(t->op_params), "custom op params");
+    std::memcpy(&p, t->op_params, sizeof(p));
+    p.fun(t, 0, 1, p.userdata);
+}
+
+// The weights as build_moe_ffn's GET_ROWS, SUM_ROWS (double sum), CLAMP
+// (MAX(MIN(x, max), min): NaN -> max), DIV and SCALE make them on the CPU.
+void route_weights(const float* probs, const std::int32_t* ids, int n_used, bool norm,
+                   float clamp_min, bool scaled, float scale, float* w) {
+    for (int k = 0; k < n_used; ++k)
+        w[k] = probs[ids[k]];
+    if (norm) {
+        double sum = 0.0;
+        for (int k = 0; k < n_used; ++k)
+            sum += static_cast<double>(w[k]);
+        float den = static_cast<float>(sum);
+        den = den < INFINITY ? den : INFINITY;
+        den = den > clamp_min ? den : clamp_min;
+        for (int k = 0; k < n_used; ++k)
+            w[k] = w[k] / den;
+    }
+    if (scaled)
+        for (int k = 0; k < n_used; ++k)
+            w[k] = w[k] * scale;
+}
+
+// ec_select of one token (ec_rank, ec_swap_missing), for the selftests:
+// ids = the top n_used after the swaps; returns the swaps.
+std::uint32_t route_select(const float* s, const std::int32_t* res, int n_expert, int n_used,
+                           float ratio, int tail, std::int32_t* ids) {
+    std::vector<std::int32_t> order(static_cast<std::size_t>(n_expert));
+    for (int e = 0; e < n_expert; ++e)
+        order[e] = e;
+    std::sort(order.begin(), order.end(), [s](std::int32_t a, std::int32_t b) {
+        return s[a] > s[b] || (s[a] == s[b] && a < b);
+    });
+    std::uint32_t swaps = 0;
+    std::int64_t i = n_used;
+    for (std::int64_t j = n_used - 1; j >= 0; --j) {
+        const std::int32_t m = order[j];
+        if (res[m] >= 0)
+            continue;
+        while (i < n_expert && res[order[i]] < 0)
+            i++;
+        if (i == n_expert)
+            break;
+        const std::int32_t r = order[i];
+        const float rj = n_used - j <= tail ? 0.0f : ratio;
+        if (!(s[r] > 0.0f) || s[r] < rj * s[m])
+            break;
+        std::swap(order[j], order[i]);
+        i++;
+        swaps++;
+    }
+    std::copy(order.begin(), order.begin() + n_used, ids);
+    return swaps;
+}
+
+// A record's sigmoid against the CPU's (ggml-cpu: 1 / (1 + expf(-x))).
+bool route_sig_same(const std::uint8_t* rec) {
+    float x = 0.0f, y = 0.0f;
+    std::memcpy(&x, rec + kRecGate, sizeof(x));
+    std::memcpy(&y, rec + kRecSig, sizeof(y));
+    const float want = 1.f / (1.f + std::exp(-x));
+    return std::memcmp(&want, &y, sizeof(y)) == 0 || (want != want && y != y);
+}
+
+// The routing of the layer whose softmax is graph node gi: its nodes up to
+// the slot ids, all of them routing nodes, in the order build_moe_ffn makes
+// them, used nowhere else but W, the slot ids and the sigmoid (sig_cand, the
+// node before the softmax, when it is the shared expert's gate). Returns why
+// not, else nullptr; idxs = the graph nodes the use counts were checked for.
+const char* route_match(ggml_cgraph* cgraph, int gi, ggml_tensor* sig_cand, int sig_gi,
+                        RouteGrp* r, std::vector<int>* idxs) {
+    idxs->clear();
+    ggml_tensor* S = ggml_graph_node(cgraph, gi);
+    const ggml_tensor* logits = S->src[0];
+    if (!elt_operand(logits) || !ggml_is_contiguous(logits) ||
+        ggml_nelements(logits) != S->ne[0])
+        return "router logits not in D3D12_Host";
+    ggml_tensor *C1 = nullptr, *C2 = nullptr, *C3 = nullptr, *gr = nullptr, *sum = nullptr,
+                *clamp = nullptr, *div = nullptr, *scale = nullptr;
+    int i3 = -1, igr = -1, idiv = -1, iscale = -1;
+    float clamp_min = 0.0f, scale_v = 1.0f;
+    llama_ec_route_info ri1{}, ri2{};
+    std::vector<int> members, views;
+    const int n = ggml_graph_n_nodes(cgraph);
+    for (int j = gi + 1; j < n && !C3; ++j) {
+        ggml_tensor* t = ggml_graph_node(cgraph, j);
+        if ((t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || t->op == GGML_OP_NONE)
+            continue;
+        if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE ||
+            t->op == GGML_OP_TRANSPOSE) {
+            views.push_back(j);
+            continue;
+        }
+        if (!route_node(t))
+            return "another node inside the routing";
+        switch (t->op) {
+        case GGML_OP_CUSTOM: {
+            llama_ec_route_info ri{};
+            ri.size = sizeof(ri);
+            const int kind = llama_ec_route_query(t, &ri);
+            if (kind == 1 && !C1 && t->src[0] == S) {
+                C1 = t;
+                ri1 = ri;
+            } else if (kind == 2 && C1 && !C2 && t->src[0] == C1) {
+                C2 = t;
+                ri2 = ri;
+            } else if (kind == 3 && C2 && t->src[0] == C2) {
+                C3 = t;
+                i3 = j;
+            } else {
+                return "expert cache ops out of order";
+            }
+            if (ri.layer_id != ri1.layer_id)
+                return "expert cache ops of two layers";
+            break;
+        }
+        case GGML_OP_GET_ROWS: {
+            const ggml_tensor* a = t->src[0];
+            if (gr || !C1 || t->src[1] != C1 || base_of(a) != S || a->data != S->data ||
+                a->type != GGML_TYPE_F32 || a->ne[0] != 1 || a->ne[1] != S->ne[0] ||
+                a->ne[2] != 1 || a->nb[1] != sizeof(float) || !ggml_is_contiguous(t))
+                return "weights gather";
+            gr = t;
+            igr = j;
+            break;
+        }
+        case GGML_OP_SUM_ROWS:
+            if (sum || !gr || base_of(t->src[0]) != gr || t->src[0]->data != gr->data ||
+                !ggml_is_contiguous(t->src[0]) || t->src[0]->ne[0] != gr->ne[1])
+                return "weights sum";
+            sum = t;
+            break;
+        case GGML_OP_CLAMP: {
+            float mm[2] = {};
+            std::memcpy(mm, t->op_params, sizeof(mm)); // min, max
+            if (clamp || !sum || t->src[0] != sum || !(mm[1] == INFINITY) || !std::isfinite(mm[0]))
+                return "weights sum clamp";
+            clamp = t;
+            clamp_min = mm[0];
+            break;
+        }
+        case GGML_OP_DIV:
+            if (div || !clamp || t->src[1] != clamp || base_of(t->src[0]) != gr ||
+                t->src[0]->data != gr->data || !ggml_is_contiguous(t->src[0]) ||
+                ggml_nelements(t->src[0]) != ggml_nelements(gr) || !ggml_is_contiguous(t))
+                return "weights norm";
+            div = t;
+            idiv = j;
+            break;
+        case GGML_OP_SCALE: {
+            float sb[2] = {};
+            std::memcpy(sb, t->op_params, sizeof(sb)); // scale, bias
+            const ggml_tensor* w = div ? div : gr;
+            if (scale || !gr || base_of(t->src[0]) != w || t->src[0]->data != w->data ||
+                sb[1] != 0.0f || !std::isfinite(sb[0]) || !ggml_is_contiguous(t))
+                return "weights scale";
+            scale = t;
+            iscale = j;
+            scale_v = sb[0];
+            break;
+        }
+        default:
+            return "a routing node out of place";
+        }
+        members.push_back(j);
+    }
+    if (!C3)
+        return "no slot ids";
+    if (!gr)
+        return "no weights gather";
+    if ((sum != nullptr) != (div != nullptr) || (sum != nullptr) != (clamp != nullptr))
+        return "a partial weights norm";
+    const std::int64_t n_used = C1->ne[0];
+    if (n_used < 1 || n_used > kRouteMaxUsed || C2->ne[0] != n_used || C3->ne[0] != n_used ||
+        gr->ne[1] != n_used)
+        return "n_used";
+    ggml_tensor* W = scale ? scale : div ? div : gr;
+    const int iw = scale ? iscale : div ? idiv : igr;
+    if (W->type != GGML_TYPE_F32 || !ggml_is_contiguous(W) || ggml_nelements(W) != n_used)
+        return "weights layout";
+    if (C3->type != GGML_TYPE_I32 || !ggml_is_contiguous(C3))
+        return "slot ids layout";
+    if (ri2.n_slots < n_used || ri1.n_expert != S->ne[0])
+        return "expert cache shape";
+    if (!std::isfinite(ri1.swap_ratio) || ri1.swap_ratio < 0.0f)
+        return "swap ratio";
+    auto host_buf = [](const ggml_tensor* t) {
+        return t->buffer && t->buffer->buft == &kHostBuft;
+    };
+    if (!host_buf(S))
+        return "not in D3D12_Host";
+    for (const int j : members)
+        if (!host_buf(ggml_graph_node(cgraph, j)))
+            return "not in D3D12_Host";
+    ggml_tensor* sig = nullptr;
+    const ggml_tensor* sig_src = nullptr;
+    if (sig_cand && sig_cand->op == GGML_OP_UNARY && route_node(sig_cand) &&
+        elt_operand(sig_cand->src[0]) && ggml_nelements(sig_cand->src[0]) == 1 &&
+        ggml_is_contiguous(sig_cand) && host_buf(sig_cand)) {
+        sig = sig_cand;
+        sig_src = sig_cand->src[0];
+    }
+    std::vector<int>& ix = *idxs;
+    ix.push_back(gi);
+    ix.insert(ix.end(), members.begin(), members.end());
+    if (sig)
+        ix.push_back(sig_gi);
+    for (const int j : views) {
+        const ggml_tensor* b = base_of(ggml_graph_node(cgraph, j));
+        if (b == W || b == C3)
+            continue; // a view of an output is read later, like the output
+        bool ours = b == S;
+        for (std::size_t k = 0; !ours && k < members.size(); ++k)
+            ours = ggml_graph_node(cgraph, members[k]) == b;
+        if (ours)
+            ix.push_back(j);
+    }
+    std::sort(ix.begin(), ix.end());
+    std::vector<ggml_op> opv;
+    for (const int j : ix)
+        opv.push_back(ggml_graph_node(cgraph, j)->op);
+    int outs[3] = {iw, i3, sig_gi};
+    if (!ggml_can_fuse_subgraph_ext(cgraph, ix.data(), static_cast<int>(ix.size()), opv.data(),
+                                    outs, sig ? 3 : 2))
+        return "used outside the routing";
+    r->S = S;
+    r->C1 = C1;
+    r->C2 = C2;
+    r->C3 = C3;
+    r->W = W;
+    r->sig = sig;
+    r->sig_src = sig_src;
+    r->logits = logits;
+    r->host.clear();
+    r->host.push_back(S);
+    for (const int j : members)
+        r->host.push_back(ggml_graph_node(cgraph, j));
+    r->n_expert = static_cast<int>(S->ne[0]);
+    r->n_used = static_cast<int>(n_used);
+    r->n_slots = ri2.n_slots;
+    r->norm = div != nullptr;
+    r->clamp_min = clamp_min;
+    r->scaled = scale != nullptr;
+    r->scale = scale_v;
+    std::uint32_t rb = 0, cb = 0, sb = 0;
+    std::memcpy(&rb, &ri1.swap_ratio, sizeof(rb));
+    std::memcpy(&cb, &clamp_min, sizeof(cb));
+    std::memcpy(&sb, &scale_v, sizeof(sb));
+    const std::uint32_t c[8] = {static_cast<std::uint32_t>(r->n_expert),
+                                static_cast<std::uint32_t>(r->n_used),
+                                rb,
+                                static_cast<std::uint32_t>(std::max(0, ri1.swap_tail)),
+                                cb,
+                                sb,
+                                0,
+                                (r->norm ? 1u : 0u) | (r->scaled ? 2u : 0u) | (sig ? 4u : 0u)};
+    std::copy(std::begin(c), std::end(c), r->c);
+    return nullptr;
+}
+
+void route_log(const char* what, const RouteGrp& r, std::uint32_t state) {
+    char msg[256];
+    std::snprintf(msg, sizeof(msg), "[xllama] d3d12 GPU routing: %s in %s (state %u)\n", what,
+                  r.S ? r.S->name : "?", state);
+    log_output(std::string(msg));
+}
+
+// A layer the GPU routed whole: the cache's own select, plan and load on the
+// record's probabilities, so its LRU state moves as on the CPU; the GPU's
+// choices are checked against them on the way (counters at backend_free).
+void replay_hit(Gpu& g, RouteGrp& r) {
+    const auto t0 = std::chrono::steady_clock::now();
+    std::uint8_t* rec = g.route_ptr + r.slot * kRouteRec;
+    std::uint32_t state = 0, swaps = 0;
+    std::memcpy(&state, rec + kRecState, sizeof(state));
+    std::memcpy(&swaps, rec + kRecSwaps, sizeof(swaps));
+    if (state != 1 && g.n_route_bad++ < 3)
+        route_log("a layer ran past its gate without a hit", r, state);
+    ggml_tensor fs = *r.S;
+    fs.data = rec + kRecProbs;
+    std::int32_t sel[kRouteMaxUsed] = {}, slots[kRouteMaxUsed] = {}, loaded[kRouteMaxUsed] = {};
+    const std::size_t nb = static_cast<std::size_t>(r.n_used) * sizeof(std::int32_t);
+    ggml_tensor f1 = *r.C1;
+    f1.src[0] = &fs;
+    f1.data = sel;
+    call_custom(&f1);
+    if (std::memcmp(sel, rec + kRecIds, nb) != 0) {
+        if (g.n_route_mis_ids++ < 3)
+            route_log("experts differ from the CPU's", r, state);
+        std::memcpy(sel, rec + kRecIds, nb); // the experts that ran
+    }
+    ggml_tensor f2 = *r.C2;
+    f2.src[0] = &f1;
+    f2.data = slots;
+    call_custom(&f2);
+    if (std::memcmp(slots, rec + kRecSlots, nb) != 0 && g.n_route_mis_slots++ < 3)
+        route_log("slots differ from the CPU's", r, state);
+    ggml_tensor f3 = *r.C3;
+    f3.src[0] = &f2;
+    f3.data = loaded;
+    call_custom(&f3);
+    float w[kRouteMaxUsed];
+    route_weights(reinterpret_cast<const float*>(rec + kRecProbs), sel, r.n_used, r.norm,
+                  r.clamp_min, r.scaled, r.scale, w);
+    if (std::memcmp(w, rec + kRecW, static_cast<std::size_t>(r.n_used) * sizeof(float)) != 0 &&
+        g.n_route_mis_w++ < 3)
+        route_log("weights differ from the CPU's", r, state);
+    if (r.sig && !route_sig_same(rec) && g.n_route_mis_sig++ < 3)
+        route_log("gate sigmoid differs from the CPU's", r, state);
+    g.n_route_swaps += swaps;
+    ++g.n_route_hit;
+    g.route_replay_ms +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// The layer whose route wrote the predicate: its routing and reads on the
+// CPU (the nodes as the CPU backend ran them before), then the weights and
+// slot ids into its record for the emit kernel at the head of the rest.
+bool host_route(Gpu& g, RouteGrp& r) {
+    std::uint8_t* rec = g.route_ptr + r.slot * kRouteRec;
+    std::uint32_t state = 0;
+    std::memcpy(&state, rec + kRecState, sizeof(state));
+    if (state != 2 && state != 3 && g.n_route_bad++ < 3)
+        route_log("predicate without a miss", r, state);
+    if (!host_compute(g, r.host.data(), r.host.size()))
+        return false;
+    if ((state == 1 || state == 2) &&
+        std::memcmp(r.S->data, rec + kRecProbs, static_cast<std::size_t>(r.n_expert) * 4) != 0 &&
+        g.n_route_mis_probs++ < 3)
+        route_log("probabilities differ from the CPU's", r, state);
+    if (r.plain && state == 2 &&
+        std::memcmp(r.C1->data, rec + kRecIds, static_cast<std::size_t>(r.n_used) * 4) != 0 &&
+        g.n_route_mis_ids++ < 3)
+        route_log("experts differ from the CPU's", r, state);
+    if (r.sig && state != 0 && !route_sig_same(rec) && g.n_route_mis_sig++ < 3)
+        route_log("gate sigmoid differs from the CPU's", r, state);
+    std::memcpy(rec + kRecW, r.W->data, static_cast<std::size_t>(r.n_used) * sizeof(float));
+    std::memcpy(rec + kRecSlots, r.C3->data, static_cast<std::size_t>(r.n_used) * 4);
+    if (state == 2)
+        ++g.n_route_miss;
+    ++g.n_route_host;
+    return true;
+}
+
+// Submit ops holding routes' gates (pred_op), then settle each layer in
+// order: hits replayed, the first miss routed on the CPU and the list from
+// after its gate submitted again, until one runs to its end. rhints and
+// rtails (a kept plan's, else this call's) keep each miss's rest of the list.
+bool submit_routed(Gpu& g, const std::vector<Op>& ops, std::vector<RouteGrp>& routes,
+                   ListHint* hint, std::vector<ListHint>* rhints,
+                   std::vector<std::vector<Op>>* rtails) {
+    thread_local std::vector<ListHint> own_hints;
+    thread_local std::vector<std::vector<Op>> own_tails;
+    if (!rhints) {
+        own_hints.clear();
+        rhints = &own_hints;
+    }
+    if (!rtails) {
+        own_tails.clear();
+        rtails = &own_tails;
+    }
+    rhints->resize(routes.size());
+    rtails->resize(routes.size());
+    for (RouteGrp& r : routes) {
+        // the layer's prefetch round settles first, as in ec_plan
+        llama_ec_route_prepare(r.C1);
+        llama_ec_route_info ri{};
+        ri.size = sizeof(ri);
+        const int kind = llama_ec_route_query(r.C1, &ri);
+        r.plain = kind == 1 && ri.plain && ri.n_expert == r.n_expert && ri.slot_of;
+        std::uint8_t* rec = g.route_ptr + r.slot * kRouteRec;
+        if (r.plain)
+            std::memcpy(rec + kRecMirror, ri.slot_of, static_cast<std::size_t>(r.n_expert) * 4);
+        else // all missing: the CPU decides
+            std::memset(rec + kRecMirror, 0xff, static_cast<std::size_t>(r.n_expert) * 4);
+        std::memset(rec + kRecState, 0, 4);
+        ++g.n_route;
+    }
+    std::memset(g.pred_ptr, 0, 8);
+    if (!submit_ops(g, ops, false, hint))
+        return false;
+    std::size_t k = 0;
+    for (;;) {
+        std::uint32_t pv = 0;
+        std::memcpy(&pv, g.pred_ptr, sizeof(pv));
+        const std::size_t m = pv ? pv - 1 : routes.size();
+        if (m < k || m > routes.size() || (pv && m == routes.size())) {
+            char msg[160];
+            std::snprintf(msg, sizeof(msg),
+                          "[xllama] d3d12 GPU routing: predicate %u after layer %zu of %zu\n", pv,
+                          k, routes.size());
+            log_output(std::string(msg));
+            return false;
+        }
+        for (; k < m; ++k)
+            replay_hit(g, routes[k]);
+        if (!pv)
+            return true;
+        RouteGrp& r = routes[m];
+        if (!host_route(g, r))
+            return false;
+        k = m + 1;
+        std::vector<Op>& tail = (*rtails)[m];
+        if (tail.empty())
+            tail.assign(ops.begin() + static_cast<std::ptrdiff_t>(r.pred_op) + 1, ops.end());
+        std::memset(g.pred_ptr, 0, 8);
+        ++g.n_route_resub;
+        if (!tail.empty() && !submit_ops(g, tail, false, &(*rhints)[m]))
+            return false;
+    }
+}
+
 // --- Plan cache (XLLAMA_D3D12_PLANCACHE) ---
 // llama.cpp hands the same split graphs back every decode token: the same
 // nodes at the same addresses, only the values in the inputs change (row and
@@ -2516,6 +3237,9 @@ struct SplitPlan {
     std::uint64_t n_gdn = 0;
     Gpu::SegStat* seg = nullptr;
     ListHint hint;
+    std::vector<RouteGrp> routes; // GPU-routed layers (submit_routed)
+    std::vector<ListHint> rhints; // the rest of the list after each one's gate
+    std::vector<std::vector<Op>> rtails;
 };
 constexpr std::size_t kMaxPlans = 1024;
 std::unordered_map<std::uint64_t, SplitPlan>& plan_cache() { // guarded by gpu().mu
@@ -2638,7 +3362,9 @@ ggml_status run_plan(Gpu& g, SplitPlan& p, std::chrono::steady_clock::time_point
     const auto tf = std::chrono::steady_clock::now();
     g.pc_ms += std::chrono::duration<double, std::milli>(tf - t0).count();
     const double rw = g.rec_ms + g.wait_ms;
-    if (!p.ops.empty() && !submit_ops(g, p.ops, false, &p.hint))
+    if (!p.ops.empty() &&
+        !(p.routes.empty() ? submit_ops(g, p.ops, false, &p.hint)
+                           : submit_routed(g, p.ops, p.routes, &p.hint, &p.rhints, &p.rtails)))
         return GGML_STATUS_FAILED;
     const auto t_end = std::chrono::steady_clock::now();
     g.sub_ms += std::chrono::duration<double, std::milli>(t_end - tf).count() -
@@ -2761,6 +3487,11 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
         case GGML_OP_CONCAT:
         case GGML_OP_SSM_CONV:
         case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_SOFT_MAX: // GPU routing (route_node)
+        case GGML_OP_CUSTOM:
+        case GGML_OP_SUM_ROWS:
+        case GGML_OP_CLAMP:
+        case GGML_OP_DIV:
             nodes.push_back(node);
             node_idx.push_back(i);
             break;
@@ -2820,6 +3551,21 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
     t_pc_uses.clear();
     ListHint pc_hint;
     bool pc_keep = pc;
+    // GPU routing: the call's routed layers (rgrps), those recorded since the
+    // last submission (pend, each one's record slot its index there), what a
+    // kept plan takes (pc_routes, pc_rhints, pc_rtails), and the softmax and
+    // slot ids of each group -> its index in rgrps.
+    thread_local std::vector<RouteGrp> rgrps, pend, pc_routes;
+    thread_local std::unordered_map<const ggml_tensor*, std::size_t> rg_at;
+    thread_local std::vector<ListHint> pc_rhints;
+    thread_local std::vector<std::vector<Op>> pc_rtails;
+    thread_local std::vector<int> ridx;
+    rgrps.clear();
+    pend.clear();
+    pc_routes.clear();
+    rg_at.clear();
+    pc_rhints.clear();
+    pc_rtails.clear();
     // shexp_async: the index after the last router logits when this call ends
     // with a MoE layer's shared expert whose intermediates are graph outputs
     // (patch 0014, one token); ops up to there are waited for, the rest is
@@ -2871,6 +3617,39 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
             fused_away.insert(f.cpy);
         }
         g.n_gdn_fused += gdn_fused.size();
+    }
+    if (g.route_on) {
+        for (std::size_t i = 0; i < nodes.size(); ++i) {
+            if (nodes[i]->op != GGML_OP_SOFT_MAX || !route_node(nodes[i]))
+                continue;
+            RouteGrp r;
+            const char* why = route_match(cgraph, node_idx[i], i ? nodes[i - 1] : nullptr,
+                                          i ? node_idx[i - 1] : -1, &r, &ridx);
+            if (pc)
+                for (const int j : ridx)
+                    t_pc_uses.push_back(ggml_graph_node(cgraph, j));
+            if (why) {
+                static int logged = 0;
+                if (logged < 3) {
+                    ++logged;
+                    char msg[256];
+                    std::snprintf(msg, sizeof(msg),
+                                  "[xllama] d3d12 GPU routing: %s not routed: %s\n",
+                                  nodes[i]->name, why);
+                    log_output(std::string(msg));
+                }
+                continue;
+            }
+            const std::size_t at = rgrps.size();
+            rg_at[r.S] = at;
+            rg_at[r.C3] = at;
+            for (ggml_tensor* t : r.host)
+                if (t != r.S && t != r.C3)
+                    fused_away.insert(t);
+            if (r.sig)
+                fused_away.insert(r.sig);
+            rgrps.push_back(std::move(r));
+        }
     }
     const auto t_plan = std::chrono::steady_clock::now();
     g.gdn_ms += std::chrono::duration<double, std::milli>(t_plan - t0).count();
@@ -2924,8 +3703,17 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
             pc_ops = ops;
         const auto tf = std::chrono::steady_clock::now();
         const double rw = g.rec_ms + g.wait_ms;
-        const bool ok =
-            ops.empty() || submit_ops(g, ops, async, last && pc_keep ? &pc_hint : nullptr);
+        const bool keep = last && pc_keep;
+        bool ok = true;
+        if (!ops.empty() && !pend.empty()) {
+            ok = submit_routed(g, ops, pend, keep ? &pc_hint : nullptr,
+                               keep ? &pc_rhints : nullptr, keep ? &pc_rtails : nullptr);
+            if (keep)
+                pc_routes = pend;
+        } else if (!ops.empty()) {
+            ok = submit_ops(g, ops, async, keep ? &pc_hint : nullptr);
+        }
+        pend.clear();
         g.sub_ms +=
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count() -
             (g.rec_ms + g.wait_ms - rw);
@@ -3207,7 +3995,74 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
         if (ggml_nelements(node) == 0)
             continue; // a ubatch without output rows: nothing to compute
         if (!fused_away.empty() && fused_away.count(node))
-            continue; // a delta-net state copy the fused KERNEL 5 does itself
+            continue; // a delta-net state copy the fused KERNEL 5 does itself, or a routed node
+        if (!rg_at.empty()) {
+            const auto rit = rg_at.find(node);
+            if (rit != rg_at.end()) {
+                RouteGrp& r = rgrps[rit->second];
+                if (node == r.S) {
+                    // The route kernel, then the gate.
+                    if (pend.size() >= kRouteMax && !flush())
+                        return GGML_STATUS_FAILED;
+                    r.slot = pend.size();
+                    std::uint8_t* rec = g.route_ptr + r.slot * kRouteRec;
+                    const Rng rec_rng{reinterpret_cast<std::uintptr_t>(rec),
+                                      reinterpret_cast<std::uintptr_t>(rec + kRouteRec)};
+                    const Rng pred_rng{reinterpret_cast<std::uintptr_t>(g.pred_ptr),
+                                       reinterpret_cast<std::uintptr_t>(g.pred_ptr + 8)};
+                    Op op;
+                    op.pso = g.pso_route[kRouteRoute].Get();
+                    std::copy(std::begin(r.c), std::end(r.c), op.c);
+                    op.c[6] = static_cast<std::uint32_t>(r.slot + 1);
+                    op.u[0] = g.route_va + r.slot * kRouteRec;
+                    op.u[1] = tensor_va(r.logits);
+                    op.u[2] = g.pred_va;
+                    if (r.sig) {
+                        op.u[3] = tensor_va(r.sig_src);
+                        op.u[4] = tensor_va(r.sig);
+                    }
+                    op.gx = op.gy = 1;
+                    record(op, {rng_of(r.logits), rng_of(r.sig ? r.sig_src : r.logits)},
+                           {rec_rng, pred_rng, r.sig ? rng_of(r.sig) : rec_rng});
+                    Op gate;
+                    gate.pred = 1; // its UAV barrier stands for the hazards so far
+                    ops.push_back(gate);
+                    bar_r.clear();
+                    bar_w.clear();
+                    r.pred_op = ops.size() - 1;
+                    pend.push_back(r);
+                    continue;
+                }
+                if (node == r.C3) {
+                    // The emit kernel: the weights and the slot ids from the record.
+                    std::uint8_t* rec = g.route_ptr + r.slot * kRouteRec;
+                    const Rng rec_rng{reinterpret_cast<std::uintptr_t>(rec),
+                                      reinterpret_cast<std::uintptr_t>(rec + kRouteRec)};
+                    Op e;
+                    e.pso = g.pso_route[kRouteEmit].Get();
+                    set_c(e, {static_cast<std::uint64_t>(r.n_used),
+                              static_cast<std::uint64_t>(r.n_slots)});
+                    e.u[0] = tensor_va(r.W);
+                    e.u[1] = g.route_va + r.slot * kRouteRec;
+                    e.u[2] = tensor_va(r.C3);
+                    e.gx = e.gy = 1;
+                    record(e, {rec_rng}, {rng_of(r.W), rng_of(r.C3)});
+                    continue;
+                }
+            }
+        }
+        if (g.route_on && route_node(node)) {
+            // A routing node no group took: on the CPU, as before.
+            if (!flush() || !host_compute(g, &node, 1))
+                return GGML_STATUS_FAILED;
+            static int logged = 0;
+            if (logged < 3) {
+                ++logged;
+                log_output("[xllama] d3d12 GPU routing: " + std::string(node->name) +
+                           " ran on the CPU\n");
+            }
+            continue;
+        }
         const ggml_tensor* a = node->src[0];
         const ggml_tensor* b = node->src[1];
         switch (node->op) {
@@ -3334,30 +4189,40 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
             const bool flat = x->ne[2] == 1 || x->nb[2] == x->ne[1] * x->nb[1];
             const bool gpu_q =
                 flat && g.elt_ok && elt_operand(x) && ncols <= static_cast<int>(kD3d12MaxGroups);
+            // Slot ids the emit kernel writes (GPU routing): read in place, the
+            // emit clamps them to the cache's slots.
+            const auto rgi = rg_at.empty() ? rg_at.end() : rg_at.find(ids);
+            const bool routed = rgi != rg_at.end() && rgrps[rgi->second].C3 == ids;
+            if (routed)
+                GGML_ASSERT(a->ne[2] >= rgrps[rgi->second].n_slots);
             // Ids and X share the scratch: flush first if either must, so the
             // second reservation cannot recycle the first.
-            if ((any_overlap(batch_w, rng_of(ids)) ||
+            if (((!routed && any_overlap(batch_w, rng_of(ids))) ||
                  (!gpu_q && any_overlap(batch_w, rng_of(x)))) &&
                 !flush())
                 return GGML_STATUS_FAILED;
-            const std::size_t need = ((plan.ids_bytes + 255) & ~std::size_t(255)) +
-                                     ((plan.x_bytes + 255) & ~std::size_t(255));
+            const std::size_t need =
+                (routed ? 0 : ((plan.ids_bytes + 255) & ~std::size_t(255))) +
+                ((plan.x_bytes + 255) & ~std::size_t(255));
             if (used + need > g.xq_bytes && (!flush() || !ensure_xq(g, need)))
                 return GGML_STATUS_FAILED;
-            // The kernel does not bound-check slot ids; ggml-cpu asserts the same.
-            const auto* idp = static_cast<const std::uint8_t*>(ids->data);
-            for (std::int64_t t = 0; t < ids->ne[1]; ++t)
-                for (std::int64_t j = 0; j < ids->ne[0]; ++j) {
-                    std::int32_t id = 0;
-                    std::memcpy(&id, idp + t * ids->nb[1] + j * sizeof(std::int32_t), sizeof(id));
-                    GGML_ASSERT(id >= 0 && id < a->ne[2]);
-                }
             std::size_t ioff = 0, xoff = 0;
-            if (!reserve(plan.ids_bytes, &ioff))
-                return GGML_STATUS_FAILED;
-            pc_ids(ids->data, ids->ne[0], ids->ne[1], ids->nb[1], a->ne[2]);
-            pc_copy(ids->data, ioff, plan.ids_bytes);
-            std::memcpy(g.xq_ptr + ioff, ids->data, plan.ids_bytes);
+            if (!routed) {
+                // The kernel does not bound-check slot ids; ggml-cpu asserts the same.
+                const auto* idp = static_cast<const std::uint8_t*>(ids->data);
+                for (std::int64_t t = 0; t < ids->ne[1]; ++t)
+                    for (std::int64_t j = 0; j < ids->ne[0]; ++j) {
+                        std::int32_t id = 0;
+                        std::memcpy(&id, idp + t * ids->nb[1] + j * sizeof(std::int32_t),
+                                    sizeof(id));
+                        GGML_ASSERT(id >= 0 && id < a->ne[2]);
+                    }
+                if (!reserve(plan.ids_bytes, &ioff))
+                    return GGML_STATUS_FAILED;
+                pc_ids(ids->data, ids->ne[0], ids->ne[1], ids->nb[1], a->ne[2]);
+                pc_copy(ids->data, ioff, plan.ids_bytes);
+                std::memcpy(g.xq_ptr + ioff, ids->data, plan.ids_bytes);
+            }
             if (flat) {
                 if (!quantize(x, a->type, ncols, &xoff))
                     return GGML_STATUS_FAILED;
@@ -3373,12 +4238,15 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
             static_assert(sizeof(plan.params) == sizeof(m.c), "13 root constants");
             std::memcpy(m.c, &plan.params, sizeof(m.c));
             m.t0 = tensor_va(a);
-            m.t1 = xq_va(ioff);
+            m.t1 = routed ? tensor_va(ids) : xq_va(ioff);
             m.u[0] = tensor_va(node);
             m.u[1] = xq_va(xoff);
             m.gx = plan.groups_x;
             m.gy = plan.groups_y;
-            record(m, {xq_rng(xoff, plan.x_bytes), xq_rng(ioff, plan.ids_bytes)}, {rng_of(node)});
+            record(m,
+                   {xq_rng(xoff, plan.x_bytes),
+                    routed ? rng_of(ids) : xq_rng(ioff, plan.ids_bytes)},
+                   {rng_of(node)});
             break;
         }
         // The delta net's kernels (ggml_d3d12_ssm_emu.h). supports_op admits
@@ -3745,7 +4613,8 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
         const SplitPlan& p = *vplan;
         bool& same = pc_same;
         same = pc_keep && p.n_gdn == gdn_fused.size() && p.ops.size() == pc_ops.size() &&
-                    p.acts.size() == pc_acts.size() && p.guards.size() == pc_guards.size();
+                    p.acts.size() == pc_acts.size() && p.guards.size() == pc_guards.size() &&
+                    p.routes.size() == pc_routes.size();
         const char* what = !pc_keep ? "not cacheable" : "sizes";
         for (std::size_t j = 0; same && j < pc_ops.size(); ++j)
             if (!same_op(p.ops[j], pc_ops[j])) {
@@ -3792,6 +4661,9 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
         p.n_gdn = gdn_fused.size();
         p.seg = seg;
         p.hint = pc_hint;
+        p.routes = pc_routes;
+        p.rhints = pc_rhints;
+        p.rtails = pc_rtails;
         ++g.n_pc_store;
     } else if (pc && !pc_keep) {
         ++g.n_pc_skip;
@@ -3945,6 +4817,32 @@ ggml_backend_t dev_init_backend(ggml_backend_dev_t dev, const char*) {
         if (replaced > 0)
             log_output("[xllama] d3d12: " + std::to_string(replaced) +
                        " kernel(s) from XLLAMA_D3D12_SHADER_DIR\n");
+        const char* grv = std::getenv("XLLAMA_D3D12_GPUROUTE");
+        const bool route_want = grv && *grv && *grv != '0';
+        const char* gsv = std::getenv("XLLAMA_D3D12_GPUROUTE_SIG");
+        g.route_sig = !(gsv && *gsv == '0');
+        const char* giv = std::getenv("XLLAMA_D3D12_GPUROUTE_IO");
+        g.route_io = std::clamp(giv && *giv ? std::atoi(giv) : 6, 1, 64);
+        const char* gpv = std::getenv("XLLAMA_D3D12_GPUROUTE_POLL");
+        g.route_poll = std::clamp(gpv && *gpv ? std::atoi(gpv) : 0, 0, 100);
+        g.route_on = false;
+        if (route_want) {
+            const char* off = !g.route_ok      ? "no route kernels"
+                              : g.waves        ? "XLLAMA_D3D12_WAVES"
+                              : g.shexp_async  ? "XLLAMA_D3D12_SHEXP_ASYNC"
+                              : g.prof_on      ? "XLLAMA_D3D12_PROFILE"
+                              : !ensure_route_bufs(g) ? "no buffers"
+                              : !host_cpu(g)   ? "no CPU backend"
+                                               : nullptr;
+            g.route_on = off == nullptr;
+            log_output(g.route_on
+                           ? "[xllama] d3d12: MoE routing on the GPU, predicated on a miss "
+                             "(XLLAMA_D3D12_GPUROUTE, sigmoid " +
+                                 std::string(g.route_sig ? "on" : "off") + ", " +
+                                 std::to_string(g.route_io) + " CPU threads, poll " +
+                                 std::to_string(g.route_poll) + ")\n"
+                           : "[xllama] d3d12: GPU routing off: " + std::string(off) + "\n");
+        }
     }
     return new ggml_backend{backend_guid(), kBackendIface, dev, nullptr};
 }
@@ -4001,6 +4899,8 @@ bool fed_by_d3d12(const ggml_tensor* t, int depth = 2) {
 }
 
 bool dev_supports_op(ggml_backend_dev_t, const ggml_tensor* op) {
+    if (gpu().route_on && route_node(op))
+        return true; // a MoE layer's routing (XLLAMA_D3D12_GPUROUTE)
     switch (op->op) {
     case GGML_OP_NONE:
     case GGML_OP_RESHAPE:
@@ -5628,6 +6528,534 @@ D3d12SelftestRow run_ssm_case(ggml_backend_t backend, int kind) {
     return row;
 }
 
+// ggml-cpu's own soft_max (one row) or sigmoid of n floats, one thread.
+bool route_cpu_ref(bool softmax, const float* x, int n, float* y) {
+    ggml_cpu_init();
+    ggml_init_params ip = {};
+    ip.mem_size = ggml_graph_overhead() + 4 * ggml_tensor_overhead() +
+                  4 * static_cast<std::size_t>(n) * sizeof(float) + (1u << 20);
+    ip.no_alloc = false;
+    ggml_context* ctx = ggml_init(ip);
+    if (!ctx)
+        return false;
+    ggml_tensor* a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+    std::memcpy(a->data, x, static_cast<std::size_t>(n) * sizeof(float));
+    ggml_tensor* o = softmax ? ggml_soft_max(ctx, a) : ggml_sigmoid(ctx, a);
+    ggml_cgraph* gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, o);
+    const bool ok = ggml_graph_compute_with_ctx(ctx, gf, 1) == GGML_STATUS_SUCCESS;
+    if (ok)
+        std::memcpy(y, o->data, static_cast<std::size_t>(n) * sizeof(float));
+    ggml_free(ctx);
+    return ok;
+}
+
+bool same_bits_or_nan(float a, float b) {
+    return std::memcmp(&a, &b, sizeof(a)) == 0 || (a != a && b != b);
+}
+
+// The route kernel's sigmoid (flag 8: c0 values, a group per 256) against
+// ggml-cpu's over specials, -110..110, gate-like logits and random bits.
+// rel_err = values that differ; error also counts where std::exp would have.
+D3d12SelftestRow run_route_sig_case() {
+    D3d12SelftestRow row;
+    row.type = "route_sig";
+    row.n = 65536;
+    Gpu& g = gpu();
+    const int n = row.n;
+    std::vector<float> x(static_cast<std::size_t>(n));
+    const std::uint32_t specials[] = {0x00000000u, 0x80000000u, 0x00000001u, 0x807FFFFFu,
+                                      0x00800000u, 0x80800000u, 0x7F800000u, 0xFF800000u,
+                                      0x7FC00000u, 0xFFC00000u, 0x7F800001u, 0xFFBFFFFFu,
+                                      0x7F7FFFFFu, 0xFF7FFFFFu, 0x42B17218u, 0xC2B17218u,
+                                      0x42CFF1B5u, 0xC2CFF1B5u, 0x42DC0000u, 0xC2DC0000u};
+    int i = 0;
+    for (const std::uint32_t u : specials)
+        std::memcpy(&x[static_cast<std::size_t>(i++)], &u, sizeof(u));
+    const int n_sweep = n / 4;
+    for (int k = 0; k < n_sweep; ++k)
+        x[static_cast<std::size_t>(i++)] = -110.0f + 220.0f * static_cast<float>(k) /
+                                                         static_cast<float>(n_sweep - 1);
+    std::mt19937 rng(20261111u);
+    std::uniform_real_distribution<float> gate(-20.0f, 20.0f);
+    for (int k = 0; k < n / 4; ++k)
+        x[static_cast<std::size_t>(i++)] = gate(rng);
+    std::uniform_int_distribution<std::uint32_t> bits;
+    while (i < n) {
+        const std::uint32_t u = bits(rng);
+        std::memcpy(&x[static_cast<std::size_t>(i++)], &u, sizeof(u));
+    }
+    std::vector<float> ref(x.size());
+    if (!route_cpu_ref(false, x.data(), n, ref.data())) {
+        row.error = "CPU reference failed";
+        return row;
+    }
+    BufCtx b;
+    std::string err;
+    const std::size_t bytes = static_cast<std::size_t>(n) * sizeof(float);
+    if (!create_host_res(g, 2 * bytes, false, &b, &err)) {
+        row.error = "buffer: " + err;
+        return row;
+    }
+    std::memcpy(b.host, x.data(), bytes);
+    std::memset(b.host + bytes, 0xCD, bytes);
+    Op op;
+    {
+        std::lock_guard<std::mutex> lock(g.mu);
+        op.pso = g.pso_route[kRouteRoute].Get();
+        op.c[0] = static_cast<std::uint32_t>(n);
+        op.c[7] = 8u;
+        op.u[0] = b.va + bytes;
+        op.u[1] = b.va;
+        op.u[2] = b.va + bytes;
+        op.u[3] = b.va;
+        op.u[4] = b.va + bytes;
+        op.gx = static_cast<UINT>(n / 256);
+        op.gy = 1;
+        const std::vector<Op> one = {op};
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!run_now(g, [&](ID3D12GraphicsCommandList* cl) { record_ops(g, cl, one, false, false); })) {
+            row.error = "submit failed";
+            return row;
+        }
+        row.gpu_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    }
+    row.d3d12_ran = true;
+    int bad = 0, bad_exp = 0, first = -1;
+    for (int k = 0; k < n; ++k) {
+        float got = 0.0f;
+        std::memcpy(&got, b.host + bytes + 4u * static_cast<std::size_t>(k), sizeof(got));
+        if (!same_bits_or_nan(got, ref[static_cast<std::size_t>(k)])) {
+            if (first < 0)
+                first = k;
+            ++bad;
+        }
+        const float xs = x[static_cast<std::size_t>(k)];
+        if (!same_bits_or_nan(1.f / (1.f + std::exp(-xs)), ref[static_cast<std::size_t>(k)]))
+            ++bad_exp;
+    }
+    row.rel_err = bad;
+    row.ok = bad == 0;
+    char msg[200];
+    if (first >= 0) {
+        std::uint32_t xb = 0, gb = 0, rb = 0;
+        float got = 0.0f;
+        std::memcpy(&got, b.host + bytes + 4u * static_cast<std::size_t>(first), sizeof(got));
+        std::memcpy(&xb, &x[static_cast<std::size_t>(first)], 4);
+        std::memcpy(&gb, &got, 4);
+        std::memcpy(&rb, &ref[static_cast<std::size_t>(first)], 4);
+        std::snprintf(msg, sizeof(msg),
+                      "%d differ from ggml (first x %08X: gpu %08X, cpu %08X); std::exp %d", bad, xb,
+                      gb, rb, bad_exp);
+        row.error = msg;
+    } else if (bad_exp) {
+        std::snprintf(msg, sizeof(msg), "bit-exact; std::exp would differ in %d", bad_exp);
+        row.error = msg;
+    }
+    return row;
+}
+
+// One route kernel case: experts, used, residency (0 all, 1 none, 2 two in
+// three), swap ratio and tail, the weight norm and scale, logits (0 normal,
+// 1 ties, 2 underflowing probabilities, 3 an inf), the gate sigmoid.
+struct RouteCfg {
+    int e, u, res;
+    float ratio;
+    int tail;
+    bool norm, scaled;
+    float scale;
+    int logits;
+    bool sig;
+};
+
+std::vector<RouteCfg> route_cfgs() {
+    std::vector<RouteCfg> v;
+    for (const int e : {8, 64, 128, 256})
+        for (const int u : {1, 4, 8, 16})
+            if (u <= e)
+                v.push_back({e, u, 2, 0.5f, 2, true, false, 1.0f, 0, true});
+    const RouteCfg base = {256, 8, 2, 0.5f, 2, true, false, 1.0f, 0, true};
+    auto add = [&](auto f) {
+        RouteCfg c = base;
+        f(c);
+        v.push_back(c);
+    };
+    add([](RouteCfg& c) { c.res = 0; });
+    add([](RouteCfg& c) { c.res = 1; });
+    for (const float r : {0.0f, 1.0f, 2.0f})
+        for (const int t : {2, 16})
+            add([&](RouteCfg& c) {
+                c.ratio = r;
+                c.tail = t;
+            });
+    add([](RouteCfg& c) { c.norm = false; });
+    add([](RouteCfg& c) {
+        c.norm = false;
+        c.scaled = true;
+        c.scale = 2.5f;
+    });
+    add([](RouteCfg& c) {
+        c.scaled = true;
+        c.scale = 2.5f;
+    });
+    add([](RouteCfg& c) { c.logits = 1; });
+    add([](RouteCfg& c) {
+        c.logits = 1;
+        c.res = 0;
+    });
+    add([](RouteCfg& c) { c.logits = 2; });
+    add([](RouteCfg& c) {
+        c.logits = 2;
+        c.norm = false;
+    });
+    add([](RouteCfg& c) { c.logits = 3; });
+    add([](RouteCfg& c) { c.sig = false; });
+    for (int s = 0; s < 10; ++s)
+        add([](RouteCfg&) {});
+    return v;
+}
+
+// The route and emit kernels over route_cfgs() in one list (routes, a
+// barrier, emits) against ggml-cpu's soft_max, ec_rank + ec_swap_missing,
+// the weights as build_moe_ffn makes them and the sigmoid: every bit, the
+// state, the swaps, and the predicate written only on a miss.
+D3d12SelftestRow run_route_case() {
+    D3d12SelftestRow row;
+    row.type = "route";
+    Gpu& g = gpu();
+    const std::vector<RouteCfg> cfgs = route_cfgs();
+    const std::size_t nc = cfgs.size();
+    row.n = static_cast<int>(nc);
+    constexpr std::size_t kData = 4096;
+    constexpr std::size_t kLog = 0, kGate = 1024, kSig = 1280, kW = 1536, kC3 = 1792, kP = 2048;
+    constexpr int kSlots = 54;
+    constexpr float kClampMin = 6.103515625e-5f;
+    BufCtx b;
+    std::string err;
+    if (!create_host_res(g, nc * (kRouteRec + kData), false, &b, &err)) {
+        row.error = "buffer: " + err;
+        return row;
+    }
+    std::memset(b.host, 0, nc * (kRouteRec + kData));
+    auto rec = [&](std::size_t i) { return b.host + i * kRouteRec; };
+    auto dat = [&](std::size_t i) { return b.host + nc * kRouteRec + i * kData; };
+    auto rec_va = [&](std::size_t i) { return b.va + i * kRouteRec; };
+    auto dat_va = [&](std::size_t i) { return b.va + nc * kRouteRec + i * kData; };
+    std::vector<std::vector<float>> logits(nc);
+    std::vector<std::vector<std::int32_t>> mirror(nc);
+    std::vector<float> gates(nc);
+    std::vector<Op> ops;
+    for (std::size_t i = 0; i < nc; ++i) {
+        const RouteCfg& c = cfgs[i];
+        std::mt19937 rng(static_cast<std::uint32_t>(1000 + i));
+        std::normal_distribution<float> nd(0.0f, 2.0f);
+        std::uniform_real_distribution<float> ud(-200.0f, 0.0f);
+        logits[i].resize(static_cast<std::size_t>(c.e));
+        mirror[i].resize(static_cast<std::size_t>(c.e));
+        for (int e = 0; e < c.e; ++e) {
+            float v = nd(rng);
+            if (c.logits == 1)
+                v = static_cast<float>(static_cast<int>(rng() % 3u) - 1);
+            else if (c.logits == 2)
+                v = e == 5 ? 0.0f : ud(rng);
+            logits[i][static_cast<std::size_t>(e)] = v;
+            const bool resident = c.res == 0 || (c.res == 2 && rng() % 3u != 0u);
+            mirror[i][static_cast<std::size_t>(e)] = resident ? (e * 7) % kSlots : -1;
+        }
+        if (c.logits == 3)
+            logits[i][3] = INFINITY;
+        gates[i] = nd(rng) * 3.0f;
+        std::memcpy(dat(i) + kLog, logits[i].data(), static_cast<std::size_t>(c.e) * 4);
+        std::memcpy(dat(i) + kGate, &gates[i], 4);
+        std::memset(dat(i) + kW, 0xEF, 64);
+        std::memset(dat(i) + kC3, 0xEF, 64);
+        std::memcpy(rec(i) + kRecMirror, mirror[i].data(), static_cast<std::size_t>(c.e) * 4);
+        std::uint32_t rb = 0, cb = 0, sb = 0;
+        std::memcpy(&rb, &c.ratio, 4);
+        std::memcpy(&cb, &kClampMin, 4);
+        std::memcpy(&sb, &c.scale, 4);
+        Op op;
+        op.pso = g.pso_route[kRouteRoute].Get();
+        const std::uint32_t cc[8] = {static_cast<std::uint32_t>(c.e),
+                                     static_cast<std::uint32_t>(c.u),
+                                     rb,
+                                     static_cast<std::uint32_t>(c.tail),
+                                     cb,
+                                     sb,
+                                     static_cast<std::uint32_t>(i + 1),
+                                     (c.norm ? 1u : 0u) | (c.scaled ? 2u : 0u) | (c.sig ? 4u : 0u)};
+        std::copy(std::begin(cc), std::end(cc), op.c);
+        op.u[0] = rec_va(i);
+        op.u[1] = dat_va(i) + kLog;
+        op.u[2] = dat_va(i) + kP;
+        if (c.sig) {
+            op.u[3] = dat_va(i) + kGate;
+            op.u[4] = dat_va(i) + kSig;
+        }
+        op.gx = op.gy = 1;
+        ops.push_back(op);
+    }
+    ops.push_back(Op{});
+    for (std::size_t i = 0; i < nc; ++i) {
+        Op e;
+        e.pso = g.pso_route[kRouteEmit].Get();
+        e.c[0] = static_cast<std::uint32_t>(cfgs[i].u);
+        e.c[1] = kSlots;
+        e.u[0] = dat_va(i) + kW;
+        e.u[1] = rec_va(i);
+        e.u[2] = dat_va(i) + kC3;
+        e.gx = e.gy = 1;
+        ops.push_back(e);
+    }
+    {
+        std::lock_guard<std::mutex> lock(g.mu);
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!run_now(g, [&](ID3D12GraphicsCommandList* cl) { record_ops(g, cl, ops, false, false); })) {
+            row.error = "submit failed";
+            return row;
+        }
+        row.gpu_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    }
+    row.d3d12_ran = true;
+    int bad = 0;
+    std::string first;
+    auto fail = [&](std::size_t i, const char* what) {
+        if (bad++ == 0) {
+            const RouteCfg& c = cfgs[i];
+            char msg[200];
+            std::snprintf(msg, sizeof(msg),
+                          "case %zu (e %d u %d res %d ratio %g tail %d norm %d scale %g logits %d "
+                          "sig %d): %s",
+                          i, c.e, c.u, c.res, static_cast<double>(c.ratio), c.tail, c.norm ? 1 : 0,
+                          c.scaled ? static_cast<double>(c.scale) : 0.0, c.logits, c.sig ? 1 : 0,
+                          what);
+            first = msg;
+        }
+    };
+    for (std::size_t i = 0; i < nc; ++i) {
+        const RouteCfg& c = cfgs[i];
+        const std::size_t ne = static_cast<std::size_t>(c.e), nu = static_cast<std::size_t>(c.u);
+        std::uint32_t state = 0, swaps = 0, pv = 0;
+        std::memcpy(&state, rec(i) + kRecState, 4);
+        std::memcpy(&swaps, rec(i) + kRecSwaps, 4);
+        std::memcpy(&pv, dat(i) + kP, 4);
+        if (c.sig) {
+            float gin = 0.0f, gs = 0.0f, sref = 0.0f, sout = 0.0f;
+            std::memcpy(&gin, rec(i) + kRecGate, 4);
+            std::memcpy(&gs, rec(i) + kRecSig, 4);
+            std::memcpy(&sout, dat(i) + kSig, 4);
+            if (!route_cpu_ref(false, &gates[i], 1, &sref) ||
+                std::memcmp(&gin, &gates[i], 4) != 0 || !same_bits_or_nan(gs, sref) ||
+                !same_bits_or_nan(sout, sref)) {
+                fail(i, "gate sigmoid");
+                continue;
+            }
+        }
+        if (c.logits == 3) {
+            if (state != 3 || pv != i + 1)
+                fail(i, "an inf logit: state 3 and the predicate");
+            continue;
+        }
+        std::vector<float> probs(ne);
+        if (!route_cpu_ref(true, logits[i].data(), c.e, probs.data())) {
+            fail(i, "CPU reference failed");
+            continue;
+        }
+        if (std::memcmp(probs.data(), rec(i) + kRecProbs, ne * 4) != 0) {
+            fail(i, "probabilities");
+            continue;
+        }
+        std::int32_t ids[kRouteMaxUsed] = {};
+        const std::uint32_t want_swaps =
+            route_select(probs.data(), mirror[i].data(), c.e, c.u, c.ratio, c.tail, ids);
+        if (std::memcmp(ids, rec(i) + kRecIds, nu * 4) != 0) {
+            fail(i, "experts");
+            continue;
+        }
+        if (swaps != want_swaps) {
+            fail(i, "swaps");
+            continue;
+        }
+        bool hit = true;
+        std::int32_t slots[kRouteMaxUsed] = {}, clamped[kRouteMaxUsed] = {};
+        for (std::size_t k = 0; k < nu; ++k) {
+            slots[k] = mirror[i][static_cast<std::size_t>(ids[k])];
+            hit = hit && slots[k] >= 0;
+            clamped[k] = std::clamp(slots[k], 0, kSlots - 1);
+        }
+        if (std::memcmp(slots, rec(i) + kRecSlots, nu * 4) != 0) {
+            fail(i, "slots");
+            continue;
+        }
+        if (state != (hit ? 1u : 2u)) {
+            fail(i, "state");
+            continue;
+        }
+        if (pv != (hit ? 0u : static_cast<std::uint32_t>(i + 1))) {
+            fail(i, "predicate");
+            continue;
+        }
+        float w[kRouteMaxUsed] = {};
+        route_weights(probs.data(), ids, c.u, c.norm, kClampMin, c.scaled, c.scale, w);
+        if (std::memcmp(w, rec(i) + kRecW, nu * 4) != 0) {
+            fail(i, "weights");
+            continue;
+        }
+        if (std::memcmp(w, dat(i) + kW, nu * 4) != 0 ||
+            std::memcmp(clamped, dat(i) + kC3, nu * 4) != 0)
+            fail(i, "emit");
+    }
+    row.rel_err = bad;
+    row.ok = bad == 0;
+    if (bad)
+        row.error = std::to_string(bad) + " case(s) differ; " + first;
+    return row;
+}
+
+// The gate: [route A, gate, emit A, route B, gate, emit B] on the routing's
+// own records and predicate. A hit then B missing: emit A runs, B's route
+// writes 2 and its emit is skipped; A missing: everything after A's gate is
+// skipped; both hits: both emits; and a list without a gate runs whatever
+// the predicate holds.
+D3d12SelftestRow run_route_pred_case() {
+    D3d12SelftestRow row;
+    row.type = "route_pred";
+    row.n = 4;
+    Gpu& g = gpu();
+    if (!ensure_route_bufs(g)) {
+        row.error = "routing buffers";
+        return row;
+    }
+    constexpr int kE = 8, kU = 2, kSlots = 54;
+    constexpr std::size_t kData = 4096;
+    constexpr std::size_t kLog = 0, kW = 1024, kC3 = 1536;
+    constexpr std::uint32_t kSentinel = 0xDEADBEEFu;
+    BufCtx b;
+    std::string err;
+    if (!create_host_res(g, 2 * kData, false, &b, &err)) {
+        row.error = "buffer: " + err;
+        return row;
+    }
+    std::memset(b.host, 0, 2 * kData);
+    auto dat = [&](int l) { return b.host + static_cast<std::size_t>(l) * kData; };
+    auto dat_va = [&](int l) { return b.va + static_cast<std::size_t>(l) * kData; };
+    auto rec = [&](int l) { return g.route_ptr + static_cast<std::size_t>(l) * kRouteRec; };
+    for (int l = 0; l < 2; ++l)
+        for (int e = 0; e < kE; ++e) {
+            const float v = static_cast<float>((e * 5 + l * 3) % kE) * 0.25f;
+            std::memcpy(dat(l) + kLog + 4u * static_cast<std::size_t>(e), &v, 4);
+        }
+    std::vector<Op> ops;
+    for (int l = 0; l < 2; ++l) {
+        Op r;
+        r.pso = g.pso_route[kRouteRoute].Get();
+        r.c[0] = kE;
+        r.c[1] = kU;
+        r.c[6] = static_cast<std::uint32_t>(l + 1);
+        r.c[7] = 1u;
+        const float cm = 6.103515625e-5f;
+        std::memcpy(&r.c[4], &cm, 4);
+        r.u[0] = g.route_va + static_cast<std::size_t>(l) * kRouteRec;
+        r.u[1] = dat_va(l) + kLog;
+        r.u[2] = g.pred_va;
+        r.gx = r.gy = 1;
+        Op gate;
+        gate.pred = 1;
+        Op e;
+        e.pso = g.pso_route[kRouteEmit].Get();
+        e.c[0] = kU;
+        e.c[1] = kSlots;
+        e.u[0] = dat_va(l) + kW;
+        e.u[1] = g.route_va + static_cast<std::size_t>(l) * kRouteRec;
+        e.u[2] = dat_va(l) + kC3;
+        e.gx = e.gy = 1;
+        ops.push_back(r);
+        ops.push_back(gate);
+        ops.push_back(e);
+    }
+    auto set_res = [&](int l, bool resident) {
+        for (int e = 0; e < kE; ++e) {
+            const std::int32_t s = resident ? e : -1;
+            std::memcpy(rec(l) + kRecMirror + 4u * static_cast<std::size_t>(e), &s, 4);
+        }
+    };
+    auto emitted = [&](int l) {
+        std::uint32_t w = 0;
+        std::memcpy(&w, dat(l) + kW, 4);
+        return w != kSentinel;
+    };
+    auto state_of = [&](int l) {
+        std::uint32_t s = 0;
+        std::memcpy(&s, rec(l) + kRecState, 4);
+        return s;
+    };
+    auto pred = [&]() {
+        std::uint32_t p = 0;
+        std::memcpy(&p, g.pred_ptr, 4);
+        return p;
+    };
+    std::lock_guard<std::mutex> lock(g.mu);
+    auto run = [&](const std::vector<Op>& list, std::uint32_t p0) {
+        for (int l = 0; l < 2; ++l) {
+            std::memcpy(rec(l) + kRecState, &kSentinel, 4);
+            for (int k = 0; k < kU; ++k) {
+                std::memcpy(dat(l) + kW + 4u * static_cast<std::size_t>(k), &kSentinel, 4);
+                std::memcpy(dat(l) + kC3 + 4u * static_cast<std::size_t>(k), &kSentinel, 4);
+            }
+        }
+        std::memset(g.pred_ptr, 0, 8);
+        std::memcpy(g.pred_ptr, &p0, 4);
+        return run_now(g, [&](ID3D12GraphicsCommandList* cl) { record_ops(g, cl, list, false, false); });
+    };
+    std::string bad;
+    // 1: A hits, B misses
+    set_res(0, true);
+    set_res(1, false);
+    if (!run(ops, 0))
+        bad = "submit failed";
+    else if (!emitted(0) || state_of(1) != 2 || emitted(1) || pred() != 2)
+        bad = "A hit, B missing: emit A " + std::to_string(emitted(0)) + ", state B " +
+              std::to_string(state_of(1)) + ", emit B " + std::to_string(emitted(1)) +
+              ", predicate " + std::to_string(pred());
+    // 2: A misses
+    if (bad.empty()) {
+        set_res(0, false);
+        set_res(1, true);
+        if (!run(ops, 0))
+            bad = "submit failed";
+        else if (emitted(0) || state_of(1) != kSentinel || emitted(1) || pred() != 1)
+            bad = "A missing: emit A " + std::to_string(emitted(0)) + ", state B " +
+                  std::to_string(state_of(1)) + ", emit B " + std::to_string(emitted(1)) +
+                  ", predicate " + std::to_string(pred());
+    }
+    // 3: both hit
+    if (bad.empty()) {
+        set_res(0, true);
+        set_res(1, true);
+        if (!run(ops, 0))
+            bad = "submit failed";
+        else if (!emitted(0) || !emitted(1) || state_of(0) != 1 || state_of(1) != 1 ||
+                 pred() != 0)
+            bad = "both hit: emit A " + std::to_string(emitted(0)) + ", emit B " +
+                  std::to_string(emitted(1)) + ", predicate " + std::to_string(pred());
+    }
+    // 4: no gate in the list, the predicate left at 1
+    if (bad.empty()) {
+        const std::vector<Op> one = {ops[2]};
+        if (!run(one, 1))
+            bad = "submit failed";
+        else if (!emitted(0))
+            bad = "an emit without a gate was skipped";
+    }
+    std::memset(g.pred_ptr, 0, 8);
+    row.d3d12_ran = bad != "submit failed";
+    row.ok = bad.empty();
+    row.error = bad;
+    return row;
+}
+
 // The fixed cost of one graph_compute: an empty command list submitted and
 // waited for, median wall of 256 (in gpu_ms). Every CPU<->GPU split of a
 // model pays it once per ubatch.
@@ -6087,6 +7515,11 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
     if (gpu().ssm_ok)
         for (int kind = 0; kind < 8; ++kind)
             out->push_back(run_ssm_case(backend, kind));
+    if (gpu().route_ok) {
+        out->push_back(run_route_sig_case());
+        out->push_back(run_route_case());
+        out->push_back(run_route_pred_case());
+    }
     out->push_back(run_submit_rtt());
     if (const char* lp = std::getenv("XLLAMA_D3D12_LATPROBE"); lp && std::atoi(lp) > 0)
         run_latency_probe(out);
