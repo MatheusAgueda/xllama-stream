@@ -4744,6 +4744,284 @@ D3d12SelftestRow run_submit_rtt() {
     return row;
 }
 
+// XLLAMA_D3D12_LATPROBE=1 (selftest only): where the time a submission costs
+// beyond its GPU work goes, on prerecorded lists executed again (like a kept
+// list replayed). GPU timestamps go onto the QPC clock through
+// GetClockCalibration, taken right before each submission. Three lists,
+// interleaved: an empty one (two timestamps), one copying 64 KiB from an
+// upload buffer into write-back CUSTOM L0 memory and then writing a flag there
+// (WriteBufferImmediate MARKER_OUT, else a 4-byte copy), and the empty one
+// submitted behind queue->Wait on a fence the CPU signals ~200 us later.
+// Rows, gpu_ms = median ms, rel_err = p90 ms, error = the spread in us:
+//   lat_exec          the ExecuteCommandLists call
+//   lat_launch        Execute returned -> the list's first timestamp
+//   lat_gpu           first -> last timestamp of the empty list
+//   lat_tail_fence    last timestamp -> CPU sees the fence (spin on GetCompletedValue)
+//   lat_tail_flag     last timestamp -> CPU sees the flag (spin on the memory);
+//                     says whether the 64 KiB copy before it was visible then
+//   lat_rtt_fence / lat_rtt_flag   Execute called -> CPU sees completion
+//   lat_signal_cpu    ID3D12Fence::Signal from the CPU
+//   lat_resume        the gated list: CPU Signal returned -> its first timestamp
+//   lat_rtt_gated     the gated list: CPU Signal called -> CPU sees the fence
+//   lat_getcompleted  one GetCompletedValue call
+void run_latency_probe(std::vector<D3d12SelftestRow>* out) {
+    Gpu& g = gpu();
+    auto fail = [&](const std::string& e) {
+        D3d12SelftestRow r;
+        r.type = "lat_probe";
+        r.error = e;
+        out->push_back(std::move(r));
+    };
+    if (!g.ts_freq) {
+        fail("no timestamp frequency");
+        return;
+    }
+    constexpr UINT64 kData = 64u << 10;
+    constexpr UINT32 kMagic = 0x5EA1F1A6u;
+    constexpr int kIters = 600; // 200 per list
+    std::string err;
+    ComPtr<ID3D12Fence> fa, fb;
+    if (FAILED(g.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fa))) ||
+        FAILED(g.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fb)))) {
+        fail("CreateFence failed");
+        return;
+    }
+    D3D12_QUERY_HEAP_DESC qhd = {};
+    qhd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    qhd.Count = 6;
+    ComPtr<ID3D12QueryHeap> qh;
+    if (FAILED(g.device->CreateQueryHeap(&qhd, IID_PPV_ARGS(&qh)))) {
+        fail("CreateQueryHeap failed");
+        return;
+    }
+    auto rb = d3d12c::create_buffer(g.device.Get(), 256, D3D12_HEAP_TYPE_READBACK,
+                                    D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST,
+                                    "lat_rb", &err);
+    auto up = d3d12c::create_buffer(g.device.Get(), kData + 256, D3D12_HEAP_TYPE_UPLOAD,
+                                    D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                    "lat_up", &err);
+    auto wb = d3d12c::create_buffer_props(g.device.Get(), kData + 256, custom_l0_props(),
+                                          D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST,
+                                          "lat_wb", &err);
+    if (!rb || !up || !wb) {
+        fail("buffers: " + err);
+        return;
+    }
+    void* p_rb = nullptr;
+    void* p_up = nullptr;
+    void* p_wb = nullptr;
+    const D3D12_RANGE none = {0, 0};
+    if (FAILED(rb->Map(0, nullptr, &p_rb)) || FAILED(up->Map(0, &none, &p_up)) ||
+        FAILED(wb->Map(0, nullptr, &p_wb))) {
+        fail("Map failed");
+        return;
+    }
+    const auto* ts = static_cast<const std::uint64_t*>(p_rb);
+    auto* up_w = static_cast<std::uint32_t*>(p_up);
+    auto* wb_w = static_cast<volatile std::uint32_t*>(p_wb);
+    constexpr std::size_t kWords = kData / 4;
+    up_w[kWords] = kMagic; // the 4-byte copy's source
+
+    D3D12_FEATURE_DATA_D3D12_OPTIONS3 o3 = {};
+    bool wbi = SUCCEEDED(g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &o3,
+                                                       sizeof(o3))) &&
+               (o3.WriteBufferImmediateSupportFlags & D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT);
+    ComPtr<ID3D12CommandAllocator> al;
+    ComPtr<ID3D12GraphicsCommandList> cls[3];
+    if (FAILED(g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&al)))) {
+        fail("CreateCommandAllocator failed");
+        return;
+    }
+    for (int m = 0; m < 3; ++m) {
+        if (FAILED(g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, al.Get(), nullptr,
+                                               IID_PPV_ARGS(&cls[m])))) {
+            fail("CreateCommandList failed");
+            return;
+        }
+        ID3D12GraphicsCommandList* cl = cls[m].Get();
+        const UINT q = static_cast<UINT>(2 * m);
+        cl->EndQuery(qh.Get(), D3D12_QUERY_TYPE_TIMESTAMP, q);
+        if (m == 1)
+            cl->CopyBufferRegion(wb.Get(), 0, up.Get(), 0, kData);
+        cl->EndQuery(qh.Get(), D3D12_QUERY_TYPE_TIMESTAMP, q + 1);
+        if (m == 1) {
+            ComPtr<ID3D12GraphicsCommandList2> cl2;
+            if (wbi && SUCCEEDED(cls[m].As(&cl2))) {
+                D3D12_WRITEBUFFERIMMEDIATE_PARAMETER prm = {wb->GetGPUVirtualAddress() + kData,
+                                                            kMagic};
+                const D3D12_WRITEBUFFERIMMEDIATE_MODE mode =
+                    D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
+                cl2->WriteBufferImmediate(1, &prm, &mode);
+            } else {
+                wbi = false;
+                cl->CopyBufferRegion(wb.Get(), kData, up.Get(), kData, 4);
+            }
+        }
+        cl->ResolveQueryData(qh.Get(), D3D12_QUERY_TYPE_TIMESTAMP, q, 2, rb.Get(), 16ull * m);
+        if (FAILED(cl->Close())) {
+            fail("Close failed");
+            return;
+        }
+    }
+
+    LARGE_INTEGER qf;
+    QueryPerformanceFrequency(&qf);
+    const double us_per_qpc = 1e6 / static_cast<double>(qf.QuadPart);
+    const double qpc_per_tick = static_cast<double>(qf.QuadPart) / static_cast<double>(g.ts_freq);
+    auto qpc = [] {
+        LARGE_INTEGER t;
+        QueryPerformanceCounter(&t);
+        return t.QuadPart;
+    };
+    // Spins until done() or ~2 s; false on the timeout.
+    auto spin = [&](auto&& done) {
+        const LONGLONG t0 = qpc();
+        for (unsigned i = 1;; ++i) {
+            if (done())
+                return true;
+            YieldProcessor();
+            if ((i & 63) == 0 && (qpc() - t0) * us_per_qpc > 2e6)
+                return false;
+        }
+    };
+    std::vector<double> exec, launch, gpu_us, tail_fence, tail_flag, rtt_fence, rtt_flag, sig_cpu,
+        resume, rtt_gated;
+    int flag_timeouts = 0, data_bad = 0, early = 0;
+    UINT64 va = 0, vb = 0;
+    bool hung = false;
+    std::uint32_t seed = 0;
+    {
+        std::lock_guard<std::mutex> lock(g.mu);
+        drain_pending(g);
+        for (int i = 0; i < kIters && !hung; ++i) {
+            const int m = i % 3;
+            if (m == 1) {
+                seed = 0x9E3779B9u * static_cast<std::uint32_t>(i + 1);
+                for (std::size_t w = 0; w < kWords; ++w)
+                    up_w[w] = seed;
+                for (std::size_t w = 0; w <= kWords; ++w)
+                    wb_w[w] = 0;
+            }
+            const UINT64 a = ++va;
+            if (m == 2)
+                g.queue->Wait(fb.Get(), ++vb);
+            UINT64 cal_gpu = 0, cal_cpu = 0;
+            g.queue->GetClockCalibration(&cal_gpu, &cal_cpu);
+            ID3D12CommandList* lists[] = {cls[m].Get()};
+            const LONGLONG q0 = qpc();
+            g.queue->ExecuteCommandLists(1, lists);
+            const LONGLONG q1 = qpc();
+            g.queue->Signal(fa.Get(), a);
+            LONGLONG q2 = 0, q3 = 0, q4 = 0;
+            if (m == 0) {
+                hung = !spin([&] { return fa->GetCompletedValue() >= a; });
+                q2 = qpc();
+            } else if (m == 1) {
+                if (!spin([&] { return wb_w[kWords] == kMagic; }))
+                    ++flag_timeouts;
+                q2 = qpc();
+                std::atomic_thread_fence(std::memory_order_acquire);
+                for (std::size_t w = 0; w < kWords; ++w)
+                    if (wb_w[w] != seed) {
+                        ++data_bad;
+                        break;
+                    }
+                hung = !spin([&] { return fa->GetCompletedValue() >= a; });
+            } else {
+                const LONGLONG hold = qpc();
+                while ((qpc() - hold) * us_per_qpc < 200.0)
+                    YieldProcessor();
+                q2 = qpc();
+                fb->Signal(vb);
+                q3 = qpc();
+                hung = !spin([&] { return fa->GetCompletedValue() >= a; });
+                q4 = qpc();
+            }
+            if (hung)
+                break;
+            const std::uint64_t t0 = ts[2 * m], t1 = ts[2 * m + 1];
+            auto cpu_of = [&](std::uint64_t t) {
+                return static_cast<double>(cal_cpu) +
+                       static_cast<double>(static_cast<std::int64_t>(t - cal_gpu)) * qpc_per_tick;
+            };
+            const double c0 = cpu_of(t0), c1 = cpu_of(t1);
+            if (m == 0) {
+                exec.push_back((q1 - q0) * us_per_qpc);
+                launch.push_back((c0 - static_cast<double>(q1)) * us_per_qpc);
+                gpu_us.push_back((c1 - c0) * us_per_qpc);
+                tail_fence.push_back((static_cast<double>(q2) - c1) * us_per_qpc);
+                rtt_fence.push_back((q2 - q0) * us_per_qpc);
+            } else if (m == 1) {
+                tail_flag.push_back((static_cast<double>(q2) - c1) * us_per_qpc);
+                rtt_flag.push_back((q2 - q0) * us_per_qpc);
+            } else {
+                if (c0 < static_cast<double>(q2))
+                    ++early;
+                sig_cpu.push_back((q3 - q2) * us_per_qpc);
+                resume.push_back((c0 - static_cast<double>(q3)) * us_per_qpc);
+                rtt_gated.push_back((q4 - q2) * us_per_qpc);
+            }
+        }
+        if (hung && vb && fb->GetCompletedValue() < vb)
+            fb->Signal(vb); // never leave the queue parked behind the gate
+    }
+    double gcv_us = 0.0;
+    {
+        volatile UINT64 sink = 0;
+        const LONGLONG q0 = qpc();
+        for (int i = 0; i < 1000; ++i)
+            sink = sink + fa->GetCompletedValue();
+        gcv_us = (qpc() - q0) * us_per_qpc / 1000.0;
+    }
+    rb->Unmap(0, &none);
+    up->Unmap(0, nullptr);
+    wb->Unmap(0, nullptr);
+    if (hung) {
+        fail("a list did not complete within 2 s");
+        return;
+    }
+    auto row = [&](const char* name, std::vector<double>& us, const std::string& extra) {
+        D3d12SelftestRow r;
+        r.type = name;
+        r.n = static_cast<int>(us.size());
+        if (us.empty()) {
+            r.error = "no samples" + extra;
+            out->push_back(std::move(r));
+            return;
+        }
+        std::sort(us.begin(), us.end());
+        auto at = [&](double f) {
+            return us[std::min(us.size() - 1, static_cast<std::size_t>(f * us.size()))];
+        };
+        r.gpu_ms = at(0.5) / 1000.0;
+        r.rel_err = at(0.9) / 1000.0;
+        char b[200];
+        std::snprintf(b, sizeof(b), "us p10 %.1f p50 %.1f p90 %.1f max %.1f%s", at(0.1), at(0.5),
+                      at(0.9), us.back(), extra.c_str());
+        r.error = b;
+        r.ok = r.d3d12_ran = true;
+        out->push_back(std::move(r));
+    };
+    char fx[160];
+    std::snprintf(fx, sizeof(fx), "; %s; flag timeouts %d; 64 KiB copy not visible at the flag %d/%zu",
+                  wbi ? "WriteBufferImmediate MARKER_OUT" : "4-byte copy", flag_timeouts, data_bad,
+                  tail_flag.size());
+    char gx[64];
+    std::snprintf(gx, sizeof(gx), "; started before the CPU signal %d", early);
+    row("lat_exec", exec, "");
+    row("lat_launch", launch, "");
+    row("lat_gpu", gpu_us, "");
+    row("lat_tail_fence", tail_fence, "");
+    row("lat_tail_flag", tail_flag, fx);
+    row("lat_rtt_fence", rtt_fence, "");
+    row("lat_rtt_flag", rtt_flag, fx);
+    row("lat_signal_cpu", sig_cpu, "");
+    row("lat_resume", resume, gx);
+    row("lat_rtt_gated", rtt_gated, gx);
+    std::vector<double> gcv = {gcv_us};
+    row("lat_getcompleted", gcv, "");
+}
+
 } // namespace
 
 void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
@@ -4824,6 +5102,8 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
         for (int kind = 0; kind < 8; ++kind)
             out->push_back(run_ssm_case(backend, kind));
     out->push_back(run_submit_rtt());
+    if (const char* lp = std::getenv("XLLAMA_D3D12_LATPROBE"); lp && std::atoi(lp) > 0)
+        run_latency_probe(out);
     ggml_backend_free(backend);
 }
 
