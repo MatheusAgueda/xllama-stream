@@ -1155,8 +1155,33 @@ void host_memset(ggml_backend_buffer_t, ggml_tensor* t, uint8_t v, size_t off, s
 void host_set(ggml_backend_buffer_t, ggml_tensor* t, const void* data, size_t off, size_t size) {
     std::memcpy(static_cast<std::uint8_t*>(t->data) + off, data, size);
 }
-void host_get(ggml_backend_buffer_t, const ggml_tensor* t, void* data, size_t off, size_t size) {
-    std::memcpy(data, static_cast<const std::uint8_t*>(t->data) + off, size);
+// A write-combined buffer is uncached for the CPU: reading the 62.8 MiB
+// recurrent state of the 35B out of one ran at ~127 MB/s on Series X (KV
+// checkpoint 494 ms against 16 ms write-back, 2026-11-11), while the GPU reads
+// it at full speed. Reads of kWcGpuReadMin or more go through the readback
+// ring, as for weights; buffers decay to COMMON after every submission, so the
+// copy source is promoted implicitly. A failed submission falls back to memcpy.
+constexpr std::size_t kWcGpuReadMin = 64u << 10;
+
+void host_get(ggml_backend_buffer_t b, const ggml_tensor* t, void* data, size_t off, size_t size) {
+    const auto* src = static_cast<const std::uint8_t*>(t->data) + off;
+    auto* c = static_cast<BufCtx*>(b->context);
+    if (!c->wc || size < kWcGpuReadMin) {
+        std::memcpy(data, src, size);
+        return;
+    }
+    const std::size_t src_off = tensor_offset(t) + off;
+    Gpu& g = gpu();
+    std::lock_guard<std::mutex> lock(g.mu);
+    for (std::size_t done = 0; done < size;) {
+        const std::size_t chunk = std::min<std::size_t>(size - done, kStagingBytes);
+        const bool ok = run_now(g, [&](ID3D12GraphicsCommandList* cl) {
+            cl->CopyBufferRegion(g.readback.Get(), 0, c->res.Get(), src_off + done, chunk);
+        });
+        std::memcpy(static_cast<std::uint8_t*>(data) + done, ok ? g.readback_ptr : src + done,
+                    chunk);
+        done += chunk;
+    }
 }
 bool host_cpy(ggml_backend_buffer_t, const ggml_tensor* src, ggml_tensor* dst) {
     if (!ggml_backend_buffer_is_host(src->buffer))
