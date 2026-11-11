@@ -3566,10 +3566,10 @@ void run_d3d12_memprobe(const std::function<void(const std::string&)>& emit) {
         probe_fill(g, "custom_l0", 12288, &hold, emit);
     }
     emit("released: " + probe_state(g));
-    // D: reserved buffers backed by 64 MiB heaps.
-    for (std::size_t mb : {1024, 2048, 3072})
-        probe_tiled(g, mb, emit);
     // E: GPU buffers over CPU memory, alone and on top of a full DXGI budget.
+    // Before D: on the Series X (1.7.12.49, 2026-11-11) the process ended inside
+    // D's first reserved buffer without a line.
+    emit("existing: start");
     probe_existing_rw(g, emit);
     {
         ProbeHold hold;
@@ -3581,6 +3581,12 @@ void run_d3d12_memprobe(const std::function<void(const std::string&)>& emit) {
         probe_fill(g, "default", 12288, &hold, emit);
         probe_fill(g, "existing", 8192, &hold, emit);
         probe_fill(g, "heap", 8192, &hold, emit);
+    }
+    emit("released: " + probe_state(g));
+    // D: reserved buffers backed by 64 MiB heaps, last, a line before each.
+    for (std::size_t mb : {1024, 2048, 3072}) {
+        emit("tiled " + std::to_string(mb) + " MB: start");
+        probe_tiled(g, mb, emit);
     }
     emit("done: " + probe_state(g));
 }
