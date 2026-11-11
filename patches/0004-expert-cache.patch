@@ -71,10 +71,10 @@ index 07b4c61..6557247 100644
              cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
 diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
 new file mode 100644
-index 0000000..ca51106
+index 0000000..60f5d16
 --- /dev/null
 +++ b/src/llama-expert-cache.cpp
-@@ -0,0 +1,2247 @@
+@@ -0,0 +1,2415 @@
 +#include "llama-expert-cache.h"
 +
 +#include "llama-impl.h"
@@ -222,6 +222,8 @@ index 0000000..ca51106
 +    int32_t  expert     = -1;
 +    int32_t  old_expert = -1;
 +    uint64_t old_used   = 0;
++    double   old_val    = 0.0; // the slot's LRFU value and its tick, restored with old_expert
++    uint64_t old_last   = 0;
 +    int32_t  parts      = 1;
 +    int64_t  t_queue    = 0; // when the round was queued (us)
 +    std::atomic<int>      state {EC_PF_DONE};
@@ -288,6 +290,18 @@ index 0000000..ca51106
 +    std::vector<int32_t>  helped; // settle scratch: the queued parts of a read the plan waits for
 +    std::vector<float>    prob;   // prefetch scratch with a swap ratio: a token's unnormalized softmax
 +
++    // LLAMA_EXPERT_DEFER: the experts the select op stood a resident in for (expert -> summed router
++    // score of those tokens, and the list of them), its scratch (a token's top-k before the swaps),
++    // the plan's credit of background reads, a round the plan queued for the load op to hand to the
++    // I/O threads, and whether this layer's load op holds the deferred reads back (cache->loads)
++    std::vector<float>   dwant;
++    std::vector<uint8_t> dmark; // expert -> listed in dlist
++    std::vector<int32_t> dlist;
++    std::vector<int32_t> dtop;
++    double d_credit  = 0.0;
++    bool   d_queue   = false;
++    bool   load_gate = false;
++
 +    // expert-major round (one ubatch, every expert tensor of the layer): the missing experts whose
 +    // reads go to a slot instead of a staging buffer (expert -> slot, -1, and the list of them), each
 +    // tensor's progress (1 prepared, 2 computed) and the hash of the ubatch's ids
@@ -353,6 +367,13 @@ index 0000000..ca51106
 +    bool     pf_ahead = false;
 +    int      pf_prio  = 1;
 +    bool     pf_help  = true;
++    // deferred admission (LLAMA_EXPERT_DEFER=<reads>[:<tokens>]): in ubatches of at most defer_tok
++    // tokens, up to defer_b experts per layer and ubatch (a fraction accrues as credit) that the
++    // select op stood a resident in for are read in the background by the I/O threads, which wait
++    // while a load op reads (loads); the prefetch's round, counters and settle carry them
++    double   defer_b   = 0.0;
++    uint32_t defer_tok = 1;
++    std::atomic<int>      loads {0}; // load ops of layers with a deferred round between plan and load end
 +    std::atomic<int>      pf_prio_threads {0}; // I/O threads running at pf_prio
 +    std::atomic<uint64_t> pf_reads     {0}; // experts read ahead
 +    std::atomic<uint64_t> pf_used      {0}; // of those, used by the ubatch they were read for
@@ -409,16 +430,21 @@ index 0000000..ca51106
 +            }
 +        }
 +        char pf[320] = "";
-+        if (pf_k > 0) {
++        if (pf_k > 0 || defer_b > 0.0) {
 +            const uint64_t n = pf_reads.load();
 +            char prio[32] = "";
 +            if (pf_prio_threads.load() > 0) {
 +                snprintf(prio, sizeof(prio), ", prio %d", pf_prio);
 +            }
-+            snprintf(pf, sizeof(pf), "; prefetch %" PRIu64 " read (%" PRIu64 " used), %" PRIu64 " dropped, %.0f ms waited for %" PRIu64 " (%" PRIu64 " parts read by the plan), %.2f ms queued + %.2f ms reading each%s%s%s",
++            char mode[48] = "";
++            if (pf_k == 0) {
++                snprintf(mode, sizeof(mode), ", %g per layer up to %u tokens", defer_b, defer_tok);
++            }
++            snprintf(pf, sizeof(pf), "; %s %" PRIu64 " read (%" PRIu64 " used), %" PRIu64 " dropped, %.0f ms waited for %" PRIu64 " (%" PRIu64 " parts read by the plan), %.2f ms queued + %.2f ms reading each%s%s%s%s",
++                    pf_k > 0 ? "prefetch" : "deferred",
 +                    n, pf_used.load(), pf_cancelled.load(), pf_wait_us.load()/1000.0, pf_waits.load(), pf_helped.load(),
 +                    n ? pf_lag_us.load()/1000.0/n : 0.0, n ? pf_run_us.load()/1000.0/n : 0.0,
-+                    pf_ahead ? ", ahead" : "", pf_help ? ", help" : "", prio);
++                    pf_ahead ? ", ahead" : "", pf_help ? ", help" : "", prio, mode);
 +        }
 +        char em[320] = "";
 +        if (em_rounds.load() > 0) {
@@ -870,7 +896,8 @@ index 0000000..ca51106
 +        ec_pf_part e;
 +        {
 +            std::unique_lock<std::mutex> lock(C->pf_mtx);
-+            C->pf_cv.wait(lock, [C] { return C->pf_stop || !C->pf_queue.empty(); });
++            // a load op reading (LLAMA_EXPERT_DEFER) has the disk: its reads block the graph
++            C->pf_cv.wait(lock, [C] { return C->pf_stop || (!C->pf_queue.empty() && C->loads.load(std::memory_order_relaxed) == 0); });
 +            if (C->pf_stop) {
 +                return;
 +            }
@@ -965,7 +992,9 @@ index 0000000..ca51106
 +            if (j.old_expert >= 0) {
 +                L.slot_of[j.old_expert] = j.slot;
 +            }
-+            L.used[j.slot] = j.old_used;
++            L.used[j.slot]      = j.old_used;
++            L.lrfu_val[j.slot]  = j.old_val;
++            L.lrfu_last[j.slot] = j.old_last;
 +            dropped++;
 +            continue;
 +        }
@@ -1003,6 +1032,27 @@ index 0000000..ca51106
 +    }
 +}
 +
++// LLAMA_EXPERT_DEFER, end of a layer's load op: the I/O threads may read again (the gate the plan
++// took for the load's reads) and, run = the load ran, get the round of reads the plan deferred. A
++// round never queued (a graph stopped before the load op) stays QUEUED for the settle to drop
++static void ec_defer_end(ec_layer & L, bool run) {
++    llama_expert_cache & C = *L.cache;
++    if (L.load_gate) {
++        L.load_gate = false;
++        {
++            std::lock_guard<std::mutex> lock(C.pf_mtx);
++            C.loads.fetch_sub(1, std::memory_order_relaxed);
++        }
++        C.pf_cv.notify_all();
++    }
++    if (L.d_queue) {
++        L.d_queue = false;
++        if (run && L.n_pf > 0) {
++            C.pf_enqueue(L);
++        }
++    }
++}
++
 +// the slots a plan gave to missing experts whose load op never ran (a graph stopped by its abort
 +// callback, which ggml checks between ops); the last thread of a load op clears the list
 +static void ec_drop_unloaded(ec_layer & L) {
@@ -1010,6 +1060,7 @@ index 0000000..ca51106
 +        ec_evict(L, job.first, job.second);
 +    }
 +    L.pending.clear();
++    ec_defer_end(L, false);
 +}
 +
 +// close a layer's expert-major round: the experts it read into slots stay resident if every expert
@@ -1200,6 +1251,8 @@ index 0000000..ca51106
 +        j.expert     = e;
 +        j.old_expert = L.expert_of[victim];
 +        j.old_used   = L.used[victim];
++        j.old_val    = L.lrfu_val[victim];
++        j.old_last   = L.lrfu_last[victim];
 +        if (j.old_expert >= 0) {
 +            L.slot_of[j.old_expert] = -1;
 +        }
@@ -1271,6 +1324,11 @@ index 0000000..ca51106
 +    if (lrfu) {
 +        std::fill(L.wsum.begin(), L.wsum.end(), 0.0f);
 +    }
++    // LLAMA_EXPERT_DEFER: the experts of each token's top-k a resident stood in for, by routed weight
++    const bool defer = C.defer_b > 0.0 && n_tokens <= (int64_t) C.defer_tok && !L.dwant.empty();
++    if (defer) {
++        L.dtop.resize((size_t) n_used);
++    }
 +    uint64_t swaps = 0;
 +    for (int64_t t = 0; t < n_tokens; ++t) {
 +        const float * s = (const float *) ((const char *) scores->data + t*scores->nb[1]);
@@ -1282,7 +1340,11 @@ index 0000000..ca51106
 +        for (int64_t k = 0; k < n_tr; ++k) {
 +            put(&s[order[k]], sizeof(float));
 +        }
-+        swaps += ec_swap_missing(*res, order, s, n_used, C.swap_ratio, C.swap_tail);
++        if (defer) {
++            std::copy(order.begin(), order.begin() + n_used, L.dtop.begin());
++        }
++        const uint64_t sw = ec_swap_missing(*res, order, s, n_used, C.swap_ratio, C.swap_tail);
++        swaps += sw;
 +
 +        int32_t * out = (int32_t *) ((char *) dst->data + t*dst->nb[1]);
 +        for (int64_t k = 0; k < n_used; ++k) {
@@ -1290,6 +1352,19 @@ index 0000000..ca51106
 +            if (lrfu) {
 +                const float v = s[order[k]];
 +                L.wsum[order[k]] += v == v && v > 0.0f ? v : 0.0f;
++            }
++        }
++        if (defer && sw > 0) {
++            for (const int32_t e : L.dtop) {
++                if (std::find(order.begin(), order.begin() + n_used, e) != order.begin() + n_used) {
++                    continue;
++                }
++                const float v = s[e];
++                L.dwant[e] += v == v && v > 0.0f ? v : 0.0f;
++                if (!L.dmark[e]) {
++                    L.dmark[e] = 1;
++                    L.dlist.push_back(e);
++                }
 +            }
 +        }
 +    }
@@ -1434,28 +1509,32 @@ index 0000000..ca51106
 +
 +    // missing experts: take the least recently used slot that this ubatch does not need (LRFU: the
 +    // lowest decayed value, then the least recently used)
++    auto pick_victim = [&L, lrfu, tick, n_slots]() {
++        int32_t victim = -1;
++        for (int32_t s = 0; s < n_slots; ++s) {
++            if (L.used[s] == tick) {
++                continue;
++            }
++            if (victim < 0) {
++                victim = s;
++            } else if (lrfu) {
++                const double a = L.lrfu_key[s], b = L.lrfu_key[victim];
++                if (a < b || (a == b && L.used[s] < L.used[victim])) {
++                    victim = s;
++                }
++            } else if (L.used[s] < L.used[victim]) {
++                victim = s;
++            }
++        }
++        return victim;
++    };
 +    for (int64_t i1 = 0; i1 < n_tokens; ++i1) {
 +        for (int64_t i0 = 0; i0 < n_used; ++i0) {
 +            const int32_t e = ec_id_at(ids, i0, i1);
 +            if (L.slot_of[e] >= 0) {
 +                continue;
 +            }
-+            int32_t victim = -1;
-+            for (int32_t s = 0; s < n_slots; ++s) {
-+                if (L.used[s] == tick) {
-+                    continue;
-+                }
-+                if (victim < 0) {
-+                    victim = s;
-+                } else if (lrfu) {
-+                    const double a = L.lrfu_key[s], b = L.lrfu_key[victim];
-+                    if (a < b || (a == b && L.used[s] < L.used[victim])) {
-+                        victim = s;
-+                    }
-+                } else if (L.used[s] < L.used[victim]) {
-+                    victim = s;
-+                }
-+            }
++            const int32_t victim = pick_victim();
 +            if (victim < 0) {
 +                GGML_ABORT("expert cache: layer %d needs more than %d experts in one ubatch - lower n_ubatch", L.id, n_slots);
 +            }
@@ -1470,6 +1549,66 @@ index 0000000..ca51106
 +                L.lrfu_val[victim]  = wtd ? (double) L.wsum[e] : 1.0;
 +                L.lrfu_last[victim] = tick;
 +            }
++        }
++    }
++
++    // LLAMA_EXPERT_DEFER: the experts the select op stood residents in for, most routed weight first,
++    // take the next victims as a round of background reads (ec_prefetch's jobs: the next plan drops
++    // the ones not started and waits for the rest). The victims are slots this ubatch does not use,
++    // so its matmuls never see them; the admitted expert has no use yet (LRFU value 0, the next
++    // victim unless a token wants it). The load op hands the round to the I/O threads
++    if (!L.dwant.empty()) {
++        const bool round = C.defer_b > 0.0 && n_tokens <= (int64_t) C.defer_tok && !L.dlist.empty();
++        if (n_tokens <= (int64_t) C.defer_tok) {
++            L.d_credit = std::min(L.d_credit + C.defer_b, std::max(C.defer_b, 1.0) * 2.0);
++        }
++        if (round) {
++            std::sort(L.dlist.begin(), L.dlist.end(), [&L](int32_t a, int32_t b) {
++                return L.dwant[a] > L.dwant[b] || (L.dwant[a] == L.dwant[b] && a < b);
++            });
++            for (const int32_t e : L.dlist) {
++                if (L.d_credit < 1.0 || L.n_pf >= n_slots) {
++                    break;
++                }
++                if (L.slot_of[e] >= 0) {
++                    continue;
++                }
++                const int32_t victim = pick_victim();
++                if (victim < 0) {
++                    break;
++                }
++                ec_pf & j = L.pf[L.n_pf++];
++                j.slot       = victim;
++                j.expert     = e;
++                j.old_expert = L.expert_of[victim];
++                j.old_used   = L.used[victim];
++                j.old_val    = L.lrfu_val[victim];
++                j.old_last   = L.lrfu_last[victim];
++                if (j.old_expert >= 0) {
++                    L.slot_of[j.old_expert] = -1;
++                }
++                L.expert_of[victim] = e;
++                L.slot_of[e]        = victim;
++                L.used[victim]      = tick;
++                L.lrfu_val[victim]  = 0.0;
++                L.lrfu_last[victim] = tick;
++                j.parts = C.io_split ? (int32_t) (L.tensors.size()*EC_PF_SUBPARTS) : 1;
++                j.left.store(j.parts, std::memory_order_relaxed);
++                j.gen.store(j.gen.load(std::memory_order_relaxed) + 1, std::memory_order_release);
++                j.state.store(EC_PF_QUEUED, std::memory_order_release);
++                L.d_credit -= 1.0;
++            }
++        }
++        for (const int32_t e : L.dlist) {
++            L.dwant[e] = 0.0f;
++            L.dmark[e] = 0;
++        }
++        L.dlist.clear();
++        L.d_queue = L.n_pf > 0;
++        // the load op's blocking reads have the disk: the I/O threads wait until they are done
++        if (!L.pending.empty()) {
++            L.load_gate = true;
++            C.loads.fetch_add(1, std::memory_order_relaxed);
 +        }
 +    }
 +
@@ -1524,10 +1663,11 @@ index 0000000..ca51106
 +        while (prev < dt && !L.load_us.compare_exchange_weak(prev, dt)) {
 +        }
 +    }
-+    // the reads are done: nothing left for a plan to undo
++    // the reads are done: nothing left for a plan to undo (the deferred round goes to the I/O threads)
 +    if (L.load_done.fetch_add(1, std::memory_order_acq_rel) + 1 == nth) {
 +        L.load_done.store(0, std::memory_order_relaxed);
 +        L.pending.clear();
++        ec_defer_end(L, true);
 +    }
 +
 +    if (ith == 0) {
@@ -2033,6 +2173,30 @@ index 0000000..ca51106
 +    const char * help = getenv("LLAMA_EXPERT_PREFETCH_HELP");
 +    cache->pf_help = help == nullptr || *help == '\0' || atoi(help) != 0;
 +
++    // LLAMA_EXPERT_DEFER=<reads>[:<tokens>] (with a swap ratio, without LLAMA_EXPERT_PREFETCH): after
++    // the blocking reads of a ubatch of at most <tokens> tokens (1, the default: decode), up to <reads>
++    // experts per layer that its select op stood a resident in for (most routed weight first; a
++    // fraction accrues) are read by the I/O threads while the GPU computes, into slots the ubatch does
++    // not use, at the lowest LRFU value: the next token that wants them finds them resident. The I/O
++    // threads pause while a load op reads; the next plan of the layer drops the reads not started and
++    // waits for those in flight. Replay of the 40-prompt trace at 54 slots, swap 0.5, LRFU 8, 1:1:
++    // 17.7% fewer blocking decode reads, more router mass kept (97.33 -> 97.48%)
++    const char * df = getenv("LLAMA_EXPERT_DEFER");
++    if (df != nullptr && *df != '\0') {
++        double   b = 0.0;
++        unsigned t = 1;
++        const int n = sscanf(df, "%lf:%u", &b, &t);
++        if (n >= 1 && b > 0.0 && b <= 64.0 && t >= 1 && cache->swap_ratio > 0.0f && cache->pf_k == 0) {
++            cache->defer_b   = b;
++            cache->defer_tok = t;
++            LLAMA_LOG_INFO("%s: expert cache: deferred admission, %g reads per layer in ubatches up to %u tokens\n",
++                __func__, b, t);
++        } else {
++            LLAMA_LOG_WARN("%s: expert cache: LLAMA_EXPERT_DEFER=%s ignored (<reads>[:<tokens>], needs a swap ratio, not with LLAMA_EXPERT_PREFETCH)\n",
++                __func__, df);
++        }
++    }
++
 +    // LLAMA_EXPERT_MAJOR: largest expert-major ubatch (0 = off, the default)
 +    const char * em = getenv("LLAMA_EXPERT_MAJOR");
 +    cache->em_max = em != nullptr && *em != '\0' ? (uint32_t) std::min(std::max(atoi(em), 0), 65536) : 0;
@@ -2199,6 +2363,10 @@ index 0000000..ca51106
 +        }
 +        slot->pf.reset(new ec_pf[n_slots]);
 +        slot->seen.assign(n_expert, 0);
++        if (cache->defer_b > 0.0) {
++            slot->dwant.assign(n_expert, 0.0f);
++            slot->dmark.assign(n_expert, 0);
++        }
 +        cache->first_layer = std::min(cache->first_layer, il);
 +    }
 +    if ((int64_t) slot->slot_of.size() != n_expert) {

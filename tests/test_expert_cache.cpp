@@ -48,6 +48,7 @@ struct EcLog {
     std::string slots_line; // the LLAMA_EXPERT_SLOTS_LAYERS init line
     std::string lrfu_line;  // the LLAMA_EXPERT_LRFU init line
     std::string rd_line;    // the LLAMA_EXPERT_RD init line (or its warning)
+    std::string defer_line; // the LLAMA_EXPERT_DEFER init line (or its warning)
 };
 
 void ec_log_cb(ggml_log_level, const char* text, void* user_data) {
@@ -65,6 +66,10 @@ void ec_log_cb(ggml_log_level, const char* text, void* user_data) {
     if (std::strstr(text, "reuse-distance term") || std::strstr(text, "LLAMA_EXPERT_RD=")) {
         std::lock_guard<std::mutex> lock(log->mtx);
         log->rd_line = text;
+    }
+    if (std::strstr(text, "deferred admission") || std::strstr(text, "LLAMA_EXPERT_DEFER=")) {
+        std::lock_guard<std::mutex> lock(log->mtx);
+        log->defer_line = text;
     }
     if (!std::strstr(text, "expert cache (final)"))
         return;
@@ -97,6 +102,27 @@ long long prefetched_of(const std::string& line) {
     if (!p || std::sscanf(p, "; prefetch %llu read", &reads) != 1)
         return -1;
     return static_cast<long long>(reads);
+}
+
+// The "deferred N read (U used), D dropped" counts of a stats line (the
+// LLAMA_EXPERT_DEFER background reads: done, used by the next ubatch, dropped
+// before they started), all -1 when deferred admission is off.
+struct DeferStats {
+    long long reads = -1;
+    long long used = -1;
+    long long dropped = -1;
+};
+
+DeferStats deferred_of(const std::string& line) {
+    DeferStats d;
+    const char* p = std::strstr(line.c_str(), "; deferred ");
+    unsigned long long n = 0, u = 0, x = 0;
+    if (p && std::sscanf(p, "; deferred %llu read (%llu used), %llu dropped", &n, &u, &x) == 3) {
+        d.reads = static_cast<long long>(n);
+        d.used = static_cast<long long>(u);
+        d.dropped = static_cast<long long>(x);
+    }
+    return d;
 }
 
 // The "waited for N (P parts read by the plan)" counts of a stats line: the
@@ -848,6 +874,76 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
             std::lock_guard<std::mutex> lock(log.mtx);
             MESSAGE(log.rd_line);
             CHECK(log.rd_line.find("ignored") != std::string::npos);
+        }
+
+        // Deferred admission (LLAMA_EXPERT_DEFER, on LRFU): the experts the
+        // select op stood residents in for are read in the background into slots
+        // the ubatch does not use. Exact routing never swaps, so nothing is
+        // deferred and the tokens stay plain's. At 0.5, in every ubatch (1:512),
+        // the swaps give rounds: their reads finish or are dropped, the run holds
+        // together and reads no more than plain. Without a swap ratio, or with
+        // the prefetch, the knob is refused.
+        set_env_s("LLAMA_EXPERT_LRFU", "8");
+        set_env_s("LLAMA_EXPERT_DEFER", "1:512");
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            log.final_line.clear();
+            log.defer_line.clear();
+        }
+        const EcRun defer_exact = run_greedy(path, c.slots, 512, c.used, 24, 1000.0f);
+        REQUIRE(defer_exact.ok);
+        CHECK(defer_exact.tokens == plain.tokens);
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            MESSAGE(log.defer_line);
+            MESSAGE(log.final_line);
+            CHECK(log.defer_line.find("deferred admission, 1 reads per layer in ubatches up to 512 tokens") != std::string::npos);
+            CHECK(swaps_of(log.final_line) == 0);
+            const DeferStats d = deferred_of(log.final_line);
+            CHECK(d.reads == 0);
+            CHECK(d.dropped == 0);
+            log.final_line.clear();
+        }
+        const EcRun defer_swap = run_greedy(path, c.slots, 512, c.used, 24, 0.5f);
+        REQUIRE(defer_swap.ok);
+        CHECK(defer_swap.n_ubatch == cached.n_ubatch);
+        CHECK(defer_swap.tokens.size() == swapped.tokens.size());
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            MESSAGE(log.final_line);
+            const DeferStats d = deferred_of(log.final_line);
+            CHECK(d.reads >= 0);
+            CHECK(d.used >= 0);
+            CHECK(d.used <= d.reads);
+            if (swaps_of(log.final_line) > 0)
+                CHECK(d.reads + d.dropped > 0);
+            CHECK(misses_of(log.final_line) <= plain_misses);
+            log.final_line.clear();
+            log.defer_line.clear();
+        }
+        const EcRun defer_noswap = run_greedy(path, c.slots, 512, c.used, 24);
+        REQUIRE(defer_noswap.ok);
+        CHECK(defer_noswap.tokens == plain.tokens);
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            MESSAGE(log.defer_line);
+            CHECK(log.defer_line.find("ignored") != std::string::npos);
+            CHECK(deferred_of(log.final_line).reads == -1);
+            log.final_line.clear();
+            log.defer_line.clear();
+        }
+        set_prefetch(2);
+        const EcRun defer_pf = run_greedy(path, c.slots, 512, c.used, 24, 0.5f);
+        set_prefetch(-1);
+        set_env_s("LLAMA_EXPERT_DEFER", nullptr);
+        set_env_s("LLAMA_EXPERT_LRFU", nullptr);
+        REQUIRE(defer_pf.ok);
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            MESSAGE(log.defer_line);
+            CHECK(log.defer_line.find("ignored") != std::string::npos);
+            CHECK(deferred_of(log.final_line).reads == -1);
+            CHECK(prefetched_of(log.final_line) >= 0);
         }
 
         // Both: the prefetch predicts the swapped routing (stand-ins kept, only
