@@ -616,12 +616,14 @@ void run_d3d12_memprobe(const std::function<void(const std::string&)>& emit) {
         #include <memory>
         #include <mutex>
         #include <random>
+        #include <thread>
         #include <tuple>
         #include <unordered_map>
         #include <unordered_set>
         #include <vector>
 
         #include <dxgi1_4.h>
+        #include <intrin.h>
 
         #include "d3d12_compute.h"
         #include "ggml-alloc.h"
@@ -733,6 +735,8 @@ const char* host_slot_name(int s) {
     return s < GGML_OP_COUNT ? ggml_op_name(static_cast<ggml_op>(s)) : kNames[s - GGML_OP_COUNT];
 }
 
+struct KeptList; // a recorded submission kept for replay (list_cache, below)
+
 // Process-wide D3D12 state behind the ggml device. One queue, serialised.
 struct Gpu {
     ComPtr<ID3D12Device> device;
@@ -803,6 +807,42 @@ struct Gpu {
     std::uint64_t n_pc_fast = 0;     // hits on the node list and tensor_gen, no fingerprint
     std::uint64_t n_pc_fast_bad = 0; // plan_mode 2: those that the fingerprint would refuse
     double pc_ms = 0.0;                         // host time of the hits before submitting
+    // XLLAMA_D3D12_PRESUBMIT (read when a backend is created; needs
+    // PLANCACHE=1, no timestamps, profile or HOSTPROF): after a call runs from
+    // its kept plan, a helper thread submits the kept list of the plan that
+    // came next last time, behind queue->Wait on `gate`, while the CPU split
+    // runs. The next call, if it is that plan and still current, writes its
+    // host actions and signals the gate from the CPU instead of calling
+    // ExecuteCommandLists. Anything else that uses the queue (drain_pending)
+    // first opens the gate with the predicate set: the parked list's dispatches
+    // and copies are skipped (SetPredication). A parked list touches no memory
+    // before its gate opens, so host reads and writes and synchronize leave it.
+    // 1 = the helper sleeps on an event between requests, 2 = it spins ~2 ms.
+    int presub = 0;
+    ComPtr<ID3D12Fence> gate;
+    UINT64 gate_v = 0;
+    ComPtr<ID3D12Resource> pred;                // 8 bytes, upload heap: 0 runs, 1 skips
+    volatile std::uint64_t* pred_ptr = nullptr;
+    std::atomic<bool> armed{false};             // a list is parked; written under mu
+    std::uint64_t armed_key = 0, armed_lgen = 0;
+    KeptList* armed_kl = nullptr;
+    UINT64 armed_gate_v = 0, armed_fence_v = 0;
+    bool req = false;            // a request for the helper (req_key's list), under mu
+    std::uint64_t req_key = 0;
+    std::uint64_t prev_key = 0;  // the previous call's plan key: plans learn their successor
+    std::thread presub_thread;
+    HANDLE presub_ev = nullptr;  // auto-reset
+    std::atomic<bool> presub_stop{false};
+    std::atomic<bool> presub_sleeping{false};
+    std::atomic<std::uint64_t> req_seq{0};
+    std::chrono::steady_clock::time_point t_req{};
+    bool t_req_set = false;
+    std::uint64_t n_ps_req = 0, n_ps_arm = 0, n_ps_hit = 0, n_ps_cancel = 0, n_ps_late = 0;
+    std::uint64_t n_ps_nolist = 0, n_ps_rec = 0;
+    double ps_exec_ms = 0.0, ps_rec_ms = 0.0, ps_sig_ms = 0.0, ps_wait_ms = 0.0;
+    // Time from a request to the next call (the CPU split the helper has):
+    // < 20, 40, 80, 160, 320, 640, 1280 us, more.
+    std::uint64_t ps_gap[8] = {};
     // IQ3_S group geometry asked for by XLLAMA_D3D12_IQ3S_RSL / _RT (read when a
     // backend is created; d3d12_geom_for shapes each matmul from it).
     D3d12GeomReq iq3s_geom;
@@ -1221,9 +1261,31 @@ Gpu& gpu() {
     return g;
 }
 
-// Wait for the submission a shexp_async call left running, and take its GPU
-// time. Caller holds g.mu.
+// Opens the gate of the list the presubmit helper left parked: run = its
+// commands execute, else its dispatches and copies are skipped. The predicate
+// and the host actions' scratch writes reach memory before the signal (the
+// upload heap is write-combined). Caller holds g.mu.
+void gate_open(Gpu& g, bool run) {
+    *g.pred_ptr = run ? 0 : 1;
+    _mm_sfence();
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    g.gate->Signal(g.armed_gate_v);
+    g.armed.store(false, std::memory_order_relaxed);
+}
+
+// A parked list that is not the call that came: skipped, and drained like a
+// submission left running. Caller holds g.mu.
+void gate_cancel(Gpu& g) {
+    gate_open(g, false);
+    g.pending.store(g.armed_fence_v, std::memory_order_relaxed);
+    ++g.n_ps_cancel;
+}
+
+// Wait for the submission a shexp_async call left running, or a cancelled
+// parked list, and take its GPU time. Caller holds g.mu.
 void drain_pending(Gpu& g) {
+    if (g.armed.load(std::memory_order_relaxed))
+        gate_cancel(g);
     const UINT64 v = g.pending.load(std::memory_order_relaxed);
     if (!v)
         return;
@@ -1397,6 +1459,8 @@ ComPtr<ID3D12Resource> create_tiled_buffer(Gpu& g, UINT64 bytes,
         region.UseBox = FALSE;
         const D3D12_TILE_RANGE_FLAGS range_flags = D3D12_TILE_RANGE_FLAG_NONE;
         const UINT heap_start = 0, range_tiles = static_cast<UINT>(n);
+        if (t0 == 0)
+            drain_pending(g); // never behind a parked list
         g.queue->UpdateTileMappings(res.Get(), 1, &coord, &region, heap.Get(), 1, &range_flags,
                                     &heap_start, &range_tiles, D3D12_TILE_MAPPING_FLAG_NONE);
         heaps->push_back(heap);
@@ -1427,6 +1491,12 @@ ggml_status host_init_tensor(ggml_backend_buffer_t, ggml_tensor*) {
 }
 
 void buf_free(ggml_backend_buffer_t b) {
+    Gpu& g = gpu();
+    if (g.presub) { // a parked or requested list may reference the buffer
+        std::lock_guard<std::mutex> lock(g.mu);
+        g.req = false;
+        drain_pending(g);
+    }
     drain_pending_unlocked();
     gpu().buf_gen.fetch_add(1, std::memory_order_relaxed); // kept plans hold its addresses
     delete static_cast<BufCtx*>(b->context);
@@ -1827,10 +1897,14 @@ const char* backend_name(ggml_backend_t) {
 }
 void plan_cache_clear(); // the plan cache (XLLAMA_D3D12_PLANCACHE), below
 
+void presubmit_stop(Gpu& g); // the presubmission helper (XLLAMA_D3D12_PRESUBMIT), below
+
 void backend_free(ggml_backend_t b) {
     Gpu& g = gpu();
+    presubmit_stop(g);
     {
         std::lock_guard<std::mutex> lock(g.mu);
+        g.req = false;
         drain_pending(g);
         char msg[384];
         std::snprintf(msg, sizeof(msg),
@@ -1911,6 +1985,35 @@ void backend_free(ggml_backend_t b) {
                           static_cast<unsigned long long>(g.n_pc_fast_bad));
             log_output(msg);
         }
+        if (g.presub) {
+            const std::uint64_t* q = g.ps_gap;
+            char pm[640];
+            std::snprintf(pm, sizeof(pm),
+                          "[xllama] d3d12 presubmit: %llu requested, %llu parked (%.1f ms "
+                          "Execute, %llu recorded in %.1f ms), %llu hits (%.1f ms signalling, "
+                          "%.1f ms waiting), %llu cancelled, %llu late, %llu without a list; "
+                          "CPU split us <20 %llu <40 %llu <80 %llu <160 %llu <320 %llu <640 "
+                          "%llu <1280 %llu more %llu\n",
+                          static_cast<unsigned long long>(g.n_ps_req),
+                          static_cast<unsigned long long>(g.n_ps_arm), g.ps_exec_ms,
+                          static_cast<unsigned long long>(g.n_ps_rec), g.ps_rec_ms,
+                          static_cast<unsigned long long>(g.n_ps_hit), g.ps_sig_ms, g.ps_wait_ms,
+                          static_cast<unsigned long long>(g.n_ps_cancel),
+                          static_cast<unsigned long long>(g.n_ps_late),
+                          static_cast<unsigned long long>(g.n_ps_nolist),
+                          static_cast<unsigned long long>(q[0]), static_cast<unsigned long long>(q[1]),
+                          static_cast<unsigned long long>(q[2]), static_cast<unsigned long long>(q[3]),
+                          static_cast<unsigned long long>(q[4]), static_cast<unsigned long long>(q[5]),
+                          static_cast<unsigned long long>(q[6]), static_cast<unsigned long long>(q[7]));
+            log_output(pm);
+        }
+        g.presub = 0;
+        g.prev_key = 0;
+        g.t_req_set = false;
+        g.n_ps_req = g.n_ps_arm = g.n_ps_hit = g.n_ps_cancel = g.n_ps_late = 0;
+        g.n_ps_nolist = g.n_ps_rec = 0;
+        g.ps_exec_ms = g.ps_rec_ms = g.ps_sig_ms = g.ps_wait_ms = 0.0;
+        std::fill(std::begin(g.ps_gap), std::end(g.ps_gap), std::uint64_t{0});
         g.n_pc_hit = g.n_pc_miss = g.n_pc_guard = g.n_pc_store = g.n_pc_skip = 0;
         g.n_pc_same = g.n_pc_diff = g.n_pc_fast = g.n_pc_fast_bad = 0;
         g.pc_ms = 0.0;
@@ -2315,6 +2418,12 @@ struct KeptList {
     ComPtr<ID3D12GraphicsCommandList> cl;
     std::vector<Op> ops;
     std::uint64_t n = 0;
+    std::uint64_t n_bar = 0; // its barriers
+    // The same ops under SetPredication on Gpu::pred, for XLLAMA_D3D12_PRESUBMIT;
+    // recorded by the helper the first time it parks this list.
+    ComPtr<ID3D12CommandAllocator> galloc;
+    ComPtr<ID3D12GraphicsCommandList> gcl;
+    bool gfail = false;
 };
 struct ListCache {
     std::unordered_map<std::uint64_t, KeptList> kept; // by ops_hash
@@ -2389,6 +2498,8 @@ bool submit_ops(Gpu& g, const std::vector<Op>& ops, bool async = false,
             done = true;
             if (ran) {
                 k.ops = ops;
+                k.n_bar = static_cast<std::uint64_t>(
+                    std::count_if(ops.begin(), ops.end(), [](const Op& op) { return !op.pso; }));
                 KeptList& kept = lc.kept.emplace(h, std::move(k)).first->second;
                 if (hint)
                     *hint = {&kept, lc.gen};
@@ -2467,6 +2578,7 @@ struct SplitPlan {
     std::uint64_t n_gdn = 0;
     Gpu::SegStat* seg = nullptr;
     ListHint hint;
+    std::uint64_t next_key = 0; // the call that followed this one last time (PRESUBMIT)
 };
 constexpr std::size_t kMaxPlans = 1024;
 std::unordered_map<std::uint64_t, SplitPlan>& plan_cache() { // guarded by gpu().mu
@@ -2475,6 +2587,234 @@ std::unordered_map<std::uint64_t, SplitPlan>& plan_cache() { // guarded by gpu()
 }
 void plan_cache_clear() {
     plan_cache().clear();
+}
+
+// --- Presubmission (XLLAMA_D3D12_PRESUBMIT, see Gpu::presub) ---
+
+// The kept list's ops again, between SetPredication on the predicate and its
+// reset. Caller holds g.mu.
+bool record_gated(Gpu& g, KeptList& k) {
+    HRESULT hr = g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                  IID_PPV_ARGS(&k.galloc));
+    if (SUCCEEDED(hr))
+        hr = g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, k.galloc.Get(), nullptr,
+                                         IID_PPV_ARGS(&k.gcl));
+    if (SUCCEEDED(hr)) {
+        k.gcl->SetPredication(g.pred.Get(), 0, D3D12_PREDICATION_OP_NOT_EQUAL_ZERO);
+        record_ops(g, k.gcl.Get(), k.ops, false, false);
+        k.gcl->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+        hr = k.gcl->Close();
+    }
+    if (FAILED(hr)) {
+        k.gcl.Reset();
+        k.galloc.Reset();
+        k.gfail = true;
+        return false;
+    }
+    return true;
+}
+
+// The helper's half: park the requested plan's list behind the gate. Nothing
+// may be running (a parked list is the only submission in flight). Caller
+// holds g.mu.
+void presubmit_arm(Gpu& g) {
+    if (!g.req)
+        return;
+    g.req = false;
+    if (g.armed.load(std::memory_order_relaxed) || g.pending.load(std::memory_order_relaxed))
+        return;
+    auto& pcache = plan_cache();
+    const auto it = pcache.find(g.req_key);
+    if (it == pcache.end())
+        return;
+    SplitPlan& p = it->second;
+    ListCache& lc = list_cache();
+    KeptList* kl = p.hint.k && p.hint.gen == lc.gen ? p.hint.k : nullptr;
+    if (!kl || kl->gfail || p.ops.empty()) {
+        ++g.n_ps_nolist;
+        return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!kl->gcl) {
+        if (!record_gated(g, *kl))
+            return;
+        ++g.n_ps_rec;
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    g.ps_rec_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    const UINT64 gv = ++g.gate_v;
+    if (FAILED(g.queue->Wait(g.gate.Get(), gv)))
+        return;
+    ID3D12CommandList* lists[] = {kl->gcl.Get()};
+    g.queue->ExecuteCommandLists(1, lists);
+    g.armed_gate_v = gv;
+    UINT64 fv = 0;
+    if (!g.fence.signal(g.queue.Get(), &fv)) {
+        gate_open(g, false); // nothing to wait on: let it through skipped and drain the queue
+        g.fence.signal_and_wait(g.queue.Get(), /*spin=*/false);
+        return;
+    }
+    g.armed_key = g.req_key;
+    g.armed_kl = kl;
+    g.armed_lgen = lc.gen;
+    g.armed_fence_v = fv;
+    g.armed.store(true, std::memory_order_relaxed);
+    ++g.n_ps_arm;
+    g.ps_exec_ms +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+}
+
+// A plan-cache call coming in: drop a request the helper did not take in
+// time, teach the previous plan its successor, and time the CPU split.
+// Caller holds g.mu.
+void presubmit_enter(Gpu& g, std::uint64_t key, std::chrono::steady_clock::time_point t_in) {
+    if (g.req) {
+        g.req = false;
+        ++g.n_ps_late;
+    }
+    if (g.prev_key) {
+        auto& pcache = plan_cache();
+        const auto pit = pcache.find(g.prev_key);
+        if (pit != pcache.end())
+            pit->second.next_key = key;
+    }
+    g.prev_key = key;
+    if (g.t_req_set) {
+        const double us = std::chrono::duration<double, std::micro>(t_in - g.t_req).count();
+        int b = 0;
+        for (double lim = 20.0; b < 7 && us >= lim; lim *= 2.0)
+            ++b;
+        ++g.ps_gap[b];
+        g.t_req_set = false;
+    }
+}
+
+// Whether the parked list is this call's: the plan the request named, its
+// kept list unchanged. The caller checked plan_current. Caller holds g.mu.
+bool presubmit_matches(Gpu& g, std::uint64_t key, const SplitPlan& p) {
+    return g.armed.load(std::memory_order_relaxed) && g.armed_key == key &&
+           p.hint.k == g.armed_kl && p.hint.gen == g.armed_lgen &&
+           g.armed_lgen == list_cache().gen;
+}
+
+// A call that ran from plan p: ask the helper to park the plan that followed
+// p last time. Caller holds g.mu.
+void presubmit_request(Gpu& g, const SplitPlan& p) {
+    if (!p.next_key)
+        return;
+    g.req_key = p.next_key;
+    g.req = true;
+    ++g.n_ps_req;
+    g.req_seq.fetch_add(1, std::memory_order_seq_cst);
+    if (g.presub == 1 || g.presub_sleeping.load(std::memory_order_seq_cst))
+        SetEvent(g.presub_ev);
+    g.t_req = std::chrono::steady_clock::now();
+    g.t_req_set = true;
+}
+
+// The parked list is this call's: open its gate and wait for it, instead of
+// submit_ops. The host actions were written already. Caller holds g.mu.
+bool run_gated(Gpu& g) {
+    KeptList* kl = g.armed_kl;
+    const UINT64 fv = g.armed_fence_v;
+    const auto t0 = std::chrono::steady_clock::now();
+    gate_open(g, true);
+    const auto t1 = std::chrono::steady_clock::now();
+    const bool ok = g.fence.wait(fv, /*spin=*/true);
+    const auto t2 = std::chrono::steady_clock::now();
+    const double sig = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    const double wt = std::chrono::duration<double, std::milli>(t2 - t1).count();
+    g.rec_ms += sig;
+    g.wait_ms += wt;
+    g.ps_sig_ms += sig;
+    g.ps_wait_ms += wt;
+    if (!ok)
+        return false;
+    ++g.n_replays;
+    ++g.n_ps_hit;
+    g.n_barriers += kl->n_bar;
+    g.n_dispatches += kl->n;
+    ++g.n_submits;
+    return true;
+}
+
+void presubmit_loop(Gpu* gp) {
+    Gpu& g = *gp;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    std::uint64_t seen = g.req_seq.load(std::memory_order_seq_cst);
+    while (!g.presub_stop.load(std::memory_order_seq_cst)) {
+        if (g.presub == 2) {
+            // Spin ~2 ms for the next request, then sleep until one comes.
+            const auto t0 = std::chrono::steady_clock::now();
+            bool got = false;
+            for (unsigned i = 1;; ++i) {
+                if (g.req_seq.load(std::memory_order_seq_cst) != seen ||
+                    g.presub_stop.load(std::memory_order_relaxed)) {
+                    got = true;
+                    break;
+                }
+                YieldProcessor();
+                if ((i & 255) == 0 &&
+                    std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(2))
+                    break;
+            }
+            if (!got) {
+                g.presub_sleeping.store(true, std::memory_order_seq_cst);
+                if (g.req_seq.load(std::memory_order_seq_cst) == seen &&
+                    !g.presub_stop.load(std::memory_order_seq_cst))
+                    WaitForSingleObject(g.presub_ev, 50);
+                g.presub_sleeping.store(false, std::memory_order_seq_cst);
+            }
+        } else {
+            WaitForSingleObject(g.presub_ev, 50);
+        }
+        if (g.presub_stop.load(std::memory_order_seq_cst))
+            break;
+        seen = g.req_seq.load(std::memory_order_seq_cst);
+        std::lock_guard<std::mutex> lock(g.mu);
+        presubmit_arm(g);
+    }
+}
+
+// The gate, the predicate and the helper. Caller holds g.mu.
+bool presubmit_start(Gpu& g, std::string* err) {
+    if (!g.gate && FAILED(g.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g.gate)))) {
+        *err = "CreateFence failed";
+        return false;
+    }
+    if (!g.pred) {
+        g.pred = d3d12c::create_buffer(g.device.Get(), 256, D3D12_HEAP_TYPE_UPLOAD,
+                                       D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                       "D3D12_Pred", err);
+        void* p = nullptr;
+        const D3D12_RANGE none = {0, 0};
+        if (!g.pred || FAILED(g.pred->Map(0, &none, &p))) {
+            g.pred.Reset();
+            if (err->empty())
+                *err = "predicate Map failed";
+            return false;
+        }
+        g.pred_ptr = static_cast<volatile std::uint64_t*>(p);
+        *g.pred_ptr = 1;
+    }
+    if (!g.presub_ev && !(g.presub_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr))) {
+        *err = "CreateEvent failed";
+        return false;
+    }
+    if (!g.presub_thread.joinable()) {
+        g.presub_stop.store(false, std::memory_order_seq_cst);
+        g.presub_thread = std::thread(presubmit_loop, &g);
+    }
+    return true;
+}
+
+// Stops the helper. Called without g.mu (the helper takes it).
+void presubmit_stop(Gpu& g) {
+    if (!g.presub_thread.joinable())
+        return;
+    g.presub_stop.store(true, std::memory_order_seq_cst);
+    SetEvent(g.presub_ev);
+    g.presub_thread.join();
 }
 // The tensors whose graph use counts the fusion checks of this graph_compute
 // call consulted.
@@ -2589,8 +2929,12 @@ ggml_status run_plan(Gpu& g, SplitPlan& p, std::chrono::steady_clock::time_point
     const auto tf = std::chrono::steady_clock::now();
     g.pc_ms += std::chrono::duration<double, std::milli>(tf - t0).count();
     const double rw = g.rec_ms + g.wait_ms;
-    if (!p.ops.empty() && !submit_ops(g, p.ops, false, &p.hint))
+    if (g.armed.load(std::memory_order_relaxed)) { // presubmit_matches: its list is parked
+        if (!run_gated(g))
+            return GGML_STATUS_FAILED;
+    } else if (!p.ops.empty() && !submit_ops(g, p.ops, false, &p.hint)) {
         return GGML_STATUS_FAILED;
+    }
     const auto t_end = std::chrono::steady_clock::now();
     g.sub_ms += std::chrono::duration<double, std::milli>(t_end - tf).count() -
                 (g.rec_ms + g.wait_ms - rw);
@@ -2681,13 +3025,23 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
         std::lock_guard<std::mutex> lock(g.mu);
         auto& pcache = plan_cache();
         const auto it = pcache.find(pc_key);
-        if (it != pcache.end() && plan_current(g, cgraph, it->second)) {
-            drain_pending(g);
+        const bool cur = it != pcache.end() && plan_current(g, cgraph, it->second);
+        if (g.presub)
+            presubmit_enter(g, pc_key, t_in);
+        if (g.armed.load(std::memory_order_relaxed) &&
+            !(cur && presubmit_matches(g, pc_key, it->second)))
+            gate_cancel(g);
+        if (cur) {
+            if (!g.armed.load(std::memory_order_relaxed))
+                drain_pending(g); // a parked list is the only submission in flight
             const auto t0 = std::chrono::steady_clock::now();
             g.pre_ms += std::chrono::duration<double, std::milli>(t0 - t_in).count();
             g.last_gpu_ms = 0.0;
             ++g.n_pc_fast;
-            return run_plan(g, it->second, t0);
+            const ggml_status st = run_plan(g, it->second, t0);
+            if (st == GGML_STATUS_SUCCESS && g.presub)
+                presubmit_request(g, it->second);
+            return st;
         }
     }
     for (int i = 0; i < ggml_graph_n_nodes(cgraph); ++i) {
@@ -3785,6 +4139,28 @@ ggml_backend_t dev_init_backend(ggml_backend_dev_t dev, const char*) {
         g.host_prof = hp && *hp && *hp != '0';
         if (g.host_prof)
             log_output("[xllama] d3d12: host time per op (XLLAMA_D3D12_HOSTPROF)\n");
+        const char* psv = std::getenv("XLLAMA_D3D12_PRESUBMIT");
+        int ps = psv && *psv ? std::atoi(psv) : 0;
+        if (ps < 0 || ps > 2)
+            ps = 0;
+        if (ps && (g.plan_mode != 1 || g.ts_on || g.prof_on || g.host_prof || g.shexp_async)) {
+            log_output("[xllama] d3d12: XLLAMA_D3D12_PRESUBMIT needs PLANCACHE=1 without "
+                       "timestamps, profile, HOSTPROF or SHEXP_ASYNC; off\n");
+            ps = 0;
+        }
+        std::string pserr;
+        g.presub = ps; // before the helper starts: it reads its mode
+        if (ps && !presubmit_start(g, &pserr)) {
+            log_output("[xllama] d3d12: presubmission unavailable: " + pserr + "\n");
+            g.presub = ps = 0;
+        }
+        g.prev_key = 0;
+        g.req = false;
+        if (ps)
+            log_output(ps == 1 ? "[xllama] d3d12: next split's list parked behind a gate while "
+                                 "the CPU works (XLLAMA_D3D12_PRESUBMIT=1, helper sleeps)\n"
+                               : "[xllama] d3d12: next split's list parked behind a gate while "
+                                 "the CPU works (XLLAMA_D3D12_PRESUBMIT=2, helper spins)\n");
         g.iq3s_geom.rsl = d3d12_geom_parse(std::getenv("XLLAMA_D3D12_IQ3S_RSL"), 1);
         g.iq3s_geom.rt = d3d12_geom_parse(std::getenv("XLLAMA_D3D12_IQ3S_RT"), 1);
         if (g.iq3s_geom.rsl != 1 || g.iq3s_geom.rt != 1)
@@ -5215,6 +5591,185 @@ D3d12SelftestRow run_submit_rtt() {
     return row;
 }
 
+// XLLAMA_D3D12_PRESUBMIT's contract on this GPU: a list executed behind
+// queue->Wait on a fence the CPU signals later, its commands under
+// SetPredication on an upload-heap word, sees what the CPU wrote after
+// ExecuteCommandLists and before the signal when the word is 0, and skips its
+// dispatch and its copy when the word is 1. The list: KERNEL 1 scale by 1 on a
+// 64 KiB write-back UAV (like D3D12_Host and the q8 scratch), then a 64 KiB
+// copy out of an upload buffer. 48 rounds, every third skipped; gpu_ms = the
+// median CPU signal -> completion seen, error = what was wrong.
+D3d12SelftestRow run_gate_case() {
+    D3d12SelftestRow row;
+    row.type = "gate_presubmit";
+    Gpu& g = gpu();
+    constexpr UINT64 kData = 64u << 10;
+    constexpr std::size_t kWords = kData / 4;
+    constexpr int kRounds = 48;
+    std::string err;
+    ComPtr<ID3D12Fence> fa, fb;
+    if (FAILED(g.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fa))) ||
+        FAILED(g.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fb)))) {
+        row.error = "CreateFence failed";
+        return row;
+    }
+    auto up = d3d12c::create_buffer(g.device.Get(), kData, D3D12_HEAP_TYPE_UPLOAD,
+                                    D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                    "gate_up", &err);
+    auto pr = d3d12c::create_buffer(g.device.Get(), 256, D3D12_HEAP_TYPE_UPLOAD,
+                                    D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                    "gate_pred", &err);
+    auto wb = d3d12c::create_buffer_props(g.device.Get(), kData, custom_l0_props(),
+                                          D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST,
+                                          "gate_wb", &err);
+    auto ua = d3d12c::create_buffer_props(
+        g.device.Get(), 2 * kData, custom_l0_props(), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "gate_ua", &err);
+    if (!up || !pr || !wb || !ua) {
+        row.error = "buffers: " + err;
+        return row;
+    }
+    void* p_up = nullptr;
+    void* p_pr = nullptr;
+    void* p_wb = nullptr;
+    void* p_ua = nullptr;
+    const D3D12_RANGE none = {0, 0};
+    if (FAILED(up->Map(0, &none, &p_up)) || FAILED(pr->Map(0, &none, &p_pr)) ||
+        FAILED(wb->Map(0, nullptr, &p_wb)) || FAILED(ua->Map(0, nullptr, &p_ua))) {
+        row.error = "Map failed";
+        return row;
+    }
+    auto* up_w = static_cast<std::uint32_t*>(p_up);
+    auto* pred = static_cast<volatile std::uint64_t*>(p_pr);
+    auto* wb_w = static_cast<volatile std::uint32_t*>(p_wb);
+    auto* ua_w = static_cast<volatile std::uint32_t*>(p_ua);
+    const bool uav_ok = g.ssm_ok && g.pso_ssm[kSsmUnary];
+    ComPtr<ID3D12CommandAllocator> al;
+    ComPtr<ID3D12GraphicsCommandList> cl;
+    if (FAILED(g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&al))) ||
+        FAILED(g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, al.Get(), nullptr,
+                                           IID_PPV_ARGS(&cl)))) {
+        row.error = "command list creation failed";
+        return row;
+    }
+    cl->SetPredication(pr.Get(), 0, D3D12_PREDICATION_OP_NOT_EQUAL_ZERO);
+    if (uav_ok) {
+        D3d12SsmUnaryParams prm;
+        prm.ne0 = static_cast<std::uint32_t>(kWords);
+        prm.op = kD3d12SsmScale;
+        prm.scale_bits = 0x3F800000u; // 1.0f
+        Op op;
+        op.pso = g.pso_ssm[kSsmUnary].Get();
+        std::memcpy(op.c, &prm, sizeof(prm));
+        op.u[0] = ua->GetGPUVirtualAddress() + kData;
+        op.u[1] = ua->GetGPUVirtualAddress();
+        op.gx = static_cast<UINT>((kWords + kD3d12SsmThreads - 1) / kD3d12SsmThreads);
+        op.gy = 1;
+        const std::vector<Op> one = {op};
+        record_ops(g, cl.Get(), one, false, false);
+    }
+    cl->CopyBufferRegion(wb.Get(), 0, up.Get(), 0, kData);
+    cl->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+    if (FAILED(cl->Close())) {
+        row.error = "Close failed";
+        return row;
+    }
+    auto uav_word = [](std::uint32_t s, std::size_t w) {
+        return 0x3F800000u | ((s ^ (0x85EBCA6Bu * static_cast<std::uint32_t>(w + 1))) & 0x007FFFFFu);
+    };
+    auto spin_until = [](auto&& done, double us) {
+        const auto t0 = std::chrono::steady_clock::now();
+        for (unsigned i = 1;; ++i) {
+            if (done())
+                return true;
+            YieldProcessor();
+            if ((i & 63) == 0 &&
+                std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0)
+                        .count() > us)
+                return false;
+        }
+    };
+    std::vector<double> ms;
+    int run_bad = 0, skip_bad = 0, runs = 0, skips = 0;
+    bool hung = false;
+    UINT64 va = 0, vb = 0;
+    {
+        std::lock_guard<std::mutex> lock(g.mu);
+        drain_pending(g);
+        for (int i = 0; i < kRounds && !hung; ++i) {
+            const bool skip = i % 3 == 2;
+            const std::uint32_t seed = 0x9E3779B9u * static_cast<std::uint32_t>(i + 1);
+            for (std::size_t w = 0; w < kWords; ++w) {
+                ua_w[w] = 0;
+                ua_w[kWords + w] = 0;
+                wb_w[w] = 0;
+                up_w[w] = 0;
+            }
+            *pred = 1;
+            _mm_sfence();
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            g.queue->Wait(fb.Get(), ++vb);
+            ID3D12CommandList* lists[] = {cl.Get()};
+            g.queue->ExecuteCommandLists(1, lists);
+            g.queue->Signal(fa.Get(), ++va);
+            spin_until([] { return false; }, 40.0); // the queue reaches the wait
+            // The inputs are written only now, after the list was submitted.
+            for (std::size_t w = 0; w < kWords; ++w) {
+                ua_w[w] = uav_word(seed, w);
+                up_w[w] = seed ^ static_cast<std::uint32_t>(w);
+            }
+            *pred = skip ? 1 : 0;
+            _mm_sfence();
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            const auto t0 = std::chrono::steady_clock::now();
+            fb->Signal(vb);
+            if (!spin_until([&] { return fa->GetCompletedValue() >= va; }, 2e6)) {
+                hung = true;
+                break;
+            }
+            ms.push_back(
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                    .count());
+            std::atomic_thread_fence(std::memory_order_acquire);
+            bool bad = false;
+            for (std::size_t w = 0; w < kWords && !bad; ++w) {
+                const std::uint32_t want_u = skip || !uav_ok ? 0u : uav_word(seed, w);
+                const std::uint32_t want_c = skip ? 0u : (seed ^ static_cast<std::uint32_t>(w));
+                bad = ua_w[kWords + w] != want_u || wb_w[w] != want_c;
+            }
+            if (skip) {
+                ++skips;
+                skip_bad += bad;
+            } else {
+                ++runs;
+                run_bad += bad;
+            }
+        }
+        if (vb && fb->GetCompletedValue() < vb)
+            fb->Signal(vb); // never leave the queue parked behind the gate
+        if (hung)
+            spin_until([&] { return fa->GetCompletedValue() >= va; }, 2e6);
+    }
+    up->Unmap(0, nullptr);
+    pr->Unmap(0, nullptr);
+    wb->Unmap(0, nullptr);
+    ua->Unmap(0, nullptr);
+    row.n = runs + skips;
+    row.d3d12_ran = !ms.empty();
+    if (!ms.empty()) {
+        std::sort(ms.begin(), ms.end());
+        row.gpu_ms = ms[ms.size() / 2];
+    }
+    char b[200];
+    std::snprintf(b, sizeof(b), "%s; run rounds wrong %d/%d; skipped rounds wrong %d/%d%s",
+                  uav_ok ? "dispatch + copy" : "copy only (no SSM kernels)", run_bad, runs, skip_bad,
+                  skips, hung ? "; a round did not complete within 2 s" : "");
+    row.ok = !hung && run_bad == 0 && skip_bad == 0 && runs > 0 && skips > 0;
+    if (!row.ok)
+        row.error = b;
+    return row;
+}
+
 // XLLAMA_D3D12_LATPROBE=1 (selftest only): where the time a submission costs
 // beyond its GPU work goes, on prerecorded lists executed again (like a kept
 // list replayed). GPU timestamps go onto the QPC clock through
@@ -5634,6 +6189,7 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
         for (int kind = 0; kind < 8; ++kind)
             out->push_back(run_ssm_case(backend, kind));
     out->push_back(run_submit_rtt());
+    out->push_back(run_gate_case());
     if (const char* lp = std::getenv("XLLAMA_D3D12_LATPROBE"); lp && std::atoi(lp) > 0)
         run_latency_probe(out);
     ggml_backend_free(backend);
