@@ -325,7 +325,13 @@ class GgufCpuThreadpools {
     // XLLAMA_CPU_POLL (0..100, ggml's default 50): how long the workers spin
     // before sleeping between graphs; XLLAMA_CPU_PRIO (-1..3, GGML_SCHED_PRIO_*).
     // Both from the catalogue "env".
+    // With XLLAMA_D3D12_GPUROUTE=1 a miss's routing runs on the CPU inside a
+    // d3d12 split, while workers that spin after a CPU split hold the app's
+    // six cores: 107 ms per miss at poll 50, 1.5 ms at poll 0 (console, 11/11).
+    // There the poll defaults to 0.
     static void tune(ggml_threadpool_params& p) {
+        if (const char* r = std::getenv("XLLAMA_D3D12_GPUROUTE"); r && *r && *r != '0')
+            p.poll = 0;
         if (const char* s = std::getenv("XLLAMA_CPU_POLL"); s && *s)
             p.poll = static_cast<uint32_t>(std::clamp(std::atoi(s), 0, 100));
         if (const char* s = std::getenv("XLLAMA_CPU_PRIO"); s && *s)

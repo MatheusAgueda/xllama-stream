@@ -939,7 +939,7 @@ struct Gpu {
     // GPU routing's host side: the first kRouteTimed misses run node by node,
     // timed by op and name (layer suffix dropped), and the prefetch settle.
     std::map<std::string, SegStat> route_nodes;
-    std::uint64_t n_route_timed = 0;
+    std::uint64_t n_route_timed = 0, n_route_probs_checked = 0;
     double route_prep_ms = 0.0;
     // The segs entry of a graph by its first and last node and node count, so
     // a reused graph finds its entry without building the name again.
@@ -2027,7 +2027,7 @@ void backend_free(ggml_backend_t b) {
                           "[xllama] d3d12 gpu route: %llu layers, %llu hit, %llu missed (%llu bad), "
                           "%llu on the host, %llu resubmits, %llu swaps; %.1f ms host routing, "
                           "%.1f ms replay; mismatches ids %llu slots %llu w %llu sig %llu probs "
-                          "%llu\n",
+                          "%llu of %llu checked\n",
                           static_cast<unsigned long long>(g.n_route),
                           static_cast<unsigned long long>(g.n_route_hit),
                           static_cast<unsigned long long>(g.n_route_miss),
@@ -2039,11 +2039,12 @@ void backend_free(ggml_backend_t b) {
                           static_cast<unsigned long long>(g.n_route_mis_slots),
                           static_cast<unsigned long long>(g.n_route_mis_w),
                           static_cast<unsigned long long>(g.n_route_mis_sig),
-                          static_cast<unsigned long long>(g.n_route_mis_probs));
+                          static_cast<unsigned long long>(g.n_route_mis_probs),
+                          static_cast<unsigned long long>(g.n_route_probs_checked));
             log_output(rmsg);
             std::snprintf(rmsg, sizeof(rmsg),
                           "[xllama] d3d12 gpu route: %.1f ms settling prefetch rounds; the first "
-                          "%llu host routings node by node:\n",
+                          "%llu host graphs node by node:\n",
                           g.route_prep_ms, static_cast<unsigned long long>(g.n_route_timed));
             log_output(rmsg);
             std::vector<std::pair<std::string, Gpu::SegStat>> rn(g.route_nodes.begin(),
@@ -2057,7 +2058,7 @@ void backend_free(ggml_backend_t b) {
             }
         }
         g.route_nodes.clear();
-        g.n_route_timed = 0;
+        g.n_route_timed = g.n_route_probs_checked = 0;
         g.route_prep_ms = 0.0;
         g.n_route = g.n_route_hit = g.n_route_miss = g.n_route_bad = g.n_route_host = 0;
         g.n_route_resub = g.n_route_swaps = 0;
@@ -3180,11 +3181,19 @@ bool host_route(Gpu& g, RouteGrp& r) {
     std::uint32_t lg[kRouteMaxExpert];
     const std::size_t nbe = static_cast<std::size_t>(r.n_expert) * 4;
     std::memcpy(lg, r.logits->data, nbe);
-    if (!host_compute(g, r.host.data(), r.host.size()))
+    // The first misses check the probs right after the softmax: later nodes
+    // of the group may take its memory once their reads of it are done.
+    if (g.n_route_probs_checked < 64 && (state == 1 || state == 2)) {
+        ++g.n_route_probs_checked;
+        if (!host_compute(g, r.host.data(), 1))
+            return false;
+        if (std::memcmp(r.S->data, rec + kRecProbs, nbe) != 0 && g.n_route_mis_probs++ < 3)
+            route_probs_log(r, rec, lg, state);
+        if (!host_compute(g, r.host.data() + 1, r.host.size() - 1))
+            return false;
+    } else if (!host_compute(g, r.host.data(), r.host.size())) {
         return false;
-    if ((state == 1 || state == 2) && std::memcmp(r.S->data, rec + kRecProbs, nbe) != 0 &&
-        g.n_route_mis_probs++ < 3)
-        route_probs_log(r, rec, lg, state);
+    }
     if (r.plain && state == 2 &&
         std::memcmp(r.C1->data, rec + kRecIds, static_cast<std::size_t>(r.n_used) * 4) != 0 &&
         g.n_route_mis_ids++ < 3)
