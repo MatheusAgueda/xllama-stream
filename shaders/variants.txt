@@ -11,3 +11,9 @@ coop ggml_d3d12_mmid_iq3_s_t64 shaders/ggml_d3d12_mmid_iq3_s.hlsl -D NUM_THREADS
 coop ggml_d3d12_mmid_iq3_s_t128 shaders/ggml_d3d12_mmid_iq3_s.hlsl -D NUM_THREADS=128 -D IQ3S_COOP=1
 gdn8 ggml_d3d12_ssm_gdn shaders/ggml_d3d12_ssm.hlsl -D KERNEL=5 -D GDN_LANES=8
 gdn16 ggml_d3d12_ssm_gdn shaders/ggml_d3d12_ssm.hlsl -D KERNEL=5 -D GDN_LANES=16
+roof ggml_d3d12_mmv_q6_k_t64 shaders/ggml_d3d12_roofline.hlsl -D NUM_THREADS=64
+roof ggml_d3d12_mmv_q6_k_t128 shaders/ggml_d3d12_roofline.hlsl -D NUM_THREADS=128
+roof ggml_d3d12_mmv_q4_k_t64 shaders/ggml_d3d12_roofline.hlsl -D NUM_THREADS=64
+roof ggml_d3d12_mmv_q4_k_t128 shaders/ggml_d3d12_roofline.hlsl -D NUM_THREADS=128
+roof ggml_d3d12_mmv_iq3_s_t64 shaders/ggml_d3d12_roofline.hlsl -D NUM_THREADS=64
+roof ggml_d3d12_mmv_iq3_s_t128 shaders/ggml_d3d12_roofline.hlsl -D NUM_THREADS=128
