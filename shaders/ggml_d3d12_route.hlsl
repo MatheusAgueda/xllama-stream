@@ -23,8 +23,8 @@
 // multiply-adds; nothing depends on the GPU's fp32 rounding or denormal mode.
 // Floats travel as their bits. Needs double and int64 shader ops (the host
 // checks both) and dxc -Gis.
-// Root signature: 8 constants at b0, root UAVs u0 (record / dst) and u1 to u4,
-// D3D12_Host raw buffers.
+// Root signature: 11 of the 13 constants at b0, root UAVs u0 (record / dst)
+// and u1 to u5, D3D12_Host raw buffers.
 
 #ifndef KERNEL
 #define KERNEL 1
@@ -39,6 +39,9 @@ cbuffer Params : register(b0) {
     uint c5;
     uint c6;
     uint c7;
+    uint c8;
+    uint c9;
+    uint c10;
 };
 
 #if KERNEL == 3
@@ -287,8 +290,13 @@ groupshared uint gs_v;
 // zeroes it; written only when an expert is missing). Grid (1, 1, 1).
 // bit 3 alone is the selftest's sigmoid over c0 values (u3 in, u4 out, a
 // group per 256).
+// bit 4 fuses the emit (XLLAMA_D3D12_GPUROUTE_FUSE): on a hit the kernel
+// also writes the weights at u5 + c9 and the slots, clamped into [0, c8 =
+// n_slots), at u5 + c10, which the emit kernel would have copied from the
+// record after the gate; on a miss neither is touched (the host writes them).
 RWByteAddressBuffer U3 : register(u3);
 RWByteAddressBuffer U4 : register(u4);
+RWByteAddressBuffer U5 : register(u5);
 
 [numthreads(256, 1, 1)]
 void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
@@ -425,6 +433,7 @@ void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
         den = dd < asdouble(0u, 0x7FF00000u) ? den : 0x7F800000u; // MIN(x, INFINITY)
         den = f2d(den) > f2d(c4) ? den : c4;      // MAX(., 6.103515625e-5)
     }
+    const bool fuse = hit && (c7 & 16u) != 0u;
     for (uint k = 0u; k < n_used; ++k) {
         uint w = wv[k];
         if ((c7 & 1u) != 0u)
@@ -432,6 +441,10 @@ void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
         if ((c7 & 2u) != 0u)
             w = mul32(w, c5);
         D.Store(REC_W + 4u * k, w);
+        if (fuse) {
+            U5.Store(c9 + 4u * k, w);
+            U5.Store(c10 + 4u * k, (uint)clamp(gs_res[gs_order[k]], 0, (int)c8 - 1));
+        }
     }
     D.Store(REC_SWAPS, swaps);
     const uint state = gs_bad != 0u ? 3u : hit ? 1u : 2u;

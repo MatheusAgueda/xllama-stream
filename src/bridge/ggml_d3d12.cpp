@@ -821,6 +821,12 @@ struct Gpu {
     // miss skips the rest of its submission, fewer layers each = shorter tails
     // for more submissions.
     std::size_t route_max = 128;
+    // XLLAMA_D3D12_GPUROUTE_FUSE=1: a hit's route kernel writes the weights
+    // and slot ids itself (c7 bit 4), so the layer has no emit dispatch and no
+    // barrier after it; a layer whose weights and slots are in two buffers
+    // keeps the emit. Needs a route DXIL of this build (a SHADER_DIR override
+    // without bit 4 would leave both tensors unwritten).
+    bool route_fuse = false;
     // A layer's record (shaders/ggml_d3d12_route.hlsl) per kRouteRec bytes and
     // the predicate, D3D12_Host buffers.
     ComPtr<ID3D12Resource> route_res;
@@ -831,7 +837,7 @@ struct Gpu {
     D3D12_GPU_VIRTUAL_ADDRESS pred_va = 0;
     std::uint64_t n_route = 0, n_route_hit = 0, n_route_miss = 0, n_route_bad = 0;
     std::uint64_t n_route_mis_ids = 0, n_route_mis_w = 0, n_route_mis_sig = 0;
-    std::uint64_t n_route_resub = 0, n_route_host = 0, n_route_swaps = 0;
+    std::uint64_t n_route_resub = 0, n_route_host = 0, n_route_swaps = 0, n_route_fused = 0;
     std::uint64_t n_route_mis_slots = 0, n_route_mis_probs = 0;
     double route_cpu_ms = 0.0, route_replay_ms = 0.0;
     // The linear-attention layers' ops (gated delta net, conv, the recurrent
@@ -2071,9 +2077,10 @@ void backend_free(ggml_backend_t b) {
                           static_cast<unsigned long long>(g.n_route_probs_checked));
             log_output(rmsg);
             std::snprintf(rmsg, sizeof(rmsg),
-                          "[xllama] d3d12 gpu route: %.1f ms settling prefetch rounds; the first "
-                          "%llu host graphs node by node:\n",
-                          g.route_prep_ms, static_cast<unsigned long long>(g.n_route_timed));
+                          "[xllama] d3d12 gpu route: %.1f ms settling prefetch rounds; %llu layers "
+                          "recorded with the emit fused; the first %llu host graphs node by node:\n",
+                          g.route_prep_ms, static_cast<unsigned long long>(g.n_route_fused),
+                          static_cast<unsigned long long>(g.n_route_timed));
             log_output(rmsg);
             std::vector<std::pair<std::string, Gpu::SegStat>> rn(g.route_nodes.begin(),
                                                                  g.route_nodes.end());
@@ -2089,7 +2096,7 @@ void backend_free(ggml_backend_t b) {
         g.n_route_timed = g.n_route_probs_checked = 0;
         g.route_prep_ms = 0.0;
         g.n_route = g.n_route_hit = g.n_route_miss = g.n_route_bad = g.n_route_host = 0;
-        g.n_route_resub = g.n_route_swaps = 0;
+        g.n_route_resub = g.n_route_swaps = g.n_route_fused = 0;
         g.n_route_mis_ids = g.n_route_mis_slots = g.n_route_mis_w = g.n_route_mis_sig = 0;
         g.n_route_mis_probs = 0;
         g.route_cpu_ms = g.route_replay_ms = 0.0;
@@ -2701,6 +2708,7 @@ struct RouteGrp {
     int n_expert = 0, n_used = 0, n_slots = 0;
     float clamp_min = 0.0f, scale = 1.0f;
     bool norm = false, scaled = false, plain = false;
+    bool fused = false; // the route kernel writes W and C3 (XLLAMA_D3D12_GPUROUTE_FUSE)
     std::uint32_t c[8] = {};
 };
 
@@ -4180,9 +4188,28 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
                         op.u[3] = tensor_va(r.sig_src);
                         op.u[4] = tensor_va(r.sig);
                     }
+                    // Fused emit: one root UAV over the buffer holding both
+                    // tensors, each at its offset from the lower of the two.
+                    r.fused = false;
+                    if (g.route_fuse && r.W->buffer == r.C3->buffer) {
+                        const D3D12_GPU_VIRTUAL_ADDRESS vw = tensor_va(r.W), vc = tensor_va(r.C3);
+                        const D3D12_GPU_VIRTUAL_ADDRESS b = std::min(vw, vc);
+                        if (vw - b <= 0xFFFFFFF0ull && vc - b <= 0xFFFFFFF0ull) {
+                            op.c[7] |= 16u;
+                            op.c[8] = static_cast<std::uint32_t>(r.n_slots);
+                            op.c[9] = static_cast<std::uint32_t>(vw - b);
+                            op.c[10] = static_cast<std::uint32_t>(vc - b);
+                            op.u[5] = b;
+                            r.fused = true;
+                            ++g.n_route_fused;
+                        }
+                    }
+                    if (!op.u[5])
+                        op.u[5] = op.u[0]; // declared by the kernel: never left to a stale binding
                     op.gx = op.gy = 1;
                     record(op, {rng_of(r.logits), rng_of(r.sig ? r.sig_src : r.logits)},
-                           {rec_rng, pred_rng, r.sig ? rng_of(r.sig) : rec_rng});
+                           {rec_rng, pred_rng, r.sig ? rng_of(r.sig) : rec_rng,
+                            r.fused ? rng_of(r.W) : rec_rng, r.fused ? rng_of(r.C3) : rec_rng});
                     Op gate;
                     gate.pred = 1; // its UAV barrier stands for the hazards so far
                     ops.push_back(gate);
@@ -4193,6 +4220,8 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
                     continue;
                 }
                 if (node == r.C3) {
+                    if (r.fused)
+                        continue; // the route kernel wrote both before its gate
                     // The emit kernel: the weights and the slot ids from the record.
                     std::uint8_t* rec = g.route_ptr + r.slot * kRouteRec;
                     const Rng rec_rng{reinterpret_cast<std::uintptr_t>(rec),
@@ -4986,6 +5015,8 @@ ggml_backend_t dev_init_backend(ggml_backend_dev_t dev, const char*) {
         g.route_sig = !(gsv && *gsv == '0');
         const char* gshv = std::getenv("XLLAMA_D3D12_GPUROUTE_SHARED");
         g.route_shared = !(gshv && *gshv == '0');
+        const char* gfv = std::getenv("XLLAMA_D3D12_GPUROUTE_FUSE");
+        g.route_fuse = gfv && *gfv && *gfv != '0';
         const char* giv = std::getenv("XLLAMA_D3D12_GPUROUTE_IO");
         g.route_io = std::clamp(giv && *giv ? std::atoi(giv) : 6, 1, 64);
         const char* gpv = std::getenv("XLLAMA_D3D12_GPUROUTE_POLL");
@@ -5011,7 +5042,7 @@ ggml_backend_t dev_init_backend(ggml_backend_dev_t dev, const char*) {
                                       ? std::string("llama's CPU threadpool")
                                       : std::to_string(g.route_io) + " CPU threads, poll " +
                                             std::to_string(g.route_poll)) +
-                                 ")\n"
+                                 (g.route_fuse ? ", emit fused" : "") + ")\n"
                            : "[xllama] d3d12: GPU routing off: " + std::string(off) + "\n");
         }
     }
@@ -6791,6 +6822,7 @@ D3d12SelftestRow run_route_sig_case() {
         op.u[2] = b.va + bytes;
         op.u[3] = b.va;
         op.u[4] = b.va + bytes;
+        op.u[5] = b.va + bytes;
         op.gx = static_cast<UINT>(n / 256);
         op.gy = 1;
         const std::vector<Op> one = {op};
@@ -6910,6 +6942,9 @@ D3d12SelftestRow run_route_case() {
     row.n = static_cast<int>(nc);
     constexpr std::size_t kData = 4096;
     constexpr std::size_t kLog = 0, kGate = 1024, kSig = 1280, kW = 1536, kC3 = 1792, kP = 2048;
+    // odd cases also run the fused emit (c7 bit 4, XLLAMA_D3D12_GPUROUTE_FUSE)
+    // into these, u5 = the case's data: written on a hit only
+    constexpr std::size_t kFW = 2560, kFC3 = 2816;
     constexpr int kSlots = 54;
     constexpr float kClampMin = 6.103515625e-5f;
     BufCtx b;
@@ -6951,6 +6986,8 @@ D3d12SelftestRow run_route_case() {
         std::memcpy(dat(i) + kGate, &gates[i], 4);
         std::memset(dat(i) + kW, 0xEF, 64);
         std::memset(dat(i) + kC3, 0xEF, 64);
+        std::memset(dat(i) + kFW, 0xEF, 64);
+        std::memset(dat(i) + kFC3, 0xEF, 64);
         std::memcpy(rec(i) + kRecMirror, mirror[i].data(), static_cast<std::size_t>(c.e) * 4);
         std::uint32_t rb = 0, cb = 0, sb = 0;
         std::memcpy(&rb, &c.ratio, 4);
@@ -6967,6 +7004,12 @@ D3d12SelftestRow run_route_case() {
                                      static_cast<std::uint32_t>(i + 1),
                                      (c.norm ? 1u : 0u) | (c.scaled ? 2u : 0u) | (c.sig ? 4u : 0u)};
         std::copy(std::begin(cc), std::end(cc), op.c);
+        if (i % 2 == 1) {
+            op.c[7] |= 16u;
+            op.c[8] = kSlots;
+            op.c[9] = static_cast<std::uint32_t>(kFW);
+            op.c[10] = static_cast<std::uint32_t>(kFC3);
+        }
         op.u[0] = rec_va(i);
         op.u[1] = dat_va(i) + kLog;
         op.u[2] = dat_va(i) + kP;
@@ -6974,6 +7017,7 @@ D3d12SelftestRow run_route_case() {
             op.u[3] = dat_va(i) + kGate;
             op.u[4] = dat_va(i) + kSig;
         }
+        op.u[5] = dat_va(i);
         op.gx = op.gy = 1;
         ops.push_back(op);
     }
@@ -7015,6 +7059,20 @@ D3d12SelftestRow run_route_case() {
             first = msg;
         }
     };
+    // the fused emit's tensors: the emit's bytes on a fused hit, else untouched
+    int fused_hits = 0;
+    auto fused_ok = [&](std::size_t i, bool hit, const float* w, const std::int32_t* cl) {
+        const std::size_t nu = static_cast<std::size_t>(cfgs[i].u);
+        if (i % 2 == 1 && hit) {
+            ++fused_hits;
+            return std::memcmp(w, dat(i) + kFW, nu * 4) == 0 &&
+                   std::memcmp(cl, dat(i) + kFC3, nu * 4) == 0;
+        }
+        for (std::size_t k = 0; k < 64; ++k)
+            if (dat(i)[kFW + k] != 0xEF || dat(i)[kFC3 + k] != 0xEF)
+                return false;
+        return true;
+    };
     for (std::size_t i = 0; i < nc; ++i) {
         const RouteCfg& c = cfgs[i];
         const std::size_t ne = static_cast<std::size_t>(c.e), nu = static_cast<std::size_t>(c.u);
@@ -7037,6 +7095,8 @@ D3d12SelftestRow run_route_case() {
         if (c.logits == 3) {
             if (state != 3 || pv != i + 1 || swaps != 0)
                 fail(i, "an inf logit: state 3, no swaps and the predicate");
+            else if (!fused_ok(i, false, nullptr, nullptr))
+                fail(i, "an inf logit wrote the fused emit's tensors");
             continue;
         }
         std::vector<float> probs(ne);
@@ -7087,6 +7147,12 @@ D3d12SelftestRow run_route_case() {
         if (std::memcmp(w, dat(i) + kW, nu * 4) != 0 ||
             std::memcmp(clamped, dat(i) + kC3, nu * 4) != 0)
             fail(i, "emit");
+        else if (!fused_ok(i, hit, w, clamped))
+            fail(i, hit && i % 2 == 1 ? "fused emit" : "fused emit wrote without a fused hit");
+    }
+    if (bad == 0 && fused_hits == 0) {
+        bad = 1;
+        first = "no case ran the fused emit on a hit";
     }
     row.rel_err = bad;
     row.ok = bad == 0;
@@ -7141,6 +7207,7 @@ D3d12SelftestRow run_route_pred_case() {
         r.u[0] = g.route_va + static_cast<std::size_t>(l) * kRouteRec;
         r.u[1] = dat_va(l) + kLog;
         r.u[2] = g.pred_va;
+        r.u[5] = r.u[0];
         r.gx = r.gy = 1;
         Op gate;
         gate.pred = 1;
