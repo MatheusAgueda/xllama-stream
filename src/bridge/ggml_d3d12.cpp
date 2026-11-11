@@ -4194,7 +4194,10 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
                     if (g.route_fuse && r.W->buffer == r.C3->buffer) {
                         const D3D12_GPU_VIRTUAL_ADDRESS vw = tensor_va(r.W), vc = tensor_va(r.C3);
                         const D3D12_GPU_VIRTUAL_ADDRESS b = std::min(vw, vc);
-                        if (vw - b <= 0xFFFFFFF0ull && vc - b <= 0xFFFFFFF0ull) {
+                        const std::uint64_t ew = vw + ggml_nbytes(r.W), ec = vc + ggml_nbytes(r.C3);
+                        // disjoint (an aliased pair would overwrite weights with slots)
+                        // and every byte both stores reach addressable by a uint offset
+                        if ((ew <= vc || ec <= vw) && std::max(ew, ec) - b <= 0x100000000ull) {
                             op.c[7] |= 16u;
                             op.c[8] = static_cast<std::uint32_t>(r.n_slots);
                             op.c[9] = static_cast<std::uint32_t>(vw - b);
