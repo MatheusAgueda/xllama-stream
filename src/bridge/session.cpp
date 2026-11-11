@@ -546,7 +546,13 @@ class LlamaSession final : public Session {
         {
             llama_context_params cparams = llama_context_default_params();
             cparams.n_ctx = m_n_ctx;
-            cparams.n_threads = m_n_threads;
+            // XLLAMA_CPU_THREADS_TG (catalogue env, 1..n_threads): threads of a
+            // one-token decode graph; with GPU layers its CPU splits are the
+            // MoE router + expert reads and a few tiny ops, where every node
+            // pays a barrier across the pool.
+            const char* tg = std::getenv("XLLAMA_CPU_THREADS_TG");
+            cparams.n_threads =
+                tg && *tg ? std::clamp(std::atoi(tg), 1, m_n_threads) : m_n_threads;
             // Prefill (any ubatch > 1 token) runs on n_threads_batch, whose
             // default is GGML_DEFAULT_N_THREADS (4) regardless of n_threads —
             // left unset it caps prefill at 4 threads while decode gets 6 (#168).
@@ -606,7 +612,8 @@ class LlamaSession final : public Session {
                 m_kv_q8 = false;
                 m_ctx.reset(llama_init_from_model(m_model.get(), cparams));
             }
-            m_cpu_pools.attach(m_gpu_layers, m_ctx.get(), m_n_threads, m_n_threads);
+            m_cpu_pools.attach(m_gpu_layers, m_ctx.get(), static_cast<int>(cparams.n_threads),
+                               static_cast<int>(cparams.n_threads_batch));
             log_gguf_ws("after context");
             if (!m_ctx) {
                 if (err)
@@ -671,7 +678,8 @@ class LlamaSession final : public Session {
                        std::to_string(m_mtp_n) + ")\n");
             return;
         }
-        m_cpu_pools.attach(m_gpu_layers, m_mtp_ctx.get(), m_n_threads, m_n_threads);
+        m_cpu_pools.attach(m_gpu_layers, m_mtp_ctx.get(), static_cast<int>(cparams.n_threads),
+                           static_cast<int>(cparams.n_threads_batch));
         common_params_speculative sp;
         sp.types = {COMMON_SPECULATIVE_TYPE_DRAFT_MTP};
         sp.draft.n_max = m_mtp_n;

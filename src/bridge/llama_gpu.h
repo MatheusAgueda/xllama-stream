@@ -305,7 +305,8 @@ class GgufCpuThreadpools {
                 tune(pb);
                 tp_batch_ = ggml_threadpool_new(&pb);
             }
-            log_output("[xllama] cpu threadpool: " + std::to_string(n_threads) + " threads, poll " +
+            log_output("[xllama] cpu threadpool: " + std::to_string(n_threads) + " threads (batch " +
+                       std::to_string(tp_batch_ ? n_threads_batch : n_threads) + "), poll " +
                        std::to_string(p.poll) + ", prio " + std::to_string(int(p.prio)) + "\n");
         }
         if (tp_)

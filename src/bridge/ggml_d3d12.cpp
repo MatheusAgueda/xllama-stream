@@ -787,11 +787,12 @@ struct Gpu {
     // XLLAMA_D3D12_HOSTPROF=1 (read when a backend is created): host time of
     // graph_compute per op type, recording and waiting excluded.
     bool host_prof = false;
-    // XLLAMA_D3D12_PLANCACHE (read when a backend is created): 1 = a split graph
-    // seen before runs its kept plan (ops + host actions, see SplitPlan) without
-    // planning again; 2 = plans every call and counts the calls whose ops or
-    // host actions differ from the kept plan (nothing runs from the cache).
-    int plan_mode = 0;
+    // XLLAMA_D3D12_PLANCACHE (read when a backend is created): 1 (default) = a
+    // split graph seen before runs its kept plan (ops + host actions, see
+    // SplitPlan) without planning again; 2 = plans every call and counts the
+    // calls whose ops or host actions differ from the kept plan (nothing runs
+    // from the cache); 0 = off.
+    int plan_mode = 1;
     std::uint64_t xq_gen = 0;               // bumped when ensure_xq replaces the scratch
     std::atomic<std::uint64_t> buf_gen{0};  // bumped when a buffer is allocated or freed
     // Bumped when a tensor is placed in a host buffer (init_tensor): ggml-alloc
@@ -3772,9 +3773,11 @@ ggml_backend_t dev_init_backend(ggml_backend_dev_t dev, const char*) {
         if (g.ts_on)
             log_output("[xllama] d3d12: GPU time of every submission (XLLAMA_D3D12_TIMESTAMPS)\n");
         const char* pcv = std::getenv("XLLAMA_D3D12_PLANCACHE");
-        g.plan_mode = pcv && *pcv ? std::atoi(pcv) : 0;
+        // On by default since 1.7.12.65 (#63 A/B: -4.3% decode, replies bit-identical);
+        // XLLAMA_D3D12_PLANCACHE=0 plans every call.
+        g.plan_mode = pcv && *pcv ? std::atoi(pcv) : 1;
         if (g.plan_mode < 0 || g.plan_mode > 2)
-            g.plan_mode = 0;
+            g.plan_mode = 1;
         if (g.plan_mode)
             log_output(g.plan_mode == 1
                            ? "[xllama] d3d12: split plans kept and replayed (XLLAMA_D3D12_PLANCACHE=1)\n"
