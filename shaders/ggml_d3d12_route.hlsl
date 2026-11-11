@@ -293,6 +293,16 @@ void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
         InterlockedOr(gs_bad, 1u); // assert(!isnan) in ops.cpp; an inf logit ends in NaN probs
     gs_d[tid] = f2d(x);
     GroupMemoryBarrierWithGroupSync();
+    // gs_bad is uniform past the barrier: a non-finite logit leaves the layer
+    // to the host before any ranking (NaN probs tie, gs_order would have holes)
+    if (gs_bad != 0u) {
+        if (tid == 0u) {
+            D.Store(REC_SWAPS, 0u);
+            D.Store(REC_STATE, 3u);
+            U2.Store(0u, c6);
+        }
+        return;
+    }
     for (uint w = 128u; w > 0u; w >>= 1) {
         if (tid < w) {
             const double a = gs_d[tid], b = gs_d[tid + w];

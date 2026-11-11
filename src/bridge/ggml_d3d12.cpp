@@ -4190,9 +4190,13 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
             const bool gpu_q =
                 flat && g.elt_ok && elt_operand(x) && ncols <= static_cast<int>(kD3d12MaxGroups);
             // Slot ids the emit kernel writes (GPU routing): read in place, the
-            // emit clamps them to the cache's slots.
-            const auto rgi = rg_at.empty() ? rg_at.end() : rg_at.find(ids);
-            const bool routed = rgi != rg_at.end() && rgrps[rgi->second].C3 == ids;
+            // emit clamps them to the cache's slots. A view of them counts when
+            // it is the same bytes (route_match lets views of C3 through).
+            const ggml_tensor* idb = rg_at.empty() ? nullptr : base_of(ids);
+            const auto rgi = idb ? rg_at.find(idb) : rg_at.end();
+            const bool routed = rgi != rg_at.end() && rgrps[rgi->second].C3 == idb &&
+                                ids->data == idb->data && ggml_are_same_shape(ids, idb) &&
+                                ggml_is_contiguous(ids);
             if (routed)
                 GGML_ASSERT(a->ne[2] >= rgrps[rgi->second].n_slots);
             // Ids and X share the scratch: flush first if either must, so the
@@ -6854,8 +6858,8 @@ D3d12SelftestRow run_route_case() {
             }
         }
         if (c.logits == 3) {
-            if (state != 3 || pv != i + 1)
-                fail(i, "an inf logit: state 3 and the predicate");
+            if (state != 3 || pv != i + 1 || swaps != 0)
+                fail(i, "an inf logit: state 3, no swaps and the predicate");
             continue;
         }
         std::vector<float> probs(ne);
