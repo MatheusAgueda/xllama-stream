@@ -57,6 +57,7 @@ RWByteAddressBuffer U2 : register(u2);
 #define REC_SWAPS 2244u
 #define REC_GATE 2248u
 #define REC_SIG 2252u
+#define REC_LOGITS 3072u // the logits as the kernel read them [256]: the host's probs check
 
 // float bits -> double, exact (denormals included).
 double f2d(uint f) {
@@ -286,6 +287,7 @@ void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
     uint x = 0xFF800000u; // -inf
     if (tid < n) {
         x = U1.Load(4u * tid);
+        D.Store(REC_LOGITS + 4u * tid, x);
         gs_res[tid] = (int)D.Load(REC_MIRROR + 4u * tid);
     }
     GroupMemoryBarrierWithGroupSync();

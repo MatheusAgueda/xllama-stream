@@ -936,6 +936,11 @@ struct Gpu {
         double ms = 0.0;
     };
     std::map<std::string, SegStat> segs;
+    // GPU routing's host side: the first kRouteTimed misses run node by node,
+    // timed by op and name (layer suffix dropped), and the prefetch settle.
+    std::map<std::string, SegStat> route_nodes;
+    std::uint64_t n_route_timed = 0;
+    double route_prep_ms = 0.0;
     // The segs entry of a graph by its first and last node and node count, so
     // a reused graph finds its entry without building the name again.
     std::map<std::tuple<const void*, const void*, std::size_t>, SegStat*> seg_of;
@@ -2036,7 +2041,24 @@ void backend_free(ggml_backend_t b) {
                           static_cast<unsigned long long>(g.n_route_mis_sig),
                           static_cast<unsigned long long>(g.n_route_mis_probs));
             log_output(rmsg);
+            std::snprintf(rmsg, sizeof(rmsg),
+                          "[xllama] d3d12 gpu route: %.1f ms settling prefetch rounds; the first "
+                          "%llu host routings node by node:\n",
+                          g.route_prep_ms, static_cast<unsigned long long>(g.n_route_timed));
+            log_output(rmsg);
+            std::vector<std::pair<std::string, Gpu::SegStat>> rn(g.route_nodes.begin(),
+                                                                 g.route_nodes.end());
+            std::sort(rn.begin(), rn.end(),
+                      [](const auto& x, const auto& y) { return x.second.ms > y.second.ms; });
+            for (const auto& [key, s] : rn) {
+                std::snprintf(rmsg, sizeof(rmsg), "[xllama] d3d12 route node: %6llu x %9.2f ms  %s\n",
+                              static_cast<unsigned long long>(s.n), s.ms, key.c_str());
+                log_output(rmsg);
+            }
         }
+        g.route_nodes.clear();
+        g.n_route_timed = 0;
+        g.route_prep_ms = 0.0;
         g.n_route = g.n_route_hit = g.n_route_miss = g.n_route_bad = g.n_route_host = 0;
         g.n_route_resub = g.n_route_swaps = 0;
         g.n_route_mis_ids = g.n_route_mis_slots = g.n_route_mis_w = g.n_route_mis_sig = 0;
@@ -2617,7 +2639,7 @@ constexpr std::size_t kRouteRec = 4096; // bytes per layer record
 constexpr std::size_t kRouteMax = 128;  // records per submission
 constexpr std::size_t kRecProbs = 0, kRecMirror = 1024, kRecIds = 2048, kRecSlots = 2112,
                       kRecW = 2176, kRecState = 2240, kRecSwaps = 2244, kRecGate = 2248,
-                      kRecSig = 2252;
+                      kRecSig = 2252, kRecLogits = 3072;
 constexpr std::int64_t kRouteMaxExpert = 256, kRouteMaxUsed = 16;
 
 // One layer's routing in a graph: S the softmax, C1..C3 the expert cache's
@@ -2760,11 +2782,29 @@ bool host_compute(Gpu& g, ggml_tensor* const* nodes, std::size_t n) {
     HostCpu* h = host_cpu(g);
     if (!h || n > kHostGraph)
         return false;
+    constexpr std::uint64_t kRouteTimed = 64;
     const auto t0 = std::chrono::steady_clock::now();
-    ggml_graph_clear(h->gf);
-    for (std::size_t i = 0; i < n; ++i)
-        ggml_graph_add_node(h->gf, nodes[i]);
-    const bool ok = ggml_backend_graph_compute(h->be, h->gf) == GGML_STATUS_SUCCESS;
+    bool ok = true;
+    if (g.n_route_timed < kRouteTimed) {
+        // node by node, each timed: where a miss's host time goes
+        ++g.n_route_timed;
+        for (std::size_t i = 0; ok && i < n; ++i) {
+            const auto t1 = std::chrono::steady_clock::now();
+            ggml_graph_clear(h->gf);
+            ggml_graph_add_node(h->gf, nodes[i]);
+            ok = ggml_backend_graph_compute(h->be, h->gf) == GGML_STATUS_SUCCESS;
+            Gpu::SegStat& s = g.route_nodes[std::string(ggml_op_desc(nodes[i])) + " " +
+                                            seg_name(nodes[i])];
+            ++s.n;
+            s.ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1)
+                        .count();
+        }
+    } else {
+        ggml_graph_clear(h->gf);
+        for (std::size_t i = 0; i < n; ++i)
+            ggml_graph_add_node(h->gf, nodes[i]);
+        ok = ggml_backend_graph_compute(h->be, h->gf) == GGML_STATUS_SUCCESS;
+    }
     g.route_cpu_ms +=
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return ok;
@@ -3095,6 +3135,38 @@ void replay_hit(Gpu& g, RouteGrp& r) {
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
+// A probabilities mismatch told apart: inputs (the logits the kernel read,
+// kept at kRecLogits, against the CPU's) or arithmetic (how many probs, how
+// many ulp, and whether a side is a denormal or zero).
+void route_probs_log(const RouteGrp& r, const std::uint8_t* rec, const std::uint32_t* lg,
+                     std::uint32_t state) {
+    const int n = r.n_expert;
+    const auto* gp = reinterpret_cast<const std::uint32_t*>(rec + kRecProbs);
+    const auto* cp = static_cast<const std::uint32_t*>(r.S->data);
+    const auto* gl = reinterpret_cast<const std::uint32_t*>(rec + kRecLogits);
+    int np = 0, nl = 0, nden = 0, fp = -1, fl = -1;
+    std::uint32_t ulp = 0;
+    for (int i = 0; i < n; ++i) {
+        if (gl[i] != lg[i] && nl++ == 0)
+            fl = i;
+        if (gp[i] == cp[i])
+            continue;
+        if (np++ == 0)
+            fp = i;
+        ulp = std::max(ulp, gp[i] > cp[i] ? gp[i] - cp[i] : cp[i] - gp[i]);
+        nden += (gp[i] < 0x00800000u || cp[i] < 0x00800000u) ? 1 : 0;
+    }
+    char msg[400];
+    std::snprintf(msg, sizeof(msg),
+                  "[xllama] d3d12 GPU routing: probabilities differ in %s (state %u): %d of %d, "
+                  "max %u ulp, %d with a denormal or zero side, first [%d] gpu %08X cpu %08X "
+                  "logit %08X; logits the kernel read differ in %d (first [%d] gpu %08X cpu %08X)%s\n",
+                  r.S->name, state, np, n, ulp, nden, fp, fp >= 0 ? gp[fp] : 0u,
+                  fp >= 0 ? cp[fp] : 0u, fp >= 0 ? lg[fp] : 0u, nl, fl, fl >= 0 ? gl[fl] : 0u,
+                  fl >= 0 ? lg[fl] : 0u, r.S->data == r.logits->data ? ", softmax in place" : "");
+    log_output(std::string(msg));
+}
+
 // The layer whose route wrote the predicate: its routing and reads on the
 // CPU (the nodes as the CPU backend ran them before), then the weights and
 // slot ids into its record for the emit kernel at the head of the rest.
@@ -3104,12 +3176,15 @@ bool host_route(Gpu& g, RouteGrp& r) {
     std::memcpy(&state, rec + kRecState, sizeof(state));
     if (state != 2 && state != 3 && g.n_route_bad++ < 3)
         route_log("predicate without a miss", r, state);
+    // the logits before the CPU's softmax runs (it may run in place)
+    std::uint32_t lg[kRouteMaxExpert];
+    const std::size_t nbe = static_cast<std::size_t>(r.n_expert) * 4;
+    std::memcpy(lg, r.logits->data, nbe);
     if (!host_compute(g, r.host.data(), r.host.size()))
         return false;
-    if ((state == 1 || state == 2) &&
-        std::memcmp(r.S->data, rec + kRecProbs, static_cast<std::size_t>(r.n_expert) * 4) != 0 &&
+    if ((state == 1 || state == 2) && std::memcmp(r.S->data, rec + kRecProbs, nbe) != 0 &&
         g.n_route_mis_probs++ < 3)
-        route_log("probabilities differ from the CPU's", r, state);
+        route_probs_log(r, rec, lg, state);
     if (r.plain && state == 2 &&
         std::memcmp(r.C1->data, rec + kRecIds, static_cast<std::size_t>(r.n_used) * 4) != 0 &&
         g.n_route_mis_ids++ < 3)
@@ -3145,7 +3220,10 @@ bool submit_routed(Gpu& g, const std::vector<Op>& ops, std::vector<RouteGrp>& ro
     rtails->resize(routes.size());
     for (RouteGrp& r : routes) {
         // the layer's prefetch round settles first, as in ec_plan
+        const auto tp = std::chrono::steady_clock::now();
         llama_ec_route_prepare(r.C1);
+        g.route_prep_ms +=
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp).count();
         llama_ec_route_info ri{};
         ri.size = sizeof(ri);
         const int kind = llama_ec_route_query(r.C1, &ri);
