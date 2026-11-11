@@ -659,20 +659,21 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
             while (std::fread(head, sizeof(head), 1, f) == 1) {
                 records++;
                 const int32_t n_tok = head[2], k = head[3];
-                if (head[0] != 0x31544345 || head[1] < 0 || n_tok < 1 || k < 1 || k > 32 || head[4] < 1 || head[4] > k) {
+                if (head[0] != 0x31544345 || head[1] < 0 || n_tok < 1 || k < 1 || k > 32 ||
+                    head[4] < 1 || head[4] > k) {
                     bad++;
                     break;
                 }
-                std::vector<int16_t> ids((size_t) k);
-                std::vector<float> sc((size_t) k);
+                std::vector<int16_t> ids((size_t)k);
+                std::vector<float> sc((size_t)k);
                 for (int32_t t = 0; t < n_tok; ++t) {
-                    if (std::fread(ids.data(), sizeof(int16_t), (size_t) k, f) != (size_t) k ||
-                        std::fread(sc.data(), sizeof(float), (size_t) k, f) != (size_t) k) {
+                    if (std::fread(ids.data(), sizeof(int16_t), (size_t)k, f) != (size_t)k ||
+                        std::fread(sc.data(), sizeof(float), (size_t)k, f) != (size_t)k) {
                         bad++;
                         break;
                     }
                     for (int32_t j = 0; j < k; ++j) {
-                        if (ids[(size_t) j] < 0 || (j > 0 && sc[(size_t) j] > sc[(size_t) j - 1]))
+                        if (ids[(size_t)j] < 0 || (j > 0 && sc[(size_t)j] > sc[(size_t)j - 1]))
                             bad++;
                     }
                     token_layers++;
