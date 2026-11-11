@@ -794,8 +794,14 @@ struct Gpu {
     int plan_mode = 0;
     std::uint64_t xq_gen = 0;               // bumped when ensure_xq replaces the scratch
     std::atomic<std::uint64_t> buf_gen{0};  // bumped when a buffer is allocated or freed
+    // Bumped when a tensor is placed in a host buffer (init_tensor): ggml-alloc
+    // places every tensor of a graph it allocates, so a rebuilt graph bumps it
+    // and a reused one (llama.cpp graph reuse) does not.
+    std::atomic<std::uint64_t> tensor_gen{0};
     std::uint64_t n_pc_hit = 0, n_pc_miss = 0, n_pc_guard = 0, n_pc_store = 0, n_pc_skip = 0;
     std::uint64_t n_pc_same = 0, n_pc_diff = 0; // plan_mode 2
+    std::uint64_t n_pc_fast = 0;     // hits on the node list and tensor_gen, no fingerprint
+    std::uint64_t n_pc_fast_bad = 0; // plan_mode 2: those that the fingerprint would refuse
     double pc_ms = 0.0;                         // host time of the hits before submitting
     // IQ3_S group geometry asked for by XLLAMA_D3D12_IQ3S_RSL / _RT (read when a
     // backend is created; d3d12_geom_for shapes each matmul from it).
@@ -1415,6 +1421,11 @@ void* buf_base(ggml_backend_buffer_t b) {
                       : reinterpret_cast<void*>(static_cast<std::uintptr_t>(c->va));
 }
 
+ggml_status host_init_tensor(ggml_backend_buffer_t, ggml_tensor*) {
+    gpu().tensor_gen.fetch_add(1, std::memory_order_relaxed);
+    return GGML_STATUS_SUCCESS;
+}
+
 void buf_free(ggml_backend_buffer_t b) {
     drain_pending_unlocked();
     gpu().buf_gen.fetch_add(1, std::memory_order_relaxed); // kept plans hold its addresses
@@ -1483,7 +1494,7 @@ void host_clear(ggml_backend_buffer_t b, uint8_t v) {
 const ggml_backend_buffer_i kHostBufIface = {
     /* .free_buffer   = */ buf_free,
     /* .get_base      = */ buf_base,
-    /* .init_tensor   = */ nullptr,
+    /* .init_tensor   = */ host_init_tensor,
     /* .memset_tensor = */ host_memset,
     /* .set_tensor    = */ host_set,
     /* .get_tensor    = */ host_get,
@@ -1888,18 +1899,20 @@ void backend_free(ggml_backend_t b) {
             std::snprintf(msg, sizeof(msg),
                           "[xllama] d3d12 plan cache: %llu hits (%.1f ms host), %llu misses, %llu "
                           "guard misses, %llu stored, %llu not cacheable; checked %llu same, %llu "
-                          "differ\n",
+                          "differ; %llu hits without fingerprint, %llu fast checks wrong\n",
                           static_cast<unsigned long long>(g.n_pc_hit), g.pc_ms,
                           static_cast<unsigned long long>(g.n_pc_miss),
                           static_cast<unsigned long long>(g.n_pc_guard),
                           static_cast<unsigned long long>(g.n_pc_store),
                           static_cast<unsigned long long>(g.n_pc_skip),
                           static_cast<unsigned long long>(g.n_pc_same),
-                          static_cast<unsigned long long>(g.n_pc_diff));
+                          static_cast<unsigned long long>(g.n_pc_diff),
+                          static_cast<unsigned long long>(g.n_pc_fast),
+                          static_cast<unsigned long long>(g.n_pc_fast_bad));
             log_output(msg);
         }
         g.n_pc_hit = g.n_pc_miss = g.n_pc_guard = g.n_pc_store = g.n_pc_skip = 0;
-        g.n_pc_same = g.n_pc_diff = 0;
+        g.n_pc_same = g.n_pc_diff = g.n_pc_fast = g.n_pc_fast_bad = 0;
         g.pc_ms = 0.0;
         plan_cache_clear(); // its plans point into the stats cleared next
         g.seg_of.clear();
@@ -2445,6 +2458,8 @@ struct PlanGuard {
 };
 struct SplitPlan {
     std::vector<std::uint64_t> fp;
+    std::vector<const ggml_tensor*> nodes; // the graph's node list, for the fast check
+    std::uint64_t tgen = 0;                // tensor_gen when fp was last matched
     std::vector<Op> ops;
     std::vector<PlanAct> acts; // in planning order, before the submission
     std::vector<PlanGuard> guards;
@@ -2509,13 +2524,13 @@ void fp_node(std::vector<std::uint64_t>& fp, const ggml_tensor* node) {
             fp_tensor(fp, node->src[j]);
 }
 
-std::uint64_t plan_key(ggml_cgraph* cgraph, const std::vector<std::uint64_t>& fp) {
+std::uint64_t plan_key(ggml_cgraph* cgraph) {
     const int n = ggml_graph_n_nodes(cgraph);
     std::uint64_t h = 1469598103934665603ull;
     for (const std::uint64_t v :
-         {static_cast<std::uint64_t>(n), static_cast<std::uint64_t>(fp.size()),
+         {static_cast<std::uint64_t>(n), reinterpret_cast<std::uintptr_t>(cgraph),
           reinterpret_cast<std::uintptr_t>(ggml_graph_node(cgraph, 0)),
-          reinterpret_cast<std::uintptr_t>(ggml_graph_node(cgraph, n - 1)), fp[fp.size() / 2]})
+          reinterpret_cast<std::uintptr_t>(ggml_graph_node(cgraph, n - 1))})
         h = ((h ^ v) * 1099511628211ull) ^ (h >> 29);
     return h;
 }
@@ -2531,6 +2546,65 @@ bool plan_guards_hold(ggml_cgraph* cgraph, const SplitPlan& p) {
             return false;
     }
     return true;
+}
+
+// The fast check: no graph was allocated since the plan's fingerprint last
+// matched (tensor_gen), so the same node list holds the same tensors.
+bool plan_current(Gpu& g, ggml_cgraph* cgraph, const SplitPlan& p) {
+    const int n = ggml_graph_n_nodes(cgraph);
+    return p.tgen == g.tensor_gen.load(std::memory_order_relaxed) &&
+           p.nodes.size() == static_cast<std::size_t>(n) &&
+           std::memcmp(p.nodes.data(), cgraph->nodes, n * sizeof(ggml_tensor*)) == 0 &&
+           p.xq_gen == g.xq_gen && p.buf_gen == g.buf_gen.load(std::memory_order_relaxed) &&
+           plan_guards_hold(cgraph, p);
+}
+
+// A hit: the plan's host actions, then its one submission. Caller holds g.mu.
+ggml_status run_plan(Gpu& g, SplitPlan& p, std::chrono::steady_clock::time_point t0) {
+    for (const PlanAct& a : p.acts) {
+        switch (a.kind) {
+        case PlanAct::kCopy:
+            std::memcpy(g.xq_ptr + a.off, a.src, a.bytes);
+            break;
+        case PlanAct::kIds:
+            // The kernels do not bound-check ids; ggml-cpu asserts the same.
+            for (std::int64_t t = 0; t < a.n1; ++t)
+                for (std::int64_t j = 0; j < a.n0; ++j) {
+                    std::int32_t id = 0;
+                    std::memcpy(&id, a.src + t * a.nb1 + j * sizeof(std::int32_t), sizeof(id));
+                    GGML_ASSERT(id >= 0 && id < a.bound);
+                }
+            break;
+        case PlanAct::kQuant: {
+            const auto tq = std::chrono::steady_clock::now();
+            d3d12_quantize_activations(a.wt, reinterpret_cast<const float*>(a.src), a.stride, a.k,
+                                       a.ncols, g.xq_ptr + a.off);
+            g.cpuq_ms +=
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tq)
+                    .count();
+            break;
+        }
+        }
+    }
+    const auto tf = std::chrono::steady_clock::now();
+    g.pc_ms += std::chrono::duration<double, std::milli>(tf - t0).count();
+    const double rw = g.rec_ms + g.wait_ms;
+    if (!p.ops.empty() && !submit_ops(g, p.ops, false, &p.hint))
+        return GGML_STATUS_FAILED;
+    const auto t_end = std::chrono::steady_clock::now();
+    g.sub_ms += std::chrono::duration<double, std::milli>(t_end - tf).count() -
+                (g.rec_ms + g.wait_ms - rw);
+    ++g.n_pc_hit;
+    g.n_gdn_fused += p.n_gdn;
+    ++g.n_calls;
+    g.gpu_ms += g.last_gpu_ms;
+    const double ms = std::chrono::duration<double, std::milli>(t_end - t0).count();
+    g.wall_ms += ms;
+    if (p.seg) {
+        ++p.seg->n;
+        p.seg->ms += ms;
+    }
+    return GGML_STATUS_SUCCESS;
 }
 
 // Whether the nodes of a MoE plan can run as one dispatch that writes only
@@ -2600,7 +2674,22 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
     node_idx.clear();
     fp.clear();
     // plan_mode, prof_on and host_prof change only when a backend is created.
-    const bool pc = g.plan_mode != 0 && !g.prof_on && !g.host_prof && !g.shexp_async;
+    const bool pc = g.plan_mode != 0 && !g.prof_on && !g.host_prof && !g.shexp_async &&
+                    ggml_graph_n_nodes(cgraph) > 0;
+    const std::uint64_t pc_key = pc ? plan_key(cgraph) : 0;
+    if (pc && g.plan_mode == 1) {
+        std::lock_guard<std::mutex> lock(g.mu);
+        auto& pcache = plan_cache();
+        const auto it = pcache.find(pc_key);
+        if (it != pcache.end() && plan_current(g, cgraph, it->second)) {
+            drain_pending(g);
+            const auto t0 = std::chrono::steady_clock::now();
+            g.pre_ms += std::chrono::duration<double, std::milli>(t0 - t_in).count();
+            g.last_gpu_ms = 0.0;
+            ++g.n_pc_fast;
+            return run_plan(g, it->second, t0);
+        }
+    }
     for (int i = 0; i < ggml_graph_n_nodes(cgraph); ++i) {
         ggml_tensor* node = ggml_graph_node(cgraph, i);
         if (pc)
@@ -2647,66 +2736,28 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
     g.pre_ms += std::chrono::duration<double, std::milli>(t0 - t_in).count();
     g.last_gpu_ms = 0.0;
     SplitPlan* vplan = nullptr; // plan_mode 2: the kept plan this call's planning must equal
-    std::uint64_t pc_key = 0;
     if (pc) {
-        pc_key = plan_key(cgraph, fp);
         auto& pcache = plan_cache();
         const auto it = pcache.find(pc_key);
-        if (it == pcache.end() || it->second.fp.size() != fp.size() ||
-            std::memcmp(it->second.fp.data(), fp.data(), fp.size() * sizeof(std::uint64_t)) != 0 ||
-            it->second.xq_gen != g.xq_gen ||
-            it->second.buf_gen != g.buf_gen.load(std::memory_order_relaxed)) {
+        const bool fp_same =
+            it != pcache.end() && it->second.fp.size() == fp.size() &&
+            std::memcmp(it->second.fp.data(), fp.data(), fp.size() * sizeof(std::uint64_t)) == 0 &&
+            it->second.xq_gen == g.xq_gen &&
+            it->second.buf_gen == g.buf_gen.load(std::memory_order_relaxed);
+        if (g.plan_mode == 2 && it != pcache.end() && !fp_same &&
+            plan_current(g, cgraph, it->second))
+            ++g.n_pc_fast_bad; // the fast check would have replayed a stale plan
+        if (!fp_same) {
             ++g.n_pc_miss;
         } else if (!plan_guards_hold(cgraph, it->second)) {
             ++g.n_pc_guard;
         } else if (g.plan_mode == 2) {
             vplan = &it->second;
         } else {
+            // Same tensors after a graph was allocated: the fast check holds again.
             SplitPlan& p = it->second;
-            for (const PlanAct& a : p.acts) {
-                switch (a.kind) {
-                case PlanAct::kCopy:
-                    std::memcpy(g.xq_ptr + a.off, a.src, a.bytes);
-                    break;
-                case PlanAct::kIds:
-                    // The kernels do not bound-check ids; ggml-cpu asserts the same.
-                    for (std::int64_t t = 0; t < a.n1; ++t)
-                        for (std::int64_t j = 0; j < a.n0; ++j) {
-                            std::int32_t id = 0;
-                            std::memcpy(&id, a.src + t * a.nb1 + j * sizeof(std::int32_t), sizeof(id));
-                            GGML_ASSERT(id >= 0 && id < a.bound);
-                        }
-                    break;
-                case PlanAct::kQuant: {
-                    const auto tq = std::chrono::steady_clock::now();
-                    d3d12_quantize_activations(a.wt, reinterpret_cast<const float*>(a.src), a.stride,
-                                               a.k, a.ncols, g.xq_ptr + a.off);
-                    g.cpuq_ms += std::chrono::duration<double, std::milli>(
-                                     std::chrono::steady_clock::now() - tq)
-                                     .count();
-                    break;
-                }
-                }
-            }
-            const auto tf = std::chrono::steady_clock::now();
-            g.pc_ms += std::chrono::duration<double, std::milli>(tf - t0).count();
-            const double rw = g.rec_ms + g.wait_ms;
-            if (!p.ops.empty() && !submit_ops(g, p.ops, false, &p.hint))
-                return GGML_STATUS_FAILED;
-            const auto t_end = std::chrono::steady_clock::now();
-            g.sub_ms += std::chrono::duration<double, std::milli>(t_end - tf).count() -
-                        (g.rec_ms + g.wait_ms - rw);
-            ++g.n_pc_hit;
-            g.n_gdn_fused += p.n_gdn;
-            ++g.n_calls;
-            g.gpu_ms += g.last_gpu_ms;
-            const double ms = std::chrono::duration<double, std::milli>(t_end - t0).count();
-            g.wall_ms += ms;
-            if (p.seg) {
-                ++p.seg->n;
-                p.seg->ms += ms;
-            }
-            return GGML_STATUS_SUCCESS;
+            p.tgen = g.tensor_gen.load(std::memory_order_relaxed);
+            return run_plan(g, p, t0);
         }
     }
     // What a kept plan needs of this call: the host actions in order, the
@@ -3591,6 +3642,8 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
             pcache.clear();
         SplitPlan& p = pcache[pc_key];
         p.fp = fp;
+        p.nodes.assign(cgraph->nodes, cgraph->nodes + ggml_graph_n_nodes(cgraph));
+        p.tgen = g.tensor_gen.load(std::memory_order_relaxed);
         p.ops = pc_ops;
         p.acts = pc_acts;
         p.guards = pc_guards;
