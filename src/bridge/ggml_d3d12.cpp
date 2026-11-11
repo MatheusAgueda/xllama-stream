@@ -3156,13 +3156,141 @@ struct ProbeHold {
     std::vector<ComPtr<ID3D12Resource>> res;
     std::vector<ComPtr<ID3D12Heap>> heaps;
     std::vector<void*> heap_blocks;
+    std::vector<void*> va_blocks; // under heaps opened from their address: freed after them
     ~ProbeHold() {
+        res.clear();
+        heaps.clear();
         for (void* p : heap_blocks)
             std::free(p);
+        for (void* p : va_blocks)
+            VirtualFree(p, 0, MEM_RELEASE);
     }
 };
 
 volatile std::uint8_t g_probe_sink = 0;
+
+// A GPU buffer over CPU memory: committed, touched pages (VirtualAllocFromApp),
+// a heap opened on them (ID3D12Device3::OpenExistingHeapFromAddress) and a
+// cross-adapter buffer placed at its start. Series X Dev Mode (2026-11-10):
+// committed resources of every heap kind stop at the 4147 MB DXGI budget while
+// plain heap memory still grows by ~700 MB on top; whether memory reached this
+// way counts against that budget is what the probe measures.
+ComPtr<ID3D12Resource> existing_buffer(Gpu& g, std::size_t bytes, void** mem,
+                                       ComPtr<ID3D12Heap>* heap_out, std::string* err) {
+    ComPtr<ID3D12Device3> d3;
+    if (FAILED(g.device.As(&d3))) {
+        *err = "no ID3D12Device3";
+        return {};
+    }
+    void* p = VirtualAllocFromApp(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!p) {
+        *err = "VirtualAllocFromApp error " + std::to_string(GetLastError());
+        return {};
+    }
+    auto* page = static_cast<std::uint8_t*>(p);
+    for (std::size_t off = 0; off < bytes; off += 4096)
+        page[off] = static_cast<std::uint8_t>(off >> 12);
+    ComPtr<ID3D12Heap> heap;
+    HRESULT hr = d3->OpenExistingHeapFromAddress(p, IID_PPV_ARGS(&heap));
+    ComPtr<ID3D12Resource> res;
+    if (SUCCEEDED(hr)) {
+        D3D12_RESOURCE_DESC rd = {};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = bytes;
+        rd.Height = 1;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.Format = DXGI_FORMAT_UNKNOWN;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        rd.Flags =
+            D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        hr = g.device->CreatePlacedResource(heap.Get(), 0, &rd, D3D12_RESOURCE_STATE_COMMON,
+                                            nullptr, IID_PPV_ARGS(&res));
+        if (FAILED(hr))
+            *err = d3d12c::hr_message("CreatePlacedResource (existing heap)", hr);
+    } else {
+        *err = d3d12c::hr_message("OpenExistingHeapFromAddress", hr);
+    }
+    if (!res) {
+        heap.Reset();
+        VirtualFree(p, 0, MEM_RELEASE);
+        return {};
+    }
+    *mem = p;
+    *heap_out = heap;
+    return res;
+}
+
+// One 64 MiB existing-heap buffer: a CPU pattern read by a GPU copy, a GPU copy
+// read by the CPU, then the GPU time of one whole-buffer copy into a DEFAULT
+// buffer from it, from a write-back and from a write-combined CUSTOM L0 buffer.
+void probe_existing_rw(Gpu& g, const std::function<void(const std::string&)>& emit) {
+    constexpr std::size_t kMiB = 1u << 20;
+    const std::size_t bytes = kProbeStep;
+    void* mem = nullptr;
+    ComPtr<ID3D12Heap> heap;
+    std::string err;
+    auto res = existing_buffer(g, bytes, &mem, &heap, &err);
+    if (!res) {
+        emit("existing rw: FAIL " + err + "; " + probe_state(g));
+        return;
+    }
+    auto* m = static_cast<std::uint8_t*>(mem);
+    for (std::size_t i = 0; i < bytes; ++i)
+        m[i] = static_cast<std::uint8_t>(i * 13 + 5);
+    auto dst =
+        d3d12c::create_buffer(g.device.Get(), bytes, D3D12_HEAP_TYPE_DEFAULT,
+                              D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON, "probe", &err);
+    D3D12_HEAP_PROPERTIES wc = custom_l0_props();
+    wc.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE;
+    auto src_wb = d3d12c::create_buffer_props(g.device.Get(), bytes, custom_l0_props(),
+                                              D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON,
+                                              "probe", &err);
+    auto src_wc = d3d12c::create_buffer_props(g.device.Get(), bytes, wc, D3D12_RESOURCE_FLAG_NONE,
+                                              D3D12_RESOURCE_STATE_COMMON, "probe", &err);
+    bool rd_ok = false, wr_ok = false;
+    double ms_ex = -1, ms_wb = -1, ms_wc = -1;
+    {
+        std::lock_guard<std::mutex> lock(g.mu);
+        run_now(g, [&](ID3D12GraphicsCommandList* cl) {
+            cl->CopyBufferRegion(g.readback.Get(), 0, res.Get(), bytes - kMiB, kMiB);
+        });
+        rd_ok = std::memcmp(g.readback_ptr, m + bytes - kMiB, kMiB) == 0;
+        for (std::size_t i = 0; i < kMiB; ++i)
+            g.staging_ptr[i] = static_cast<std::uint8_t>(i * 7 + 3);
+        run_now(g, [&](ID3D12GraphicsCommandList* cl) {
+            cl->CopyBufferRegion(res.Get(), 0, g.staging.Get(), 0, kMiB);
+        });
+        wr_ok = std::memcmp(m, g.staging_ptr, kMiB) == 0;
+        auto time_copy = [&](ID3D12Resource* src, double* ms) {
+            if (!dst || !src)
+                return;
+            for (int rep = 0; rep < 2; ++rep) { // the first run pays residency
+                double w = 0;
+                run_now(
+                    g,
+                    [&](ID3D12GraphicsCommandList* cl) {
+                        cl->CopyBufferRegion(dst.Get(), 0, src, 0, bytes);
+                    },
+                    nullptr, &w);
+                *ms = w;
+            }
+        };
+        time_copy(res.Get(), &ms_ex);
+        time_copy(src_wb.Get(), &ms_wb);
+        time_copy(src_wc.Get(), &ms_wc);
+    }
+    char b[256];
+    std::snprintf(b, sizeof(b),
+                  "existing rw: cpu->gpu %s, gpu->cpu %s; 64 MiB copy ms existing %.2f "
+                  "custom_wb %.2f custom_wc %.2f; ",
+                  rd_ok ? "MATCH" : "MISMATCH", wr_ok ? "MATCH" : "MISMATCH", ms_ex, ms_wb, ms_wc);
+    emit(std::string(b) + probe_state(g));
+    res.Reset();
+    heap.Reset();
+    VirtualFree(mem, 0, MEM_RELEASE);
+}
 
 // Adds kProbeStep units of one kind until an allocation fails, the cap is hit
 // or (heap) avail_phys drops under the floor. Returns MiB added.
@@ -3188,6 +3316,20 @@ std::size_t probe_fill(Gpu& g, const char* kind, std::size_t cap_mb, ProbeHold* 
                 ok = true;
             } else {
                 err = "malloc null";
+            }
+        } else if (std::strcmp(kind, "existing") == 0) {
+            if (avail_phys_mb() < kProbeHeapFloorMb + (kProbeStep >> 20)) {
+                stop = "avail_floor";
+                break;
+            }
+            void* mem = nullptr;
+            ComPtr<ID3D12Heap> heap;
+            auto r = existing_buffer(g, kProbeStep, &mem, &heap, &err);
+            if (r) {
+                hold->res.push_back(r);
+                hold->heaps.push_back(heap);
+                hold->va_blocks.push_back(mem);
+                ok = true;
             }
         } else if (std::strcmp(kind, "default") == 0) {
             auto r = d3d12c::create_buffer(g.device.Get(), kProbeStep, D3D12_HEAP_TYPE_DEFAULT,
@@ -3329,6 +3471,19 @@ void run_d3d12_memprobe(const std::function<void(const std::string&)>& emit) {
     // D: reserved buffers backed by 64 MiB heaps.
     for (std::size_t mb : {1024, 2048, 3072})
         probe_tiled(g, mb, emit);
+    // E: GPU buffers over CPU memory, alone and on top of a full DXGI budget.
+    probe_existing_rw(g, emit);
+    {
+        ProbeHold hold;
+        probe_fill(g, "existing", 8192, &hold, emit);
+    }
+    emit("released: " + probe_state(g));
+    {
+        ProbeHold hold;
+        probe_fill(g, "default", 12288, &hold, emit);
+        probe_fill(g, "existing", 8192, &hold, emit);
+        probe_fill(g, "heap", 8192, &hold, emit);
+    }
     emit("done: " + probe_state(g));
 }
 
