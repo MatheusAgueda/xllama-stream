@@ -612,6 +612,7 @@ void run_d3d12_memprobe(const std::function<void(const std::string&)>& emit) {
         #include <cstdlib>
         #include <iterator>
         #include <map>
+        #include <memory>
         #include <mutex>
         #include <random>
         #include <tuple>
@@ -805,6 +806,10 @@ struct PsoSlot {
     ComPtr<ID3D12PipelineState>* pso;
 };
 
+// std::addressof, never &: WRL's ComPtr::operator& is a ComPtrRef whose
+// conversion to ComPtr<T>* empties the ComPtr first (an out-parameter idiom),
+// so `&g.pso[i][wd]` here released every pipeline at the end of init_gpu and
+// 1.7.12.54 ran every op as a bare barrier (0 dispatches, 1/48 selftest cases).
 std::vector<PsoSlot> pso_slots(Gpu& g) {
     static const char* const mmv[] = {"q4_0", "q4_k", "q6_k", "iq3_s", "iq4_xs", "q5_k", "f32"};
     static const char* const mmid[] = {"iq4_xs", "iq3_s"};
@@ -819,17 +824,19 @@ std::vector<PsoSlot> pso_slots(Gpu& g) {
     std::vector<PsoSlot> s;
     for (int i = 0; i < kPsoCount; ++i)
         for (int wd = 0; wd < 2; ++wd)
-            s.push_back({std::string("ggml_d3d12_mmv_") + mmv[i] + wide[wd], &g.pso[i][wd]});
-    s.push_back({"ggml_d3d12_get_rows_q6_k", &g.pso_get_rows});
+            s.push_back(
+                {std::string("ggml_d3d12_mmv_") + mmv[i] + wide[wd], std::addressof(g.pso[i][wd])});
+    s.push_back({"ggml_d3d12_get_rows_q6_k", std::addressof(g.pso_get_rows)});
     for (int i = 0; i < kMmidCount; ++i)
         for (int wd = 0; wd < 2; ++wd)
-            s.push_back({std::string("ggml_d3d12_mmid_") + mmid[i] + wide[wd], &g.pso_mmid[i][wd]});
+            s.push_back({std::string("ggml_d3d12_mmid_") + mmid[i] + wide[wd],
+                         std::addressof(g.pso_mmid[i][wd])});
     for (int i = 0; i < kEltCount; ++i)
-        s.push_back({std::string("ggml_d3d12_elt_") + elt[i], &g.pso_elt[i]});
+        s.push_back({std::string("ggml_d3d12_elt_") + elt[i], std::addressof(g.pso_elt[i])});
     for (int i = 0; i < kMoeCount; ++i)
-        s.push_back({std::string("ggml_d3d12_moe_") + moe[i], &g.pso_moe[i]});
+        s.push_back({std::string("ggml_d3d12_moe_") + moe[i], std::addressof(g.pso_moe[i])});
     for (int i = 0; i < kSsmCount; ++i)
-        s.push_back({std::string("ggml_d3d12_ssm_") + ssm[i], &g.pso_ssm[i]});
+        s.push_back({std::string("ggml_d3d12_ssm_") + ssm[i], std::addressof(g.pso_ssm[i])});
     return s;
 }
 
@@ -1119,6 +1126,15 @@ bool init_gpu(Gpu& g) {
     g.readback_ptr = static_cast<std::uint8_t*>(p);
     for (const PsoSlot& s : pso_slots(g))
         g.pso_builtin.push_back(*s.pso);
+    // The matmul pipelines are required above: one gone now means the slot
+    // table broke them, and a backend whose ops record as bare barriers returns
+    // garbage, where no backend leaves the model on the CPU.
+    for (int i = 0; i < kPsoCount; ++i)
+        for (int wd = 0; wd < 2; ++wd)
+            if (!g.pso[i][wd]) {
+                err = "a built-in pipeline was released after creation";
+                return false;
+            }
     return true;
 }
 
