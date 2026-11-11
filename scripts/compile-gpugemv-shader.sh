@@ -13,7 +13,7 @@
 #   shaders/ggml_d3d12_elt.hlsl → ggml_d3d12_elt_{binary,rms_norm,quant_q8_k,norm_quant,bin_quant}_dxil.h (cs_6_4, -D KERNEL)
 #   shaders/ggml_d3d12_moe.hlsl → ggml_d3d12_moe_{combine,tail}_dxil.h (cs_6_4, -D KERNEL)
 #   shaders/ggml_d3d12_ssm.hlsl → ggml_d3d12_ssm_{unary,copy,get_rows,conv,gdn}_dxil.h (cs_6_4, -D KERNEL)
-#   shaders/ggml_d3d12_route.hlsl → ggml_d3d12_route_{route,emit}_dxil.h (cs_6_4, -D KERNEL, -Gis)
+#   shaders/ggml_d3d12_route.hlsl → ggml_d3d12_route_{route,emit,hs}_dxil.h (cs_6_4, -D KERNEL, -Gis)
 #   variants: shaders/variants.txt → $VARIANTS_OUT/<tag>/<slot>.dxil, raw blobs
 #     for XLLAMA_D3D12_SHADER_DIR (default out: build/shader-variants)
 #
@@ -152,7 +152,7 @@ compile_target() {
 		;;
 	route)
 		local k n name sym
-		for k in 1:route:Route 2:emit:Emit; do
+		for k in 1:route:Route 2:emit:Emit 3:hs:Hs; do
 			IFS=: read -r n name sym <<<"$k"
 			compile_one "$ROOT/shaders/ggml_d3d12_route.hlsl" \
 				"$ROOT/shaders/generated/ggml_d3d12_route_${name}_dxil.h" \

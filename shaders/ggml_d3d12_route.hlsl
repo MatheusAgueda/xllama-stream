@@ -7,10 +7,12 @@
 // list is skipped (D3D12 predication, NOT_EQUAL_ZERO) and the host reads the
 // expert in and resubmits from that layer's emit (src/bridge/ggml_d3d12.cpp
 // submit_routed).
-// One source, two kernels picked with -D KERNEL=n:
+// One source, three kernels picked with -D KERNEL=n:
 //   1 route: one group per layer, at the router softmax's place.
 //   2 emit:  the record's weights and slots into the tensors the experts'
 //            MUL_MAT_ID and combine read, at the expert load's place.
+//   3 hs:    selftest probe only (XLLAMA_D3D12_HSPROBE): a word handed GPU ->
+//            CPU and back while the submission still runs.
 // Bit for bit ggml-cpu's AVX2 + FMA path, the xllama build's ISA
 // (CMakeLists.txt GGML_AVX2/GGML_FMA): ops.cpp soft_max_f32 (vec.cpp
 // ggml_vec_soft_max_f32 with vec.h ggml_v_expf, the sum in double eight lanes
@@ -39,7 +41,11 @@ cbuffer Params : register(b0) {
     uint c7;
 };
 
+#if KERNEL == 3
+globallycoherent RWByteAddressBuffer D : register(u0);
+#else
 RWByteAddressBuffer D : register(u0);
+#endif
 RWByteAddressBuffer U1 : register(u1);
 RWByteAddressBuffer U2 : register(u2);
 
@@ -445,5 +451,41 @@ void CSMain(uint tid : SV_GroupIndex) {
     D.Store(4u * tid, U1.Load(REC_W + 4u * tid));
     const int s = (int)U1.Load(REC_SLOTS + 4u * tid);
     U2.Store(4u * tid, (uint)clamp(s, 0, (int)c1 - 1));
+}
+#elif KERNEL == 3
+// u0 (globallycoherent, write-back CUSTOM L0 memory): [0] the token for the
+// CPU, [64] the CPU's answer, [128] spins done, [132] the answer seen, [136]
+// ~token once the wait is over. c0 bit 0: read the answer with an atomic
+// (InterlockedOr 0) instead of a load; bit 1: write the token with an atomic
+// exchange instead of a store. c1 = spin limit (the host sizes it from a
+// calibration, so a lost answer still ends the dispatch), c2 = token.
+// Grid (1, 1, 1).
+[numthreads(1, 1, 1)]
+void CSMain() {
+    if ((c0 & 2u) != 0u) {
+        uint old;
+        D.InterlockedExchange(0u, c2, old);
+    } else {
+        D.Store(0u, c2);
+    }
+    DeviceMemoryBarrier();
+    uint i = 0u;
+    uint seen = 0u;
+    [loop]
+    for (; i < c1; ++i) {
+        uint v;
+        if ((c0 & 1u) != 0u)
+            D.InterlockedOr(64u, 0u, v);
+        else
+            v = D.Load(64u);
+        if (v == c2) {
+            seen = v;
+            break;
+        }
+    }
+    D.Store(128u, i);
+    D.Store(132u, seen);
+    DeviceMemoryBarrier();
+    D.Store(136u, ~c2);
 }
 #endif

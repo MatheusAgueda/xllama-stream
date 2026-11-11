@@ -624,6 +624,7 @@ void run_d3d12_memprobe(const std::function<void(const std::string&)>& emit) {
         #include <vector>
 
         #include <dxgi1_4.h>
+        #include <emmintrin.h>
 
         #include "d3d12_compute.h"
         #include "ggml-alloc.h"
@@ -659,6 +660,7 @@ void run_d3d12_memprobe(const std::function<void(const std::string&)>& emit) {
         #include "ggml_d3d12_moe_emu.h"
         #include "ggml_d3d12_moe_tail_dxil.h"
         #include "ggml_d3d12_route_emit_dxil.h"
+        #include "ggml_d3d12_route_hs_dxil.h"
         #include "ggml_d3d12_route_route_dxil.h"
         #include "ggml_d3d12_ssm_conv_dxil.h"
         #include "ggml_d3d12_ssm_copy_dxil.h"
@@ -7600,6 +7602,318 @@ void run_latency_probe(std::vector<D3d12SelftestRow>* out) {
     row("lat_getcompleted", gcv, "");
 }
 
+// XLLAMA_D3D12_HSPROBE=1 (selftest only): can the GPU and the CPU hand each
+// other a word while one submission still runs, on write-back CUSTOM L0 memory
+// like D3D12_Host's? If so, a miss's expert read can start before the list
+// ends, and a kernel can wait for an expert instead of predicating the rest of
+// the list off and having it submitted again. Kernel 3 of
+// ggml_d3d12_route.hlsl, one thread: writes a token, spins (bounded) until the
+// CPU writes the token back, stores its spin count. GPU variants: "atomic"
+// reads the answer with InterlockedOr, "load" with a globallycoherent load,
+// "xchg" also writes the token with an atomic exchange. CPU variants: "coh"
+// plain loads and stores, "flush" a clflush before each poll and after the
+// answer. Calibration lists (no answer) give a spin's GPU time and size the
+// answered lists' limit to ~20 ms, so a lost answer still ends the dispatch.
+// Rows, gpu_ms = median ms, rel_err = p90 ms:
+//   hs_cal_<gpu>          a spin's GPU time (error: us per 1000 spins)
+//   hs_g2c_<gpu>_<cpu>    first GPU timestamp -> the CPU sees the token; error:
+//                         seen before the list's last timestamp (mid-flight)
+//                         n/N, the answer reached the shader n/N
+//   hs_c2g_<gpu>_<cpu>    the CPU wrote the answer -> the list's last timestamp
+//                         (answered lists only)
+//   hs_hold_<gpu>_<cpu>   answer held back 100 us: first -> last timestamp
+void run_hs_probe(std::vector<D3d12SelftestRow>* out) {
+    Gpu& g = gpu();
+    auto fail = [&](const std::string& e) {
+        D3d12SelftestRow r;
+        r.type = "hs_probe";
+        r.error = e;
+        out->push_back(std::move(r));
+    };
+    if (!g.ts_freq) {
+        fail("no timestamp frequency");
+        return;
+    }
+    ComPtr<ID3D12PipelineState> pso;
+    {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
+        pd.pRootSignature = g.root.Get();
+        pd.CS.pShaderBytecode = kGgmlD3d12RouteHsDxil;
+        pd.CS.BytecodeLength = kGgmlD3d12RouteHsDxilSize;
+        const HRESULT hr = g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso));
+        if (FAILED(hr)) {
+            fail(d3d12c::hr_message("CreateComputePipelineState (hs)", hr));
+            return;
+        }
+    }
+    std::string err;
+    ComPtr<ID3D12Fence> fa;
+    if (FAILED(g.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fa)))) {
+        fail("CreateFence failed");
+        return;
+    }
+    D3D12_QUERY_HEAP_DESC qhd = {};
+    qhd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    qhd.Count = 2;
+    ComPtr<ID3D12QueryHeap> qh;
+    if (FAILED(g.device->CreateQueryHeap(&qhd, IID_PPV_ARGS(&qh)))) {
+        fail("CreateQueryHeap failed");
+        return;
+    }
+    auto rb = d3d12c::create_buffer(g.device.Get(), 256, D3D12_HEAP_TYPE_READBACK,
+                                    D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST,
+                                    "hs_rb", &err);
+    auto hb = d3d12c::create_buffer_props(g.device.Get(), 4096, custom_l0_props(),
+                                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "hs_buf", &err);
+    if (!rb || !hb) {
+        fail("buffers: " + err);
+        return;
+    }
+    void* p_rb = nullptr;
+    void* p_hb = nullptr;
+    const D3D12_RANGE none = {0, 0};
+    if (FAILED(rb->Map(0, nullptr, &p_rb)) || FAILED(hb->Map(0, nullptr, &p_hb))) {
+        fail("Map failed");
+        return;
+    }
+    const auto* ts = static_cast<const std::uint64_t*>(p_rb);
+    auto* hw = static_cast<volatile std::uint32_t*>(p_hb);
+    // Word offsets of the kernel's bytes 0 / 64 / 128 / 132 / 136.
+    constexpr std::size_t kTok = 0, kAns = 16, kSpins = 32, kSeen = 33, kEnd = 34;
+    auto clflush = [&](std::size_t w) {
+        _mm_clflush(const_cast<const std::uint32_t*>(hw + w));
+    };
+    ComPtr<ID3D12CommandAllocator> al;
+    ComPtr<ID3D12GraphicsCommandList> cl;
+    if (FAILED(g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                IID_PPV_ARGS(&al))) ||
+        FAILED(g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, al.Get(), nullptr,
+                                           IID_PPV_ARGS(&cl))) ||
+        FAILED(cl->Close())) {
+        fail("command list failed");
+        return;
+    }
+    auto record = [&](std::uint32_t c0, std::uint32_t limit, std::uint32_t token) {
+        if (FAILED(al->Reset()) || FAILED(cl->Reset(al.Get(), nullptr)))
+            return false;
+        cl->EndQuery(qh.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+        Op op;
+        op.pso = pso.Get();
+        set_c(op, {c0, limit, token});
+        op.u[0] = hb->GetGPUVirtualAddress();
+        op.gx = 1;
+        op.gy = 1;
+        const std::vector<Op> one = {op};
+        record_ops(g, cl.Get(), one, false, false);
+        cl->EndQuery(qh.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+        cl->ResolveQueryData(qh.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, rb.Get(), 0);
+        return SUCCEEDED(cl->Close());
+    };
+
+    LARGE_INTEGER qf;
+    QueryPerformanceFrequency(&qf);
+    const double us_per_qpc = 1e6 / static_cast<double>(qf.QuadPart);
+    const double qpc_per_tick = static_cast<double>(qf.QuadPart) / static_cast<double>(g.ts_freq);
+    auto qpc = [] {
+        LARGE_INTEGER t;
+        QueryPerformanceCounter(&t);
+        return t.QuadPart;
+    };
+    // Spins until done() or limit_us; false on the timeout.
+    auto spin = [&](double limit_us, auto&& done) {
+        const LONGLONG t0 = qpc();
+        for (unsigned i = 1;; ++i) {
+            if (done())
+                return true;
+            YieldProcessor();
+            if ((i & 15) == 0 && (qpc() - t0) * us_per_qpc > limit_us)
+                return false;
+        }
+    };
+
+    struct GpuVar {
+        const char* name;
+        std::uint32_t c0;
+    };
+    const GpuVar gvars[] = {{"atomic", 1u}, {"load", 0u}, {"xchg", 3u}};
+    constexpr int kIters = 30;
+    constexpr std::uint32_t kCalSpins = 4096;
+    struct Sample {
+        double g2c = 0.0, c2g = 0.0, gpu = 0.0;
+        bool seen = false, mid = false, answered = false;
+        std::uint32_t spins = 0;
+    };
+    std::uint64_t va = 0;
+    std::uint32_t serial = 0;
+    bool hung = false, bad_end = false;
+    // One list: answer (or not) after an optional hold; the sample's times in us.
+    auto run_one = [&](std::uint32_t c0, std::uint32_t limit, bool answer, bool flush,
+                       double hold_us, Sample* s) {
+        const std::uint32_t tok = 0x5A000000u | (++serial & 0x00FFFFFFu);
+        for (std::size_t w = 0; w < 48; ++w)
+            hw[w] = 0;
+        if (flush) {
+            clflush(kTok);
+            clflush(kAns);
+            clflush(kSpins);
+        }
+        _mm_mfence();
+        if (!record(c0, limit, tok)) {
+            hung = true;
+            return;
+        }
+        UINT64 cal_gpu = 0, cal_cpu = 0;
+        g.queue->GetClockCalibration(&cal_gpu, &cal_cpu);
+        ID3D12CommandList* lists[] = {cl.Get()};
+        const UINT64 a = ++va;
+        g.queue->ExecuteCommandLists(1, lists);
+        g.queue->Signal(fa.Get(), a);
+        LONGLONG q2 = 0, q3 = 0;
+        if (answer) {
+            s->seen = spin(30000.0, [&] {
+                if (flush) {
+                    clflush(kTok);
+                    _mm_mfence();
+                }
+                return hw[kTok] == tok;
+            });
+            q2 = qpc();
+            if (hold_us > 0.0) {
+                const LONGLONG h = qpc();
+                while ((qpc() - h) * us_per_qpc < hold_us)
+                    YieldProcessor();
+            }
+            hw[kAns] = tok;
+            if (flush)
+                clflush(kAns);
+            _mm_mfence();
+            q3 = qpc();
+        }
+        if (!spin(2e6, [&] { return fa->GetCompletedValue() >= a; })) {
+            hung = true;
+            return;
+        }
+        if (flush) {
+            clflush(kSpins);
+            _mm_mfence();
+        }
+        s->spins = hw[kSpins];
+        s->answered = answer && hw[kSeen] == tok && s->spins < limit;
+        if (hw[kEnd] != ~tok)
+            bad_end = true;
+        auto cpu_of = [&](std::uint64_t t) {
+            return static_cast<double>(cal_cpu) +
+                   static_cast<double>(static_cast<std::int64_t>(t - cal_gpu)) * qpc_per_tick;
+        };
+        const double c0t = cpu_of(ts[0]), c1t = cpu_of(ts[1]);
+        s->gpu = (c1t - c0t) * us_per_qpc;
+        if (answer) {
+            s->g2c = (static_cast<double>(q2) - c0t) * us_per_qpc;
+            s->mid = s->seen && static_cast<double>(q2) < c1t;
+            s->c2g = (c1t - static_cast<double>(q3)) * us_per_qpc;
+        }
+    };
+
+    auto row = [&](const std::string& name, std::vector<double>& us, const std::string& extra) {
+        D3d12SelftestRow r;
+        r.type = name;
+        r.n = static_cast<int>(us.size());
+        if (us.empty()) {
+            r.error = "no samples" + extra;
+            out->push_back(std::move(r));
+            return;
+        }
+        std::sort(us.begin(), us.end());
+        auto at = [&](double f) {
+            return us[std::min(us.size() - 1, static_cast<std::size_t>(f * us.size()))];
+        };
+        r.gpu_ms = at(0.5) / 1000.0;
+        r.rel_err = at(0.9) / 1000.0;
+        char b[240];
+        std::snprintf(b, sizeof(b), "us p10 %.2f p50 %.2f p90 %.2f max %.2f%s", at(0.1), at(0.5),
+                      at(0.9), us.back(), extra.c_str());
+        r.error = b;
+        r.ok = r.d3d12_ran = true;
+        out->push_back(std::move(r));
+    };
+
+    std::uint32_t limit[3] = {};
+    {
+        std::lock_guard<std::mutex> lock(g.mu);
+        drain_pending(g);
+        for (int v = 0; v < 3 && !hung; ++v) {
+            std::vector<double> per_k;
+            for (int i = 0; i < kIters && !hung; ++i) {
+                Sample s;
+                run_one(gvars[v].c0, kCalSpins, false, false, 0.0, &s);
+                if (!hung && s.spins > 0)
+                    per_k.push_back(s.gpu * 1000.0 / s.spins);
+            }
+            if (hung)
+                break;
+            std::sort(per_k.begin(), per_k.end());
+            const double us_k = per_k.empty() ? 0.0 : per_k[per_k.size() / 2];
+            // ~20 ms of spinning, at least the calibration's count
+            const double n = us_k > 0.0 ? 20000.0 * 1000.0 / us_k : 1e8;
+            limit[v] = static_cast<std::uint32_t>(std::clamp(n, double(kCalSpins), 1e8));
+            std::vector<double> rowv = per_k;
+            char x[96];
+            std::snprintf(x, sizeof(x), "; per 1000 spins; answered lists' limit %u", limit[v]);
+            row(std::string("hs_cal_") + gvars[v].name, rowv, x);
+        }
+        for (int v = 0; v < 3 && !hung; ++v)
+            for (int f = 0; f < 2 && !hung; ++f) {
+                std::vector<double> g2c, c2g;
+                int seen = 0, mid = 0, answered = 0;
+                for (int i = 0; i < kIters && !hung; ++i) {
+                    Sample s;
+                    run_one(gvars[v].c0, limit[v], true, f != 0, 0.0, &s);
+                    if (hung)
+                        break;
+                    seen += s.seen;
+                    mid += s.mid;
+                    answered += s.answered;
+                    if (s.seen)
+                        g2c.push_back(s.g2c);
+                    if (s.answered)
+                        c2g.push_back(s.c2g);
+                }
+                const std::string tag = std::string(gvars[v].name) + (f ? "_flush" : "_coh");
+                char x[160];
+                std::snprintf(x, sizeof(x), "; seen %d/%d, mid-flight %d, answer reached the shader %d",
+                              seen, kIters, mid, answered);
+                row("hs_g2c_" + tag, g2c, x);
+                row("hs_c2g_" + tag, c2g, x);
+            }
+        for (int f = 0; f < 2 && !hung; ++f) {
+            std::vector<double> held;
+            int answered = 0;
+            for (int i = 0; i < kIters && !hung; ++i) {
+                Sample s;
+                run_one(gvars[0].c0, limit[0], true, f != 0, 100.0, &s);
+                if (hung)
+                    break;
+                answered += s.answered;
+                held.push_back(s.gpu);
+            }
+            char x[96];
+            std::snprintf(x, sizeof(x), "; answer reached the shader %d/%d", answered, kIters);
+            row(std::string("hs_hold_atomic") + (f ? "_flush" : "_coh"), held, x);
+        }
+    }
+    // A list still running must not outlive its buffers: block on the fence
+    // (a removed device signals it UINT64_MAX).
+    if (hung && va > 0 && fa->GetCompletedValue() < va)
+        fa->SetEventOnCompletion(va, nullptr);
+    rb->Unmap(0, &none);
+    hb->Unmap(0, nullptr);
+    if (hung)
+        fail("a list did not complete within 2 s (or a recording failed)");
+    if (bad_end)
+        fail("the kernel's end word did not match its token at least once");
+}
+
 } // namespace
 
 void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
@@ -7702,6 +8016,8 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
     out->push_back(run_submit_rtt());
     if (const char* lp = std::getenv("XLLAMA_D3D12_LATPROBE"); lp && std::atoi(lp) > 0)
         run_latency_probe(out);
+    if (const char* hp = std::getenv("XLLAMA_D3D12_HSPROBE"); hp && std::atoi(hp) > 0)
+        run_hs_probe(out);
     ggml_backend_free(backend);
 }
 
