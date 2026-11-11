@@ -815,6 +815,10 @@ struct Gpu {
     bool route_shared = true;
     int route_io = 6;
     int route_poll = 0;
+    // XLLAMA_D3D12_GPUROUTE_MAX: routed layers per submission (kRouteMax); a
+    // miss skips the rest of its submission, fewer layers each = shorter tails
+    // for more submissions.
+    std::size_t route_max = 128;
     // A layer's record (shaders/ggml_d3d12_route.hlsl) per kRouteRec bytes and
     // the predicate, D3D12_Host buffers.
     ComPtr<ID3D12Resource> route_res;
@@ -951,6 +955,10 @@ struct Gpu {
     std::map<std::tuple<const void*, const void*, std::size_t>, SegStat*> seg_of;
     // XLLAMA_D3D12_PROFILE: dispatches by pipeline and grid.
     std::map<std::tuple<const ID3D12PipelineState*, UINT, UINT, UINT>, SegStat> kernels;
+    // ... less the dispatches a missed route's predicate skipped (the rest of
+    // its list after the gate), counted here with the barriers among them.
+    SegStat prof_tail;
+    std::uint64_t prof_tail_bars = 0;
     std::mutex mu;
     bool ok = false;
     std::string error;
@@ -1940,6 +1948,10 @@ std::string pso_name(const Gpu& g, const ID3D12PipelineState* p) {
     for (int i = 0; i < kSsmCount; ++i)
         if (g.pso_ssm[i].Get() == p)
             return kSsms[i];
+    if (g.pso_route[kRouteRoute].Get() == p)
+        return "route";
+    if (g.pso_route[kRouteEmit].Get() == p)
+        return "route emit";
     return "?";
 }
 
@@ -2013,6 +2025,15 @@ void backend_free(ggml_backend_t b) {
                 line, sizeof(line), "[xllama] d3d12 kernel: %9llu x %9.1f ms  %s grid %ux%ux%u\n",
                 static_cast<unsigned long long>(s.n), s.ms, pso_name(g, std::get<0>(key)).c_str(),
                 std::get<1>(key), std::get<2>(key), std::get<3>(key));
+            log_output(line);
+        }
+        if (g.prof_tail.n || g.prof_tail_bars) {
+            char line[192];
+            std::snprintf(line, sizeof(line),
+                          "[xllama] d3d12 kernel: %9llu x %9.1f ms  skipped by a miss's predicate "
+                          "(%llu barriers among them)\n",
+                          static_cast<unsigned long long>(g.prof_tail.n), g.prof_tail.ms,
+                          static_cast<unsigned long long>(g.prof_tail_bars));
             log_output(line);
         }
         std::vector<std::pair<std::string, Gpu::SegStat>> top(g.segs.begin(), g.segs.end());
@@ -2099,6 +2120,8 @@ void backend_free(ggml_backend_t b) {
         g.seg_of.clear();
         g.segs.clear();
         g.kernels.clear();
+        g.prof_tail = {};
+        g.prof_tail_bars = 0;
     }
     delete b;
 }
@@ -2458,18 +2481,33 @@ std::uint64_t record_ops(Gpu& g, ID3D12GraphicsCommandList* cl, const std::vecto
 
 // Each profiled dispatch's time, from the stamps record_ops resolved: the gap
 // from the previous stamp, so a barrier counts towards the dispatch after it.
+// With GPU routing, the predicate the run left (the missed layer's route
+// kernel wrote its c6) marks where skipping began: after that kernel's gate.
 void add_profile(Gpu& g, const std::vector<Op>& ops) {
     void* p = nullptr;
     if (FAILED(g.prof_rb->Map(0, nullptr, &p)))
         return;
     const auto* t = static_cast<const std::uint64_t*>(p);
+    std::uint32_t pv = 0;
+    if (g.route_on && g.pred_ptr)
+        std::memcpy(&pv, g.pred_ptr, sizeof(pv));
+    const ID3D12PipelineState* route = g.pso_route[kRouteRoute].Get();
+    bool armed = false, skipping = false;
     UINT k = 1;
     for (const Op& op : ops) {
-        if (!op.pso)
+        if (!op.pso) {
+            if (op.pred && armed)
+                skipping = true;
+            if (skipping)
+                ++g.prof_tail_bars;
             continue;
+        }
+        if (pv && op.pso == route && op.c[6] == pv)
+            armed = true;
         if (k >= kProfStamps)
             break;
-        Gpu::SegStat& s = g.kernels[std::make_tuple(op.pso, op.gx, op.gy, op.gz)];
+        Gpu::SegStat& s = skipping ? g.prof_tail
+                                   : g.kernels[std::make_tuple(op.pso, op.gx, op.gy, op.gz)];
         ++s.n;
         if (t[k] > t[k - 1])
             s.ms += 1000.0 * static_cast<double>(t[k] - t[k - 1]) / static_cast<double>(g.ts_freq);
@@ -4121,7 +4159,7 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
                 RouteGrp& r = rgrps[rit->second];
                 if (node == r.S) {
                     // The route kernel, then the gate.
-                    if (pend.size() >= kRouteMax && !flush())
+                    if (pend.size() >= g.route_max && !flush())
                         return GGML_STATUS_FAILED;
                     r.slot = pend.size();
                     std::uint8_t* rec = g.route_ptr + r.slot * kRouteRec;
@@ -4950,12 +4988,15 @@ ggml_backend_t dev_init_backend(ggml_backend_dev_t dev, const char*) {
         g.route_io = std::clamp(giv && *giv ? std::atoi(giv) : 6, 1, 64);
         const char* gpv = std::getenv("XLLAMA_D3D12_GPUROUTE_POLL");
         g.route_poll = std::clamp(gpv && *gpv ? std::atoi(gpv) : 0, 0, 100);
+        const char* gmv = std::getenv("XLLAMA_D3D12_GPUROUTE_MAX");
+        g.route_max = static_cast<std::size_t>(
+            std::clamp(gmv && *gmv ? std::atoi(gmv) : static_cast<int>(kRouteMax), 1,
+                       static_cast<int>(kRouteMax)));
         g.route_on = false;
         if (route_want) {
             const char* off = !g.route_ok      ? "no route kernels"
                               : g.waves        ? "XLLAMA_D3D12_WAVES"
                               : g.shexp_async  ? "XLLAMA_D3D12_SHEXP_ASYNC"
-                              : g.prof_on      ? "XLLAMA_D3D12_PROFILE"
                               : !ensure_route_bufs(g) ? "no buffers"
                               : !host_cpu(g)   ? "no CPU backend"
                                                : nullptr;
