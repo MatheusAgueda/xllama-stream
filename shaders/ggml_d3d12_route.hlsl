@@ -21,7 +21,7 @@
 // multiply-adds; nothing depends on the GPU's fp32 rounding or denormal mode.
 // Floats travel as their bits. Needs double and int64 shader ops (the host
 // checks both) and dxc -Gis.
-// Root signature: 8 constants at b0, root UAVs u0 (record / dst) and u1, u2,
+// Root signature: 8 constants at b0, root UAVs u0 (record / dst) and u1 to u4,
 // D3D12_Host raw buffers.
 
 #ifndef KERNEL
@@ -46,7 +46,8 @@ RWByteAddressBuffer U2 : register(u2);
 // A layer's record (kRoute* in ggml_d3d12.cpp): probs [256] floats, the host's
 // copy of the layer's slot_of [256] (>= 0 resident), ids / slots / weights
 // [16] each, then the state (0 not run, 1 every expert resident, 2 missing,
-// 3 a non-finite logit) and the swaps made.
+// 3 a non-finite logit), the swaps made and the gate's logit and sigmoid (the
+// host checks them against its own expf).
 #define REC_PROBS 0u
 #define REC_MIRROR 1024u
 #define REC_IDS 2048u
@@ -54,6 +55,8 @@ RWByteAddressBuffer U2 : register(u2);
 #define REC_W 2176u
 #define REC_STATE 2240u
 #define REC_SWAPS 2244u
+#define REC_GATE 2248u
+#define REC_SIG 2252u
 
 // float bits -> double, exact (denormals included).
 double f2d(uint f) {
@@ -206,6 +209,42 @@ uint expf_avx2(uint x) {
     return mul32(fma32(s2, j, s2), s1);
 }
 
+// exp(x) in double for |x| <= 110: x = k ln 2 + r (Cody-Waite, ln 2 split so
+// k * hi is exact), e^r by its degree-13 Taylor polynomial (|r| < 0.35: the
+// truncation is under 1e-17), times 2^k. A few double ulps from e^x, so its
+// float rounding is the correctly rounded expf but next to a float midpoint.
+static const uint kInvFact[28] = {
+    0x13A86D09u, 0x3DE61246u, 0xEFF8D898u, 0x3E21EED8u, 0x67F544E4u, 0x3E5AE645u, 0xB7789F5Cu, 0x3E927E4Fu,
+    0xA556C734u, 0x3EC71DE3u, 0x1A01A01Au, 0x3EFA01A0u, 0x1A01A01Au, 0x3F2A01A0u, 0x16C16C17u, 0x3F56C16Cu,
+    0x11111111u, 0x3F811111u, 0x55555555u, 0x3FA55555u, 0x55555555u, 0x3FC55555u, 0x00000000u, 0x3FE00000u,
+    0x00000000u, 0x3FF00000u, 0x00000000u, 0x3FF00000u,
+}; // 1/13! ... 1/0!, (lo, hi) pairs
+double exp_d(double x) {
+    precise double kx = x * asdouble(0x652B82FEu, 0x3FF71547u); // log2(e)
+    const int k = (int)(kx >= 0.0 ? kx + 0.5 : kx - 0.5);
+    const double kd = (double)k;
+    precise double r = (x - kd * asdouble(0xFEE00000u, 0x3FE62E42u)) - kd * asdouble(0x35793C76u, 0x3DEA39EFu);
+    precise double p = asdouble(kInvFact[0], kInvFact[1]);
+    for (uint i = 1u; i < 14u; ++i)
+        p = p * r + asdouble(kInvFact[2u * i], kInvFact[2u * i + 1u]);
+    return p * asdouble(0u, (uint)(k + 1023) << 20);
+}
+
+// ggml-cpu unary-ops.cpp op_sigmoid, 1.f / (1.f + expf(-x)), one value
+uint sigmoid32(uint x) {
+    if ((x & 0x7FFFFFFFu) > 0x7F800000u)
+        return (x ^ 0x80000000u) | 0x400000u; // NaN: the quieted -x the SSE ops carry through
+    const double nx = -f2d(x);
+    uint e;
+    if (nx > 90.0)
+        e = 0x7F800000u; // expf overflows from 88.73
+    else if (nx < -110.0)
+        e = 0u; // and underflows to +0 below -103.98
+    else
+        e = d2f(exp_d(nx));
+    return div32(0x3F800000u, add32(0x3F800000u, e));
+}
+
 groupshared double gs_d[256];
 groupshared uint gs_p[256];
 groupshared uint gs_order[256];
@@ -216,14 +255,34 @@ groupshared uint gs_v;
 // c0 = n_expert (a multiple of 8, <= 256), c1 = n_used (<= 16), c2 = swap
 // ratio (float bits, >= 0), c3 = swap tail ranks, c4 = clamp minimum (float
 // bits), c5 = scale (float bits), c6 = predicate value (layer + 1, != 0), c7 =
-// flags: bit 0 normalise (sum_rows, clamp, div), bit 1 scale. u0 = record,
+// flags: bit 0 normalise (sum_rows, clamp, div), bit 1 scale, bit 2 the
+// shared expert's gate sigmoid (u3 one logit in, u4 out). u0 = record,
 // u1 = router logits (n_expert floats), u2 = predicate (uint64, the host
 // zeroes it; written only when an expert is missing). Grid (1, 1, 1).
+// bit 3 alone is the selftest's sigmoid over c0 values (u3 in, u4 out, a
+// group per 256).
+RWByteAddressBuffer U3 : register(u3);
+RWByteAddressBuffer U4 : register(u4);
+
 [numthreads(256, 1, 1)]
-void CSMain(uint tid : SV_GroupIndex) {
+void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
     const uint n = c0;
-    if (tid == 0u)
+    if ((c7 & 8u) != 0u) {
+        const uint idx = gid.x * 256u + tid;
+        if (idx < n)
+            U4.Store(4u * idx, sigmoid32(U3.Load(4u * idx)));
+        return;
+    }
+    if (tid == 0u) {
         gs_bad = 0u;
+        if ((c7 & 4u) != 0u) {
+            const uint g = U3.Load(0u);
+            const uint sg = sigmoid32(g);
+            U4.Store(0u, sg);
+            D.Store(REC_GATE, g);
+            D.Store(REC_SIG, sg);
+        }
+    }
     uint x = 0xFF800000u; // -inf
     if (tid < n) {
         x = U1.Load(4u * tid);
