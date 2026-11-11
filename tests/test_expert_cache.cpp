@@ -45,12 +45,19 @@ namespace {
 struct EcLog {
     std::mutex mtx;
     std::string final_line;
+    std::string slots_line; // the LLAMA_EXPERT_SLOTS_LAYERS init line
 };
 
 void ec_log_cb(ggml_log_level, const char* text, void* user_data) {
-    if (!text || !std::strstr(text, "expert cache (final)"))
+    if (!text)
         return;
     auto* log = static_cast<EcLog*>(user_data);
+    if (std::strstr(text, "slots per layer")) {
+        std::lock_guard<std::mutex> lock(log->mtx);
+        log->slots_line = text;
+    }
+    if (!std::strstr(text, "expert cache (final)"))
+        return;
     std::lock_guard<std::mutex> lock(log->mtx);
     log->final_line = text;
 }
@@ -685,6 +692,31 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
             CHECK(records > 0);
             CHECK(token_layers >= records);
             CHECK(bad == 0);
+        }
+
+        // Slots per layer (LLAMA_EXPERT_SLOTS_LAYERS): layer 0 holds one more
+        // expert, the others keep the default, so the ubatch cap (smallest layer)
+        // stays. Exact routing: same tokens as plain, and LRU is a stack policy, so
+        // more slots never miss more.
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            log.final_line.clear();
+            log.slots_line.clear();
+        }
+        const std::string wider = std::to_string(c.slots + 1);
+        set_env_s("LLAMA_EXPERT_SLOTS_LAYERS", wider.c_str());
+        const EcRun layered = run_greedy(path, c.slots, 512, c.used, 24);
+        set_env_s("LLAMA_EXPERT_SLOTS_LAYERS", nullptr);
+        REQUIRE(layered.ok);
+        CHECK(layered.n_ubatch == cached.n_ubatch);
+        CHECK(layered.tokens == plain.tokens);
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            MESSAGE(log.slots_line);
+            MESSAGE(log.final_line);
+            CHECK(log.slots_line.find("for 1 layers: min " + wider) != std::string::npos);
+            CHECK(misses_of(log.final_line) > 0);
+            CHECK(misses_of(log.final_line) <= plain_misses);
         }
 
         // Both: the prefetch predicts the swapped routing (stand-ins kept, only

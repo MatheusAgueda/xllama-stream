@@ -74,7 +74,7 @@ new file mode 100644
 index 0000000..b93f475
 --- /dev/null
 +++ b/src/llama-expert-cache.cpp
-@@ -0,0 +1,1995 @@
+@@ -0,0 +1,2038 @@
 +#include "llama-expert-cache.h"
 +
 +#include "llama-impl.h"
@@ -278,6 +278,9 @@ index 0000000..b93f475
 +    uint32_t n_expert_used = 1;
 +    float    swap_ratio    = 0.0f;
 +    uint32_t swap_tail     = 0; // LLAMA_EXPERT_SWAP_TAIL: weakest ranks of the top-k a resident takes at any score
++    // LLAMA_EXPERT_SLOTS_LAYERS: the slots of layer il (n_slots past the list) - an uneven split at the
++    // same total moves memory to the layers whose routing misses most
++    std::vector<uint32_t> slots_layer;
 +
 +    // LLAMA_EXPERT_TRACE=<file>: the router's ranking of every token, layer and ubatch as the select op
 +    // saw it, before any swap (records "ECT1", layer, n_tokens, k, n_used, then per token k int16 ids
@@ -1781,6 +1784,30 @@ index 0000000..b93f475
 +        LLAMA_LOG_INFO("%s: expert cache: swap tail %u of %u ranks (a resident stands in at any score)\n",
 +            __func__, cache->swap_tail, cache->n_expert_used);
 +    }
++    // LLAMA_EXPERT_SLOTS_LAYERS=<n0>,<n1>,...: resident experts of each layer, at least n_expert_used
++    // (layers past the list keep n_slots). The split comes from a routing trace replayed offline; the
++    // ubatch cap follows the smallest layer
++    const char * sl = getenv("LLAMA_EXPERT_SLOTS_LAYERS");
++    for (const char * p = sl != nullptr ? sl : ""; *p != '\0';) {
++        char * end = nullptr;
++        const long v = strtol(p, &end, 10);
++        if (end == p) {
++            break;
++        }
++        cache->slots_layer.push_back((uint32_t) std::min<long>(std::max<long>(v, cache->n_expert_used), 65536));
++        p = *end == ',' ? end + 1 : end;
++    }
++    if (!cache->slots_layer.empty()) {
++        uint64_t sum = 0;
++        for (uint32_t s : cache->slots_layer) {
++            sum += s;
++        }
++        LLAMA_LOG_INFO("%s: expert cache: slots per layer for %zu layers: min %u, max %u, total %llu (default %u)\n",
++            __func__, cache->slots_layer.size(),
++            *std::min_element(cache->slots_layer.begin(), cache->slots_layer.end()),
++            *std::max_element(cache->slots_layer.begin(), cache->slots_layer.end()), (unsigned long long) sum,
++            cache->n_slots);
++    }
 +    // LLAMA_EXPERT_TRACE: needs the select op, i.e. a swap ratio (a ratio above 1 never swaps: an exact
 +    // routing trace)
 +    const char * tr = getenv("LLAMA_EXPERT_TRACE");
@@ -1883,7 +1910,22 @@ index 0000000..b93f475
 +}
 +
 +uint32_t llama_expert_cache_max_ubatch(const llama_expert_cache & cache) {
-+    return std::max<uint32_t>(1, cache.n_slots / cache.n_expert_used);
++    // every layer must hold one ubatch's experts at once: the smallest bound layer decides
++    uint32_t lo = cache.layers.empty() ? cache.n_slots : UINT32_MAX;
++    for (const auto & it : cache.layers) {
++        lo = std::min(lo, (uint32_t) it.second->expert_of.size());
++    }
++    return std::max<uint32_t>(1, lo / cache.n_expert_used);
++}
++
++// the slots of an expert tensor's layer (blk.<il>.*): LLAMA_EXPERT_SLOTS_LAYERS, n_slots by default
++static uint32_t ec_slots_of(const llama_expert_cache & cache, const ggml_tensor * t) {
++    int32_t il = -1;
++    if (cache.slots_layer.empty() || sscanf(ggml_get_name(t), "blk.%d.", &il) != 1 || il < 0 ||
++            (size_t) il >= cache.slots_layer.size()) {
++        return cache.n_slots;
++    }
++    return cache.slots_layer[il];
 +}
 +
 +uint32_t llama_expert_cache_expert_major(llama_expert_cache & cache) {
@@ -1893,7 +1935,7 @@ index 0000000..b93f475
 +
 +bool llama_expert_cache_wants(ggml_backend_buffer_type_t buft, const ggml_tensor * t) {
 +    const llama_expert_cache * cache = ec_of_buft(buft);
-+    return cache != nullptr && t->ne[3] == 1 && t->ne[2] > (int64_t) cache->n_slots &&
++    return cache != nullptr && t->ne[3] == 1 && t->ne[2] > (int64_t) ec_slots_of(*cache, t) &&
 +           t->nb[2] == t->nb[1]*(size_t) t->ne[1];
 +}
 +
@@ -1901,7 +1943,7 @@ index 0000000..b93f475
 +    if (!llama_expert_cache_wants(buft, t)) {
 +        return;
 +    }
-+    t->ne[2] = ec_of_buft(buft)->n_slots;
++    t->ne[2] = ec_slots_of(*ec_of_buft(buft), t);
 +    t->nb[3] = t->nb[2]*(size_t) t->ne[2];
 +}
 +
@@ -1921,7 +1963,8 @@ index 0000000..b93f475
 +    if (sscanf(ggml_get_name(t), "blk.%d.", &il) != 1 || il < 0) {
 +        throw std::runtime_error(std::string("expert cache: no layer in tensor name ") + ggml_get_name(t));
 +    }
-+    if (t->ne[3] != 1 || t->ne[2] != (int64_t) cache->n_slots || n_expert <= t->ne[2] ||
++    const uint32_t n_slots = ec_slots_of(*cache, t);
++    if (t->ne[3] != 1 || t->ne[2] != (int64_t) n_slots || n_expert <= t->ne[2] ||
 +            t->nb[2] != t->nb[1]*(size_t) t->ne[1]) {
 +        throw std::runtime_error(std::string("expert cache: unsupported layout for ") + ggml_get_name(t));
 +    }
@@ -1943,9 +1986,9 @@ index 0000000..b93f475
 +        slot->cache = cache;
 +        slot->id    = il;
 +        slot->slot_of.assign(n_expert, -1);
-+        slot->expert_of.assign(cache->n_slots, -1);
-+        slot->used.assign(cache->n_slots, 0);
-+        slot->pf.reset(new ec_pf[cache->n_slots]);
++        slot->expert_of.assign(n_slots, -1);
++        slot->used.assign(n_slots, 0);
++        slot->pf.reset(new ec_pf[n_slots]);
 +        slot->seen.assign(n_expert, 0);
 +        cache->first_layer = std::min(cache->first_layer, il);
 +    }
