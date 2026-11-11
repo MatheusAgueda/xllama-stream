@@ -4747,11 +4747,12 @@ D3d12SelftestRow run_submit_rtt() {
 // XLLAMA_D3D12_LATPROBE=1 (selftest only): where the time a submission costs
 // beyond its GPU work goes, on prerecorded lists executed again (like a kept
 // list replayed). GPU timestamps go onto the QPC clock through
-// GetClockCalibration, taken right before each submission. Three lists,
+// GetClockCalibration, taken right before each submission. Four lists,
 // interleaved: an empty one (two timestamps), one copying 64 KiB from an
 // upload buffer into write-back CUSTOM L0 memory and then writing a flag there
-// (WriteBufferImmediate MARKER_OUT, else a 4-byte copy), and the empty one
-// submitted behind queue->Wait on a fence the CPU signals ~200 us later.
+// (WriteBufferImmediate MARKER_OUT, else a 4-byte copy), the empty one
+// submitted behind queue->Wait on a fence the CPU signals ~200 us later, and
+// one dispatch (KERNEL 1 scale by 1, 64 KiB write-back UAV to UAV) then the flag.
 // Rows, gpu_ms = median ms, rel_err = p90 ms, error = the spread in us:
 //   lat_exec          the ExecuteCommandLists call
 //   lat_launch        Execute returned -> the list's first timestamp
@@ -4759,7 +4760,8 @@ D3d12SelftestRow run_submit_rtt() {
 //   lat_tail_fence    last timestamp -> CPU sees the fence (spin on GetCompletedValue)
 //   lat_tail_flag     last timestamp -> CPU sees the flag (spin on the memory);
 //                     says whether the 64 KiB copy before it was visible then
-//   lat_rtt_fence / lat_rtt_flag   Execute called -> CPU sees completion
+//   lat_tail_flag_uav the same after the dispatch, whose output is checked
+//   lat_rtt_fence / lat_rtt_flag / lat_rtt_flag_uav   Execute called -> CPU sees completion
 //   lat_signal_cpu    ID3D12Fence::Signal from the CPU
 //   lat_resume        the gated list: CPU Signal returned -> its first timestamp
 //   lat_rtt_gated     the gated list: CPU Signal called -> CPU sees the fence
@@ -4778,7 +4780,8 @@ void run_latency_probe(std::vector<D3d12SelftestRow>* out) {
     }
     constexpr UINT64 kData = 64u << 10;
     constexpr UINT32 kMagic = 0x5EA1F1A6u;
-    constexpr int kIters = 600; // 200 per list
+    constexpr int kModes = 4;
+    constexpr int kIters = 200 * kModes;
     std::string err;
     ComPtr<ID3D12Fence> fa, fb;
     if (FAILED(g.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fa))) ||
@@ -4788,7 +4791,7 @@ void run_latency_probe(std::vector<D3d12SelftestRow>* out) {
     }
     D3D12_QUERY_HEAP_DESC qhd = {};
     qhd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-    qhd.Count = 6;
+    qhd.Count = 2 * kModes;
     ComPtr<ID3D12QueryHeap> qh;
     if (FAILED(g.device->CreateQueryHeap(&qhd, IID_PPV_ARGS(&qh)))) {
         fail("CreateQueryHeap failed");
@@ -4803,36 +4806,44 @@ void run_latency_probe(std::vector<D3d12SelftestRow>* out) {
     auto wb = d3d12c::create_buffer_props(g.device.Get(), kData + 256, custom_l0_props(),
                                           D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST,
                                           "lat_wb", &err);
-    if (!rb || !up || !wb) {
+    // Mode 3's dispatch: src at 0, dst at kData, write-back UAVs like D3D12_Host.
+    auto ua = d3d12c::create_buffer_props(
+        g.device.Get(), 2 * kData, custom_l0_props(), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "lat_ua", &err);
+    if (!rb || !up || !wb || !ua) {
         fail("buffers: " + err);
         return;
     }
     void* p_rb = nullptr;
     void* p_up = nullptr;
     void* p_wb = nullptr;
+    void* p_ua = nullptr;
     const D3D12_RANGE none = {0, 0};
     if (FAILED(rb->Map(0, nullptr, &p_rb)) || FAILED(up->Map(0, &none, &p_up)) ||
-        FAILED(wb->Map(0, nullptr, &p_wb))) {
+        FAILED(wb->Map(0, nullptr, &p_wb)) || FAILED(ua->Map(0, nullptr, &p_ua))) {
         fail("Map failed");
         return;
     }
     const auto* ts = static_cast<const std::uint64_t*>(p_rb);
     auto* up_w = static_cast<std::uint32_t*>(p_up);
     auto* wb_w = static_cast<volatile std::uint32_t*>(p_wb);
+    auto* ua_w = static_cast<volatile std::uint32_t*>(p_ua);
     constexpr std::size_t kWords = kData / 4;
+    constexpr std::size_t kFlag[kModes] = {0, kWords, 0, kWords + 4}; // flag word per mode
     up_w[kWords] = kMagic; // the 4-byte copy's source
+    const bool uav_ok = g.ssm_ok && g.pso_ssm[kSsmUnary];
 
     D3D12_FEATURE_DATA_D3D12_OPTIONS3 o3 = {};
     bool wbi = SUCCEEDED(g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &o3,
                                                        sizeof(o3))) &&
                (o3.WriteBufferImmediateSupportFlags & D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT);
     ComPtr<ID3D12CommandAllocator> al;
-    ComPtr<ID3D12GraphicsCommandList> cls[3];
+    ComPtr<ID3D12GraphicsCommandList> cls[kModes];
     if (FAILED(g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&al)))) {
         fail("CreateCommandAllocator failed");
         return;
     }
-    for (int m = 0; m < 3; ++m) {
+    for (int m = 0; m < kModes; ++m) {
         if (FAILED(g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, al.Get(), nullptr,
                                                IID_PPV_ARGS(&cls[m])))) {
             fail("CreateCommandList failed");
@@ -4843,18 +4854,33 @@ void run_latency_probe(std::vector<D3d12SelftestRow>* out) {
         cl->EndQuery(qh.Get(), D3D12_QUERY_TYPE_TIMESTAMP, q);
         if (m == 1)
             cl->CopyBufferRegion(wb.Get(), 0, up.Get(), 0, kData);
+        if (m == 3 && uav_ok) {
+            D3d12SsmUnaryParams prm;
+            prm.ne0 = static_cast<std::uint32_t>(kWords);
+            prm.op = kD3d12SsmScale;
+            prm.scale_bits = 0x3F800000u; // 1.0f
+            Op op;
+            op.pso = g.pso_ssm[kSsmUnary].Get();
+            std::memcpy(op.c, &prm, sizeof(prm));
+            op.u[0] = ua->GetGPUVirtualAddress() + kData;
+            op.u[1] = ua->GetGPUVirtualAddress();
+            op.gx = static_cast<UINT>((kWords + kD3d12SsmThreads - 1) / kD3d12SsmThreads);
+            op.gy = 1;
+            const std::vector<Op> one = {op};
+            record_ops(g, cl, one, false, false);
+        }
         cl->EndQuery(qh.Get(), D3D12_QUERY_TYPE_TIMESTAMP, q + 1);
-        if (m == 1) {
+        if (m == 1 || m == 3) {
             ComPtr<ID3D12GraphicsCommandList2> cl2;
             if (wbi && SUCCEEDED(cls[m].As(&cl2))) {
-                D3D12_WRITEBUFFERIMMEDIATE_PARAMETER prm = {wb->GetGPUVirtualAddress() + kData,
-                                                            kMagic};
+                D3D12_WRITEBUFFERIMMEDIATE_PARAMETER prm = {
+                    wb->GetGPUVirtualAddress() + 4ull * kFlag[m], kMagic};
                 const D3D12_WRITEBUFFERIMMEDIATE_MODE mode =
                     D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
                 cl2->WriteBufferImmediate(1, &prm, &mode);
             } else {
                 wbi = false;
-                cl->CopyBufferRegion(wb.Get(), kData, up.Get(), kData, 4);
+                cl->CopyBufferRegion(wb.Get(), 4ull * kFlag[m], up.Get(), kData, 4);
             }
         }
         cl->ResolveQueryData(qh.Get(), D3D12_QUERY_TYPE_TIMESTAMP, q, 2, rb.Get(), 16ull * m);
@@ -4885,22 +4911,36 @@ void run_latency_probe(std::vector<D3d12SelftestRow>* out) {
         }
     };
     std::vector<double> exec, launch, gpu_us, tail_fence, tail_flag, rtt_fence, rtt_flag, sig_cpu,
-        resume, rtt_gated;
-    int flag_timeouts = 0, data_bad = 0, early = 0;
+        resume, rtt_gated, tail_uav, rtt_uav;
+    int flag_timeouts = 0, data_bad = 0, early = 0, uav_timeouts = 0, uav_bad = 0;
     UINT64 va = 0, vb = 0;
     bool hung = false;
     std::uint32_t seed = 0;
+    // Mode 3's source word w: a normal float in [1, 2), exact under the scale by 1.
+    auto uav_word = [](std::uint32_t s, std::size_t w) {
+        return 0x3F800000u | ((s ^ (0x85EBCA6Bu * static_cast<std::uint32_t>(w + 1))) & 0x007FFFFFu);
+    };
     {
         std::lock_guard<std::mutex> lock(g.mu);
         drain_pending(g);
         for (int i = 0; i < kIters && !hung; ++i) {
-            const int m = i % 3;
+            const int m = i % kModes;
+            if (m == 3 && !uav_ok)
+                continue;
             if (m == 1) {
                 seed = 0x9E3779B9u * static_cast<std::uint32_t>(i + 1);
                 for (std::size_t w = 0; w < kWords; ++w)
                     up_w[w] = seed;
                 for (std::size_t w = 0; w <= kWords; ++w)
                     wb_w[w] = 0;
+            } else if (m == 3) {
+                seed = 0x9E3779B9u * static_cast<std::uint32_t>(i + 1);
+                for (std::size_t w = 0; w < kWords; ++w) {
+                    ua_w[w] = uav_word(seed, w);
+                    ua_w[kWords + w] = 0;
+                }
+                wb_w[kFlag[3]] = 0;
+                std::atomic_thread_fence(std::memory_order_release);
             }
             const UINT64 a = ++va;
             if (m == 2)
@@ -4924,6 +4964,17 @@ void run_latency_probe(std::vector<D3d12SelftestRow>* out) {
                 for (std::size_t w = 0; w < kWords; ++w)
                     if (wb_w[w] != seed) {
                         ++data_bad;
+                        break;
+                    }
+                hung = !spin([&] { return fa->GetCompletedValue() >= a; });
+            } else if (m == 3) {
+                if (!spin([&] { return wb_w[kFlag[3]] == kMagic; }))
+                    ++uav_timeouts;
+                q2 = qpc();
+                std::atomic_thread_fence(std::memory_order_acquire);
+                for (std::size_t w = 0; w < kWords; ++w)
+                    if (ua_w[kWords + w] != uav_word(seed, w)) {
+                        ++uav_bad;
                         break;
                     }
                 hung = !spin([&] { return fa->GetCompletedValue() >= a; });
@@ -4954,6 +5005,9 @@ void run_latency_probe(std::vector<D3d12SelftestRow>* out) {
             } else if (m == 1) {
                 tail_flag.push_back((static_cast<double>(q2) - c1) * us_per_qpc);
                 rtt_flag.push_back((q2 - q0) * us_per_qpc);
+            } else if (m == 3) {
+                tail_uav.push_back((static_cast<double>(q2) - c1) * us_per_qpc);
+                rtt_uav.push_back((q2 - q0) * us_per_qpc);
             } else {
                 if (c0 < static_cast<double>(q2))
                     ++early;
@@ -4976,6 +5030,7 @@ void run_latency_probe(std::vector<D3d12SelftestRow>* out) {
     rb->Unmap(0, &none);
     up->Unmap(0, nullptr);
     wb->Unmap(0, nullptr);
+    ua->Unmap(0, nullptr);
     if (hung) {
         fail("a list did not complete within 2 s");
         return;
@@ -5006,6 +5061,10 @@ void run_latency_probe(std::vector<D3d12SelftestRow>* out) {
     std::snprintf(fx, sizeof(fx), "; %s; flag timeouts %d; 64 KiB copy not visible at the flag %d/%zu",
                   wbi ? "WriteBufferImmediate MARKER_OUT" : "4-byte copy", flag_timeouts, data_bad,
                   tail_flag.size());
+    char ux[160];
+    std::snprintf(ux, sizeof(ux), "; %s; flag timeouts %d; dispatch output not visible at the flag %d/%zu",
+                  uav_ok ? (wbi ? "WriteBufferImmediate MARKER_OUT" : "4-byte copy") : "no SSM kernels",
+                  uav_timeouts, uav_bad, tail_uav.size());
     char gx[64];
     std::snprintf(gx, sizeof(gx), "; started before the CPU signal %d", early);
     row("lat_exec", exec, "");
@@ -5015,6 +5074,8 @@ void run_latency_probe(std::vector<D3d12SelftestRow>* out) {
     row("lat_tail_flag", tail_flag, fx);
     row("lat_rtt_fence", rtt_fence, "");
     row("lat_rtt_flag", rtt_flag, fx);
+    row("lat_tail_flag_uav", tail_uav, ux);
+    row("lat_rtt_flag_uav", rtt_uav, ux);
     row("lat_signal_cpu", sig_cpu, "");
     row("lat_resume", resume, gx);
     row("lat_rtt_gated", rtt_gated, gx);
