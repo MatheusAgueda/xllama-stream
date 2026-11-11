@@ -121,7 +121,7 @@ compile_target() {
 		"shaders/ggml_d3d12_get_rows_q6_k.hlsl" "kGgmlD3d12GetRowsQ6KDxil" cs_6_4 ;;
 	elt)
 		local k n name sym
-		for k in 1:binary:Binary 2:rms_norm:RmsNorm 3:quant_q8_k:QuantQ8K; do
+		for k in 1:binary:Binary 2:rms_norm:RmsNorm 3:quant_q8_k:QuantQ8K 4:norm_quant:NormQuant; do
 			IFS=: read -r n name sym <<<"$k"
 			compile_one "$ROOT/shaders/ggml_d3d12_elt.hlsl" \
 				"$ROOT/shaders/generated/ggml_d3d12_elt_${name}_dxil.h" \
