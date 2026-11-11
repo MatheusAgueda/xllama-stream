@@ -435,7 +435,8 @@ std::unique_ptr<Session> create_ort(const SessionParams& sp, std::string* err) {
 
     #include "llama.h"
 
-    #include "decode_loop.h" // shared prefill + generation loops; needs llama.h
+    #include "decode_loop.h"     // shared prefill + generation loops; needs llama.h
+    #include "decode_loop_mtp.h" // MTP self-speculation (sidecar head, patch 0012)
     #include "llama_gpu.h"
     #include "sampler_chain.h" // shared sampler chain (#125); needs llama.h
     #include "xllama/llama_raii.h"
@@ -458,6 +459,15 @@ class LlamaSession final : public Session {
     // the whole conversation. Created lazily on the first generate().
     GgufCpuThreadpools m_cpu_pools; // declared before m_ctx: must outlive it
     LlamaContextPtr m_ctx;
+    // MTP self-speculation (decode_loop_mtp.h): the head's own context, the
+    // common/speculative state driving it, and the loop's handle on both.
+    // Declared after m_ctx so they go first — the drafter reads the target's
+    // hidden rows. m_mtp_n = drafts per round (XLLAMA_MTP_DRAFT, 0 = off).
+    int m_mtp_n = 0;
+    float m_mtp_p_min = 0.0f;
+    LlamaContextPtr m_mtp_ctx;
+    common_speculative_ptr m_mtp_spec;
+    MtpDrafter m_mtp;
     // #175 decision: sampler state follows the KV lifecycle, mirroring the ORT
     // persistent generator — the penalty window (and the dist RNG) live as long
     // as the conversation, so the tail of the previous reply stays penalized at
@@ -517,10 +527,11 @@ class LlamaSession final : public Session {
 
     explicit LlamaSession(LlamaModelPtr model, LlamaAdapterLoraPtr adapter, float lora_scale,
                           int n_ctx, int n_threads, int n_batch, int n_ubatch, bool kv_q8,
-                          bool prompt_lookup, int gpu_layers)
+                          bool prompt_lookup, int gpu_layers, int mtp_n = 0, float mtp_p_min = 0.0f)
         : m_model(std::move(model)), m_adapter(std::move(adapter)), m_lora_scale(lora_scale),
           m_n_ctx(n_ctx), m_n_threads(n_threads), m_n_batch(n_batch), m_n_ubatch(n_ubatch),
-          m_kv_q8(kv_q8), m_prompt_lookup(prompt_lookup), m_gpu_layers(gpu_layers) {}
+          m_mtp_n(mtp_n), m_mtp_p_min(mtp_p_min), m_kv_q8(kv_q8), m_prompt_lookup(prompt_lookup),
+          m_gpu_layers(gpu_layers) {}
 
     const void* resident_llama_model() const override {
         return m_model.get();
@@ -544,8 +555,20 @@ class LlamaSession final : public Session {
                 cparams.n_batch = static_cast<uint32_t>(m_n_batch);
             if (m_n_ubatch > 0)
                 cparams.n_ubatch = static_cast<uint32_t>(m_n_ubatch);
-            apply_gguf_gpu_context(m_gpu_layers, cparams,
-                                   gguf_gpu_outputs_max(for_embedding, m_prompt_lookup));
+            // MTP: the model must carry the head (patch 0012 sidecar), and the
+            // recurrent layers keep a snapshot per draft so a rejected tail rolls
+            // back (llama.cpp n_rs_seq; the verify batch is 1 + m_mtp_n rows).
+            const bool mtp_on =
+                m_mtp_n > 0 && !for_embedding && llama_model_n_layer_nextn(m_model.get()) > 0;
+            if (m_mtp_n > 0 && !for_embedding && !mtp_on)
+                log_output("[xllama] mtp: XLLAMA_MTP_DRAFT set but the model has no MTP "
+                           "layer (XLLAMA_MTP_SIDECAR?) — off\n");
+            uint32_t outputs_max = gguf_gpu_outputs_max(for_embedding, m_prompt_lookup);
+            if (mtp_on) {
+                cparams.n_rs_seq = static_cast<uint32_t>(m_mtp_n);
+                outputs_max = std::max(outputs_max, 1u + static_cast<uint32_t>(m_mtp_n));
+            }
+            apply_gguf_gpu_context(m_gpu_layers, cparams, outputs_max);
     #ifdef XLLAMA_UWP
             // The session's decode loop asks for the same rows on the CPU, so
             // the CPU path takes the cap too: the default reserve is n_ubatch
@@ -553,7 +576,6 @@ class LlamaSession final : public Session {
             // a 4.2 GB IQ3_M from getting a context under the Series X's
             // 4.86 GB heap (2026-11-09).
             if (m_gpu_layers <= 0) {
-                const uint32_t outputs_max = gguf_gpu_outputs_max(for_embedding, m_prompt_lookup);
                 if (outputs_max > 0)
                     cparams.n_outputs_max = outputs_max;
             }
@@ -625,8 +647,59 @@ class LlamaSession final : public Session {
                 }
                 log_output("[xllama] session: runtime LoRA adapter applied\n");
             }
+            if (mtp_on)
+                init_mtp(cparams);
         }
         return true;
+    }
+
+    // The MTP head's context: same model, LLAMA_CONTEXT_TYPE_MTP (llama.cpp
+    // builds only the nextn block there, with a plain KV cache of its own), as
+    // many positions as the target. One logits row: draft() decodes one token,
+    // the catch-up mirror none. A failure leaves the session drafting-free.
+    void init_mtp(llama_context_params cparams) {
+        cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        cparams.n_rs_seq = 0;
+        cparams.ctx_other = m_ctx.get();
+        cparams.n_ctx = llama_n_ctx(m_ctx.get());
+        cparams.n_outputs_max = 1;
+        cparams.embeddings = false;
+        m_mtp_ctx.reset(llama_init_from_model(m_model.get(), cparams));
+        if (!m_mtp_ctx) {
+            log_output("[xllama] mtp: draft context failed — drafting off (target keeps "
+                       "n_rs_seq " +
+                       std::to_string(m_mtp_n) + ")\n");
+            return;
+        }
+        m_cpu_pools.attach(m_gpu_layers, m_mtp_ctx.get(), m_n_threads, m_n_threads);
+        common_params_speculative sp;
+        sp.types = {COMMON_SPECULATIVE_TYPE_DRAFT_MTP};
+        sp.draft.n_max = m_mtp_n;
+        sp.draft.n_min = 0;
+        sp.draft.p_min = m_mtp_p_min;
+        sp.draft.backend_sampling = false;
+        sp.draft.ctx_tgt = m_ctx.get();
+        sp.draft.ctx_dft = m_mtp_ctx.get();
+        m_mtp_spec.reset(common_speculative_init(sp, 1));
+        if (!m_mtp_spec) {
+            log_output("[xllama] mtp: common_speculative_init failed — drafting off\n");
+            m_mtp_ctx.reset();
+            return;
+        }
+        m_mtp.ctx_dft = m_mtp_ctx.get();
+        m_mtp.spec = m_mtp_spec.get();
+        m_mtp.n_max = m_mtp_n;
+        m_mtp.broken = false;
+        m_mtp.mirror = common_batch(m_ctx.get());
+        m_mtp.verify = common_batch(m_ctx.get());
+        log_gguf_ws("after mtp context");
+        char cb[160];
+        snprintf(cb, sizeof(cb),
+                 "[xllama] mtp: drafter ready — %d draft/round, p_min %.2f, n_rs_seq %u, "
+                 "n_ctx %u\n",
+                 m_mtp_n, (double)m_mtp_p_min, llama_n_rs_seq(m_ctx.get()),
+                 llama_n_ctx(m_mtp_ctx.get()));
+        log_output(cb);
     }
 
     // #170c: restore the longest checkpoint whose history is a prefix of
@@ -792,8 +865,16 @@ class LlamaSession final : public Session {
                 // state cannot be rewound — and mutate NOTHING on failure, so
                 // decoding on top would corrupt the output. Degrade to a full
                 // clear + re-prefill instead.
+                // With MTP the recurrent half keeps n_rs_seq rollback snapshots,
+                // and llama.cpp accepts any rollback up to that depth — but the
+                // snapshots are only those the LAST ubatch wrote (a one-token
+                // decode leaves the older slots stale), so a prefix rewind of
+                // 1..n_rs_seq would resume from a wrong state with no error.
+                // Only the verify loop rolls back through them; here the
+                // checkpoint path stays the one way back, as before MTP.
                 if (kv_keep < m_kv_tokens.size() &&
-                    !llama_memory_seq_rm(mem, 0, static_cast<llama_pos>(kv_keep), -1)) {
+                    (llama_n_rs_seq(ctx) > 0 ||
+                     !llama_memory_seq_rm(mem, 0, static_cast<llama_pos>(kv_keep), -1))) {
                     rs_common = kv_keep;
                     while (rs_common > 0 && !llama_vocab_is_control(vocab, tokens[rs_common - 1]))
                         --rs_common;
@@ -898,6 +979,7 @@ class LlamaSession final : public Session {
                                       m_kv_tokens.begin() + keep + n_discard);
                     kv_len -= n_discard;
                     shifted = true;
+                    m_mtp.keep_prefix(0); // its cells sit at the pre-shift positions
                     char sb[160];
                     snprintf(sb, sizeof(sb),
                              "[xllama] session: context shift — evicted %d tokens past "
@@ -931,6 +1013,13 @@ class LlamaSession final : public Session {
         InferenceWatchdog wd(gp.progress(), gp.abort_flag);
         wd.enter_prefill(n_pf);
         const auto t_prefill0 = std::chrono::steady_clock::now();
+        // MTP: the drafter holds what the target kept, and mirrors every
+        // prefill chunk while the target's hidden rows of that chunk are live.
+        m_mtp.keep_prefix(static_cast<llama_pos>(kv_len));
+        PrefillChunkHook mtp_hook = [this](const llama_token* t, int n, llama_pos pos0) {
+            return mtp_mirror_chunk(m_mtp, t, n, pos0);
+        };
+        const PrefillChunkHook* after_chunk = m_mtp.usable() ? &mtp_hook : nullptr;
         // #170c: split the prefill where checkpoints go — positions in the
         // history this prefill completes: the divergence point a refused
         // rewind fell back from (the next prompt likely shares it: a system
@@ -956,7 +1045,7 @@ class LlamaSession final : public Session {
         int n_done = 0;
         for (const size_t at : rs_at) {
             const int seg = static_cast<int>(at - pf_begin) - n_done;
-            if (!prefill_chunked(ctx, pf + n_done, seg, &wd, n_done)) {
+            if (!prefill_chunked(ctx, pf + n_done, seg, &wd, n_done, after_chunk)) {
                 prefilled = false;
                 break;
             }
@@ -964,7 +1053,7 @@ class LlamaSession final : public Session {
             save_rs_checkpoint(ctx, rs_hist, at);
         }
         if (prefilled)
-            prefilled = prefill_chunked(ctx, pf + n_done, n_pf - n_done, &wd, n_done);
+            prefilled = prefill_chunked(ctx, pf + n_done, n_pf - n_done, &wd, n_done, after_chunk);
         if (!prefilled) {
             if (wd.stalled()) {
                 res.stalled = true;
@@ -979,6 +1068,7 @@ class LlamaSession final : public Session {
             // m_kv_tokens) from decoding on top of half a prefill.
             m_kv_tokens.clear();
             llama_memory_clear(mem, true);
+            m_mtp.keep_prefix(0);
             return res;
         }
         res.t_p_eval_ms =
@@ -993,6 +1083,8 @@ class LlamaSession final : public Session {
             m_kv_tokens.assign(tokens.begin(), tokens.end());
         else
             m_kv_tokens.insert(m_kv_tokens.end(), tokens.begin(), tokens.end());
+        if (m_mtp.usable())
+            common_speculative_begin(m_mtp.spec, 0, m_kv_tokens);
 
         // Shared with run_inference — see src/bridge/sampler_chain.h and #125.
         // SamplingConfig::is_greedy() also covers temperature 0, where the full
@@ -1071,7 +1163,12 @@ class LlamaSession final : public Session {
             dlp.logprobs = &res.logprobs;
         }
         wd.enter_decode(dlp.n_predict);
-        const DecodeLoopResult dlr = decode_loop(dlp, res.output_text);
+        const bool use_mtp = m_mtp.usable() && !dlp.grammar && !dlp.forced && !dlp.logprobs;
+        const DecodeLoopResult dlr = use_mtp ? decode_loop_mtp(dlp, m_mtp, res.output_text)
+                                             : decode_loop(dlp, res.output_text);
+        // A classic turn (grammar, scoring) leaves the drafter without its
+        // generated tokens: a gap its attention simply skips (M-RoPE positions
+        // only have to move forward, so the next mirror still lands).
         const int n_generated = dlr.n_generated;
         const bool stopped_by_seq = dlr.ended_with_stop;
 
@@ -1089,6 +1186,7 @@ class LlamaSession final : public Session {
             m_kv_tokens.clear();
             if (m_ctx)
                 llama_memory_clear(llama_get_memory(m_ctx.get()), /*data=*/true);
+            m_mtp.keep_prefix(0);
             res.success = false;
             res.error_msg =
                 "speculative KV rewind unsupported (disable prompt_lookup for this model)";
@@ -1119,6 +1217,16 @@ class LlamaSession final : public Session {
                  "graphs reused %d\n",
                  dlr.decode_ms, dlr.sample_ms, llama_perf_context(m_ctx.get()).n_reused);
         log_output(log_buf);
+        if (use_mtp) {
+            snprintf(log_buf, sizeof(log_buf),
+                     "[xllama] mtp: rounds=%d drafted=%d accepted=%d (%.3f) tok/round=%.3f "
+                     "draft=%.1fms mirror=%.1fms%s\n",
+                     dlr.n_rounds, dlr.n_drafted, dlr.n_accepted,
+                     dlr.n_drafted > 0 ? (double)dlr.n_accepted / dlr.n_drafted : 0.0,
+                     dlr.n_rounds > 0 ? (double)n_generated / dlr.n_rounds : 0.0, dlr.draft_ms,
+                     dlr.mirror_ms, dlr.mtp_failed ? " FAILED" : "");
+            log_output(log_buf);
+        }
 
         return res;
     }
@@ -1210,6 +1318,7 @@ class LlamaSession final : public Session {
         // invalidate its token mirror; the next chat turn will prefill cleanly.
         m_kv_tokens.clear();
         llama_memory_clear(llama_get_memory(ctx), true);
+        m_mtp.keep_prefix(0);
         llama_set_embeddings(ctx, true);
         struct EmbeddingContextReset {
             llama_context* ctx;
@@ -1480,6 +1589,9 @@ class LlamaSession final : public Session {
             return false;
         }
         m_kv_tokens = std::move(tokens);
+        // The file holds the target's cells only: the drafter restarts empty
+        // (drafts read just the new tokens until the history refills).
+        m_mtp.keep_prefix(0);
         char lb[160];
         snprintf(lb, sizeof(lb),
                  "[xllama] session: KV state loaded — %zu tokens, %.1f MB (#170b)\n",
@@ -1510,6 +1622,22 @@ std::unique_ptr<Session> create_llama(const SessionParams& sp, std::string* err)
     // the expert cache (which wins over stream) keeps the experts on the CPU itself
     const bool cpu_only = sp.stream_weights && sp.expert_slots <= 0;
     apply_env_overrides(sp.env); // first: the set_env_int below honour it
+    // MTP self-speculation (decode_loop_mtp.h): XLLAMA_MTP_SIDECAR names the
+    // head's GGUF (patch 0012 adds its block to this model), XLLAMA_MTP_DRAFT
+    // the drafts per round (default 1, 0 = load nothing), XLLAMA_MTP_PMIN the
+    // head's confidence below which a round decodes one token (default 0).
+    int mtp_n = 0;
+    float mtp_p_min = 0.0f;
+    if (const char* sc = std::getenv("XLLAMA_MTP_SIDECAR"); sc && *sc) {
+        mtp_n = 1;
+        if (const char* s = std::getenv("XLLAMA_MTP_DRAFT"); s && *s)
+            mtp_n = std::clamp(std::atoi(s), 0, 8);
+        if (const char* s = std::getenv("XLLAMA_MTP_PMIN"); s && *s)
+            mtp_p_min = std::clamp(static_cast<float>(std::atof(s)), 0.0f, 1.0f);
+        mparams.load_mtp = mtp_n > 0;
+        log_output("[xllama] mtp: sidecar " + std::string(sc) + ", " + std::to_string(mtp_n) +
+                   " draft/round\n");
+    }
     const int gpu_layers = apply_gguf_gpu_layers(cpu_only ? 0 : sp.n_gpu_layers, mparams, abs_path);
     apply_gguf_residency(sp.stream_weights, mparams, sp.expert_slots, sp.expert_swap,
                          sp.expert_prefetch, sp.expert_major, sp.expert_prefetch_ahead);
@@ -1541,7 +1669,7 @@ std::unique_ptr<Session> create_llama(const SessionParams& sp, std::string* err)
     log_output("[xllama] Session: GGUF model loaded via llama.cpp (persistent)\n");
     return std::make_unique<LlamaSession>(LlamaModelPtr(raw_model), std::move(adapter),
                                           sp.lora_scale, n_ctx, n_threads, sp.n_batch, sp.n_ubatch,
-                                          sp.kv_q8, sp.prompt_lookup, gpu_layers);
+                                          sp.kv_q8, sp.prompt_lookup, gpu_layers, mtp_n, mtp_p_min);
 }
 } // namespace detail
 

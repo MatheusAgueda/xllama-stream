@@ -56,15 +56,28 @@ namespace xllama {
 //
 // |progress_base| is what earlier calls of the same prefill already fed, so a
 // prefill split at recurrent checkpoints (#170c) reports one running count.
+//
+// |after_chunk| (optional) sees every decoded chunk — its tokens, count and
+// first position — while the context still holds that chunk's outputs. The MTP
+// drafter (decode_loop_mtp.h) mirrors each chunk into its own context there,
+// pairing token i with the trunk's hidden state of token i-1; false fails the
+// prefill like a decode error.
+using PrefillChunkHook = std::function<bool(const llama_token*, int, llama_pos)>;
+
 inline bool prefill_chunked(llama_context* ctx, const llama_token* tokens, int n_tokens,
-                            InferenceWatchdog* wd = nullptr, int progress_base = 0) {
+                            InferenceWatchdog* wd = nullptr, int progress_base = 0,
+                            const PrefillChunkHook* after_chunk = nullptr) {
     const int n_batch = std::max(1, static_cast<int>(llama_n_batch(ctx)));
     for (int off = 0; off < n_tokens; off += n_batch) {
         if (wd && wd->aborted())
             return false;
         const int chunk = std::min(n_batch, n_tokens - off);
+        const llama_pos pos0 =
+            after_chunk ? llama_memory_seq_pos_max(llama_get_memory(ctx), 0) + 1 : 0;
         llama_batch batch = llama_batch_get_one(const_cast<llama_token*>(tokens) + off, chunk);
         if (llama_decode(ctx, batch) != 0)
+            return false;
+        if (after_chunk && !(*after_chunk)(tokens + off, chunk, pos0))
             return false;
         if (wd)
             wd->note_prefill_chunk(progress_base + off + chunk);
@@ -146,6 +159,12 @@ struct DecodeLoopResult {
     // Wall time of the classic path's llama_decode calls and of sampling.
     double decode_ms = 0.0;
     double sample_ms = 0.0;
+    // MTP drafter (decode_loop_mtp.h): its draft decodes, and its mirror of each
+    // verify batch (the catch-up decode that keeps its KV and hidden rows in step).
+    double draft_ms = 0.0;
+    double mirror_ms = 0.0;
+    int n_rounds = 0;        // verify batches (one target decode each)
+    bool mtp_failed = false; // the drafter's context refused a decode; drafting stopped
 };
 
 namespace detail {

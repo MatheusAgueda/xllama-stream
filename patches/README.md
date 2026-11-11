@@ -278,6 +278,17 @@ expensive kinds (`sched split: <count> x <ms> (copy <ms>) <backend> <first> ..
 synchronization costs async backends their overlap, so leave it unset for
 timing runs. Unset, the scheduler is unchanged.
 
+`0012-mtp-sidecar.patch` (applies after 0004, which adds `file_paths`): with
+`XLLAMA_MTP_SIDECAR=<gguf>` set and `load_mtp` requested, `llama_model_loader`
+opens that GGUF as one more file and adds its `blk.*` tensors the model lacks.
+It is for re-quantized targets (heretic/abliterated IQ3_S) that dropped the
+model's multi-token-prediction block: the sidecar is the original block from
+`convert_hf_to_gguf.py --mtp`, quantized on its own, while the embeddings and
+the LM head stay the target's. The sidecar's `general.architecture` must match
+the model's; its `block_count` and `nextn_predict_layers` become kv overrides
+unless the caller set them. Its routed experts go through the expert cache
+like the trunk's (its path is in `file_paths`). Unset, the loader is unchanged.
+
 ## Applying
 
 ```bash
