@@ -71,10 +71,10 @@ index 07b4c61..6557247 100644
              cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
 diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
 new file mode 100644
-index 0000000..b93f475
+index 0000000..ca51106
 --- /dev/null
 +++ b/src/llama-expert-cache.cpp
-@@ -0,0 +1,2142 @@
+@@ -0,0 +1,2247 @@
 +#include "llama-expert-cache.h"
 +
 +#include "llama-impl.h"
@@ -240,6 +240,13 @@ index 0000000..b93f475
 +    uint32_t   gen  = 0;
 +};
 +
++// LLAMA_EXPERT_RD: reuse distances d >= 1 (plan ticks) in half-octave buckets floor(2 log2 d)
++static constexpr int32_t EC_RD_BUCKETS = 24;
++
++static int32_t ec_rd_bucket(uint64_t d) {
++    return std::min((int32_t) (2.0 * std::log2((double) d)), EC_RD_BUCKETS - 1);
++}
++
 +struct ec_layer {
 +    llama_expert_cache * cache = nullptr;
 +    int32_t id = -1;
@@ -262,6 +269,16 @@ index 0000000..b93f475
 +    std::vector<double>   lrfu_key; // plan scratch: the decayed value of each slot at this tick
 +    std::vector<float>    wsum;
 +    bool                  w_ready = false;
++
++    // LLAMA_EXPERT_RD: the learned reuse distances (expert -> tick of its last use, tick of the plan
++    // that counted it; expert x bucket -> count and summed distance; the same pooled over the layer)
++    std::vector<uint64_t> rd_last;
++    std::vector<uint64_t> rd_seen;
++    std::vector<double>   rd_cnt;
++    std::vector<double>   rd_sum;
++    std::vector<double>   rdl_cnt;
++    std::vector<double>   rdl_sum;
++    double                rdl_n = 0.0;
 +
 +    std::unique_ptr<ec_pf[]> pf;  // the current prefetch round, n_pf of n_slots jobs
 +    int32_t n_pf = 0;
@@ -290,6 +307,10 @@ index 0000000..b93f475
 +    uint32_t swap_tail     = 0; // LLAMA_EXPERT_SWAP_TAIL: weakest ranks of the top-k a resident takes at any score
 +    bool     swap_batch    = false; // LLAMA_EXPERT_SWAP_BATCH: a ubatch's own reads count as resident
 +    double   lrfu_half     = 0.0;   // LLAMA_EXPERT_LRFU: eviction half-life in plan ticks, 0 = LRU
++    // LLAMA_EXPERT_RD=<window>:<weight>[:<prior>]: LRFU value + weight * P(next use within window | age)
++    uint32_t rd_window     = 0;
++    double   rd_weight     = 0.0;
++    double   rd_prior      = 4.0;
 +    // LLAMA_EXPERT_SLOTS_LAYERS: the slots of layer il (n_slots past the list) - an uneven split at the
 +    // same total moves memory to the layers whose routing misses most
 +    std::vector<uint32_t> slots_layer;
@@ -1321,6 +1342,54 @@ index 0000000..b93f475
 +        return L.lrfu_val[s] * std::exp2(-(double) (tick - L.lrfu_last[s]) / half);
 +    };
 +
++    // LLAMA_EXPERT_RD: every expert this ubatch routes to adds the distance since its last use to
++    // its histogram and the layer's (once per ubatch), before any victim is ranked
++    const bool rd = lrfu && C.rd_window > 0 && !L.rd_last.empty();
++    if (rd) {
++        for (int64_t i1 = 0; i1 < n_tokens; ++i1) {
++            for (int64_t i0 = 0; i0 < n_used; ++i0) {
++                const int32_t e = ec_id_at(ids, i0, i1);
++                if (L.rd_seen[e] == tick) {
++                    continue;
++                }
++                L.rd_seen[e] = tick;
++                if (L.rd_last[e] > 0) {
++                    const uint64_t d = tick - L.rd_last[e];
++                    const int32_t  b = ec_rd_bucket(d);
++                    L.rd_cnt[(size_t) e*EC_RD_BUCKETS + b] += 1.0;
++                    L.rd_sum[(size_t) e*EC_RD_BUCKETS + b] += (double) d;
++                    L.rdl_cnt[b] += 1.0;
++                    L.rdl_sum[b] += (double) d;
++                    L.rdl_n      += 1.0;
++                }
++                L.rd_last[e] = tick;
++            }
++        }
++    }
++    // P(the expert's next use falls within rd_window ticks | rd_window age a): the buckets whose mean
++    // distance is past a, the expert's own counts plus the layer's distribution as rd_prior uses
++    auto reuse_p = [&L, &C, tick](int32_t x) {
++        const double a  = (double) (tick - L.rd_last[x]);
++        const double nl = L.rdl_n;
++        double s0 = 0.0, sw = 0.0;
++        for (int32_t b = 0; b < EC_RD_BUCKETS; ++b) {
++            const double c = L.rd_cnt[(size_t) x*EC_RD_BUCKETS + b] + (nl > 0.0 ? C.rd_prior * L.rdl_cnt[b] / nl : 0.0);
++            if (c <= 0.0) {
++                continue;
++            }
++            const double sd = L.rd_sum[(size_t) x*EC_RD_BUCKETS + b] + (nl > 0.0 ? C.rd_prior * L.rdl_sum[b] / nl : 0.0);
++            const double m  = sd / c;
++            if (m <= a) {
++                continue;
++            }
++            s0 += c;
++            if (m <= a + (double) C.rd_window) {
++                sw += c;
++            }
++        }
++        return s0 > 0.0 ? sw / s0 : 0.0;
++    };
++
 +    // resident experts: pin them for this ubatch
 +    uint64_t hits = 0;
 +    for (int64_t i1 = 0; i1 < n_tokens; ++i1) {
@@ -1343,7 +1412,11 @@ index 0000000..b93f475
 +    if (lrfu) {
 +        L.lrfu_key.resize((size_t) n_slots);
 +        for (int32_t s = 0; s < n_slots; ++s) {
-+            L.lrfu_key[s] = L.expert_of[s] < 0 ? -INFINITY : decayed(s);
++            const int32_t x = L.expert_of[s];
++            L.lrfu_key[s] = x < 0 ? -INFINITY : decayed(s);
++            if (rd && x >= 0 && L.used[s] != tick) {
++                L.lrfu_key[s] += C.rd_weight * reuse_p(x);
++            }
 +        }
 +    }
 +
@@ -1885,6 +1958,30 @@ index 0000000..b93f475
 +        LLAMA_LOG_INFO("%s: expert cache: LRFU eviction, half-life %g ticks (%s)\n", __func__, cache->lrfu_half,
 +            cache->swap_ratio > 0.0f ? "router-weighted" : "unit uses");
 +    }
++    // LLAMA_EXPERT_RD=<window>:<weight>[:<prior>] (with LLAMA_EXPERT_LRFU): each layer learns the
++    // distances between consecutive uses of every expert (half-octave histogram, the layer's pooled
++    // histogram as <prior> uses, 4 by default) and a candidate slot's LRFU value gains <weight> x the
++    // probability that its expert's next use comes within <window> ticks given the ticks since its
++    // last one - a causal estimate of what the clairvoyant victim knows. Replay of the 40-prompt
++    // trace, 16:0.5: 4.6-5.3% fewer reads than LRFU alone at swap 0.45-0.5, uniform or split slots,
++    // the same router mass kept
++    const char * rds = getenv("LLAMA_EXPERT_RD");
++    if (rds != nullptr && *rds != '\0') {
++        unsigned w = 0;
++        double   wt = 0.0, pr = 4.0;
++        const int n = sscanf(rds, "%u:%lf:%lf", &w, &wt, &pr);
++        if (n >= 2 && w > 0 && w < (1u << 20) && wt > 0.0 && wt < 1e6 && pr >= 0.0 && pr < 1e6 &&
++                cache->lrfu_half > 0.0) {
++            cache->rd_window = w;
++            cache->rd_weight = wt;
++            cache->rd_prior  = pr;
++            LLAMA_LOG_INFO("%s: expert cache: reuse-distance term, window %u ticks, weight %g, prior %g\n", __func__,
++                w, wt, pr);
++        } else {
++            LLAMA_LOG_WARN("%s: expert cache: LLAMA_EXPERT_RD=%s ignored (<window>:<weight>[:<prior>], needs LLAMA_EXPERT_LRFU)\n",
++                __func__, rds);
++        }
++    }
 +    // LLAMA_EXPERT_SLOTS_LAYERS=<n0>,<n1>,...: resident experts of each layer, at least n_expert_used
 +    // (layers past the list keep n_slots). The split comes from a routing trace replayed offline; the
 +    // ubatch cap follows the smallest layer
@@ -2092,6 +2189,14 @@ index 0000000..b93f475
 +        slot->lrfu_val.assign(n_slots, 0.0);
 +        slot->lrfu_last.assign(n_slots, 0);
 +        slot->wsum.assign(n_expert, 0.0f);
++        if (cache->rd_window > 0) {
++            slot->rd_last.assign(n_expert, 0);
++            slot->rd_seen.assign(n_expert, 0);
++            slot->rd_cnt.assign((size_t) n_expert * EC_RD_BUCKETS, 0.0);
++            slot->rd_sum.assign((size_t) n_expert * EC_RD_BUCKETS, 0.0);
++            slot->rdl_cnt.assign(EC_RD_BUCKETS, 0.0);
++            slot->rdl_sum.assign(EC_RD_BUCKETS, 0.0);
++        }
 +        slot->pf.reset(new ec_pf[n_slots]);
 +        slot->seen.assign(n_expert, 0);
 +        cache->first_layer = std::min(cache->first_layer, il);
