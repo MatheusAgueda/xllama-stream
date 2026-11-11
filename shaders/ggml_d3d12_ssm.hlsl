@@ -13,7 +13,7 @@
 // order the emulation uses (`precise` keeps dxc from forming mads); exp and
 // log are the GPU's, so they match ggml's CPU ops within a tolerance only.
 // Root signature: 13 constants at b0, root SRVs t0 and t1, root UAVs u0 (dst)
-// and u1..u4: ggml_d3d12.cpp make_root_sig. Strides and offsets are in floats
+// and u1..u5: ggml_d3d12.cpp make_root_sig. Strides and offsets are in floats
 // and 32-bit, as the plans check.
 
 #ifndef KERNEL
@@ -132,15 +132,22 @@ void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
 // registers for all tokens: 4 lanes per row, lane l holding the float4
 // chunks l, l + 4, ..., l + 28 of row j (elements 4 * (l + 4 * e) + 0..3).
 // The state is stored transposed as in ggml: M[j][i] = S[i][j].
-// c0 = H (v heads), c1 = T, c2 = B (sequences), c3 = K | kda << 16,
-// c4 = q heads | k heads << 16, c5 = B / q seqs | B / k seqs << 16,
-// c6 / c7 = q token / sequence stride, c8 / c9 = k's, c10 / c11 = v's
-// (heads are S_v apart in each), c12 = the bits of 1 / sqrt(S_v).
+// c0 = H (v heads), c1 = T, c2 = B (sequences), c3 = K | kda << 16 |
+// fused << 17, c4 = q heads | k heads << 16, c5 = B / q seqs | B / k seqs
+// << 16, c6 / c7 = q token / sequence stride, c8 / c9 = k's, c10 / c11 =
+// v's (heads are S_v apart in each), c12 = the bits of 1 / sqrt(S_v).
 // u1 = q, u2 = k, u3 = v, u4 = g ([1 or S_v, H, T, B]), t0 = beta
 // ([1, H, T, B]), t1 = state ([S_v, S_v, H, B]), u0 = dst: the T * B * H
 // output rows of S_v, then K snapshots of every state (slot 0 the last).
+// Fused (K = 1, B = 1; ggml_d3d12_ssm_emu.h d3d12_gdn_fuse_plan): t1 is the
+// recurrent cache row of the state and the new state goes to u5, the cache
+// row it is copied to, instead of after the output rows, so build_rs's
+// GET_ROWS and the CPY back do not run. A lane loads its 32 floats of the
+// state before it stores them and no lane loads another's, so t1 and u5 may
+// be the same row.
 // Grid (S_v / 32, H, B).
 #define S_V 128u
+RWByteAddressBuffer U5 : register(u5);
 groupshared float red_k[128];
 groupshared float red_y[128];
 
@@ -148,7 +155,8 @@ groupshared float red_y[128];
 void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
     const uint H = c0, T = c1, B = c2;
     const uint K = c3 & 0xffffu;
-    const bool kda = (c3 >> 16) != 0u;
+    const bool kda = ((c3 >> 16) & 1u) != 0u;
+    const bool fused = ((c3 >> 17) & 1u) != 0u;
     const uint h = gid.y, s = gid.z;
     const uint l = tid & 3u, q4 = tid & ~3u;
     const uint j = gid.x * 32u + (tid >> 2u);
@@ -219,7 +227,10 @@ void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
                 D.Store4(4u * (ob + 4u * (l + 4u * e)), asuint(m[e]));
         }
     }
-    if (K == 1u) {
+    if (fused) {
+        [unroll] for (uint e = 0u; e < 8u; ++e)
+            U5.Store4(4u * (own + 4u * (l + 4u * e)), asuint(m[e]));
+    } else if (K == 1u) {
         [unroll] for (uint e = 0u; e < 8u; ++e)
             D.Store4(4u * (attn + own + 4u * (l + 4u * e)), asuint(m[e]));
     }

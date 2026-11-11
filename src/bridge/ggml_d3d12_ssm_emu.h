@@ -45,6 +45,8 @@ inline constexpr std::uint32_t kD3d12SsmThreads = 256; // numthreads of KERNEL 1
 inline constexpr std::uint32_t kD3d12GdnThreads = 128; // numthreads of KERNEL 5
 inline constexpr std::uint32_t kD3d12GdnSv = 128;      // the S_v KERNEL 5 is built for
 inline constexpr std::uint32_t kD3d12GdnRows = 32;     // state rows per KERNEL 5 group
+// c3 bit of a KERNEL 5 dispatch that writes the new state to u5 (d3d12_gdn_fuse_plan).
+inline constexpr std::uint32_t kD3d12GdnFused = 1u << 17;
 
 // KERNEL 1 ops.
 inline constexpr std::uint32_t kD3d12SsmScale = 0;
@@ -558,6 +560,189 @@ inline bool d3d12_gdn_plan(const ggml_tensor* node, D3d12GdnPlan* plan) {
     return true;
 }
 
+// The state's round trip through the recurrent cache at one sequence, as
+// build_rs and build_delta_net_fused make it: GET_ROWS(states, ids) gathers
+// the cache row the GATED_DELTA_NET reads (through RESHAPE / VIEW nodes), and
+// a CPY puts the new state, a VIEW of the op's output after its attention
+// rows, back into a cache row. KERNEL 5 fused (kD3d12GdnFused) reads the
+// gathered row in place and stores the new state into the destination row,
+// so neither copy runs: 2 x 2 MiB a layer per token at Qwen3.6-35B-A3B.
+// True only when that is the same computation: one sequence, K = 1, one row
+// id from a graph input (its value is known before the graph runs), the
+// GET_ROWS, the views and the new-state VIEW each read once and no graph
+// output, the CPY's destination contiguous in the same cache tensor, and no
+// node between the GET_ROWS and the op writing the cache or between the op
+// and the CPY reading it. `uses(t)` is how many nodes of the whole graph read
+// t (ggml's use counts: a split of it holds only some of them).
+struct D3d12GdnFusePlan {
+    const ggml_tensor* get_rows = nullptr; // does not run
+    const ggml_tensor* cpy = nullptr;      // does not run
+    const ggml_tensor* states = nullptr;   // the GET_ROWS source: cache rows of S_v * S_v * H
+    const ggml_tensor* ids = nullptr;      // its one row id
+    const ggml_tensor* dst = nullptr;      // the CPY destination: the cache row written
+};
+
+namespace ssm_detail {
+
+inline const ggml_tensor* view_root(const ggml_tensor* t) {
+    while (t->view_src)
+        t = t->view_src;
+    return t;
+}
+
+inline bool view_op(ggml_op op) {
+    return op == GGML_OP_NONE || op == GGML_OP_VIEW || op == GGML_OP_RESHAPE ||
+           op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
+}
+
+inline bool reads(const ggml_tensor* n, const ggml_tensor* root) {
+    for (const ggml_tensor* s : n->src)
+        if (s && view_root(s) == root)
+            return true;
+    return false;
+}
+
+inline int src_count(const ggml_tensor* n, const ggml_tensor* t) {
+    int r = 0;
+    for (const ggml_tensor* s : n->src)
+        r += s == t;
+    return r;
+}
+
+// Index of t among the nodes before `before`, or -1.
+inline int node_before(ggml_cgraph* cgraph, const ggml_tensor* t, int before) {
+    for (int i = before - 1; i >= 0; --i)
+        if (ggml_graph_node(cgraph, i) == t)
+            return i;
+    return -1;
+}
+
+// True when, of the nodes after t (at t_idx), `child` reads t once and every
+// other reader is a VIEW of no elements (no data of t; a backend skips empty
+// nodes), and t is no graph output. build_rs leaves such views: the extra
+// states of a one-sequence ubatch are 0 rows.
+template <class Uses>
+bool sole_reader(ggml_cgraph* cgraph, int t_idx, const ggml_tensor* t, const ggml_tensor* child,
+                 const Uses& uses) {
+    if (t->flags & GGML_TENSOR_FLAG_OUTPUT)
+        return false;
+    const int n_nodes = ggml_graph_n_nodes(cgraph);
+    const int want = uses(t);
+    int seen = 0, hit = 0;
+    for (int j = t_idx + 1; j < n_nodes && seen < want; ++j) {
+        const ggml_tensor* r = ggml_graph_node(cgraph, j);
+        const int c = src_count(r, t);
+        if (c == 0)
+            continue;
+        seen += c;
+        if (r == child)
+            hit += c;
+        else if (r->op != GGML_OP_VIEW || ggml_nelements(r) != 0)
+            return false;
+    }
+    return seen == want && hit == 1;
+}
+
+} // namespace ssm_detail
+
+template <class Uses>
+bool d3d12_gdn_fuse_plan(ggml_cgraph* cgraph, int gdn_idx, const Uses& uses,
+                         D3d12GdnFusePlan* plan) {
+    using namespace ssm_detail;
+    const int n_nodes = ggml_graph_n_nodes(cgraph);
+    if (!plan || gdn_idx < 0 || gdn_idx >= n_nodes)
+        return false;
+    const ggml_tensor* node = ggml_graph_node(cgraph, gdn_idx);
+    D3d12GdnPlan p;
+    if (!d3d12_gdn_plan(node, &p) || (p.params.k_kda & 0xffffu) != 1u || p.params.b != 1u)
+        return false;
+    auto once = [&](const ggml_tensor* t) {
+        return uses(t) == 1 && (t->flags & GGML_TENSOR_FLAG_OUTPUT) == 0;
+    };
+    // From the op's state up to the GET_ROWS, each tensor read by the one below.
+    const ggml_tensor* child = node;
+    const ggml_tensor* g = p.state;
+    int child_idx = gdn_idx, g_idx = -1;
+    for (;;) {
+        g_idx = node_before(cgraph, g, child_idx);
+        if (g_idx < 0 || !ggml_is_contiguous(g) || !sole_reader(cgraph, g_idx, g, child, uses))
+            return false;
+        if (g->op != GGML_OP_RESHAPE && !(g->op == GGML_OP_VIEW && g->view_offs == 0))
+            break;
+        child = g;
+        child_idx = g_idx;
+        g = g->src[0];
+    }
+    const std::int64_t n = static_cast<std::int64_t>(kD3d12GdnSv) * kD3d12GdnSv * p.params.h;
+    if (g->op != GGML_OP_GET_ROWS || g->type != GGML_TYPE_F32 || g->ne[0] != n ||
+        ggml_nrows(g) != 1 || (g->flags & GGML_TENSOR_FLAG_COMPUTE) == 0)
+        return false;
+    const ggml_tensor* states = g->src[0];
+    const ggml_tensor* ids = g->src[1];
+    if (!states || !ids || states->type != GGML_TYPE_F32 || states->ne[0] != n ||
+        states->nb[0] != sizeof(float) || states->ne[2] != 1 || states->ne[3] != 1 ||
+        ids->type != GGML_TYPE_I32 || ggml_nelements(ids) != 1 || view_root(ids)->op != GGML_OP_NONE)
+        return false;
+    const ggml_tensor* cache = view_root(states);
+    for (int i = g_idx + 1; i < gdn_idx; ++i) {
+        const ggml_tensor* t = ggml_graph_node(cgraph, i);
+        if (!view_op(t->op) && ggml_nelements(t) != 0 && view_root(t) == cache)
+            return false; // writes the cache after the GET_ROWS read it
+    }
+    // Every reader of the op is a VIEW: of the attention rows, or the new state.
+    const std::size_t attn_bytes = static_cast<std::size_t>(kD3d12GdnSv) * p.params.h *
+                                   p.params.t * sizeof(float);
+    if (node->flags & GGML_TENSOR_FLAG_OUTPUT)
+        return false;
+    const ggml_tensor* v = nullptr;
+    int v_idx = -1, seen = 0;
+    const int want = uses(node);
+    for (int j = gdn_idx + 1; j < n_nodes && seen < want; ++j) {
+        const ggml_tensor* t = ggml_graph_node(cgraph, j);
+        const int r = src_count(t, node);
+        if (r == 0)
+            continue;
+        seen += r;
+        if (t->op != GGML_OP_VIEW || t->view_src != node)
+            return false;
+        if (t->view_offs == attn_bytes && ggml_nelements(t) == n && ggml_is_contiguous(t)) {
+            if (v || !once(t))
+                return false;
+            v = t;
+            v_idx = j;
+        } else if (t->view_offs + ggml_nbytes(t) > attn_bytes) {
+            return false;
+        }
+    }
+    if (!v || seen != want)
+        return false;
+    const ggml_tensor* cpy = nullptr;
+    int c_idx = v_idx + 1;
+    while (c_idx < n_nodes && !(ggml_graph_node(cgraph, c_idx)->op == GGML_OP_CPY &&
+                                ggml_graph_node(cgraph, c_idx)->src[0] == v))
+        ++c_idx;
+    if (c_idx == n_nodes)
+        return false;
+    cpy = ggml_graph_node(cgraph, c_idx);
+    if ((cpy->flags & GGML_TENSOR_FLAG_COMPUTE) == 0)
+        return false;
+    const ggml_tensor* dst = cpy->src[1];
+    if (!dst || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
+        ggml_nelements(dst) != n || view_root(dst) != cache)
+        return false;
+    for (int i = gdn_idx + 1; i < c_idx; ++i) {
+        const ggml_tensor* t = ggml_graph_node(cgraph, i);
+        if (!view_op(t->op) && ggml_nelements(t) != 0 && (reads(t, cache) || view_root(t) == cache))
+            return false; // would see the new state before the CPY put it there
+    }
+    plan->get_rows = g;
+    plan->cpy = cpy;
+    plan->states = states;
+    plan->ids = ids;
+    plan->dst = dst;
+    return true;
+}
+
 // The kernels on the host, one rounding per operation in the shader's order
 // (moe_detail::mul_rn / add_rn keep the compiler from forming an fma, as
 // `precise` does for dxc). exp and log are the C library's, so a GPU result
@@ -637,14 +822,16 @@ inline void d3d12_ssm_conv_emulate(const D3d12SsmConvParams& p, std::uint32_t gr
 // Lane l of a row holds elements 4 * (l + 4 * e) + c, e = 0..7, c = 0..3, and
 // sums its products in that order; the row combines the four lanes as
 // (l0 + l1) + (l2 + l3).
+// state_out: the fused kernel's u5 (kD3d12GdnFused, K = 1), where the new
+// state goes instead of after the output rows; null = not fused.
 inline void d3d12_gdn_emulate(const D3d12GdnParams& p, std::uint32_t groups_x,
                               std::uint32_t groups_y, std::uint32_t groups_z, const float* q,
                               const float* k, const float* v, const float* g, const float* beta,
-                              const float* state, float* dst) {
+                              const float* state, float* dst, float* state_out = nullptr) {
     using namespace moe_detail;
     constexpr std::uint32_t sv = kD3d12GdnSv;
     const std::uint32_t K = p.k_kda & 0xffffu;
-    const bool kda = (p.k_kda >> 16) != 0;
+    const bool kda = ((p.k_kda >> 16) & 1u) != 0;
     const std::uint32_t T = p.t, H = p.h, B = p.b;
     float scale = 0.0f;
     std::memcpy(&scale, &p.scale_bits, sizeof(scale));
@@ -696,7 +883,9 @@ inline void d3d12_gdn_emulate(const D3d12GdnParams& p, std::uint32_t groups_x,
                         std::memcpy(dst + attn + slot * per_snap + own, m.data(),
                                     sv * sizeof(float));
                 }
-                if (K == 1)
+                if (state_out)
+                    std::memcpy(state_out + own, m.data(), sv * sizeof(float));
+                else if (K == 1)
                     std::memcpy(dst + attn + own, m.data(), sv * sizeof(float));
             }
 }

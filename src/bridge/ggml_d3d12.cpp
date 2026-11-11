@@ -699,6 +699,10 @@ struct Gpu {
     // state copies); without them those stay on the CPU.
     ComPtr<ID3D12PipelineState> pso_ssm[kSsmCount];
     bool ssm_ok = false;
+    // KERNEL 5 reading and writing the recurrent cache rows itself, without
+    // build_rs's GET_ROWS and the CPY back (d3d12_gdn_fuse_plan). Read when a
+    // backend is created: XLLAMA_D3D12_SSM_FUSE=0 keeps both copies.
+    bool gdn_fuse = true;
     ComPtr<ID3D12QueryHeap> ts;
     ComPtr<ID3D12Resource> ts_rb;
     // XLLAMA_D3D12_PROFILE (read when a backend is created): a timestamp after
@@ -725,6 +729,7 @@ struct Gpu {
     std::uint64_t n_submits = 0;
     std::uint64_t n_replays = 0; // submits that executed a kept command list again
     std::uint64_t n_barriers = 0;
+    std::uint64_t n_gdn_fused = 0; // delta-net layers run without their two state copies
     double wall_ms = 0.0;
     double gpu_ms = 0.0;
     // Of wall_ms: recording + submitting the graph submissions, then waiting for
@@ -755,8 +760,8 @@ constexpr UINT64 kStagingBytes = 8ull << 20;
 ComPtr<ID3D12RootSignature> make_root_sig(ID3D12Device* device, std::string* err) {
     // b0 constants, t0 weights, u0 output, u1 activations, u2 / u3 (elt: b or
     // norm weight, fused-MUL output), t1 (MUL_MAT_ID: expert ids), u4 (MoE
-    // tail: the residual).
-    D3D12_ROOT_PARAMETER p[8] = {};
+    // tail: the residual), u5 (fused delta net: the cache row of the new state).
+    D3D12_ROOT_PARAMETER p[9] = {};
     p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     p[0].Constants.ShaderRegister = 0;
     p[0].Constants.Num32BitValues = kOpConstants;
@@ -770,10 +775,12 @@ ComPtr<ID3D12RootSignature> make_root_sig(ID3D12Device* device, std::string* err
     p[6].Descriptor.ShaderRegister = 1;
     p[7].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
     p[7].Descriptor.ShaderRegister = 4;
+    p[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    p[8].Descriptor.ShaderRegister = 5;
     for (auto& q : p)
         q.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     D3D12_ROOT_SIGNATURE_DESC desc = {};
-    desc.NumParameters = 8;
+    desc.NumParameters = 9;
     desc.pParameters = p;
     auto serialize = d3d12_dyn::SerializeRootSignature();
     if (!serialize) {
@@ -1532,13 +1539,15 @@ void backend_free(ggml_backend_t b) {
         std::snprintf(msg, sizeof(msg),
                       "[xllama] d3d12: %llu graph_compute calls, %llu submits, %llu dispatches, "
                       "%.1f ms wall (%.1f ms GPU; %.1f ms recording, %.1f ms waiting, %.1f ms "
-                      "host); %llu submits replayed a kept list; %llu barriers\n",
+                      "host); %llu submits replayed a kept list; %llu barriers; %llu delta-net "
+                      "layers fused\n",
                       static_cast<unsigned long long>(g.n_calls),
                       static_cast<unsigned long long>(g.n_submits),
                       static_cast<unsigned long long>(g.n_dispatches), g.wall_ms, g.gpu_ms,
                       g.rec_ms, g.wait_ms, g.wall_ms - g.rec_ms - g.wait_ms,
                       static_cast<unsigned long long>(g.n_replays),
-                      static_cast<unsigned long long>(g.n_barriers));
+                      static_cast<unsigned long long>(g.n_barriers),
+                      static_cast<unsigned long long>(g.n_gdn_fused));
         log_output(msg);
         std::vector<
             std::pair<std::tuple<const ID3D12PipelineState*, UINT, UINT, UINT>, Gpu::SegStat>>
@@ -1566,7 +1575,7 @@ void backend_free(ggml_backend_t b) {
                           static_cast<unsigned long long>(s.n), s.ms, key.c_str());
             log_output(line);
         }
-        g.n_calls = g.n_submits = g.n_dispatches = g.n_replays = g.n_barriers = 0;
+        g.n_calls = g.n_submits = g.n_dispatches = g.n_replays = g.n_barriers = g.n_gdn_fused = 0;
         g.wall_ms = g.gpu_ms = g.rec_ms = g.wait_ms = 0.0;
         g.segs.clear();
         g.kernels.clear();
@@ -1841,7 +1850,7 @@ struct Op {
     std::uint32_t c[kOpConstants] = {};
     D3D12_GPU_VIRTUAL_ADDRESS t0 = 0;
     D3D12_GPU_VIRTUAL_ADDRESS t1 = 0;
-    D3D12_GPU_VIRTUAL_ADDRESS u[5] = {};
+    D3D12_GPU_VIRTUAL_ADDRESS u[6] = {}; // u[5]: only the kernels that read u5 set it
     UINT gx = 0, gy = 0, gz = 1;
 };
 
@@ -1887,6 +1896,8 @@ std::uint64_t record_ops(Gpu& g, ID3D12GraphicsCommandList* cl, const std::vecto
             cl->SetComputeRootUnorderedAccessView(2 + i, op.u[i] ? op.u[i] : op.u[0]);
         cl->SetComputeRootShaderResourceView(6, op.t1 ? op.t1 : op.u[0]);
         cl->SetComputeRootUnorderedAccessView(7, op.u[4] ? op.u[4] : op.u[0]);
+        if (op.u[5]) // no other shader declares u5: an unset root UAV it does not read is valid
+            cl->SetComputeRootUnorderedAccessView(8, op.u[5]);
         cl->Dispatch(op.gx, op.gy, op.gz);
         ++n;
         if (prof && stamps < kProfStamps)
@@ -2069,6 +2080,35 @@ bool moe_fusable(ggml_cgraph* cgraph, int from, const std::vector<const ggml_ten
                                       &out_idx, 1);
 }
 
+// A delta-net layer KERNEL 5 runs fused (d3d12_gdn_fuse_plan): the cache row
+// it reads, at the row id the graph input holds now, and the row it writes.
+struct GdnFused {
+    D3D12_GPU_VIRTUAL_ADDRESS src_va = 0, dst_va = 0;
+    Rng src, dst;
+};
+
+bool gdn_fuse_ok(const ggml_tensor* node, const D3d12GdnFusePlan& f, GdnFused* out) {
+    D3d12GdnPlan p;
+    if (!d3d12_gdn_plan(node, &p) || !ssm_operand(node) || !ssm_operand(f.states) ||
+        !ssm_operand(f.dst) || !f.ids->buffer || !ggml_backend_buffer_is_host(f.ids->buffer))
+        return false;
+    for (const ggml_tensor* t : {p.q, p.k, p.v, p.g, p.beta})
+        if (!ssm_operand(t) || overlaps(rng_of(t), rng_of(node)))
+            return false;
+    const std::int32_t row = *static_cast<const std::int32_t*>(f.ids->data);
+    if (row < 0 || row >= f.states->ne[1])
+        return false;
+    const std::size_t at = static_cast<std::size_t>(row) * f.states->nb[1];
+    const auto lo = reinterpret_cast<std::uintptr_t>(f.states->data) + at;
+    out->src = {lo, lo + ggml_nbytes(f.dst)};
+    out->dst = rng_of(f.dst);
+    out->src_va = tensor_va(f.states) + at;
+    out->dst_va = tensor_va(f.dst);
+    // Load4 / Store4 from the bases: 16-byte aligned rows.
+    return !overlaps(out->src, rng_of(node)) && !overlaps(out->dst, rng_of(node)) &&
+           out->src_va % 16 == 0 && out->dst_va % 16 == 0;
+}
+
 ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
     Gpu& g = gpu();
     std::vector<ggml_tensor*> nodes;
@@ -2112,6 +2152,31 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
     std::lock_guard<std::mutex> lock(g.mu);
     const auto t0 = std::chrono::steady_clock::now();
     g.last_gpu_ms = 0.0;
+    // Delta-net layers that read and write their recurrent cache rows
+    // themselves: their state GET_ROWS and the CPY of the new state do not run.
+    std::unordered_map<const ggml_tensor*, GdnFused> gdn_fused;
+    std::unordered_set<const ggml_tensor*> fused_away;
+    if (g.ssm_ok && g.gdn_fuse) {
+        auto uses = [cgraph](const ggml_tensor* t) -> int {
+            const std::size_t pos = ggml_hash_find(&cgraph->visited_hash_set, t);
+            return pos != GGML_HASHSET_FULL && ggml_bitset_get(cgraph->visited_hash_set.used, pos)
+                       ? cgraph->use_counts[pos]
+                       : 0;
+        };
+        for (std::size_t i = 0; i < nodes.size(); ++i) {
+            if (nodes[i]->op != GGML_OP_GATED_DELTA_NET)
+                continue;
+            D3d12GdnFusePlan f;
+            GdnFused fz;
+            if (!d3d12_gdn_fuse_plan(cgraph, node_idx[i], uses, &f) ||
+                !gdn_fuse_ok(nodes[i], f, &fz))
+                continue;
+            gdn_fused.emplace(nodes[i], fz);
+            fused_away.insert(f.get_rows);
+            fused_away.insert(f.cpy);
+        }
+        g.n_gdn_fused += gdn_fused.size();
+    }
     // The split's ops go into one submission. Dispatches run back to back, so
     // a UAV barrier goes in front of one that reads what another wrote since
     // the last barrier, or writes what one read or wrote (the graph allocator
@@ -2309,6 +2374,8 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
         GGML_ASSERT(node->buffer && is_ours(node->buffer->buft));
         if (ggml_nelements(node) == 0)
             continue; // a ubatch without output rows: nothing to compute
+        if (!fused_away.empty() && fused_away.count(node))
+            continue; // a delta-net state copy the fused KERNEL 5 does itself
         const ggml_tensor* a = node->src[0];
         const ggml_tensor* b = node->src[1];
         switch (node->op) {
@@ -2563,6 +2630,33 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
         case GGML_OP_GATED_DELTA_NET: {
             D3d12GdnPlan p;
             GGML_ASSERT(d3d12_gdn_plan(node, &p));
+            const auto fz = gdn_fused.find(node);
+            if (fz != gdn_fused.end()) {
+                // gdn_fuse_ok took the operands; p.state was never gathered.
+                p.params.k_kda |= kD3d12GdnFused;
+                Op op;
+                op.pso = g.pso_ssm[kSsmGdn].Get();
+                std::memcpy(op.c, &p.params, sizeof(p.params));
+                op.u[0] = tensor_va(node);
+                op.u[1] = tensor_va(p.q);
+                op.u[2] = tensor_va(p.k);
+                op.u[3] = tensor_va(p.v);
+                op.u[4] = tensor_va(p.g);
+                op.u[5] = fz->second.dst_va;
+                op.t0 = tensor_va(p.beta);
+                op.t1 = fz->second.src_va;
+                op.gx = p.groups_x;
+                op.gy = p.groups_y;
+                op.gz = p.groups_z;
+                const auto lo = reinterpret_cast<std::uintptr_t>(node->data);
+                const Rng attn{lo, lo + static_cast<std::size_t>(kD3d12GdnSv) * p.params.h *
+                                           p.params.t * p.params.b * sizeof(float)};
+                record(op,
+                       {rng_of(p.q), rng_of(p.k), rng_of(p.v), rng_of(p.g), rng_of(p.beta),
+                        fz->second.src},
+                       {attn, fz->second.dst});
+                break;
+            }
             const ggml_tensor* in[6] = {p.q, p.k, p.v, p.g, p.beta, p.state};
             bool gpu_ok = g.ssm_ok && ssm_operand(node);
             for (const ggml_tensor* t : in)
@@ -2794,6 +2888,10 @@ ggml_backend_t dev_init_backend(ggml_backend_dev_t dev, const char*) {
         }
         if (g.prof_on)
             log_output("[xllama] d3d12: profiling every dispatch (XLLAMA_D3D12_PROFILE)\n");
+        const char* f = std::getenv("XLLAMA_D3D12_SSM_FUSE");
+        g.gdn_fuse = !(f && *f == '0');
+        if (!g.gdn_fuse)
+            log_output("[xllama] d3d12: delta-net state copies kept (XLLAMA_D3D12_SSM_FUSE=0)\n");
     }
     return new ggml_backend{backend_guid(), kBackendIface, dev, nullptr};
 }
