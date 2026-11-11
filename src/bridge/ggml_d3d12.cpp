@@ -3594,13 +3594,16 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
                     // q/k/v, ffn_norm -> the shared expert): KERNEL 4 writes its
                     // q8_K copy too, which quantize() then finds in `done`, so
                     // kernel 3's dispatch and the barrier before it go.
-                    const int rows = static_cast<int>(flat_rows(node));
-                    const auto qrow = static_cast<std::uint32_t>(
-                        ggml_row_size(GGML_TYPE_Q8_K, node->ne[0]));
-                    const std::size_t qbytes = static_cast<std::size_t>(qrow) * rows;
                     const bool nq = g.normq && g.pso_elt[kEltNormQuant] && elt_rows(node) &&
                                     node->ne[0] % kD3d12Chunk == 0 && node->ne[0] <= 4096 &&
                                     q8k_reader(m, i + 2);
+                    // Sized only then: ggml_row_size asserts whole q8_K blocks
+                    // (asserts are on in this build; the delta net's norms are 128).
+                    const int rows = nq ? static_cast<int>(flat_rows(node)) : 0;
+                    const auto qrow =
+                        nq ? static_cast<std::uint32_t>(ggml_row_size(GGML_TYPE_Q8_K, node->ne[0]))
+                           : 0u;
+                    const std::size_t qbytes = static_cast<std::size_t>(qrow) * rows;
                     std::size_t qoff = 0;
                     if (nq && !reserve(qbytes, &qoff)) // may flush: nothing of e is recorded yet
                         return GGML_STATUS_FAILED;
@@ -5843,7 +5846,7 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
         // pass) x 5 tokens; 16 blocks (four full passes).
         out->push_back(run_normq_case(backend, 2048, 512, 1, false));
         out->push_back(run_normq_case(backend, 2048, 512, 1, true));
-        out->push_back(run_normq_case(backend, 512, 256, 5, false));
+        out->push_back(run_normq_case(backend, 1024, 256, 5, false));
         out->push_back(run_normq_case(backend, 4096, 256, 1, false));
     }
     if (gpu().ssm_ok)
