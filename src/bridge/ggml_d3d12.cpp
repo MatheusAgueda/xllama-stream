@@ -740,6 +740,11 @@ struct Gpu {
     // build_rs's GET_ROWS and the CPY back (d3d12_gdn_fuse_plan). Read when a
     // backend is created: XLLAMA_D3D12_SSM_FUSE=0 keeps both copies.
     bool gdn_fuse = true;
+    // XLLAMA_D3D12_WAVES=1 (read when a backend is created): each op of a
+    // submission goes into the first wave after the last one it conflicts with,
+    // and barriers go only between waves, so independent chains the graph order
+    // interleaves (shared vs routed experts, q/k/v paths) share barriers.
+    bool waves = false;
     // IQ3_S group geometry asked for by XLLAMA_D3D12_IQ3S_RSL / _RT (read when a
     // backend is created; d3d12_geom_for shapes each matmul from it).
     D3d12GeomReq iq3s_geom;
@@ -2349,7 +2354,23 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
     };
     std::vector<Quantized> done;
     std::size_t used = 0;
+    // g.waves: the submission as waves of ops, a barrier between consecutive
+    // waves. An op lands in the wave after the last one holding an op it reads
+    // after, writes after or overwrites, so it still runs after every op it
+    // depends on and before none that depends on it (those come later and see
+    // it among the waves); within a wave the recorded order is kept.
+    struct Wave {
+        std::vector<Op> ops;
+        std::vector<Rng> r, w;
+    };
+    std::vector<Wave> waves;
     auto flush = [&]() -> bool {
+        for (std::size_t wi = 0; wi < waves.size(); ++wi) {
+            if (wi > 0)
+                ops.push_back(Op{});
+            ops.insert(ops.end(), waves[wi].ops.begin(), waves[wi].ops.end());
+        }
+        waves.clear();
         const bool ok = ops.empty() || submit_ops(g, ops);
         ops.clear();
         bar_r.clear();
@@ -2361,19 +2382,37 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
     };
     auto record = [&](const Op& op, std::initializer_list<Rng> reads,
                       std::initializer_list<Rng> writes) {
-        bool hazard = false;
-        for (const Rng& r : reads)
-            hazard = hazard || any_overlap(bar_w, r);
-        for (const Rng& w : writes)
-            hazard = hazard || any_overlap(bar_w, w) || any_overlap(bar_r, w);
-        if (hazard) {
-            ops.push_back(Op{});
-            bar_r.clear();
-            bar_w.clear();
+        auto conflicts = [&](const std::vector<Rng>& r, const std::vector<Rng>& w) {
+            bool hazard = false;
+            for (const Rng& x : reads)
+                hazard = hazard || any_overlap(w, x);
+            for (const Rng& x : writes)
+                hazard = hazard || any_overlap(w, x) || any_overlap(r, x);
+            return hazard;
+        };
+        if (g.waves) {
+            std::size_t at = 0;
+            for (std::size_t wi = waves.size(); wi-- > 0;)
+                if (conflicts(waves[wi].r, waves[wi].w)) {
+                    at = wi + 1;
+                    break;
+                }
+            if (at == waves.size())
+                waves.emplace_back();
+            Wave& wave = waves[at];
+            wave.ops.push_back(op);
+            wave.r.insert(wave.r.end(), reads.begin(), reads.end());
+            wave.w.insert(wave.w.end(), writes.begin(), writes.end());
+        } else {
+            if (conflicts(bar_r, bar_w)) {
+                ops.push_back(Op{});
+                bar_r.clear();
+                bar_w.clear();
+            }
+            ops.push_back(op);
+            bar_r.insert(bar_r.end(), reads.begin(), reads.end());
+            bar_w.insert(bar_w.end(), writes.begin(), writes.end());
         }
-        ops.push_back(op);
-        bar_r.insert(bar_r.end(), reads.begin(), reads.end());
-        bar_w.insert(bar_w.end(), writes.begin(), writes.end());
         batch_w.insert(batch_w.end(), writes.begin(), writes.end());
         // A quantized copy of memory this op overwrites is stale.
         done.erase(std::remove_if(done.begin(), done.end(),
@@ -3053,6 +3092,10 @@ ggml_backend_t dev_init_backend(ggml_backend_dev_t dev, const char*) {
         g.gdn_fuse = !(f && *f == '0');
         if (!g.gdn_fuse)
             log_output("[xllama] d3d12: delta-net state copies kept (XLLAMA_D3D12_SSM_FUSE=0)\n");
+        const char* wv = std::getenv("XLLAMA_D3D12_WAVES");
+        g.waves = wv && *wv && *wv != '0';
+        if (g.waves)
+            log_output("[xllama] d3d12: ops scheduled in waves (XLLAMA_D3D12_WAVES)\n");
         g.iq3s_geom.rsl = d3d12_geom_parse(std::getenv("XLLAMA_D3D12_IQ3S_RSL"), 1);
         g.iq3s_geom.rt = d3d12_geom_parse(std::getenv("XLLAMA_D3D12_IQ3S_RT"), 1);
         if (g.iq3s_geom.rsl != 1 || g.iq3s_geom.rt != 1)
