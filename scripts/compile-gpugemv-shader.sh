@@ -10,7 +10,7 @@
 #     (D2 backend; one blob per thread-group width, -D NUM_THREADS)
 #   shaders/ggml_d3d12_mmid_{iq4_xs,iq3_s}.hlsl → ggml_d3d12_mmid_*_t{64,128}_dxil.h (cs_6_4, MUL_MAT_ID)
 #   shaders/ggml_d3d12_get_rows_q6_k.hlsl → ggml_d3d12_get_rows_q6_k_dxil.h (cs_6_4)
-#   shaders/ggml_d3d12_elt.hlsl → ggml_d3d12_elt_{binary,rms_norm,quant_q8_k}_dxil.h (cs_6_4, -D KERNEL)
+#   shaders/ggml_d3d12_elt.hlsl → ggml_d3d12_elt_{binary,rms_norm,quant_q8_k,norm_quant,bin_quant}_dxil.h (cs_6_4, -D KERNEL)
 #   shaders/ggml_d3d12_moe.hlsl → ggml_d3d12_moe_{combine,tail}_dxil.h (cs_6_4, -D KERNEL)
 #   shaders/ggml_d3d12_ssm.hlsl → ggml_d3d12_ssm_{unary,copy,get_rows,conv,gdn}_dxil.h (cs_6_4, -D KERNEL)
 #   variants: shaders/variants.txt → $VARIANTS_OUT/<tag>/<slot>.dxil, raw blobs
@@ -121,7 +121,7 @@ compile_target() {
 		"shaders/ggml_d3d12_get_rows_q6_k.hlsl" "kGgmlD3d12GetRowsQ6KDxil" cs_6_4 ;;
 	elt)
 		local k n name sym
-		for k in 1:binary:Binary 2:rms_norm:RmsNorm 3:quant_q8_k:QuantQ8K 4:norm_quant:NormQuant; do
+		for k in 1:binary:Binary 2:rms_norm:RmsNorm 3:quant_q8_k:QuantQ8K 4:norm_quant:NormQuant 5:bin_quant:BinQuant; do
 			IFS=: read -r n name sym <<<"$k"
 			compile_one "$ROOT/shaders/ggml_d3d12_elt.hlsl" \
 				"$ROOT/shaders/generated/ggml_d3d12_elt_${name}_dxil.h" \

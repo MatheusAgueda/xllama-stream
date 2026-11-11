@@ -2,12 +2,13 @@
 // layer's output projection, residual adds, norms, FFN and the next layer's
 // input projections run as one submission instead of one per matmul group
 // (docs in patches/README.md, 0005; src/bridge/ggml_d3d12.cpp graph_compute).
-// One source, four kernels picked with -D KERNEL=n:
+// One source, five kernels picked with -D KERNEL=n:
 //   1 binary:   dst[r][i] = a[r][i] (+ | * | swiglu) b[r * b_stride][i]
 //   2 rms_norm: dst[r] = a[r] / sqrt(mean(a[r]^2) + eps), optionally followed
 //               by the norm weight: dst2[r][i] = dst[r][i] * w[i]
 //   3 quant:    f32 columns -> block_q8_K, ggml's quantize_row_q8_K_ref
 //   4 norm_quant: 2 with the weight, then 3 on dst2's rows (into u4), one dispatch
+//   5 bin_quant:  1, then 3 on its result (into u4), one dispatch
 // Root signature: 8 constants at b0, root UAVs u0 (dst), u1 (a), u2 (b / w),
 // u3 (dst2). Every buffer is D3D12_Host (UNORDERED_ACCESS), so all are raw UAVs.
 
@@ -85,7 +86,7 @@ void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
             D2.Store(4u * (r * c5 + j), asuint(y * asfloat(B.Load(4u * j))));
     }
 }
-#elif KERNEL == 3 || KERNEL == 4
+#elif KERNEL >= 3 && KERNEL <= 5
 // One group per (256-element block, column). c0 = blocks per column, c1 = a
 // column stride (floats), c2 = output column stride (bytes). block_q8_K =
 // { float d; int8 qs[256]; int16 bsums[16]; } = 292 B. Thread t owns elements
@@ -202,7 +203,7 @@ void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
     if (tid == 0u)
         D.Store(ob, asuint(d));
 }
-#else // KERNEL 4
+#elif KERNEL == 4
 // rms_norm, the norm weight and block_q8_K of the product in one dispatch, one
 // group per row (ne0 = 256 * nb, nb <= 16). Kernel 2's arithmetic for dst and
 // dst2 (same per-thread sums, same tree), then kernel 3's per block on those
@@ -309,5 +310,90 @@ void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
         GroupMemoryBarrierWithGroupSync(); // s_* are rewritten by the next pass
     }
 }
-#endif // KERNEL 3 / 4
+#else // KERNEL 5
+// Kernel 1's op and kernel 3's block_q8_K of its result in one dispatch (the
+// SwiGLUs before ffn_down, the gated norm before ssm_out, the attention gate
+// before wo): one group per (256-element block, q8_K row), thread t on
+// 4t..4t+3, kernel 1's expression for the floats and kernel 3's code for the
+// block. A q8_K row may span several op rows (the gated norm's [128, 32] read
+// as [4096]); the host then passes contiguous strides.
+// c0 = q8_K row width, c1 = a row stride, c2 = b row stride (0: one row for
+// all), c3 = dst row stride (floats, per q8_K row), c4 = op (0 add, 1 mul,
+// 2 swiglu), c5 = q8_K row stride (bytes); u4 = q8_K out.
+RWByteAddressBuffer Q : register(u4);
+
+groupshared float s_ax[64];
+groupshared float s_v[64];
+groupshared uint s_i[64];
+groupshared int s_sum[64];
+
+[numthreads(64, 1, 1)]
+void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
+    const uint r = gid.y;
+    const uint i0 = gid.x * 256u + 4u * tid;
+    float x[4];
+    float ax = 0.0f, v = 0.0f;
+    uint idx = 4u * tid;
+    [unroll]
+    for (uint j = 0; j < 4u; ++j) {
+        const float a = lda(r * c1 + i0 + j);
+        const float b = asfloat(B.Load(4u * (r * c2 + i0 + j)));
+        float y;
+        if (c4 == 0u)
+            y = a + b;
+        else if (c4 == 1u)
+            y = a * b;
+        else
+            y = a / (1.0f + exp(-a)) * b; // ggml_vec_swiglu_f32
+        D.Store(4u * (r * c3 + i0 + j), asuint(y)); // d may alias a: same element, read first
+        x[j] = y;
+        if (abs(y) > ax) {
+            ax = abs(y);
+            v = y;
+            idx = 4u * tid + j;
+        }
+    }
+    s_ax[tid] = ax;
+    s_v[tid] = v;
+    s_i[tid] = idx;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll]
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            const float o = s_ax[tid + stride];
+            if (o > s_ax[tid] || (o == s_ax[tid] && s_i[tid + stride] < s_i[tid])) {
+                s_ax[tid] = o;
+                s_v[tid] = s_v[tid + stride];
+                s_i[tid] = s_i[tid + stride];
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    const float amax = s_ax[0];
+    const uint ob = r * c5 + gid.x * 292u;
+    int q[4] = {0, 0, 0, 0};
+    float d = 0.0f;
+    if (amax != 0.0f) {
+        const float vm = s_v[0];
+        const float ais = div_rn(127u, vm); // |-127 / v|
+        const float iscale = vm > 0.0f ? -ais : ais;
+        const float dm = div_rn(1u, ais); // |1 / iscale|
+        d = vm > 0.0f ? -dm : dm;
+        [unroll]
+        for (uint j = 0; j < 4u; ++j)
+            q[j] = min(127, (int)round(iscale * x[j]));
+    }
+    Q.Store(ob + 4u + 4u * tid, (uint(q[0]) & 0xffu) | ((uint(q[1]) & 0xffu) << 8) |
+                                ((uint(q[2]) & 0xffu) << 16) | (uint(q[3]) << 24));
+    s_sum[tid] = q[0] + q[1] + q[2] + q[3];
+    GroupMemoryBarrierWithGroupSync();
+    if ((tid & 7u) == 0u) {
+        const int lo = s_sum[tid] + s_sum[tid + 1u] + s_sum[tid + 2u] + s_sum[tid + 3u];
+        const int hi = s_sum[tid + 4u] + s_sum[tid + 5u] + s_sum[tid + 6u] + s_sum[tid + 7u];
+        Q.Store(ob + 260u + (tid >> 1), (uint(lo) & 0xffffu) | (uint(hi) << 16));
+    }
+    if (tid == 0u)
+        Q.Store(ob, asuint(d));
+}
+#endif // KERNEL 3 / 4 / 5
 #endif
