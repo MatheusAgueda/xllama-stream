@@ -316,6 +316,18 @@ split that runs meanwhile (3 x n_ff_shexp floats per layer). Unset, the graph
 is unchanged; set, only the node order (and, for one token, the allocation)
 changes, not any value.
 
+`0015-expert-cache-gpu-route.patch` (applies after 0004): two C entry points
+for a backend that routes a decode token's experts on the GPU.
+`llama_ec_route_query(node, &info)` says whether a graph node is the cache's
+select, plan, load or prefetch op (by the op's function), with its layer,
+`n_expert`, `n_slots`, swap ratio and tail, a pointer to the layer's
+expert-to-slot map, and `plain` (no trace, deferred reads or prefetch).
+`llama_ec_route_prepare(node)` settles the layer as the plan would before the
+backend reads that map. The D3D12 backend (`XLLAMA_D3D12_GPUROUTE=1`) then
+calls the real select, plan and load functions itself, in layer order, on the
+scores its kernel computed, so the LRU/LRFU state, the misses and the reads
+stay the cache's. Nothing calls them otherwise: the cache is unchanged.
+
 ## Applying
 
 ```bash

@@ -1,0 +1,98 @@
+diff --git a/src/llama-expert-cache.h b/src/llama-expert-cache.h
+--- a/src/llama-expert-cache.h
++++ b/src/llama-expert-cache.h
+@@ -59,6 +59,32 @@
+ // predicted experts per token read ahead, 0 when prefetch is off
+ uint32_t llama_expert_cache_prefetch(const llama_expert_cache & cache);
+ 
++// GPU routing. A backend that computes a decode ubatch's routing itself (the router softmax, the
++// cache-aware top-k against the layer's residency, the weights and the slot ids) recognizes the
++// cache's ops by their function, reads each layer's residency before it submits the graph and,
++// afterwards, calls the ops itself in layer order on its own results (the plan's LRU/LRFU state,
++// the misses and their reads stay the cache's). C linkage: the backend declares the same struct
++// and sets size to its sizeof, a mismatch returns 0.
++struct llama_ec_route_info {
++    int32_t         size;       // caller: sizeof(llama_ec_route_info)
++    int32_t         kind;       // 0 not a cache op, 1 select, 2 plan, 3 load, 4 prefetch
++    int32_t         layer;
++    int32_t         n_expert;
++    int32_t         n_slots;
++    int32_t         swap_tail;
++    float           swap_ratio;
++    int32_t         plain;      // no trace, deferred reads or prefetch: a one-token select and plan
++                                // depend only on the scores, the residency and the plan's state
++    const int32_t * slot_of;    // expert -> slot, -1 if not resident (stable until the layer's plan)
++    const void    * layer_id;   // the same for the ops of one layer
++};
++
++extern "C" int  llama_ec_route_query(const ggml_tensor * node, llama_ec_route_info * out);
++
++// before the layer's residency is read for a graph: settle the layer as its plan would first
++// (prefetch round, unloaded misses, expert-major round); idempotent, the plan does it again
++extern "C" void llama_ec_route_prepare(const ggml_tensor * node);
++
+ // end every read in flight and stop the I/O threads, before the expert buffers are freed
+ void llama_expert_cache_stop(llama_expert_cache & cache);
+ 
+diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
+--- a/src/llama-expert-cache.cpp
++++ b/src/llama-expert-cache.cpp
+@@ -2188,8 +2188,58 @@
+ 
+ uint32_t llama_expert_cache_prefetch(const llama_expert_cache & cache) {
+     return cache.pf_k;
++}
++
++// the custom op's function and layer, from the op params ggml_custom_4d wrote
++static int ec_op_kind(const ggml_tensor * node, ec_layer ** layer) {
++    if (node == nullptr || node->op != GGML_OP_CUSTOM) {
++        return 0;
++    }
++    struct {
++        ggml_custom_op_t fun;
++        int              n_tasks;
++        void           * userdata;
++    } p;
++    static_assert(sizeof(p) <= GGML_MAX_OP_PARAMS, "custom op params");
++    memcpy(&p, node->op_params, sizeof(p));
++    const int kind = p.fun == ec_select ? 1 : p.fun == ec_plan ? 2 : p.fun == ec_load ? 3 : p.fun == ec_prefetch ? 4 : 0;
++    *layer = kind != 0 ? (ec_layer *) p.userdata : nullptr;
++    return kind;
++}
++
++extern "C" int llama_ec_route_query(const ggml_tensor * node, llama_ec_route_info * out) {
++    if (out == nullptr || out->size != (int32_t) sizeof(llama_ec_route_info)) {
++        return 0;
++    }
++    ec_layer * L = nullptr;
++    const int kind = ec_op_kind(node, &L);
++    if (kind == 0 || L == nullptr || L->cache == nullptr) {
++        return 0;
++    }
++    const llama_expert_cache & C = *L->cache;
++    out->kind       = kind;
++    out->layer      = L->id;
++    out->n_expert   = (int32_t) L->slot_of.size();
++    out->n_slots    = (int32_t) L->expert_of.size();
++    out->swap_tail  = (int32_t) C.swap_tail;
++    out->swap_ratio = C.swap_ratio;
++    out->plain      = C.trace == nullptr && !(C.defer_b > 0.0) && C.pf_k == 0 && L->dwant.empty() && L->n_pf == 0;
++    out->slot_of    = L->slot_of.data();
++    out->layer_id   = L;
++    return kind;
+ }
+ 
++extern "C" void llama_ec_route_prepare(const ggml_tensor * node) {
++    ec_layer * L = nullptr;
++    const int kind = ec_op_kind(node, &L);
++    if (kind == 0 || kind == 4 || L == nullptr) {
++        return;
++    }
++    ec_settle(*L);
++    ec_drop_unloaded(*L);
++    ec_em_end(*L);
++}
++
+ void llama_expert_cache_stop(llama_expert_cache & cache) {
+     cache.pf_shutdown();
+ }
