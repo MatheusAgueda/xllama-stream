@@ -463,6 +463,24 @@
           "sha256": "4a3c682957fa64e4361f651d6a157caaf8f2447bff64167eee0d258c0c937ef4"
         }
       ]
+    },
+    {
+      "_comment": "2026-11-11: Qwen3.5-122B-A10B (Apache-2.0 base; 'heretic' refusal-ablated derivative, mradermacher i1-IQ3_S imatrix quant). qwen35moe, 48 layers, 256 experts / 8 used: 2.87 GiB dense+embed resident, experts 3.87 MiB each streamed from D: through the expert cache (output.weight on the CPU via LocalState gguf_output_cpu.txt keeps >= 9 slots under the Dev Mode GPU cap). Absolute name: the pull writes straight into D:\\DevelopmentFiles and resumes a staged .part with a Range request.",
+      "name": "D:\\DevelopmentFiles\\xllama\\models\\qwen35-122b-a10b-heretic-iq3s",
+      "display": "Qwen3.5 122B-A10B heretic (GGUF i1-IQ3_S, expert cache, 52.9 GB, experimental)",
+      "kind": "gguf",
+      "n_ctx": 4096,
+      "gpu_layers": 99,
+      "expert_slots": 9,
+      "expert_swap": 0.5,
+      "hf_base_url": "https://huggingface.co/mradermacher/Qwen3.5-122B-A10B-heretic-i1-GGUF/resolve/main",
+      "files": [
+        {
+          "filename": "Qwen3.5-122B-A10B-heretic.i1-IQ3_S.gguf",
+          "approx_bytes": 52924024160,
+          "sha256": "fad21adc17714e13e3ea7e59fe3d500cb7a44d43b878832c7579de530ae9d338"
+        }
+      ]
     }
   ]
 }
