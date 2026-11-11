@@ -74,7 +74,7 @@ new file mode 100644
 index 0000000..b93f475
 --- /dev/null
 +++ b/src/llama-expert-cache.cpp
-@@ -0,0 +1,1948 @@
+@@ -0,0 +1,1995 @@
 +#include "llama-expert-cache.h"
 +
 +#include "llama-impl.h"
@@ -279,6 +279,13 @@ index 0000000..b93f475
 +    float    swap_ratio    = 0.0f;
 +    uint32_t swap_tail     = 0; // LLAMA_EXPERT_SWAP_TAIL: weakest ranks of the top-k a resident takes at any score
 +
++    // LLAMA_EXPERT_TRACE=<file>: the router's ranking of every token, layer and ubatch as the select op
++    // saw it, before any swap (records "ECT1", layer, n_tokens, k, n_used, then per token k int16 ids
++    // and k float scores, best first) - an exact routing replay for offline cache-policy studies
++    FILE *     trace   = nullptr;
++    std::mutex trace_mu;
++    std::vector<char> trace_buf;
++
 +    ggml_backend_buffer_type buft {};
 +    ggml_backend_buffer_type_t inner = nullptr; // a GPU device's host buft holding the slots, nullptr = CPU
 +
@@ -411,6 +418,9 @@ index 0000000..b93f475
 +        pf_shutdown();
 +        if (n_rounds > 0 || em_rounds.load() > 0) {
 +            log_stats("final");
++        }
++        if (trace != nullptr) {
++            fclose(trace);
 +        }
 +    }
 +};
@@ -1189,10 +1199,30 @@ index 0000000..b93f475
 +    std::vector<int32_t> & order = L.order;
 +    order.resize((size_t) n_expert);
 +
++    // LLAMA_EXPERT_TRACE: this ubatch's ranking before the swaps, one record, one write
++    const int64_t n_tr = C.trace != nullptr ? std::min<int64_t>(32, n_expert) : 0;
++    std::unique_lock<std::mutex> tr_lock;
++    auto put = [&C](const void * p, size_t n) {
++        C.trace_buf.insert(C.trace_buf.end(), (const char *) p, (const char *) p + n);
++    };
++    if (n_tr > 0) {
++        tr_lock = std::unique_lock<std::mutex>(C.trace_mu);
++        const int32_t head[5] = { 0x31544345 /* "ECT1" */, L.id, (int32_t) n_tokens, (int32_t) n_tr, (int32_t) n_used };
++        C.trace_buf.clear();
++        put(head, sizeof(head));
++    }
++
 +    uint64_t swaps = 0;
 +    for (int64_t t = 0; t < n_tokens; ++t) {
 +        const float * s = (const float *) ((const char *) scores->data + t*scores->nb[1]);
 +        ec_rank(order, s);
++        for (int64_t k = 0; k < n_tr; ++k) {
++            const int16_t e = (int16_t) order[k];
++            put(&e, sizeof(e));
++        }
++        for (int64_t k = 0; k < n_tr; ++k) {
++            put(&s[order[k]], sizeof(float));
++        }
 +        swaps += ec_swap_missing(L, order, s, n_used, C.swap_ratio, C.swap_tail);
 +
 +        int32_t * out = (int32_t *) ((char *) dst->data + t*dst->nb[1]);
@@ -1202,6 +1232,12 @@ index 0000000..b93f475
 +    }
 +    if (swaps > 0) {
 +        C.swaps += swaps;
++    }
++    if (n_tr > 0) {
++        fwrite(C.trace_buf.data(), 1, C.trace_buf.size(), C.trace);
++        if (L.id == C.first_layer) {
++            fflush(C.trace); // once per ubatch: a killed process loses at most the last one
++        }
 +    }
 +}
 +
@@ -1744,6 +1780,17 @@ index 0000000..b93f475
 +    if (cache->swap_tail > 0) {
 +        LLAMA_LOG_INFO("%s: expert cache: swap tail %u of %u ranks (a resident stands in at any score)\n",
 +            __func__, cache->swap_tail, cache->n_expert_used);
++    }
++    // LLAMA_EXPERT_TRACE: needs the select op, i.e. a swap ratio (a ratio above 1 never swaps: an exact
++    // routing trace)
++    const char * tr = getenv("LLAMA_EXPERT_TRACE");
++    if (tr != nullptr && *tr != '\0' && cache->swap_ratio > 0.0f) {
++        cache->trace = ggml_fopen(tr, "ab");
++        if (cache->trace != nullptr) {
++            LLAMA_LOG_INFO("%s: expert cache: routing trace to %s\n", __func__, tr);
++        } else {
++            LLAMA_LOG_WARN("%s: expert cache: routing trace %s: %s\n", __func__, tr, strerror(errno));
++        }
 +    }
 +
 +    // LLAMA_EXPERT_PREFETCH: predicted experts per token read ahead (0 = off, the default: its wrong

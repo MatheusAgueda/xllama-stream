@@ -630,6 +630,62 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
             CHECK(misses_of(log.final_line) < plain_misses);
         }
 
+        // Routing trace (LLAMA_EXPERT_TRACE): a ratio above 1 never swaps, so the
+        // run is exact routing through the select op - same tokens and misses as
+        // plain - and the file holds one "ECT1" record per layer and ubatch with
+        // each token's ranking, best first, before any swap.
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            log.final_line.clear();
+        }
+        const std::string trace_path = std::string(path) + ".ectrace";
+        std::remove(trace_path.c_str());
+        set_env_s("LLAMA_EXPERT_TRACE", trace_path.c_str());
+        const EcRun traced = run_greedy(path, c.slots, 512, c.used, 24, 1000.0f);
+        set_env_s("LLAMA_EXPERT_TRACE", nullptr);
+        REQUIRE(traced.ok);
+        CHECK(traced.tokens == plain.tokens);
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            MESSAGE(log.final_line);
+            CHECK(swaps_of(log.final_line) == 0);
+            CHECK(misses_of(log.final_line) == plain_misses);
+        }
+        {
+            FILE* f = std::fopen(trace_path.c_str(), "rb");
+            REQUIRE(f != nullptr);
+            long long records = 0, bad = 0, token_layers = 0;
+            int32_t head[5];
+            while (std::fread(head, sizeof(head), 1, f) == 1) {
+                records++;
+                const int32_t n_tok = head[2], k = head[3];
+                if (head[0] != 0x31544345 || head[1] < 0 || n_tok < 1 || k < 1 || k > 32 || head[4] < 1 || head[4] > k) {
+                    bad++;
+                    break;
+                }
+                std::vector<int16_t> ids((size_t) k);
+                std::vector<float> sc((size_t) k);
+                for (int32_t t = 0; t < n_tok; ++t) {
+                    if (std::fread(ids.data(), sizeof(int16_t), (size_t) k, f) != (size_t) k ||
+                        std::fread(sc.data(), sizeof(float), (size_t) k, f) != (size_t) k) {
+                        bad++;
+                        break;
+                    }
+                    for (int32_t j = 0; j < k; ++j) {
+                        if (ids[(size_t) j] < 0 || (j > 0 && sc[(size_t) j] > sc[(size_t) j - 1]))
+                            bad++;
+                    }
+                    token_layers++;
+                }
+            }
+            std::fclose(f);
+            std::remove(trace_path.c_str());
+            MESSAGE("trace records " << records << ", token-layers " << token_layers);
+            CHECK(records > 0);
+            CHECK(token_layers >= records);
+            CHECK(bad == 0);
+        }
+
         // Both: the prefetch predicts the swapped routing (stand-ins kept, only
         // the experts still missing read ahead). Its reads change the residency
         // and so the routing; the run must hold together and report both.
