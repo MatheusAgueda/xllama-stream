@@ -289,6 +289,21 @@ the model's; its `block_count` and `nextn_predict_layers` become kv overrides
 unless the caller set them. Its routed experts go through the expert cache
 like the trunk's (its path is in `file_paths`). Unset, the loader is unchanged.
 
+`0013-sched-split-budget.patch`: `ggml_backend_sched_new` sizes its context
+buffer for one split per graph node, 60 split-input tensors each. For the
+26k-node budget of Qwen3.6-35B-A3B that is ~0.5 GiB per scheduler, committed
+and almost never touched (the real graphs split 68-104 ways). On the Series X
+the app's commit limit is ~5 GiB, so the second scheduler of an MTP context
+failed its `malloc` and the NULL buffer reached `ggml_init` as
+`GGML_ASSERT(ctx->mem_buffer != NULL)` (crash dump, 1.7.12.52).
+`GGML_SCHED_MAX_SPLITS=<n>` bounds the split count that buffer and the four
+backend-id arrays are sized for; a graph that needs more aborts with a message
+that names the variable instead of overrunning the arrays. A failed allocation
+now aborts in `sched_new` with the size. Separately, an MTP context of
+Qwen3.5/3.6 gets a `graph_max_nodes` of `max(4096, 8*n_tokens)` instead of the
+whole model's, because it builds only the nextn block. Unset, the scheduler
+is unchanged; the MTP budget applies whenever an MTP context is created.
+
 ## Applying
 
 ```bash
