@@ -304,6 +304,18 @@ Qwen3.5/3.6 gets a `graph_max_nodes` of `max(4096, 8*n_tokens)` instead of the
 whole model's, because it builds only the nextn block. Unset, the scheduler
 is unchanged; the MTP budget applies whenever an MTP context is created.
 
+`0014-qwen35moe-shared-expert-after-router.patch` (applies after 0009): with
+`XLLAMA_D3D12_SHEXP_ASYNC` set when the graph is built, Qwen3.5/3.6 MoE adds a
+layer's shared expert after the router logits instead of before the shared
+gate, so the GPU split ends with it. The D3D12 backend (same variable) then
+waits only for the ops up to the logits and leaves the shared expert running
+while the CPU split routes and reads experts. The CPU and D3D12 splits share
+one compute buffer, so for one token the shared expert's intermediates are
+marked graph outputs: the allocator never reuses their memory for the CPU
+split that runs meanwhile (3 x n_ff_shexp floats per layer). Unset, the graph
+is unchanged; set, only the node order (and, for one token, the allocation)
+changes, not any value.
+
 ## Applying
 
 ```bash

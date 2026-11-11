@@ -606,6 +606,7 @@ void run_d3d12_memprobe(const std::function<void(const std::string&)>& emit) {
 
     #else // _WIN32 — the backend itself
 
+        #include <atomic>
         #include <chrono>
         #include <cstdint>
         #include <cstdio>
@@ -745,6 +746,25 @@ struct Gpu {
     // and barriers go only between waves, so independent chains the graph order
     // interleaves (shared vs routed experts, q/k/v paths) share barriers.
     bool waves = false;
+    // XLLAMA_D3D12_SHEXP_ASYNC=1 (read when a backend is created; patch 0014
+    // reads it too, and puts a MoE layer's shared expert after the router
+    // logits, its intermediates marked outputs for one token): a call whose
+    // last node is that shared expert waits only for the ops up to the logits.
+    // The shared expert's ops stay on the GPU while the CPU split routes and
+    // reads experts; `pending` holds their fence value until drain_pending,
+    // which every later submission, buffer access, synchronize and free runs
+    // first. The graph allocator never gives the CPU split their memory
+    // (outputs are not reused), and nothing else they read or write is
+    // touched before the drain.
+    bool shexp_async = false;
+    std::atomic<UINT64> pending{0}; // written under mu; read without it to skip the lock
+    bool pending_ts = false;        // that submission's two timestamps are in ts_rb
+    // XLLAMA_D3D12_TIMESTAMPS=0 (read when a backend is created): no begin/end
+    // timestamps per submission (no GPU ms in the summary, one Map less each).
+    bool ts_on = true;
+    // XLLAMA_D3D12_HOSTPROF=1 (read when a backend is created): host time of
+    // graph_compute per op type, recording and waiting excluded.
+    bool host_prof = false;
     // IQ3_S group geometry asked for by XLLAMA_D3D12_IQ3S_RSL / _RT (read when a
     // backend is created; d3d12_geom_for shapes each matmul from it).
     D3d12GeomReq iq3s_geom;
@@ -783,6 +803,16 @@ struct Gpu {
     std::uint64_t n_replays = 0; // submits that executed a kept command list again
     std::uint64_t n_barriers = 0;
     std::uint64_t n_gdn_fused = 0; // delta-net layers run without their two state copies
+    std::uint64_t n_async = 0;       // submissions left running (shexp_async)
+    std::uint64_t n_drain_waits = 0; // drains that found one still running
+    double drain_ms = 0.0;           // time those waited
+    // Host phases of graph_compute: collecting the nodes and taking the lock,
+    // the delta-net fusion plan, CPU quantization, submitting without the
+    // recording and waiting (hashing, matching a kept list, timestamps), and
+    // the split bookkeeping after the last submission.
+    double pre_ms = 0.0, gdn_ms = 0.0, cpuq_ms = 0.0, sub_ms = 0.0, post_ms = 0.0;
+    double host_op_ms[GGML_OP_COUNT] = {};
+    std::uint64_t host_op_n[GGML_OP_COUNT] = {};
     double wall_ms = 0.0;
     double gpu_ms = 0.0;
     // Of wall_ms: recording + submitting the graph submissions, then waiting for
@@ -797,6 +827,9 @@ struct Gpu {
         double ms = 0.0;
     };
     std::map<std::string, SegStat> segs;
+    // The segs entry of a graph by its first and last node and node count, so
+    // a reused graph finds its entry without building the name again.
+    std::map<std::tuple<const void*, const void*, std::size_t>, SegStat*> seg_of;
     // XLLAMA_D3D12_PROFILE: dispatches by pipeline and grid.
     std::map<std::tuple<const ID3D12PipelineState*, UINT, UINT, UINT>, SegStat> kernels;
     std::mutex mu;
@@ -1150,32 +1183,85 @@ Gpu& gpu() {
     return g;
 }
 
-// Execute a closed list and wait for it. Caller holds g.mu. rec_ms / wait_ms,
-// when given, gain the time from t0 (recording started) to the submit and the
-// time then spent waiting for the fence.
+// Wait for the submission a shexp_async call left running, and take its GPU
+// time. Caller holds g.mu.
+void drain_pending(Gpu& g) {
+    const UINT64 v = g.pending.load(std::memory_order_relaxed);
+    if (!v)
+        return;
+    if (!g.fence.reached(v)) {
+        const auto t0 = std::chrono::steady_clock::now();
+        g.fence.wait(v, /*spin=*/true);
+        g.drain_ms +=
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        ++g.n_drain_waits;
+    }
+    if (g.pending_ts) {
+        void* p = nullptr;
+        if (SUCCEEDED(g.ts_rb->Map(0, nullptr, &p))) {
+            const auto* t = static_cast<const std::uint64_t*>(p);
+            g.gpu_ms += t[1] > t[0] ? 1000.0 * static_cast<double>(t[1] - t[0]) /
+                                          static_cast<double>(g.ts_freq)
+                                    : 0.0;
+            g.ts_rb->Unmap(0, nullptr);
+        }
+        g.pending_ts = false;
+    }
+    g.pending.store(0, std::memory_order_relaxed);
+}
+
+// drain_pending for callers without g.mu: skips the lock when nothing runs.
+// Never called with g.mu held (graph_compute drains on entry, so nothing is
+// pending while it runs).
+void drain_pending_unlocked() {
+    Gpu& g = gpu();
+    if (!g.pending.load(std::memory_order_relaxed))
+        return;
+    std::lock_guard<std::mutex> lock(g.mu);
+    drain_pending(g);
+}
+
+// Execute a closed list and wait for it, or with async only signal the fence
+// and leave it running (g.pending). Caller holds g.mu. Anything left running
+// before is drained first, so no allocator or kept list is reset or dropped
+// in flight. rec_ms / wait_ms, when given, gain the time from t0 (recording
+// started) to the submit and the time then spent waiting for the fence.
 bool execute_and_wait(Gpu& g, ID3D12GraphicsCommandList* cl,
-                      std::chrono::steady_clock::time_point t0, double* rec_ms, double* wait_ms) {
+                      std::chrono::steady_clock::time_point t0, double* rec_ms, double* wait_ms,
+                      bool async = false) {
+    drain_pending(g);
     ID3D12CommandList* lists[] = {cl};
     g.queue->ExecuteCommandLists(1, lists);
     const auto t1 = std::chrono::steady_clock::now();
-    const bool ok = g.fence.signal_and_wait(g.queue.Get(), /*spin=*/true);
     if (rec_ms)
         *rec_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    if (async) {
+        UINT64 v = 0;
+        if (!g.fence.signal(g.queue.Get(), &v))
+            return false;
+        g.pending.store(v, std::memory_order_relaxed);
+        ++g.n_async;
+        return true;
+    }
+    const bool ok = g.fence.signal_and_wait(g.queue.Get(), /*spin=*/true);
     if (wait_ms)
         *wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1)
                         .count();
     return ok;
 }
 
-// Record into the shared list and run it to completion. Caller holds g.mu.
+// Record into the shared list and run it to completion (or leave it running,
+// async). Caller holds g.mu.
 template <typename F>
-bool run_now(Gpu& g, F&& record, double* rec_ms = nullptr, double* wait_ms = nullptr) {
+bool run_now(Gpu& g, F&& record, double* rec_ms = nullptr, double* wait_ms = nullptr,
+             bool async = false) {
+    drain_pending(g); // the shared list may be the one still running
     const auto t0 = std::chrono::steady_clock::now();
     g.alloc->Reset();
     g.cl->Reset(g.alloc.Get(), nullptr);
     record(g.cl.Get());
     g.cl->Close();
-    return execute_and_wait(g, g.cl.Get(), t0, rec_ms, wait_ms);
+    return execute_and_wait(g, g.cl.Get(), t0, rec_ms, wait_ms, async);
 }
 
 // --- Buffers ---
@@ -1298,6 +1384,7 @@ void* buf_base(ggml_backend_buffer_t b) {
 }
 
 void buf_free(ggml_backend_buffer_t b) {
+    drain_pending_unlocked();
     delete static_cast<BufCtx*>(b->context);
 }
 
@@ -1310,11 +1397,13 @@ D3D12_GPU_VIRTUAL_ADDRESS tensor_va(const ggml_tensor* t) {
     return static_cast<BufCtx*>(t->buffer->context)->va + tensor_offset(t);
 }
 
-// D3D12_Host: plain memory.
+// D3D12_Host: plain memory, once a submission left running is done.
 void host_memset(ggml_backend_buffer_t, ggml_tensor* t, uint8_t v, size_t off, size_t size) {
+    drain_pending_unlocked();
     std::memset(static_cast<std::uint8_t*>(t->data) + off, v, size);
 }
 void host_set(ggml_backend_buffer_t, ggml_tensor* t, const void* data, size_t off, size_t size) {
+    drain_pending_unlocked();
     std::memcpy(static_cast<std::uint8_t*>(t->data) + off, data, size);
 }
 // A write-combined buffer is uncached for the CPU: reading the 62.8 MiB
@@ -1329,6 +1418,7 @@ void host_get(ggml_backend_buffer_t b, const ggml_tensor* t, void* data, size_t 
     const auto* src = static_cast<const std::uint8_t*>(t->data) + off;
     auto* c = static_cast<BufCtx*>(b->context);
     if (!c->wc || size < kWcGpuReadMin) {
+        drain_pending_unlocked();
         std::memcpy(data, src, size);
         return;
     }
@@ -1348,10 +1438,12 @@ void host_get(ggml_backend_buffer_t b, const ggml_tensor* t, void* data, size_t 
 bool host_cpy(ggml_backend_buffer_t, const ggml_tensor* src, ggml_tensor* dst) {
     if (!ggml_backend_buffer_is_host(src->buffer))
         return false;
+    drain_pending_unlocked();
     std::memcpy(dst->data, src->data, ggml_nbytes(src));
     return true;
 }
 void host_clear(ggml_backend_buffer_t b, uint8_t v) {
+    drain_pending_unlocked();
     std::memset(buf_base(b), v, b->size);
 }
 
@@ -1692,6 +1784,7 @@ void backend_free(ggml_backend_t b) {
     Gpu& g = gpu();
     {
         std::lock_guard<std::mutex> lock(g.mu);
+        drain_pending(g);
         char msg[384];
         std::snprintf(msg, sizeof(msg),
                       "[xllama] d3d12: %llu graph_compute calls, %llu submits, %llu dispatches, "
@@ -1706,6 +1799,23 @@ void backend_free(ggml_backend_t b) {
                       static_cast<unsigned long long>(g.n_barriers),
                       static_cast<unsigned long long>(g.n_gdn_fused));
         log_output(msg);
+        std::snprintf(msg, sizeof(msg),
+                      "[xllama] d3d12 host: %.1f ms before the lock, %.1f ms delta-net plan, %.1f "
+                      "ms CPU quantization, %.1f ms submitting, %.1f ms split bookkeeping; %llu "
+                      "submissions left running, %llu drains waited %.1f ms\n",
+                      g.pre_ms, g.gdn_ms, g.cpuq_ms, g.sub_ms, g.post_ms,
+                      static_cast<unsigned long long>(g.n_async),
+                      static_cast<unsigned long long>(g.n_drain_waits), g.drain_ms);
+        log_output(msg);
+        for (int op = 0; op < GGML_OP_COUNT; ++op) {
+            if (!g.host_op_n[op])
+                continue;
+            char line[192];
+            std::snprintf(line, sizeof(line), "[xllama] d3d12 host op: %10llu x %9.1f ms  %s\n",
+                          static_cast<unsigned long long>(g.host_op_n[op]), g.host_op_ms[op],
+                          ggml_op_name(static_cast<ggml_op>(op)));
+            log_output(line);
+        }
         std::vector<
             std::pair<std::tuple<const ID3D12PipelineState*, UINT, UINT, UINT>, Gpu::SegStat>>
             ks(g.kernels.begin(), g.kernels.end());
@@ -1733,7 +1843,12 @@ void backend_free(ggml_backend_t b) {
             log_output(line);
         }
         g.n_calls = g.n_submits = g.n_dispatches = g.n_replays = g.n_barriers = g.n_gdn_fused = 0;
-        g.wall_ms = g.gpu_ms = g.rec_ms = g.wait_ms = 0.0;
+        g.n_async = g.n_drain_waits = 0;
+        g.wall_ms = g.gpu_ms = g.rec_ms = g.wait_ms = g.drain_ms = 0.0;
+        g.pre_ms = g.gdn_ms = g.cpuq_ms = g.sub_ms = g.post_ms = 0.0;
+        std::fill(std::begin(g.host_op_ms), std::end(g.host_op_ms), 0.0);
+        std::fill(std::begin(g.host_op_n), std::end(g.host_op_n), std::uint64_t{0});
+        g.seg_of.clear();
         g.segs.clear();
         g.kernels.clear();
     }
@@ -2124,8 +2239,9 @@ std::uint64_t ops_hash(const std::vector<Op>& ops, bool ts, bool prof) {
 // commands). A submission seen a second time is recorded into a list of its
 // own and kept; from then on that list is executed again instead of recorded:
 // ~57 us of D3D12 calls per submission on Series X (1.7.12.21, 35B decode).
-// Every submission is waited for, so a kept list is never in flight when it is
-// executed again or dropped.
+// Every submission is waited for, or drained before the next one and before
+// the cache is cleared, so a kept list is never in flight when it is executed
+// again or dropped.
 struct KeptList {
     ComPtr<ID3D12CommandAllocator> alloc;
     ComPtr<ID3D12GraphicsCommandList> cl;
@@ -2144,10 +2260,12 @@ ListCache& list_cache() { // guarded by gpu().mu
     return c;
 }
 
-// Record and run one submission. Caller holds g.mu.
-bool submit_ops(Gpu& g, const std::vector<Op>& ops) {
-    const bool ts = g.ts && g.ts_rb;
+// Record and run one submission; async leaves it running (g.pending, its
+// timestamps read when drained). Caller holds g.mu.
+bool submit_ops(Gpu& g, const std::vector<Op>& ops, bool async = false) {
+    const bool ts = g.ts_on && g.ts && g.ts_rb;
     const bool prof = g.prof_on && g.prof && g.prof_rb && g.ts_freq > 0;
+    async = async && !prof; // the profile readback is mapped right after the run
     ListCache& lc = list_cache();
     const std::uint64_t h = ops_hash(ops, ts, prof);
     const auto it = lc.kept.find(h);
@@ -2157,13 +2275,15 @@ bool submit_ops(Gpu& g, const std::vector<Op>& ops) {
     if (it != lc.kept.end() && it->second.ops.size() == ops.size() &&
         std::equal(ops.begin(), ops.end(), it->second.ops.begin(), same_op)) {
         ran = execute_and_wait(g, it->second.cl.Get(), std::chrono::steady_clock::now(), &g.rec_ms,
-                               &g.wait_ms);
+                               &g.wait_ms, async);
         n = it->second.n;
         ++g.n_replays;
         done = true;
     } else if (it == lc.kept.end() && !lc.seen.insert(h).second) {
-        if (lc.kept.size() >= kMaxKeptLists)
+        if (lc.kept.size() >= kMaxKeptLists) {
+            drain_pending(g); // the list left running may be one of them
             lc.kept.clear();
+        }
         if (lc.seen.size() > 4 * kMaxKeptLists)
             lc.seen.clear();
         const auto t0 = std::chrono::steady_clock::now();
@@ -2178,7 +2298,7 @@ bool submit_ops(Gpu& g, const std::vector<Op>& ops) {
             hr = k.cl->Close();
         }
         if (SUCCEEDED(hr)) {
-            ran = execute_and_wait(g, k.cl.Get(), t0, &g.rec_ms, &g.wait_ms);
+            ran = execute_and_wait(g, k.cl.Get(), t0, &g.rec_ms, &g.wait_ms, async);
             n = k.n;
             done = true;
             if (ran) {
@@ -2190,14 +2310,16 @@ bool submit_ops(Gpu& g, const std::vector<Op>& ops) {
     if (!done)
         ran = run_now(
             g, [&](ID3D12GraphicsCommandList* cl) { n = record_ops(g, cl, ops, ts, prof); },
-            &g.rec_ms, &g.wait_ms);
+            &g.rec_ms, &g.wait_ms, async);
     if (!ran)
         return false;
     if (prof)
         add_profile(g, ops);
     g.n_barriers += static_cast<std::uint64_t>(
         std::count_if(ops.begin(), ops.end(), [](const Op& op) { return !op.pso; }));
-    if (ts) {
+    if (ts && async) {
+        g.pending_ts = true;
+    } else if (ts) {
         void* p = nullptr;
         if (SUCCEEDED(g.ts_rb->Map(0, nullptr, &p))) {
             const auto* t = static_cast<const std::uint64_t*>(p);
@@ -2268,8 +2390,13 @@ bool gdn_fuse_ok(const ggml_tensor* node, const D3d12GdnFusePlan& f, GdnFused* o
 
 ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
     Gpu& g = gpu();
-    std::vector<ggml_tensor*> nodes;
-    std::vector<int> node_idx; // each node's index in cgraph, for moe_fusable
+    const auto t_in = std::chrono::steady_clock::now();
+    // Containers kept across calls (their capacity is reused); one llama
+    // thread computes graphs.
+    thread_local std::vector<ggml_tensor*> nodes;
+    thread_local std::vector<int> node_idx; // each node's index in cgraph, for moe_fusable
+    nodes.clear();
+    node_idx.clear();
     for (int i = 0; i < ggml_graph_n_nodes(cgraph); ++i) {
         ggml_tensor* node = ggml_graph_node(cgraph, i);
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0)
@@ -2307,8 +2434,32 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
         return GGML_STATUS_SUCCESS;
 
     std::lock_guard<std::mutex> lock(g.mu);
+    // The CPU writes the q8 scratch and reads results below: a shared expert
+    // left running by the previous call finishes first.
+    drain_pending(g);
     const auto t0 = std::chrono::steady_clock::now();
+    g.pre_ms += std::chrono::duration<double, std::milli>(t0 - t_in).count();
     g.last_gpu_ms = 0.0;
+    // shexp_async: the index after the last router logits when this call ends
+    // with a MoE layer's shared expert whose intermediates are graph outputs
+    // (patch 0014, one token); ops up to there are waited for, the rest is
+    // left running. SIZE_MAX otherwise.
+    std::size_t cut = SIZE_MAX;
+    if (g.shexp_async && !g.prof_on && nodes.size() > 1 &&
+        std::strncmp(nodes.back()->name, "ffn_shexp", 9) == 0) {
+        std::size_t last_logits = SIZE_MAX;
+        for (std::size_t i = nodes.size(); i-- > 0;)
+            if (std::strncmp(nodes[i]->name, "ffn_moe_logits", 14) == 0) {
+                last_logits = i;
+                break;
+            }
+        bool ok = last_logits != SIZE_MAX && last_logits + 1 < nodes.size();
+        for (std::size_t i = last_logits + 1; ok && i + 1 < nodes.size(); ++i)
+            ok = (nodes[i]->flags & GGML_TENSOR_FLAG_OUTPUT) != 0;
+        if (ok)
+            cut = last_logits + 1;
+    }
+    bool past_cut = false;
     // Delta-net layers that read and write their recurrent cache rows
     // themselves: their state GET_ROWS and the CPY of the new state do not run.
     std::unordered_map<const ggml_tensor*, GdnFused> gdn_fused;
@@ -2334,6 +2485,8 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
         }
         g.n_gdn_fused += gdn_fused.size();
     }
+    const auto t_plan = std::chrono::steady_clock::now();
+    g.gdn_ms += std::chrono::duration<double, std::milli>(t_plan - t0).count();
     // The split's ops go into one submission. Dispatches run back to back, so
     // a UAV barrier goes in front of one that reads what another wrote since
     // the last barrier, or writes what one read or wrote (the graph allocator
@@ -2341,8 +2494,12 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
     // op whose operands the GPU path refuses — happens now, before the GPU
     // runs, so it first runs the submission when that writes what it reads.
     // Matmuls sharing an input share one quantized copy.
-    std::vector<Op> ops;
-    std::vector<Rng> bar_r, bar_w, batch_w;
+    thread_local std::vector<Op> ops;
+    thread_local std::vector<Rng> bar_r, bar_w, batch_w;
+    ops.clear();
+    bar_r.clear();
+    bar_w.clear();
+    batch_w.clear();
     struct Quantized {
         const void* data;
         std::size_t nb1;
@@ -2352,7 +2509,8 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
         int ncols;
         Rng src;
     };
-    std::vector<Quantized> done;
+    thread_local std::vector<Quantized> done;
+    done.clear();
     std::size_t used = 0;
     // g.waves: the submission as waves of ops, a barrier between consecutive
     // waves. An op lands in the wave after the last one holding an op it reads
@@ -2364,14 +2522,20 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
         std::vector<Rng> r, w;
     };
     std::vector<Wave> waves;
-    auto flush = [&]() -> bool {
+    // async: the call's last submission, past the cut (shexp_async).
+    auto flush = [&](bool async = false) -> bool {
         for (std::size_t wi = 0; wi < waves.size(); ++wi) {
             if (wi > 0)
                 ops.push_back(Op{});
             ops.insert(ops.end(), waves[wi].ops.begin(), waves[wi].ops.end());
         }
         waves.clear();
-        const bool ok = ops.empty() || submit_ops(g, ops);
+        const auto tf = std::chrono::steady_clock::now();
+        const double rw = g.rec_ms + g.wait_ms;
+        const bool ok = ops.empty() || submit_ops(g, ops, async);
+        g.sub_ms +=
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count() -
+            (g.rec_ms + g.wait_ms - rw);
         ops.clear();
         bar_r.clear();
         bar_w.clear();
@@ -2472,8 +2636,12 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
             q.gy = static_cast<UINT>(ncols);
             record(q, {xr}, {xq_rng(*off, bytes)});
         } else {
+            const auto tq = std::chrono::steady_clock::now();
             d3d12_quantize_activations(wt, static_cast<const float*>(x->data),
                                        x->nb[1] / sizeof(float), k, ncols, g.xq_ptr + *off);
+            g.cpuq_ms +=
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tq)
+                    .count();
         }
         done.push_back({x->data, x->nb[1], at, *off, row, ncols, xr});
         return true;
@@ -2560,8 +2728,35 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
         return -1;
     };
 
+    // XLLAMA_D3D12_HOSTPROF: the time from one node's turn to the next, less
+    // what submissions spent in between, goes to the first one's op.
+    int prof_op = -1;
+    auto prof_t = std::chrono::steady_clock::now();
+    double prof_sub = g.rec_ms + g.wait_ms + g.sub_ms + g.cpuq_ms;
+    auto host_mark = [&](int op) {
+        if (!g.host_prof)
+            return;
+        const auto t = std::chrono::steady_clock::now();
+        const double sub = g.rec_ms + g.wait_ms + g.sub_ms + g.cpuq_ms;
+        if (prof_op >= 0) {
+            g.host_op_ms[prof_op] +=
+                std::chrono::duration<double, std::milli>(t - prof_t).count() - (sub - prof_sub);
+            ++g.host_op_n[prof_op];
+        }
+        prof_t = t;
+        prof_sub = sub;
+        prof_op = op;
+    };
+
     for (std::size_t i = 0; i < nodes.size(); ++i) {
         ggml_tensor* node = nodes[i];
+        if (!past_cut && i >= cut) {
+            // The router logits and all before them: the CPU split needs them.
+            if (!flush())
+                return GGML_STATUS_FAILED;
+            past_cut = true;
+        }
+        host_mark(node->op);
         GGML_ASSERT(node->buffer && is_ours(node->buffer->buft));
         if (ggml_nelements(node) == 0)
             continue; // a ubatch without output rows: nothing to compute
@@ -2986,18 +3181,28 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
             GGML_ABORT("d3d12: unsupported op %s", ggml_op_desc(node));
         }
     }
-    if (!flush())
+    host_mark(-1);
+    if (!flush(/*async=*/past_cut))
         return GGML_STATUS_FAILED;
     ++g.n_calls;
     g.gpu_ms += g.last_gpu_ms;
-    const double ms =
-        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const auto t_end = std::chrono::steady_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(t_end - t0).count();
     g.wall_ms += ms;
-    Gpu::SegStat& seg = g.segs[seg_name(nodes.front()) + " .. " + seg_name(nodes.back()) + " /" +
-                               std::to_string(nodes.size())];
-    ++seg.n;
-    seg.ms += ms;
+    Gpu::SegStat*& seg = g.seg_of[{nodes.front(), nodes.back(), nodes.size()}];
+    if (!seg)
+        seg = &g.segs[seg_name(nodes.front()) + " .. " + seg_name(nodes.back()) + " /" +
+                      std::to_string(nodes.size())];
+    ++seg->n;
+    seg->ms += ms;
+    g.post_ms +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_end).count();
     return GGML_STATUS_SUCCESS;
+}
+
+// graph_compute completes before returning, except a shexp_async tail.
+void backend_synchronize(ggml_backend_t) {
+    drain_pending_unlocked();
 }
 
 ggml_guid_t backend_guid() {
@@ -3014,7 +3219,7 @@ const ggml_backend_i kBackendIface = {
     /* .set_tensor_2d_async = */ nullptr,
     /* .get_tensor_2d_async = */ nullptr,
     /* .cpy_tensor_async    = */ nullptr,
-    /* .synchronize         = */ nullptr, // graph_compute completes before returning
+    /* .synchronize         = */ backend_synchronize,
     /* .graph_plan_create   = */ nullptr,
     /* .graph_plan_free     = */ nullptr,
     /* .graph_plan_update   = */ nullptr,
@@ -3096,6 +3301,19 @@ ggml_backend_t dev_init_backend(ggml_backend_dev_t dev, const char*) {
         g.waves = wv && *wv && *wv != '0';
         if (g.waves)
             log_output("[xllama] d3d12: ops scheduled in waves (XLLAMA_D3D12_WAVES)\n");
+        const char* sa = std::getenv("XLLAMA_D3D12_SHEXP_ASYNC");
+        g.shexp_async = sa && *sa && *sa != '0';
+        if (g.shexp_async)
+            log_output("[xllama] d3d12: shared experts left running past the router "
+                       "(XLLAMA_D3D12_SHEXP_ASYNC)\n");
+        const char* tsv = std::getenv("XLLAMA_D3D12_TIMESTAMPS");
+        g.ts_on = !(tsv && *tsv == '0');
+        if (!g.ts_on)
+            log_output("[xllama] d3d12: no submission timestamps (XLLAMA_D3D12_TIMESTAMPS=0)\n");
+        const char* hp = std::getenv("XLLAMA_D3D12_HOSTPROF");
+        g.host_prof = hp && *hp && *hp != '0';
+        if (g.host_prof)
+            log_output("[xllama] d3d12: host time per op (XLLAMA_D3D12_HOSTPROF)\n");
         g.iq3s_geom.rsl = d3d12_geom_parse(std::getenv("XLLAMA_D3D12_IQ3S_RSL"), 1);
         g.iq3s_geom.rt = d3d12_geom_parse(std::getenv("XLLAMA_D3D12_IQ3S_RT"), 1);
         if (g.iq3s_geom.rsl != 1 || g.iq3s_geom.rt != 1)
