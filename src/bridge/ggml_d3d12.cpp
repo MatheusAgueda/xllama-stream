@@ -5898,6 +5898,17 @@ double reference_rel_err(ggml_type t, const std::vector<std::uint8_t>& q, std::s
     return max_ref > 0.0 ? max_diff / max_ref : max_diff;
 }
 
+// ggml_quantize_chunk asserts an importance matrix for IQ2_XXS / IQ2_XS / IQ1_S (GGML_ASSERT ->
+// abort: the 509 selftest died on its first IQ2_XXS case); a flat one weighs every column alike.
+std::size_t st_quantize(ggml_type type, const float* src, void* dst, std::int64_t nrows,
+                        std::int64_t n_per_row) {
+    std::vector<float> ones;
+    if (ggml_quantize_requires_imatrix(type))
+        ones.assign(static_cast<std::size_t>(n_per_row), 1.0f);
+    return ggml_quantize_chunk(type, src, dst, 0, nrows, n_per_row,
+                               ones.empty() ? nullptr : ones.data());
+}
+
 D3d12SelftestRow run_case(ggml_backend_t backend, const SelftestCase& sc) {
     D3d12SelftestRow row;
     row.type = sc.name;
@@ -5940,7 +5951,7 @@ D3d12SelftestRow run_case(ggml_backend_t backend, const SelftestCase& sc) {
     for (float& v : wf)
         v = uni(rng);
     std::vector<std::uint8_t> q(ggml_nbytes(w));
-    ggml_quantize_chunk(sc.type, wf.data(), q.data(), 0, sc.n, sc.k, nullptr);
+    st_quantize(sc.type, wf.data(), q.data(), sc.n, sc.k);
     ggml_backend_tensor_set(w, q.data(), 0, q.size());
     std::vector<float> xf(static_cast<std::size_t>(sc.k) * sc.ncols);
     for (float& v : xf)
@@ -6154,8 +6165,7 @@ D3d12SelftestRow run_mmid_case(ggml_backend_t backend, ggml_type wtype, int n, i
     for (float& v : wf)
         v = uni(rng);
     std::vector<std::uint8_t> q(ggml_nbytes(as));
-    ggml_quantize_chunk(wtype, wf.data(), q.data(), 0, static_cast<std::int64_t>(n) * kSlots, k,
-                        nullptr);
+    st_quantize(wtype, wf.data(), q.data(), static_cast<std::int64_t>(n) * kSlots, k);
     ggml_backend_tensor_set(as, q.data(), 0, q.size());
     std::vector<float> xf(static_cast<std::size_t>(k) * ne11 * n_tok);
     for (float& v : xf)
@@ -6414,7 +6424,7 @@ D3d12SelftestRow run_normq_case(ggml_backend_t backend, int k, int n, int ncols,
     for (float& v : wf)
         v = uni(rng);
     std::vector<std::uint8_t> q(ggml_nbytes(w));
-    ggml_quantize_chunk(wtype, wf.data(), q.data(), 0, n, k, nullptr);
+    st_quantize(wtype, wf.data(), q.data(), n, k);
     ggml_backend_tensor_set(w, q.data(), 0, q.size());
     static const float kTie[] = {-1.f, -0.5f, 0.5f, 1.f};
     std::vector<float> xf(static_cast<std::size_t>(k) * ncols), nf(k);
@@ -6564,7 +6574,7 @@ D3d12SelftestRow run_binq_case(ggml_backend_t backend, int kind, int ne0, int ne
     for (float& v : wf)
         v = uni(rng);
     std::vector<std::uint8_t> q(ggml_nbytes(w));
-    ggml_quantize_chunk(wtype, wf.data(), q.data(), 0, n, k, nullptr);
+    st_quantize(wtype, wf.data(), q.data(), n, k);
     ggml_backend_tensor_set(w, q.data(), 0, q.size());
     static const float kTie[] = {-1.f, -0.5f, 0.5f, 1.f};
     std::vector<float> af(static_cast<std::size_t>(ne0) * ne1),
