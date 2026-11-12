@@ -78,7 +78,7 @@ int main(int argc, char ** argv) {
     const int n_cases = argc > 1 ? atoi(argv[1]) : 20000;
     std::mt19937 rng(22);
     long bad = 0, n_em = 0, n_slot = 0, n_em_sw = 0;
-    uint64_t reads_exact = 0, reads_swap = 0;
+    uint64_t reads_exact = 0, reads_slots = 0, reads_swap = 0;
     for (int ci = 0; ci < n_cases; ++ci) {
         const int32_t ne_opts[] = { 8, 16, 64, 128, 256 };
         const int32_t ne = ne_opts[rng() % 5];
@@ -148,13 +148,22 @@ int main(int argc, char ** argv) {
 
         ec_select(&td, 0, 1, L.get());
 
-        // the reference: first pass against the residents, its kept missing experts resident for all
+        // the reference: first pass against the residents (expert-major: plus the reads of the tokens
+        // before), its kept missing experts resident for all; rd_slots = the reads of a first pass
+        // against the residents alone, which the expert-major one may never exceed
         std::vector<int32_t> res = L->slot_of;
+        std::set<int32_t> rd_slots;
         int32_t sw = 0;
         if (batch) {
             for (int32_t t = 0; t < nt; ++t) {
-                for (const int32_t e : ref_row(L->slot_of, sc.data() + (size_t) t*ne, ne, k, ratio, tail, sw)) {
+                const float * s = sc.data() + (size_t) t*ne;
+                for (const int32_t e : ref_row(em ? res : L->slot_of, s, ne, k, ratio, tail, sw)) {
                     res[e] = std::max(res[e], 0);
+                }
+                for (const int32_t e : ref_row(L->slot_of, s, ne, k, ratio, tail, sw)) {
+                    if (L->slot_of[e] < 0) {
+                        rd_slots.insert(e);
+                    }
                 }
             }
         }
@@ -199,7 +208,14 @@ int main(int argc, char ** argv) {
             }
         }
         if (em) {
+            for (const int32_t e : rd_swap) {
+                if (!rd_slots.count(e)) {
+                    fprintf(stderr, "case %d: expert %d read, not read against the residents alone\n", ci, e);
+                    bad++;
+                }
+            }
             reads_exact += rd_exact.size();
+            reads_slots += rd_slots.size();
             reads_swap  += rd_swap.size();
             n_em_sw     += sw_all > 0;
         }
@@ -212,9 +228,10 @@ int main(int argc, char ** argv) {
         C->em_rounds = 0; // no stats line from the destructor
         C->n_rounds  = 0;
     }
-    printf("cases %d: %ld expert-major (%ld with swaps), %ld slot path; expert-major reads %llu exact -> %llu (%.1f%%)\n",
-           n_cases, n_em, n_em_sw, n_slot, (unsigned long long) reads_exact, (unsigned long long) reads_swap,
-           reads_exact ? 100.0*reads_swap/reads_exact : 0.0);
+    printf("cases %d: %ld expert-major (%ld with swaps), %ld slot path; expert-major reads %llu exact, %llu against the "
+           "residents alone, %llu (%.1f%% of exact)\n",
+           n_cases, n_em, n_em_sw, n_slot, (unsigned long long) reads_exact, (unsigned long long) reads_slots,
+           (unsigned long long) reads_swap, reads_exact ? 100.0*reads_swap/reads_exact : 0.0);
     if (bad > 0 || n_em == 0 || n_slot == 0 || n_em_sw == 0) {
         printf("HARNESS_FAILED %ld\n", bad);
         return 1;

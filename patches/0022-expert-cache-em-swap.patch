@@ -33,7 +33,7 @@ diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
          }
          uint64_t n_direct = 0;
          uint64_t n_staged = 0;
-@@ -1522,17 +1528,23 @@
+@@ -1522,17 +1528,26 @@
          C.trace_buf.clear();
          put(head, sizeof(head));
      }
@@ -46,7 +46,11 @@ diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
  
      // LLAMA_EXPERT_SWAP_BATCH: a missing expert that some token of a multi-token ubatch keeps is read
      // for it anyway, so a first pass collects those and the real pass counts them as resident - the
-     // other tokens keep it instead of trading it for a weaker resident (same reads, truer routing)
+-    // other tokens keep it instead of trading it for a weaker resident (same reads, truer routing)
++    // other tokens keep it instead of trading it for a weaker resident (same reads, truer routing).
++    // Expert-major: the first pass already counts the reads of the tokens before as resident, so a
++    // token gives a missing expert up for one an earlier token reads (never more reads than against
++    // the slots alone: each token swaps at least what it would there)
      const std::vector<int32_t> * res = &L.slot_of;
 -    if (C.swap_batch && n_tokens > 1) {
 +    if ((C.swap_batch || em) && n_tokens > 1) {
@@ -55,11 +59,11 @@ diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
              const float * s = (const float *) ((const char *) scores->data + t*scores->nb[1]);
              ec_rank(order, s);
 -            ec_swap_missing(L.slot_of, order, s, n_used, C.swap_ratio, C.swap_tail);
-+            ec_swap_missing(L.slot_of, order, s, n_used, ratio, tail);
++            ec_swap_missing(em ? L.avail : L.slot_of, order, s, n_used, ratio, tail);
              for (int64_t k = 0; k < n_used; ++k) {
                  L.avail[order[k]] = std::max(L.avail[order[k]], 0);
              }
-@@ -1563,7 +1575,7 @@
+@@ -1563,7 +1578,7 @@
          if (defer) {
              std::copy(order.begin(), order.begin() + n_used, L.dtop.begin());
          }
@@ -68,7 +72,7 @@ diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
          swaps += sw;
  
          int32_t * out = (int32_t *) ((char *) dst->data + t*dst->nb[1]);
-@@ -1590,7 +1602,7 @@
+@@ -1590,7 +1605,7 @@
      }
      L.w_ready = lrfu;
      if (swaps > 0) {
@@ -77,7 +81,7 @@ diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
      }
      if (n_tr > 0) {
          fwrite(C.trace_buf.data(), 1, C.trace_buf.size(), C.trace);
-@@ -2959,6 +2971,18 @@
+@@ -2959,6 +2974,18 @@
              LLAMA_LOG_INFO("%s: expert cache: expert-major reads in spans of up to %u experts\n", __func__, cache->em_run);
          }
      }
@@ -96,17 +100,19 @@ diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
      // LLAMA_EXPERT_EM_RESIDENT: where an expert-major ubatch's resident experts come from (slot,
      // file, auto - the default; also 0, 1, 2)
      const char * res = getenv("LLAMA_EXPERT_EM_RESIDENT");
-@@ -3284,7 +3308,12 @@
+@@ -3284,9 +3311,14 @@
  
  ggml_tensor * llama_expert_cache_build_select(ggml_context * ctx, ggml_tensor * w, ggml_tensor * scores, int64_t n_used) {
      ec_layer * layer = ec_layer_of(w);
 -    if (layer == nullptr || !(layer->cache->swap_ratio > 0.0f) || llama_expert_cache_is_expert_major(w, scores->ne[1])) {
 +    if (layer == nullptr) {
-+        return nullptr;
-+    }
+         return nullptr;
+     }
 +    // an expert-major ubatch swaps only with LLAMA_EXPERT_EM_SWAP (ec_select picks the ratio again)
 +    const bool em = llama_expert_cache_is_expert_major(w, scores->ne[1]);
 +    if (!((em ? layer->cache->em_swap : layer->cache->swap_ratio) > 0.0f)) {
-         return nullptr;
-     }
++        return nullptr;
++    }
      // one row of scores per token, one score per expert of the tensor
+     if (scores->type != GGML_TYPE_F32 || scores->nb[0] != sizeof(float) || scores->ne[2] != 1 || scores->ne[3] != 1 ||
+             scores->ne[0] != (int64_t) layer->slot_of.size() || n_used < 1 || n_used > scores->ne[0]) {

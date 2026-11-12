@@ -445,14 +445,20 @@ the variable, `ec_select` runs on those ubatches too, at `<ratio>` instead of th
 swap ratio, without `LLAMA_EXPERT_SWAP_TAIL`, and always with the batch rule of
 `LLAMA_EXPERT_SWAP_BATCH` (one read of an expert serves every token of an
 expert-major ubatch, so an expert some token keeps counts as resident for the
-others). The slot path keeps its own ratio, tail and batch setting. Its swaps
-count apart: the `expert-major …` part of the stats line gains `, N swaps`, and
-the slot path's `swaps` total stays the slot path's. A swap only brings a
-resident expert in, so the reads are a subset of the exact routing's. Host
+others). The first pass that collects those reads goes token by token and already
+counts the reads of the earlier tokens as resident, so a token can give a missing
+expert up for one an earlier token reads. Each token then swaps at least what it
+would against the slots alone (its missing experts are a subset, its candidates
+a superset, and the weakest-first pairing only gets stronger partners), so the
+reads never exceed those of a first pass against the slots alone. The slot path
+keeps its own ratio, tail and batch setting. Its swaps count apart: the
+`expert-major …` part of the stats line gains `, N swaps`, and the slot path's
+`swaps` total stays the slot path's. A swap only brings an expert in that is
+resident or read anyway, so the reads are a subset of the exact routing's. Host
 harness `tests/harness/expert_cache_em_swap.cpp` runs the real `ec_select`
 against an independent reference on random scores (ties and zeros included),
 residency, slot counts and ubatch sizes on both sides of `max_ubatch`. It checks
-every routed expert, the subset property and which counter the swaps land in.
+every routed expert, both subset properties and which counter the swaps land in.
 Unset, nothing changes.
 
 ## Applying
