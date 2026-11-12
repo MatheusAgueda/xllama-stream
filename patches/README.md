@@ -354,6 +354,24 @@ lands in place and spills only into the gap (a part's spill is the same file
 bytes its neighbouring parts write there). The expert-major path reads into a
 stage placed the same way. Unset, nothing changes.
 
+`0018-expert-cache-em-gpu.patch` (applies after 0017):
+`LLAMA_EXPERT_EM_GPU=<experts>[:<pairs>]` runs the expert-major matmuls (prompt
+ubatches larger than the slots take) as `MUL_MAT_ID` dispatches on the GPU of
+the slots instead of the CPU's dot products (console, 2026-11-12: the 122B's
+prefill was CPU-bound, ~69% of thread time in vec_dot, the GPU idle). The
+context hands its backends to the cache (`llama_expert_cache_set_backend`); the
+one of the slots' device is kept. Per expert tensor and ubatch, threads 1.. read
+the round's kept experts into their slots and the missing ones into two staging
+halves of `<experts>` experts each (typed EXPERT_CACHE, laid out as the slots,
+padded ones too), while thread 0 dispatches: the resident experts in place,
+then each staging chunk as soon as it is read; a reader reuses a half once the
+dispatch of its previous chunk returned. Each dispatch gathers up to `<pairs>`
+(default 2048) token-expert columns of the F32 activations, which the matmul
+op then keeps as a source, and scatters the rows back; a dispatch the device
+refuses or fails is computed on the CPU from the quantized activations. A
+tensor type the device has no kernel for stays on the CPU. Unset, nothing
+changes.
+
 ## Applying
 
 ```bash

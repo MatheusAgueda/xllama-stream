@@ -1,0 +1,547 @@
+diff --git a/src/llama-expert-cache.h b/src/llama-expert-cache.h
+--- a/src/llama-expert-cache.h
++++ b/src/llama-expert-cache.h
+@@ -94,6 +94,10 @@
+ // largest expert-major ubatch, 0 when off (also when an expert type has no CPU dot product)
+ uint32_t llama_expert_cache_expert_major(llama_expert_cache & cache);
+ 
++// a backend of the context using the cache, nullptr when the context goes: with LLAMA_EXPERT_EM_GPU
++// the expert-major matmuls dispatch MUL_MAT_ID on the one of the device that holds the slots
++void llama_expert_cache_set_backend(llama_expert_cache & cache, ggml_backend_t backend);
++
+ // graph: true if w is cached and a ubatch of n_tokens runs expert-major (more than max_ubatch)
+ bool llama_expert_cache_is_expert_major(const ggml_tensor * w, int64_t n_tokens);
+ 
+diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
+--- a/src/llama-expert-cache.cpp
++++ b/src/llama-expert-cache.cpp
+@@ -133,6 +133,16 @@
+     std::atomic<int32_t> next {0};
+     std::atomic<int64_t> us   {0}; // slowest thread of the last matmul, not yet in em_us of the cache
+     std::atomic<int>     done {0}; // threads out of the matmul
++    // LLAMA_EXPERT_EM_GPU: the matmul on the GPU (the prep op decides) and its read queue, the round's
++    // experts first (into their slots), then the staged ones a chunk at a time
++    bool gpu = false;
++    std::vector<int32_t> gq;
++    int32_t n_kept  = 0;
++    int32_t n_chunk = 0;
++    std::atomic<int32_t> gnext {0};
++    std::unique_ptr<std::atomic<int32_t>[]> gread; // reads done: [0] the round's, [1 + c] chunk c's
++    int32_t n_gread = 0;
++    std::atomic<int32_t> gdisp {0}; // chunks dispatched: chunk c's half takes chunk c + 2 once gdisp > c
+ };
+ 
+ struct ec_tensor {
+@@ -143,6 +153,7 @@
+     size_t  eb;    // an expert's bytes, its stride in the file (t->nb[2], the slot stride, adds the pad)
+     bool    pad;   // slots padded and aligned to offs (LLAMA_EXPERT_PAD): spans read in place
+     std::unique_ptr<ec_em> em {};
++    int8_t  gpu_ok = -1; // LLAMA_EXPERT_EM_GPU: the device computes its matmul (-1: not asked yet)
+ };
+ 
+ enum ec_pf_state : int { EC_PF_QUEUED, EC_PF_RUNNING, EC_PF_DONE, EC_PF_CANCELLED };
+@@ -350,7 +361,45 @@
+     std::atomic<uint64_t> em_slot_us   {0}; //   and the time the copies took, summed over the threads
+     std::atomic<uint64_t> em_file_b    {0}; // bytes read from the files to the stages (halved every ubatch)
+     std::atomic<uint64_t> em_file_us   {0};
++
++    // LLAMA_EXPERT_EM_GPU=<experts>[:<pairs>] (0 = off, the default): the expert-major matmuls as
++    // MUL_MAT_ID dispatches on the GPU device whose host buffers hold the slots, which reads experts
++    // in place (unified memory). Compute thread 0 gathers the activations of each expert's tokens,
++    // dispatches and scatters the results; the other threads read the missing experts, the round's
++    // into their slots, the rest into one of two staging halves of <experts> experts: the GPU
++    // computes one while the threads fill the other. <pairs> (expert, token) pairs per dispatch size
++    // the activations and results buffers. The CPU's dot products stay the fallback of a dispatch
++    uint32_t em_gpu_chunk = 0;
++    uint32_t em_gpu_pairs = 2048;
++    ggml_backend_t gpu = nullptr; // the context's backend of buft.device (llama_expert_cache_set_backend)
++    ggml_backend_buffer_t em_gpu_stage = nullptr; // EXPERT_CACHE type: the kernel reads experts only from the cache's buffers
++    ggml_backend_buffer_t em_gpu_io    = nullptr; // activations, ids and results (write-back: thread 0 reads the results)
++    size_t em_gpu_half = 0; // a staging half's bytes
++    size_t em_gpu_ids  = 0; // offsets in em_gpu_io (the activations at 0)
++    size_t em_gpu_y    = 0;
++    bool   em_gpu_failed = false; // no room for the buffers: on the CPU
++    std::vector<uint8_t> em_gpu_meta; // the dispatch graph's context memory
++    std::vector<int32_t> em_gpu_map;  // thread 0: a dispatch's pairs, i0 + n_used*token
++    std::vector<int32_t> em_gpu_es;   // thread 0: the experts of a dispatch and their index in its tensor
++    std::vector<int32_t> em_gpu_lid;
++    std::atomic<uint64_t> em_gpu_n       {0}; // dispatches
++    std::atomic<uint64_t> em_gpu_p       {0}; // pairs they computed
++    std::atomic<uint64_t> em_gpu_us      {0}; // thread 0 in them, gather and scatter included
++    std::atomic<uint64_t> em_gpu_wait_us {0}; // thread 0 waiting for the reads
++    std::atomic<uint64_t> em_gpu_cpu     {0}; // dispatches that failed, computed on the CPU instead
+ 
++    void gpu_free() {
++        if (em_gpu_stage != nullptr) {
++            ggml_backend_buffer_free(em_gpu_stage);
++            em_gpu_stage = nullptr;
++        }
++        if (em_gpu_io != nullptr) {
++            ggml_backend_buffer_free(em_gpu_io);
++            em_gpu_io = nullptr;
++        }
++        gpu = nullptr;
++    }
++
+     void log_stats(const char * when) const {
+         const uint64_t h = hits.load();
+         const uint64_t m = misses.load();
+@@ -381,14 +430,19 @@
+                     n ? pf_lag_us.load()/1000.0/n : 0.0, n ? pf_run_us.load()/1000.0/n : 0.0,
+                     pf_ahead ? ", ahead" : "", pf_help ? ", help" : "", prio, mode);
+         }
+-        char em[320] = "";
++        char em[480] = "";
+         if (em_rounds.load() > 0) {
+             static const char * const res_name[] = { "slot", "file", "auto" };
+             const uint64_t sus = em_slot_us.load();
+             const uint64_t fus = em_file_us.load();
+-            snprintf(em, sizeof(em), "; expert-major %" PRIu64 " ubatches, %" PRIu64 " read (%.1f MiB), %" PRIu64 " resident, %" PRIu64 " kept, %.0f ms, %" PRIu64 " resident read from the file (%s; stage from slots %.0f MB/s, from the file %.0f MB/s per thread)",
++            char gp[160] = "";
++            if (em_gpu_n.load() > 0) {
++                snprintf(gp, sizeof(gp), "; gpu %" PRIu64 " dispatches, %" PRIu64 " pairs, %.0f ms, %.0f ms waiting for reads, %" PRIu64 " on the CPU",
++                        em_gpu_n.load(), em_gpu_p.load(), em_gpu_us.load()/1000.0, em_gpu_wait_us.load()/1000.0, em_gpu_cpu.load());
++            }
++            snprintf(em, sizeof(em), "; expert-major %" PRIu64 " ubatches, %" PRIu64 " read (%.1f MiB), %" PRIu64 " resident, %" PRIu64 " kept, %.0f ms, %" PRIu64 " resident read from the file (%s; stage from slots %.0f MB/s, from the file %.0f MB/s per thread)%s",
+                     em_rounds.load(), em_reads.load(), em_bytes.load()/1024.0/1024.0, em_hits.load(), em_kept.load(), em_wall/1000.0,
+-                    em_from_file.load(), res_name[em_resident], sus ? (double) em_slot_b.load()/sus : 0.0, fus ? (double) em_file_b.load()/fus : 0.0);
++                    em_from_file.load(), res_name[em_resident], sus ? (double) em_slot_b.load()/sus : 0.0, fus ? (double) em_file_b.load()/fus : 0.0, gp);
+         }
+         uint64_t n_direct = 0;
+         uint64_t n_staged = 0;
+@@ -416,6 +470,7 @@
+         if (n_rounds > 0 || em_rounds.load() > 0) {
+             log_stats("final");
+         }
++        gpu_free();
+         if (trace != nullptr) {
+             fclose(trace);
+         }
+@@ -1696,8 +1751,299 @@
+         return nullptr;
+     }
+     return w;
++}
++
++//
++// LLAMA_EXPERT_EM_GPU: the expert-major matmul as MUL_MAT_ID dispatches on the GPU of the slots
++//
++
++// the staging buffers, once: two halves of em_gpu_chunk experts of the largest expert tensor, and the
++// activations, ids and results of em_gpu_pairs pairs. From the slots' host buffer type directly (no
++// fallback to the CPU, which would move the cache's type there), typed EXPERT_CACHE so that the
++// device's kernel reads the staged experts as it reads the slots
++static bool ec_em_gpu_alloc(llama_expert_cache & C) {
++    if (C.em_gpu_stage != nullptr) {
++        return true;
++    }
++    if (C.em_gpu_failed || C.gpu == nullptr || C.inner == nullptr) {
++        return false;
++    }
++    const size_t A = EC_DIRECT_ALIGN;
++    size_t  max_eb = 0;
++    int64_t max_k  = 0;
++    int64_t max_n  = 0;
++    for (const ec_tensor & T : C.tensors) {
++        max_eb = std::max(max_eb, T.eb);
++        max_k  = std::max(max_k, T.t->ne[0]);
++        max_n  = std::max(max_n, T.t->ne[1]);
++    }
++    const size_t P = C.em_gpu_pairs;
++    C.em_gpu_half = (size_t) C.em_gpu_chunk*(GGML_PAD(max_eb, 256) + A) + 3*A;
++    C.em_gpu_ids  = GGML_PAD(P*(size_t) max_k*sizeof(float), A);
++    C.em_gpu_y    = C.em_gpu_ids + GGML_PAD(P*sizeof(int32_t), A);
++    const size_t n_stage = 2*C.em_gpu_half + 4*A;
++    const size_t n_io    = C.em_gpu_y + GGML_PAD(P*(size_t) max_n*sizeof(float), A) + A;
++    ggml_backend_buffer_t st = ggml_backend_buft_alloc_buffer(C.inner, n_stage);
++    ggml_backend_buffer_t io = st != nullptr ? ggml_backend_buft_alloc_buffer(C.inner, n_io) : nullptr;
++    if (st == nullptr || io == nullptr) {
++        if (st != nullptr) {
++            ggml_backend_buffer_free(st);
++        }
++        C.em_gpu_failed = true;
++        LLAMA_LOG_WARN("expert cache: %s could not hold the expert-major GPU buffers (%.1f + %.1f MiB), on the CPU\n",
++                ggml_backend_buft_name(C.inner), n_stage/1024.0/1024.0, n_io/1024.0/1024.0);
++        return false;
++    }
++    st->buft = &C.buft;
++    // before the first base: a write-combined compute buffer is moved to write-back there
++    ggml_backend_buffer_set_usage(io, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
++    C.em_gpu_stage = st;
++    C.em_gpu_io    = io;
++    C.em_gpu_meta.resize(8*ggml_tensor_overhead() + ggml_graph_overhead_custom(8, false));
++    C.em_gpu_map.resize(P);
++    LLAMA_LOG_INFO("expert cache: expert-major matmuls on %s, staging 2 x %u experts (%.1f MiB), %zu pairs per dispatch (%.1f MiB)\n",
++            ggml_backend_name(C.gpu), C.em_gpu_chunk, n_stage/1024.0/1024.0, P, n_io/1024.0/1024.0);
++    return true;
++}
++
++// position p of staging half h for tensor T, and the stride (nb[2] of the staged experts): a padded
++// tensor's experts at the file offset's remainder, EC_DIRECT_ALIGN apart beyond their bytes, so that
++// they read in place as into the slots
++static char * ec_em_gpu_pos(const llama_expert_cache & C, const ec_tensor & T, int h, int32_t p, size_t * nb2) {
++    const size_t A    = EC_DIRECT_ALIGN;
++    char *       half = (char *) ggml_backend_buffer_get_base(C.em_gpu_stage) + (size_t) h*C.em_gpu_half;
++    char *       d0   = nullptr;
++    size_t       s    = 0;
++    if (T.pad) {
++        d0 = (char *) GGML_PAD((uintptr_t) half + A, A) + T.offs % A;
++        s  = T.eb + A;
++    } else {
++        d0 = (char *) GGML_PAD((uintptr_t) half, 256);
++        s  = GGML_PAD(T.eb, 256);
++    }
++    if (nb2 != nullptr) {
++        *nb2 = s;
++    }
++    return d0 + (size_t) p*s;
++}
++
++// the device takes T's matmul over its slots at the largest dispatch (asked once per tensor)
++static bool ec_em_gpu_ok(llama_expert_cache & C, ec_tensor & T) {
++    if (T.gpu_ok >= 0) {
++        return T.gpu_ok == 1;
++    }
++    if (!ec_em_gpu_alloc(C)) {
++        return false;
++    }
++    ggml_init_params ip = { C.em_gpu_meta.size(), C.em_gpu_meta.data(), true };
++    ggml_context * ctx = ggml_init(ip);
++    if (ctx == nullptr) {
++        return false;
++    }
++    ggml_tensor * x   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, T.t->ne[0], 1, (int64_t) C.em_gpu_pairs);
++    ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, (int64_t) C.em_gpu_pairs);
++    ggml_tensor * y   = ggml_mul_mat_id(ctx, T.t, x, ids);
++    T.gpu_ok = ggml_backend_supports_op(C.gpu, y) ? 1 : 0;
++    ggml_free(ctx);
++    if (T.gpu_ok == 0) {
++        LLAMA_LOG_INFO("expert cache: %s (%s): expert-major on the CPU, %s has no kernel for it\n",
++                ggml_get_name(T.t), ggml_type_name(T.t->type), ggml_backend_name(C.gpu));
++    }
++    return T.gpu_ok == 1;
++}
++
++static void ec_spin(int & n) {
++    if (++n > 64) {
++        std::this_thread::yield();
++    }
++}
++
++// thread 0: dst's pairs of the experts es[i], expert lid[i] of the experts tensor, which is w (the
++// slots) or the n_as experts at as_data nb2 apart (a staging half). Up to em_gpu_pairs pairs a
++// dispatch: their activations gathered from b (the matmul's src[1]), the results scattered to dst. A
++// dispatch the device refuses or fails is computed on the CPU from the quantized activations q
++static void ec_em_gpu_run(llama_expert_cache & C, ec_em & E, ggml_tensor * dst, ggml_tensor * as_w,
++        char * as_data, size_t as_nb2, int32_t n_as) {
++    const ec_tensor &   T  = C.tensors[E.tensor];
++    ggml_tensor *       w  = T.t;
++    const ggml_tensor * q  = dst->src[0];
++    const ggml_tensor * b  = dst->src[1];
++    const int64_t k      = w->ne[0];
++    const int64_t n_rows = w->ne[1];
++    const int64_t n_used = dst->ne[1];
++    const int64_t ne11   = b->ne[1];
++    const int32_t P_max  = (int32_t) C.em_gpu_pairs;
++    char *    io = (char *) ggml_backend_buffer_get_base(C.em_gpu_io);
++    float *   X  = (float *) io;
++    int32_t * I  = (int32_t *) (io + C.em_gpu_ids);
++    float *   Y  = (float *) (io + C.em_gpu_y);
++    std::vector<int32_t> & map = C.em_gpu_map;
++    const std::vector<int32_t> & es  = C.em_gpu_es;
++    const std::vector<int32_t> & lid = C.em_gpu_lid;
++
++    auto flush = [&](int32_t P) {
++        const int64_t t0 = ggml_time_us();
++        ggml_init_params ip = { C.em_gpu_meta.size(), C.em_gpu_meta.data(), true };
++        ggml_context * ctx = ggml_init(ip);
++        bool ok = ctx != nullptr;
++        ggml_tensor * as = as_w;
++        if (ok && as == nullptr) {
++            as = ggml_new_tensor_3d(ctx, w->type, k, n_rows, n_as);
++            as->nb[2] = as_nb2;
++            as->nb[3] = as_nb2*(size_t) n_as;
++            ok = ggml_backend_tensor_alloc(C.em_gpu_stage, as, as_data) == GGML_STATUS_SUCCESS;
++        }
++        if (ok) {
++            // fresh tensors, addresses set by init_tensor: no plan of an earlier dispatch replays
++            ggml_tensor * x   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, P);
++            ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, P);
++            ggml_tensor * y   = ggml_mul_mat_id(ctx, as, x, ids);
++            ok = ggml_backend_tensor_alloc(C.em_gpu_io, x, X) == GGML_STATUS_SUCCESS &&
++                 ggml_backend_tensor_alloc(C.em_gpu_io, ids, I) == GGML_STATUS_SUCCESS &&
++                 ggml_backend_tensor_alloc(C.em_gpu_io, y, Y) == GGML_STATUS_SUCCESS &&
++                 ggml_backend_supports_op(C.gpu, y);
++            if (ok) {
++                ggml_cgraph * gf = ggml_new_graph_custom(ctx, 4, false);
++                ggml_build_forward_expand(gf, y);
++                ok = ggml_backend_graph_compute(C.gpu, gf) == GGML_STATUS_SUCCESS;
++            }
++        }
++        if (ctx != nullptr) {
++            ggml_free(ctx);
++        }
++        if (ok) {
++            for (int32_t j = 0; j < P; ++j) {
++                const int64_t kk = map[j] % n_used;
++                const int64_t t  = map[j] / n_used;
++                memcpy((char *) dst->data + kk*dst->nb[1] + t*dst->nb[2], Y + (size_t) j*n_rows, (size_t) n_rows*sizeof(float));
++            }
++        } else {
++            if (C.em_gpu_cpu.fetch_add(1) == 0) {
++                LLAMA_LOG_WARN("expert cache: a GPU expert-major dispatch on %s failed (%d pairs), on the CPU\n", ggml_get_name(w), P);
++            }
++            const ggml_type_traits_cpu * tr = ggml_get_type_traits_cpu(w->type);
++            const size_t qrs  = ggml_row_size(tr->vec_dot_type, k);
++            const char * base = as_w != nullptr ? (const char *) as_w->data : as_data;
++            const size_t nb2  = as_w != nullptr ? as_w->nb[2] : as_nb2;
++            for (int32_t j = 0; j < P; ++j) {
++                const int64_t kk  = map[j] % n_used;
++                const int64_t t   = map[j] / n_used;
++                const char *  src = (const char *) q->data + (size_t) (kk % ne11 + ne11*t)*qrs;
++                const char *  wd  = base + (size_t) I[j]*nb2;
++                float *       out = (float *) ((char *) dst->data + kk*dst->nb[1] + t*dst->nb[2]);
++                for (int64_t r = 0; r < n_rows; ++r) {
++                    tr->vec_dot((int) k, out + r, 0, wd + (size_t) r*w->nb[1], 0, src, 0, 1);
++                }
++            }
++        }
++        C.em_gpu_n++;
++        C.em_gpu_p  += (uint64_t) P;
++        C.em_gpu_us += (uint64_t) (ggml_time_us() - t0);
++    };
++
++    int32_t P = 0;
++    for (size_t i = 0; i < es.size(); ++i) {
++        const int32_t   e     = es[i];
++        const int32_t * pairs = E.pairs.data() + E.first[e];
++        for (int32_t j = 0; j < E.count[e]; ++j) {
++            const int64_t p  = pairs[j];
++            const int64_t kk = p % n_used;
++            const int64_t t  = p / n_used;
++            memcpy(X + (size_t) P*k, (const char *) b->data + (kk % ne11)*b->nb[1] + t*b->nb[2], (size_t) k*sizeof(float));
++            I[P]   = lid[i];
++            map[P] = (int32_t) p;
++            if (++P == P_max) {
++                flush(P);
++                P = 0;
++            }
++        }
++    }
++    if (P > 0) {
++        flush(P);
++    }
+ }
+ 
++// the GPU path of ec_em_mm: threads 1.. read the queue, thread 0 dispatches the slots' experts (the
++// resident ones and, once read, the round's), then each staging chunk as soon as it is read
++static void ec_em_mm_gpu(ggml_tensor * dst, int ith, ec_em & E, uint64_t & reads, uint64_t & hits,
++        uint64_t & file_b, uint64_t & file_us) {
++    llama_expert_cache & C = *E.cache;
++    ec_layer & L = *E.layer;
++    const ec_tensor & T = C.tensors[E.tensor];
++    ggml_tensor * w = T.t;
++    const int32_t nq    = (int32_t) E.gq.size();
++    const int32_t chunk = (int32_t) C.em_gpu_chunk;
++
++    if (ith != 0) {
++        for (int32_t i = E.gnext.fetch_add(1); i < nq; i = E.gnext.fetch_add(1)) {
++            const int32_t e = E.gq[i];
++            char *  buf = nullptr;
++            int32_t at  = 0;
++            if (i < E.n_kept) {
++                buf = (char *) w->data + (size_t) L.em_slot[e]*w->nb[2];
++            } else {
++                const int32_t c = (i - E.n_kept)/chunk;
++                int n = 0;
++                while (E.gdisp.load(std::memory_order_acquire) < c - 1) {
++                    ec_spin(n); // the half's previous chunk still computing
++                }
++                buf = ec_em_gpu_pos(C, T, c & 1, (i - E.n_kept) % chunk, nullptr);
++                at  = 1 + c;
++            }
++            const int64_t c0 = ggml_time_us();
++            ec_read(*C.files[T.file], ith, buf, T.eb, T.offs + (size_t) e*T.eb, T.pad);
++            file_us += (uint64_t) (ggml_time_us() - c0);
++            file_b  += T.eb;
++            reads++;
++            E.gread[at].fetch_add(1, std::memory_order_release);
++        }
++        return;
++    }
++
++    int64_t wait_us = 0;
++    auto wait_for = [&](int32_t at, int32_t n_want) {
++        if (E.gread[at].load(std::memory_order_acquire) >= n_want) {
++            return;
++        }
++        const int64_t w0 = ggml_time_us();
++        int n = 0;
++        while (E.gread[at].load(std::memory_order_acquire) < n_want) {
++            ec_spin(n);
++        }
++        wait_us += ggml_time_us() - w0;
++    };
++    C.em_gpu_es.clear();
++    C.em_gpu_lid.clear();
++    for (int32_t e : E.list) {
++        if (L.slot_of[e] >= 0) {
++            C.em_gpu_es.push_back(e);
++            C.em_gpu_lid.push_back(L.slot_of[e]);
++            if (L.em_slot[e] < 0) {
++                hits++;
++            }
++        }
++    }
++    wait_for(0, E.n_kept);
++    if (!C.em_gpu_es.empty()) {
++        ec_em_gpu_run(C, E, dst, w, nullptr, 0, 0);
++    }
++    for (int32_t c = 0; c < E.n_chunk; ++c) {
++        const int32_t i0 = E.n_kept + c*chunk;
++        const int32_t n  = std::min(chunk, nq - i0);
++        wait_for(1 + c, n);
++        C.em_gpu_es.assign(E.gq.begin() + i0, E.gq.begin() + i0 + n);
++        C.em_gpu_lid.resize((size_t) n);
++        for (int32_t j = 0; j < n; ++j) {
++            C.em_gpu_lid[j] = j;
++        }
++        size_t nb2 = 0;
++        char * base = ec_em_gpu_pos(C, T, c & 1, 0, &nb2);
++        ec_em_gpu_run(C, E, dst, nullptr, base, nb2, n);
++        E.gdisp.store(c + 1, std::memory_order_release);
++    }
++    C.em_gpu_wait_us += (uint64_t) wait_us;
++}
++
+ // all threads: the activations b [k, ne11, n_tokens] (F32) quantized for the dot product of the
+ // expert type, one row per (ne11 row, token); thread 0 also groups the ubatch's pairs by expert and,
+ // for the first expert tensor of the layer, gives slots to missing experts. src = {b, ids}, dst =
+@@ -1815,6 +2161,35 @@
+             C.em_file_us.store(C.em_file_us.load() / 2);
+         }
+     }
++
++    // LLAMA_EXPERT_EM_GPU: the matmul's read queue, the round's experts (into their slots) first
++    E.gpu = false;
++    if (C.em_gpu_chunk > 0 && nth >= 2 && C.gpu != nullptr && ec_em_gpu_ok(C, C.tensors[E.tensor])) {
++        E.gq.clear();
++        for (int32_t e : E.list) {
++            if (L.em_slot[e] >= 0) {
++                E.gq.push_back(e);
++            }
++        }
++        E.n_kept = (int32_t) E.gq.size();
++        for (int32_t e : E.list) {
++            if (L.slot_of[e] < 0) {
++                E.gq.push_back(e);
++            }
++        }
++        const int32_t chunk = (int32_t) C.em_gpu_chunk;
++        E.n_chunk = ((int32_t) E.gq.size() - E.n_kept + chunk - 1)/chunk;
++        if (E.n_gread < E.n_chunk + 1) {
++            E.gread.reset(new std::atomic<int32_t>[(size_t) E.n_chunk + 1]);
++            E.n_gread = E.n_chunk + 1;
++        }
++        for (int32_t i = 0; i < E.n_gread; ++i) {
++            E.gread[i].store(0, std::memory_order_relaxed);
++        }
++        E.gnext.store(0, std::memory_order_relaxed);
++        E.gdisp.store(0, std::memory_order_relaxed);
++        E.gpu = true;
++    }
+     L.em_state[E.pos] = 1;
+ }
+ 
+@@ -1888,6 +2263,9 @@
+     };
+     const size_t  nb1 = w->nb[1];
+     const int64_t blk = std::max<int64_t>(1, (int64_t) (EC_EM_BLOCK/nb1)); // rows per copy of a resident expert
++    if (E.gpu && dst->src[1] != nullptr) {
++        ec_em_mm_gpu(dst, ith, E, reads, hits, file_b, file_us);
++    } else
+     for (int32_t i = E.next.fetch_add(1); i < n_list; i = E.next.fetch_add(1)) {
+         const int32_t e = E.list[i];
+         const int32_t v = L.em_slot[e];
+@@ -2174,6 +2552,16 @@
+     // LLAMA_EXPERT_PAD=1: slots padded so that experts at unaligned file offsets read in place (off by default)
+     const char * pad = getenv("LLAMA_EXPERT_PAD");
+     cache->io_pad = cache->io_direct && pad != nullptr && *pad != '\0' && atoi(pad) != 0;
++    // LLAMA_EXPERT_EM_GPU=<experts>[:<pairs>]: expert-major matmuls on the GPU of the slots (0 = off)
++    const char * eg = getenv("LLAMA_EXPERT_EM_GPU");
++    if (eg != nullptr && *eg != '\0') {
++        unsigned ch = 0;
++        unsigned pr = 2048;
++        if (sscanf(eg, "%u:%u", &ch, &pr) >= 1 && ch > 0) {
++            cache->em_gpu_chunk = std::min(ch, 256u);
++            cache->em_gpu_pairs = std::min(std::max(pr, 64u), 16384u);
++        }
++    }
+     // LLAMA_EXPERT_EM_RESIDENT: where an expert-major ubatch's resident experts come from (slot,
+     // file, auto - the default; also 0, 1, 2)
+     const char * res = getenv("LLAMA_EXPERT_EM_RESIDENT");
+@@ -2220,6 +2608,22 @@
+     return false;
+ }
+ 
++void llama_expert_cache_set_backend(llama_expert_cache & cache, ggml_backend_t backend) {
++    if (backend == nullptr) {
++        cache.gpu_free();
++        for (ec_tensor & T : cache.tensors) {
++            T.gpu_ok = -1;
++        }
++        return;
++    }
++    if (cache.em_gpu_chunk == 0 || cache.inner == nullptr || cache.gpu != nullptr ||
++            ggml_backend_get_device(backend) != cache.buft.device) {
++        return;
++    }
++    cache.gpu = backend;
++    cache.em_gpu_failed = false;
++}
++
+ uint32_t llama_expert_cache_n_slots(const llama_expert_cache & cache) {
+     return cache.n_slots;
+ }
+@@ -2456,7 +2860,11 @@
+     ggml_tensor * q = ggml_custom_4d(ctx, GGML_TYPE_I8, n_q, 1, 1, 1, args, 2, ec_em_prep, GGML_N_TASKS_MAX, T.em.get());
+     ggml_format_name(q, "%s-em_act", ggml_get_name(w));
+ 
+-    ggml_tensor * res = ggml_custom_4d(ctx, GGML_TYPE_F32, w->ne[1], ids->ne[0], ids->ne[1], 1, &q, 1, ec_em_mm, GGML_N_TASKS_MAX, T.em.get());
++    // LLAMA_EXPERT_EM_GPU: the device's kernel quantizes the activations itself, so b stays alive
++    // until the matmul has gathered them
++    ggml_tensor * srcs[2] = { q, b };
++    const int n_src = C.em_gpu_chunk > 0 ? 2 : 1;
++    ggml_tensor * res = ggml_custom_4d(ctx, GGML_TYPE_F32, w->ne[1], ids->ne[0], ids->ne[1], 1, srcs, n_src, ec_em_mm, GGML_N_TASKS_MAX, T.em.get());
+     ggml_format_name(res, "%s-em", ggml_get_name(w));
+     return res;
+ #endif
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -371,6 +371,13 @@
+             throw std::runtime_error("failed to initialize CPU backend");
+         }
+         backends.emplace_back(backend_cpu);
++
++        // LLAMA_EXPERT_EM_GPU: the expert-major matmuls dispatch on the backend of the slots' device
++        if (model.expert_cache) {
++            for (auto & backend : backends) {
++                llama_expert_cache_set_backend(*model.expert_cache, backend.get());
++            }
++        }
+ 
+         // create a list of the set_n_threads functions in the backends
+         for (auto & backend : backends) {
+@@ -498,6 +505,11 @@
+     // wait for any pending asynchronous copies into the output buffers before they are freed
+     synchronize();
+ 
++    // the backends go with the context: the expert-major GPU path's buffers and backend too
++    if (model.expert_cache) {
++        llama_expert_cache_set_backend(*model.expert_cache, nullptr);
++    }
++
+     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
+     if (!model.hparams.no_alloc && !opt_ctx) {
+         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
