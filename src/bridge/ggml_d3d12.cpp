@@ -25,8 +25,8 @@ namespace xllama {
 
 bool d3d12_weight_type_supported(ggml_type t) {
     return t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q6_K ||
-           t == GGML_TYPE_IQ3_S || t == GGML_TYPE_IQ4_XS || t == GGML_TYPE_Q5_K ||
-           t == GGML_TYPE_F32;
+           t == GGML_TYPE_IQ3_S || t == GGML_TYPE_IQ2_S || t == GGML_TYPE_IQ4_XS ||
+           t == GGML_TYPE_Q5_K || t == GGML_TYPE_F32;
 }
 
 D3d12Dispatch d3d12_mm_dispatch(std::int64_t n, std::int64_t ncols) {
@@ -177,6 +177,17 @@ std::uint32_t iq3s_signed4(std::uint32_t g, std::uint32_t s4) {
     return (g ^ m) + (m & 0x01010101u);
 }
 
+constexpr std::uint32_t kIq2sGrid[512] = {
+    #include "../../shaders/ggml_d3d12_iq2s_grid.inc"
+};
+
+// shaders/ggml_d3d12_iq2s_block.hlsli iq2s_mag4: four 2-bit grid codes -> four
+// magnitude bytes 8 + 17c + (c >> 1).
+std::uint32_t iq2s_mag4(std::uint32_t c) {
+    const std::uint32_t b = (c | (c << 6) | (c << 12) | (c << 18)) & 0x03030303u;
+    return 0x08080808u + 17u * b + ((b >> 1) & 0x01010101u);
+}
+
 // One thread's contribution for one row and one 256-element chunk. `xq` is
 // one activation column in the vec_dot type's ggml blocks (block_q8_0 for
 // Q4_0, block_q8_K for Q4_K / Q6_K / IQ3_S). Integer sums are exact; the float
@@ -234,6 +245,29 @@ float thread_chunk(ggml_type t, const std::uint8_t* w, std::uint32_t row_off, st
                              (sg >> (4u * k)) & 0xFu);
             for (std::uint32_t j = 0; j < 4; ++j)
                 sumi += sbyte(g, j) * qx[e + 4u * k + j];
+        }
+        return (d * dy) * static_cast<float>(ls * sumi);
+    }
+    if (t == GGML_TYPE_IQ2_S) { // shaders/ggml_d3d12_iq2s_block.hlsli
+        const std::uint32_t ib32 = itid >> 1, h = itid & 1u, e = 32u * ib32 + 16u * h;
+        const std::uint32_t bb = row_off + blk * 82u;
+        const float d = h2f(ld16(w, bb)) * 0.125f;
+        const std::uint32_t qs = ld16(w, bb + 2u + 4u * ib32 + 2u * h);
+        const std::uint32_t sg = ld16(w, bb + 34u + 4u * ib32 + 2u * h);
+        const std::uint32_t qh = static_cast<std::uint32_t>(w[bb + 66u + ib32]) >> (4u * h);
+        const std::int32_t ls =
+            2 * static_cast<std::int32_t>((w[bb + 74u + ib32] >> (4u * h)) & 0xFu) + 1;
+        std::int32_t sumi = 0;
+        for (std::uint32_t l = 0; l < 2; ++l) {
+            const std::uint32_t idx = ((qs >> (8u * l)) & 0xFFu) | (((qh >> (2u * l)) & 3u) << 8);
+            const std::uint32_t c = (kIq2sGrid[idx >> 1] >> (16u * (idx & 1u))) & 0xFFFFu;
+            const std::uint32_t s8 = (sg >> (8u * l)) & 0xFFu;
+            for (std::uint32_t q = 0; q < 2; ++q) {
+                const std::uint32_t g =
+                    iq3s_signed4(iq2s_mag4((c >> (8u * q)) & 0xFFu), (s8 >> (4u * q)) & 0xFu);
+                for (std::uint32_t j = 0; j < 4; ++j)
+                    sumi += sbyte(g, j) * qx[e + 8u * l + 4u * q + j];
+            }
         }
         return (d * dy) * static_cast<float>(ls * sumi);
     }
@@ -638,12 +672,16 @@ void run_d3d12_memprobe(const std::function<void(const std::string&)>& emit) {
         #include "ggml_d3d12_elt_rms_norm_dxil.h"
         #include "ggml_d3d12_get_rows_q6_k_dxil.h"
         #include "ggml_d3d12_mmid_emu.h"
+        #include "ggml_d3d12_mmid_iq2_s_t128_dxil.h"
+        #include "ggml_d3d12_mmid_iq2_s_t64_dxil.h"
         #include "ggml_d3d12_mmid_iq3_s_t128_dxil.h"
         #include "ggml_d3d12_mmid_iq3_s_t64_dxil.h"
         #include "ggml_d3d12_mmid_iq4_xs_t128_dxil.h"
         #include "ggml_d3d12_mmid_iq4_xs_t64_dxil.h"
         #include "ggml_d3d12_mmv_f32_t128_dxil.h"
         #include "ggml_d3d12_mmv_f32_t64_dxil.h"
+        #include "ggml_d3d12_mmv_iq2_s_t128_dxil.h"
+        #include "ggml_d3d12_mmv_iq2_s_t64_dxil.h"
         #include "ggml_d3d12_mmv_iq3_s_t128_dxil.h"
         #include "ggml_d3d12_mmv_iq3_s_t64_dxil.h"
         #include "ggml_d3d12_mmv_iq4_xs_t128_dxil.h"
@@ -701,7 +739,8 @@ enum Pso {
     kPsoIq4Xs = 4,
     kPsoQ5K = 5,
     kPsoF32 = 6,
-    kPsoCount = 7
+    kPsoIq2S = 7,
+    kPsoCount = 8
 };
 enum Elt {
     kEltBinary = 0,
@@ -718,13 +757,16 @@ enum Route { kRouteRoute = 0, kRouteEmit = 1, kRouteCount = 2 };
 // shaders/ggml_d3d12_ssm.hlsl, KERNEL 1..5 (ggml_d3d12_ssm_emu.h).
 enum Ssm { kSsmUnary = 0, kSsmCopy = 1, kSsmGetRows = 2, kSsmConv = 3, kSsmGdn = 4, kSsmCount = 5 };
 // Root constants: the 8 every kernel reads, then MUL_MAT_ID's 5
-// (shaders/ggml_d3d12_mmid_{iq4_xs,iq3_s}.hlsl).
+// (shaders/ggml_d3d12_mmid_{iq4_xs,iq3_s,iq2_s}.hlsl).
 constexpr UINT kOpConstants = 13;
 // MUL_MAT_ID kernels by expert type (d3d12_mmid_type_supported).
-enum Mmid { kMmidIq4Xs = 0, kMmidIq3S = 1, kMmidCount = 2 };
+enum Mmid { kMmidIq4Xs = 0, kMmidIq3S = 1, kMmidIq2S = 2, kMmidCount = 3 };
 
 int mmid_for(ggml_type t) {
-    return t == GGML_TYPE_IQ4_XS ? kMmidIq4Xs : t == GGML_TYPE_IQ3_S ? kMmidIq3S : -1;
+    return t == GGML_TYPE_IQ4_XS ? kMmidIq4Xs
+           : t == GGML_TYPE_IQ3_S ? kMmidIq3S
+           : t == GGML_TYPE_IQ2_S ? kMmidIq2S
+                                  : -1;
 }
 
 int pso_for(ggml_type t) {
@@ -743,6 +785,8 @@ int pso_for(ggml_type t) {
         return kPsoQ5K;
     case GGML_TYPE_F32:
         return kPsoF32;
+    case GGML_TYPE_IQ2_S:
+        return kPsoIq2S;
     default:
         return -1;
     }
@@ -777,7 +821,7 @@ struct Gpu {
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12PipelineState> pso[kPsoCount][2]; // [type][0 = 64 threads, 1 = 128]
     ComPtr<ID3D12PipelineState> pso_get_rows;      // Q6_K
-    // MUL_MAT_ID, IQ4_XS or IQ3_S experts in an EXPERT_CACHE buffer this device
+    // MUL_MAT_ID, IQ4_XS, IQ3_S or IQ2_S experts in an EXPERT_CACHE buffer this device
     // claims: [Mmid][0 = 64 threads, 1 = 128].
     ComPtr<ID3D12PipelineState> pso_mmid[kMmidCount][2];
     // shaders/ggml_d3d12_elt.hlsl; without them (elt_ok false) those ops and
@@ -984,8 +1028,8 @@ struct PsoSlot {
 // so `&g.pso[i][wd]` here released every pipeline at the end of init_gpu and
 // 1.7.12.54 ran every op as a bare barrier (0 dispatches, 1/48 selftest cases).
 std::vector<PsoSlot> pso_slots(Gpu& g) {
-    static const char* const mmv[] = {"q4_0", "q4_k", "q6_k", "iq3_s", "iq4_xs", "q5_k", "f32"};
-    static const char* const mmid[] = {"iq4_xs", "iq3_s"};
+    static const char* const mmv[] = {"q4_0", "q4_k", "q6_k", "iq3_s", "iq4_xs", "q5_k", "f32", "iq2_s"};
+    static const char* const mmid[] = {"iq4_xs", "iq3_s", "iq2_s"};
     static const char* const elt[] = {"binary", "rms_norm", "quant_q8_k", "norm_quant",
                                       "bin_quant"};
     static const char* const moe[] = {"combine", "tail"};
@@ -1159,7 +1203,8 @@ bool init_gpu(Gpu& g) {
                                        {kGgmlD3d12MmvIq3ST64Dxil, kGgmlD3d12MmvIq3ST128Dxil},
                                        {kGgmlD3d12MmvIq4XsT64Dxil, kGgmlD3d12MmvIq4XsT128Dxil},
                                        {kGgmlD3d12MmvQ5KT64Dxil, kGgmlD3d12MmvQ5KT128Dxil},
-                                       {kGgmlD3d12MmvF32T64Dxil, kGgmlD3d12MmvF32T128Dxil}};
+                                       {kGgmlD3d12MmvF32T64Dxil, kGgmlD3d12MmvF32T128Dxil},
+                                       {kGgmlD3d12MmvIq2ST64Dxil, kGgmlD3d12MmvIq2ST128Dxil}};
     const size_t sizes[kPsoCount][2] = {
         {kGgmlD3d12MmvQ40T64DxilSize, kGgmlD3d12MmvQ40T128DxilSize},
         {kGgmlD3d12MmvQ4KT64DxilSize, kGgmlD3d12MmvQ4KT128DxilSize},
@@ -1167,7 +1212,8 @@ bool init_gpu(Gpu& g) {
         {kGgmlD3d12MmvIq3ST64DxilSize, kGgmlD3d12MmvIq3ST128DxilSize},
         {kGgmlD3d12MmvIq4XsT64DxilSize, kGgmlD3d12MmvIq4XsT128DxilSize},
         {kGgmlD3d12MmvQ5KT64DxilSize, kGgmlD3d12MmvQ5KT128DxilSize},
-        {kGgmlD3d12MmvF32T64DxilSize, kGgmlD3d12MmvF32T128DxilSize}};
+        {kGgmlD3d12MmvF32T64DxilSize, kGgmlD3d12MmvF32T128DxilSize},
+        {kGgmlD3d12MmvIq2ST64DxilSize, kGgmlD3d12MmvIq2ST128DxilSize}};
     for (int i = 0; i < kPsoCount; ++i) {
         for (int wd = 0; wd < 2; ++wd) {
             D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
@@ -1194,10 +1240,12 @@ bool init_gpu(Gpu& g) {
     }
     {
         const void* mb[kMmidCount][2] = {{kGgmlD3d12MmidIq4XsT64Dxil, kGgmlD3d12MmidIq4XsT128Dxil},
-                                         {kGgmlD3d12MmidIq3ST64Dxil, kGgmlD3d12MmidIq3ST128Dxil}};
+                                         {kGgmlD3d12MmidIq3ST64Dxil, kGgmlD3d12MmidIq3ST128Dxil},
+                                         {kGgmlD3d12MmidIq2ST64Dxil, kGgmlD3d12MmidIq2ST128Dxil}};
         const size_t ms[kMmidCount][2] = {
             {kGgmlD3d12MmidIq4XsT64DxilSize, kGgmlD3d12MmidIq4XsT128DxilSize},
-            {kGgmlD3d12MmidIq3ST64DxilSize, kGgmlD3d12MmidIq3ST128DxilSize}};
+            {kGgmlD3d12MmidIq3ST64DxilSize, kGgmlD3d12MmidIq3ST128DxilSize},
+            {kGgmlD3d12MmidIq2ST64DxilSize, kGgmlD3d12MmidIq2ST128DxilSize}};
         for (int mk = 0; mk < kMmidCount; ++mk)
             for (int wd = 0; wd < 2; ++wd) {
                 D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
@@ -1719,7 +1767,7 @@ size_t buft_alignment(ggml_backend_buffer_type_t) {
 bool buft_is_host_true(ggml_backend_buffer_type_t) {
     return true;
 }
-// The Q4_0/Q6_K/IQ3_S kernels read whole aligned dwords, up to 2 bytes past a
+// The Q4_0/Q6_K/IQ3_S/IQ2_S kernels read whole aligned dwords, up to 2 bytes past a
 // tensor's last block; root descriptors have no bounds check, so pad.
 size_t weights_alloc_size(ggml_backend_buffer_type_t, const ggml_tensor* t) {
     return ggml_nbytes(t) + 16;
@@ -1922,7 +1970,7 @@ bool in_expert_cache(const ggml_tensor* t) {
 
 // A pipeline's kernel, for the profile.
 std::string pso_name(const Gpu& g, const ID3D12PipelineState* p) {
-    static const char* const kTypes[] = {"q4_0", "q4_K", "q6_K", "iq3_s", "iq4_xs", "q5_K", "f32"};
+    static const char* const kTypes[] = {"q4_0", "q4_K", "q6_K", "iq3_s", "iq4_xs", "q5_K", "f32", "iq2_s"};
     static const char* const kElts[] = {"elt binary", "elt rms_norm", "elt quant q8_K",
                                         "elt rms_norm+q8_K", "elt binary+q8_K"};
     static const char* const kMoes[] = {"moe combine", "moe tail"};
@@ -1941,7 +1989,7 @@ std::string pso_name(const Gpu& g, const ID3D12PipelineState* p) {
                 return std::string("mmv ") + kTypes[i] + (wd ? " t128" : " t64");
     if (g.pso_get_rows.Get() == p)
         return "get_rows q6_K";
-    static const char* const kMmids[] = {"iq4_xs", "iq3_s"};
+    static const char* const kMmids[] = {"iq4_xs", "iq3_s", "iq2_s"};
     static_assert(static_cast<int>(std::size(kMmids)) == kMmidCount, "a name per mmid kernel");
     for (int mk = 0; mk < kMmidCount; ++mk)
         for (int wd = 0; wd < 2; ++wd)
@@ -4356,7 +4404,7 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
             m.u[1] = x_va;
             m.gx = d.groups_x;
             m.gy = d.groups_y;
-            if (w->type == GGML_TYPE_IQ3_S) { // pad0 = the group geometry (fewer, wider groups)
+            if (d3d12_geom_type(w->type)) { // pad0 = the group geometry (fewer, wider groups)
                 const D3d12Geom geo =
                     d3d12_geom_for(g.iq3s_geom, static_cast<std::uint32_t>(w->ne[0] / kD3d12Chunk),
                                    static_cast<std::uint32_t>(d3d12_mm_threads(w->ne[0])));
@@ -4904,7 +4952,7 @@ const char* dev_name(ggml_backend_dev_t) {
     return "D3D12";
 }
 const char* dev_description(ggml_backend_dev_t) {
-    return "xllama D3D12 compute (Q4_0/Q4_K/Q5_K/Q6_K/IQ3_S/IQ4_XS matmul, Q6_K get_rows, f32 "
+    return "xllama D3D12 compute (Q4_0/Q4_K/Q5_K/Q6_K/IQ2_S/IQ3_S/IQ4_XS matmul, Q6_K get_rows, f32 "
            "add/mul/rms_norm/swiglu, q8_K quant)";
 }
 void dev_memory(ggml_backend_dev_t, size_t* free, size_t* total) {
@@ -5999,7 +6047,7 @@ ggml_backend_buffer_t selftest_expert_cache_alloc(ggml_backend_buffer_type_t buf
     return alloc_buf(buft, size, true);
 }
 
-// MUL_MAT_ID over IQ4_XS or IQ3_S expert slots (Qwen3.6-35B-A3B's routed
+// MUL_MAT_ID over IQ4_XS, IQ3_S or IQ2_S expert slots (Qwen3.6-35B-A3B's routed
 // experts): ne11 = 1 is gate/up (one activation per token), ne11 = n_ids is
 // down (one per expert). Reference: the CPU backend's q8_K from_float and vec_dot.
 D3d12SelftestRow run_mmid_case(ggml_backend_t backend, ggml_type wtype, int n, int k, int ne11,
@@ -8023,6 +8071,15 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
         {GGML_TYPE_IQ3_S, "iq3_s", 2048, 512, 1},
         {GGML_TYPE_IQ3_S, "iq3_s", 8192, 2048, 1},
         {GGML_TYPE_IQ3_S, "iq3_s", 1030, 1024, 3},
+        // Qwen3.5-122B-A10B IQ2_M (n_embd 3072): IQ2_S attn_q/qkv/gate 3072 -> 4096+
+        // (t64), ssm_out 8192 -> (t128), shared expert 3072 -> 1024 and 1024 -> 3072,
+        // ssm_alpha/beta 3072 -> 64, and a tail no geometry divides.
+        {GGML_TYPE_IQ2_S, "iq2_s", 4096, 3072, 1},
+        {GGML_TYPE_IQ2_S, "iq2_s", 1024, 8192, 1},
+        {GGML_TYPE_IQ2_S, "iq2_s", 1024, 3072, 1},
+        {GGML_TYPE_IQ2_S, "iq2_s", 3072, 1024, 1},
+        {GGML_TYPE_IQ2_S, "iq2_s", 64, 3072, 1},
+        {GGML_TYPE_IQ2_S, "iq2_s", 1030, 1024, 3},
         // Qwen3.6-35B-A3B IQ4_XS: attn_gate 2048->4096, ssm_out 4096->2048,
         // ffn_down_shexp 512->2048, ssm_alpha 2048->32; Q5_K attn_qkv and attn_v.
         {GGML_TYPE_IQ4_XS, "iq4_xs", 4096, 2048, 1},
@@ -8044,7 +8101,7 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
     out->push_back(run_get_rows_case(backend, 65536, 1024));  // LFM2.5-350M
     // Qwen3.6-35B-A3B experts (i1-IQ4_XS and i1-IQ3_S): gate/up 2048 -> 512,
     // down 512 -> 2048; one token (decode) and five (a prefill ubatch, both blobs).
-    for (const ggml_type wtype : {GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S})
+    for (const ggml_type wtype : {GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S})
         if (gpu().pso_mmid[mmid_for(wtype)][0]) {
             out->push_back(run_mmid_case(backend, wtype, 512, 2048, 1, 1));
             out->push_back(run_mmid_case(backend, wtype, 2048, 512, 8, 1));

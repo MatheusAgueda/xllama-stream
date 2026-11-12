@@ -86,6 +86,11 @@ TEST_CASE("ggml_d3d12: weight types") {
     CHECK(d3d12_weight_type_supported(GGML_TYPE_Q6_K));
     CHECK(d3d12_weight_type_supported(GGML_TYPE_IQ3_S));
     CHECK(d3d12_activation_type(GGML_TYPE_IQ3_S) == GGML_TYPE_Q8_K);
+    CHECK(d3d12_weight_type_supported(GGML_TYPE_IQ2_S));
+    CHECK(d3d12_activation_type(GGML_TYPE_IQ2_S) == GGML_TYPE_Q8_K);
+    CHECK(d3d12_geom_type(GGML_TYPE_IQ2_S));
+    CHECK(d3d12_geom_type(GGML_TYPE_IQ3_S));
+    CHECK_FALSE(d3d12_geom_type(GGML_TYPE_IQ4_XS));
     CHECK(d3d12_weight_type_supported(GGML_TYPE_IQ4_XS));
     CHECK(d3d12_activation_type(GGML_TYPE_IQ4_XS) == GGML_TYPE_Q8_K);
     CHECK(d3d12_weight_type_supported(GGML_TYPE_Q5_K));
@@ -198,6 +203,12 @@ TEST_CASE("ggml_d3d12: kernel emulation matches the CPU backend (q8 activations)
         {GGML_TYPE_IQ3_S, 6, 2304},
         // Qwen3.5-9B ffn_down width: 48 super-blocks, 128 threads.
         {GGML_TYPE_IQ3_S, 3, 12288},
+        // Qwen3.5-122B-A10B IQ2_M: IQ2_S (82-byte blocks); 9 super-blocks = 738-byte
+        // rows, odd rows 2-byte aligned; n_embd 3072 (t64) and ssm_out 8192 (t128).
+        {GGML_TYPE_IQ2_S, 13, 1024},
+        {GGML_TYPE_IQ2_S, 6, 2304},
+        {GGML_TYPE_IQ2_S, 3, 3072},
+        {GGML_TYPE_IQ2_S, 3, 8192},
         // Qwen3.6-35B-A3B dense projections: IQ4_XS (136-byte blocks) and
         // Q5_K (176-byte blocks), both 4-byte aligned at every row.
         {GGML_TYPE_IQ4_XS, 13, 1024},
@@ -218,6 +229,7 @@ TEST_CASE("ggml_d3d12: kernel emulation matches the CPU backend (q8 activations)
     }
     CHECK(ggml_row_size(GGML_TYPE_Q6_K, 11008) % 4 == 2); // the case the ld32 trick covers
     CHECK(ggml_row_size(GGML_TYPE_IQ3_S, 2304) % 4 == 2);
+    CHECK(ggml_row_size(GGML_TYPE_IQ2_S, 2304) % 4 == 2);
 }
 
 TEST_CASE("ggml_d3d12: selftest CSV and non-Windows behaviour") {

@@ -254,7 +254,7 @@ TEST_CASE("ggml_d3d12 mmid: kernel emulation matches ggml's CPU mul_mat_id") {
         // K = 4096 (16 chunks), 4 ids per token, shared columns.
         {4096, 13, 9, 4, 1, 3, 4},
     };
-    for (const ggml_type wtype : {GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S})
+    for (const ggml_type wtype : {GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S})
         for (const auto& c : cases) {
             CAPTURE(ggml_type_name(wtype));
             CAPTURE(c.k);

@@ -1,14 +1,14 @@
 // Copyright (c) 2024 Gianluca Mazza
 // SPDX-License-Identifier: MIT
 //
-// MUL_MAT_ID on the d3d12 backend (shaders/ggml_d3d12_mmid_{iq4_xs,iq3_s}.hlsl):
+// MUL_MAT_ID on the d3d12 backend (shaders/ggml_d3d12_mmid_{iq4_xs,iq3_s,iq2_s}.hlsl):
 // the kernels' constants and grid from a GGML_OP_MUL_MAT_ID node, their
 // activation layout, and a host emulation of each (tests compare it with ggml's
-// CPU mul_mat_id; a selftest can compare it with the GPU). Both kernels share
+// CPU mul_mat_id; a selftest can compare it with the GPU). The kernels share
 // the constants, grid and thread layout; only the expert block differs.
 //
 // The node: dst[:, i, t] = as[:, :, ids[i, t]] x src1[:, i % ne11, t], with
-//   as   = the experts, IQ4_XS or IQ3_S [K, N, n_as] (with the expert cache: the
+//   as   = the experts, IQ4_XS, IQ3_S or IQ2_S [K, N, n_as] (with the expert cache: the
 //          resident slots, and ids the slot ids)
 //   src1 = the activations, F32 [K, ne11, T]; ne11 = 1 for gate/up (one
 //          column per token), n_ids for down (one per expert)
@@ -18,7 +18,7 @@
 // (d3d12_mmid_quantize_activations). One thread group per (R rows, token t,
 // id i): grid (ceil(N / R), n_ids * T), the t64 or t128 blob by
 // d3d12_mm_threads(K) as for MUL_MAT, R = d3d12_geom_rows(geometry): 4 for
-// IQ4_XS, whose kernel has no geometry, and for IQ3_S by the plan's request
+// IQ4_XS, whose kernel has no geometry, and for IQ3_S / IQ2_S by the plan's request
 // (pad0, shaders/ggml_d3d12_geom.hlsli). Offsets are 32-bit, as in the shader.
 
 #pragma once
@@ -45,7 +45,7 @@ struct D3d12MmidParams {
     std::uint32_t w_row_bytes = 0; // as nb1
     std::uint32_t x_stride = 0;    // bytes between tokens in X
     std::uint32_t y_stride = 0;    // floats between tokens in Y (dst nb2 / 4)
-    std::uint32_t pad0 = 0;        // IQ3_S: d3d12_geom_pack(geometry)
+    std::uint32_t pad0 = 0;        // IQ3_S / IQ2_S: d3d12_geom_pack(geometry)
     std::uint32_t pad1 = 0;
     std::uint32_t expert_stride = 0;   // bytes between experts in W (as nb2)
     std::uint32_t n_ids = 0;           // experts per token (ids ne0)
@@ -62,17 +62,17 @@ struct D3d12MmidPlan {
     std::uint32_t threads = 0;  // d3d12_mm_threads(K): which blob
     std::size_t x_bytes = 0;    // X (u1), d3d12_mmid_quantize_activations
     std::size_t ids_bytes = 0;  // Ids (t1) from ids->data
-    D3d12Geom geom;             // IQ3_S only; {1, 1} otherwise
+    D3d12Geom geom;             // IQ3_S / IQ2_S only; {1, 1} otherwise
 };
 
 // The expert types with a MUL_MAT_ID kernel.
 inline bool d3d12_mmid_type_supported(ggml_type t) {
-    return t == GGML_TYPE_IQ4_XS || t == GGML_TYPE_IQ3_S;
+    return t == GGML_TYPE_IQ4_XS || t == GGML_TYPE_IQ3_S || t == GGML_TYPE_IQ2_S;
 }
 
-// false when no kernel runs dst: weights neither IQ4_XS nor IQ3_S, shapes outside
+// false when no kernel runs dst: weights not IQ4_XS, IQ3_S or IQ2_S, shapes outside
 // ggml_mul_mat_id's 3-d case, ne11 neither 1 nor n_ids, a grid past
-// kD3d12MaxGroups or an offset past 32 bits. req shapes IQ3_S groups
+// kD3d12MaxGroups or an offset past 32 bits. req shapes IQ3_S / IQ2_S groups
 // (d3d12_geom_for).
 inline bool d3d12_mmid_plan(const ggml_tensor* dst, D3d12MmidPlan* plan,
                             const D3d12GeomReq& req = {}) {
@@ -106,7 +106,7 @@ inline bool d3d12_mmid_plan(const ggml_tensor* dst, D3d12MmidPlan* plan,
     const std::uint64_t x_stride = static_cast<std::uint64_t>(ne11) * xq_row;
     const std::uint32_t threads = static_cast<std::uint32_t>(d3d12_mm_threads(k));
     const D3d12Geom geom =
-        as->type == GGML_TYPE_IQ3_S
+        d3d12_geom_type(as->type)
             ? d3d12_geom_for(req, static_cast<std::uint32_t>(k / kD3d12Chunk), threads)
             : D3d12Geom{};
     const std::uint64_t rows = d3d12_geom_rows(geom);
@@ -130,7 +130,7 @@ inline bool d3d12_mmid_plan(const ggml_tensor* dst, D3d12MmidPlan* plan,
     p.w_row_bytes = static_cast<std::uint32_t>(as->nb[1]);
     p.x_stride = static_cast<std::uint32_t>(x_stride);
     p.y_stride = static_cast<std::uint32_t>(dst->nb[2] / 4);
-    p.pad0 = as->type == GGML_TYPE_IQ3_S ? d3d12_geom_pack(geom) : 0u;
+    p.pad0 = d3d12_geom_type(as->type) ? d3d12_geom_pack(geom) : 0u;
     p.expert_stride = static_cast<std::uint32_t>(as->nb[2]);
     p.n_ids = static_cast<std::uint32_t>(n_ids);
     p.ids_stride = static_cast<std::uint32_t>(ids->nb[1]);
@@ -166,6 +166,11 @@ namespace d3d12_mmid_detail {
 
 inline constexpr std::uint32_t kIq3sGrid[512] = {
 #include "../../shaders/ggml_d3d12_iq3s_grid.inc"
+};
+
+// 1024 entries x 8 two-bit codes (8 -> 0, 25 -> 1, 43 -> 2), two entries a dword.
+inline constexpr std::uint32_t kIq2sGrid[512] = {
+#include "../../shaders/ggml_d3d12_iq2s_grid.inc"
 };
 
 inline std::uint32_t ld16(const std::uint8_t* at) {
@@ -205,6 +210,27 @@ inline std::int32_t block_lsumi(ggml_type t, const std::uint8_t* bb, std::uint32
         }
         return ls * sumi;
     }
+    if (t == GGML_TYPE_IQ2_S) { // ggml_d3d12_mmid_iq2_s.hlsl: ggml's final 0.125 folded into d
+        *d *= 0.125f;
+        const std::uint32_t ib32 = itid >> 1, h = itid & 1u, e = 32u * ib32 + 16u * h;
+        const std::uint32_t qs = ld16(bb + 2u + 4u * ib32 + 2u * h);
+        const std::uint32_t sg = ld16(bb + 34u + 4u * ib32 + 2u * h);
+        const std::uint32_t qh = static_cast<std::uint32_t>(bb[66u + ib32]) >> (4u * h);
+        const std::int32_t ls =
+            2 * static_cast<std::int32_t>((bb[74u + ib32] >> (4u * h)) & 0xFu) + 1;
+        std::int32_t sumi = 0;
+        for (std::uint32_t l = 0; l < 2; ++l) {
+            const std::uint32_t idx = ((qs >> (8u * l)) & 0xFFu) | (((qh >> (2u * l)) & 3u) << 8);
+            const std::uint32_t c = (kIq2sGrid[idx >> 1] >> (16u * (idx & 1u))) & 0xFFFFu;
+            const std::uint32_t s8 = (sg >> (8u * l)) & 0xFFu;
+            for (std::uint32_t j = 0; j < 8; ++j) {
+                const std::uint32_t b = (c >> (2u * j)) & 3u;
+                const std::int32_t mag = static_cast<std::int32_t>(8u + 17u * b + (b >> 1));
+                sumi += (((s8 >> j) & 1u) ? -mag : mag) * qx[e + 8u * l + j];
+            }
+        }
+        return ls * sumi;
+    }
     // IQ4_XS, ggml_d3d12_mmid_iq4_xs.hlsl
     static constexpr std::int32_t kv[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
                                             1,    13,   25,  38,  53,  69,  89,  113};
@@ -229,7 +255,7 @@ inline std::int32_t block_lsumi(ggml_type t, const std::uint8_t* bb, std::uint32
 
 // The kernel for expert type t on the host: per group and thread the same
 // blocks in the same order, the same float operations and the same tree
-// reduction as the HLSL, IQ3_S with the geometry in p.pad0
+// reduction as the HLSL, IQ3_S / IQ2_S with the geometry in p.pad0
 // (ggml_d3d12_geom.hlsli). w, ids and xq are the t0, t1 and u1 buffers, y the
 // u0 buffer (rows past n are never written). threads is the blob's NUM_THREADS
 // (64 or 128).
@@ -246,7 +272,7 @@ inline void d3d12_mmid_emulate(ggml_type t, const D3d12MmidParams& p, std::uint3
         return;
     const std::uint32_t block_bytes = static_cast<std::uint32_t>(ggml_type_size(t));
     const std::uint32_t in_flight = threads / 16u;
-    const bool geo = t == GGML_TYPE_IQ3_S;
+    const bool geo = d3d12_geom_type(t);
     const std::uint32_t rsl = geo ? std::clamp(p.pad0 & 0xffu, 1u, in_flight) : 1u;
     const std::uint32_t rt = geo ? std::max((p.pad0 >> 8) & 0xffu, 1u) : 1u;
     const std::uint32_t cl = in_flight / rsl; // chunk lanes per row set
