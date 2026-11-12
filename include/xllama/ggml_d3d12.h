@@ -74,8 +74,8 @@ D3d12Dispatch d3d12_mm_dispatch(std::int64_t n, std::int64_t ncols);
 // kD3d12LongKChunks chunks, else 64 — measured both ways in D2a runs 1 and 2.
 int d3d12_mm_threads(std::int64_t k);
 
-// --- IQ3_S / IQ2_S group geometry (shaders/ggml_d3d12_geom.hlsli) ---
-// The IQ3_S and IQ2_S mmv and mmid kernels read their group shape from pad0 (constant 6):
+// --- IQ3_S / IQ2_S / IQ2_XXS group geometry (shaders/ggml_d3d12_geom.hlsli) ---
+// The IQ3_S, IQ2_S and IQ2_XXS mmv and mmid kernels read their group shape from pad0 (constant 6):
 // rsl row sets side by side in the group's threads/16 chunk lanes and rt row
 // tiles the group walks in turn, so group gid.x covers rows
 // [gid.x * R, (gid.x + 1) * R) with R = kD3d12MmvRows * rsl * rt. rsl = rt = 1
@@ -108,9 +108,9 @@ inline std::uint32_t d3d12_geom_rows(const D3d12Geom& g) {
     return static_cast<std::uint32_t>(kD3d12MmvRows) * g.rsl * g.rt;
 }
 // The weight types whose mmv and mmid kernels read that geometry: IQ3_S and
-// IQ2_S (both walk ggml_d3d12_geom.hlsli); the others take pad0 = 0.
+// IQ2_S and IQ2_XXS (all walk ggml_d3d12_geom.hlsli); the others take pad0 = 0.
 inline bool d3d12_geom_type(ggml_type t) {
-    return t == GGML_TYPE_IQ3_S || t == GGML_TYPE_IQ2_S;
+    return t == GGML_TYPE_IQ3_S || t == GGML_TYPE_IQ2_S || t == GGML_TYPE_IQ2_XXS;
 }
 // "auto", "0" or a count; anything else (or null) leaves `fallback`.
 std::uint32_t d3d12_geom_parse(const char* s, std::uint32_t fallback);

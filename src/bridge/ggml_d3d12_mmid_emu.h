@@ -1,14 +1,14 @@
 // Copyright (c) 2024 Gianluca Mazza
 // SPDX-License-Identifier: MIT
 //
-// MUL_MAT_ID on the d3d12 backend (shaders/ggml_d3d12_mmid_{iq4_xs,iq3_s,iq2_s}.hlsl):
+// MUL_MAT_ID on the d3d12 backend (shaders/ggml_d3d12_mmid_{iq4_xs,iq3_s,iq2_s,iq2_xxs}.hlsl):
 // the kernels' constants and grid from a GGML_OP_MUL_MAT_ID node, their
 // activation layout, and a host emulation of each (tests compare it with ggml's
 // CPU mul_mat_id; a selftest can compare it with the GPU). The kernels share
 // the constants, grid and thread layout; only the expert block differs.
 //
 // The node: dst[:, i, t] = as[:, :, ids[i, t]] x src1[:, i % ne11, t], with
-//   as   = the experts, IQ4_XS, IQ3_S or IQ2_S [K, N, n_as] (with the expert cache: the
+//   as   = the experts, IQ4_XS, IQ3_S, IQ2_S or IQ2_XXS [K, N, n_as] (with the expert cache: the
 //          resident slots, and ids the slot ids)
 //   src1 = the activations, F32 [K, ne11, T]; ne11 = 1 for gate/up (one
 //          column per token), n_ids for down (one per expert)
@@ -67,10 +67,11 @@ struct D3d12MmidPlan {
 
 // The expert types with a MUL_MAT_ID kernel.
 inline bool d3d12_mmid_type_supported(ggml_type t) {
-    return t == GGML_TYPE_IQ4_XS || t == GGML_TYPE_IQ3_S || t == GGML_TYPE_IQ2_S;
+    return t == GGML_TYPE_IQ4_XS || t == GGML_TYPE_IQ3_S || t == GGML_TYPE_IQ2_S ||
+           t == GGML_TYPE_IQ2_XXS;
 }
 
-// false when no kernel runs dst: weights not IQ4_XS, IQ3_S or IQ2_S, shapes outside
+// false when no kernel runs dst: weights not IQ4_XS, IQ3_S, IQ2_S or IQ2_XXS, shapes outside
 // ggml_mul_mat_id's 3-d case, ne11 neither 1 nor n_ids, a grid past
 // kD3d12MaxGroups or an offset past 32 bits. req shapes IQ3_S / IQ2_S groups
 // (d3d12_geom_for).
@@ -173,6 +174,11 @@ inline constexpr std::uint32_t kIq2sGrid[512] = {
 #include "../../shaders/ggml_d3d12_iq2s_grid.inc"
 };
 
+// IQ2_XXS: 256 entries in the same codes, two entries a dword.
+inline constexpr std::uint32_t kIq2xxsGrid[128] = {
+#include "../../shaders/ggml_d3d12_iq2xxs_grid.inc"
+};
+
 inline std::uint32_t ld16(const std::uint8_t* at) {
     std::uint16_t v;
     std::memcpy(&v, at, 2);
@@ -223,6 +229,30 @@ inline std::int32_t block_lsumi(ggml_type t, const std::uint8_t* bb, std::uint32
             const std::uint32_t idx = ((qs >> (8u * l)) & 0xFFu) | (((qh >> (2u * l)) & 3u) << 8);
             const std::uint32_t c = (kIq2sGrid[idx >> 1] >> (16u * (idx & 1u))) & 0xFFFFu;
             const std::uint32_t s8 = (sg >> (8u * l)) & 0xFFu;
+            for (std::uint32_t j = 0; j < 8; ++j) {
+                const std::uint32_t b = (c >> (2u * j)) & 3u;
+                const std::int32_t mag = static_cast<std::int32_t>(8u + 17u * b + (b >> 1));
+                sumi += (((s8 >> j) & 1u) ? -mag : mag) * qx[e + 8u * l + j];
+            }
+        }
+        return ls * sumi;
+    }
+    if (t == GGML_TYPE_IQ2_XXS) { // ggml_d3d12_mmid_iq2_xxs.hlsl: ggml's final 0.125 folded into d
+        *d *= 0.125f;
+        const std::uint32_t ib32 = itid >> 1, h = itid & 1u, e = 32u * ib32 + 16u * h;
+        const std::uint8_t* g8 = bb + 2u + 8u * ib32;
+        const std::uint32_t qs = ld16(g8 + 2u * h);
+        const std::uint32_t a1 = ld16(g8 + 4u) | (ld16(g8 + 6u) << 16);
+        const std::int32_t ls = 2 * static_cast<std::int32_t>(a1 >> 28) + 1;
+        const std::uint32_t sv = a1 >> (14u * h);
+        std::int32_t sumi = 0;
+        for (std::uint32_t l = 0; l < 2; ++l) {
+            const std::uint32_t idx = (qs >> (8u * l)) & 0xFFu;
+            const std::uint32_t c = (kIq2xxsGrid[idx >> 1] >> (16u * (idx & 1u))) & 0xFFFFu;
+            std::uint32_t s7 = (sv >> (7u * l)) & 127u, p = s7 ^ (s7 >> 4);
+            p ^= p >> 2;
+            p ^= p >> 1;
+            const std::uint32_t s8 = s7 | ((p & 1u) << 7);
             for (std::uint32_t j = 0; j < 8; ++j) {
                 const std::uint32_t b = (c >> (2u * j)) & 3u;
                 const std::int32_t mag = static_cast<std::int32_t>(8u + 17u * b + (b >> 1));
