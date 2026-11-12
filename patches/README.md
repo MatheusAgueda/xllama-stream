@@ -339,6 +339,21 @@ between 1.0 and 1.5 GiB per process); token_embd + output of
 Qwen3.5-122B-A10B sit at the start of the file, 920 MiB. Unset, nothing
 changes.
 
+`0017-expert-cache-padded-direct.patch` (applies after 0016): `LLAMA_EXPERT_PAD=1`
+lets experts at unaligned file offsets read in place. A GGUF aligns tensor data
+to 32 bytes; every expert tensor of the Qwen3.5-122B-A10B GGUFs sits at an offset
+that is not a multiple of 4 KiB, so each unbuffered read went through the
+thread's staging buffer and a copy into the slot (console, 2026-11-12: 45018
+reads staged, 0 direct; ~0.9-1.0 GB/s against ~2 GB/s for the 35B's in-place
+decode reads). With the knob, a tensor whose expert size is a multiple of 4 KiB
+gets slots 4 KiB apart beyond the expert's bytes (`nb[2]` = expert bytes + 4 KiB,
+the stride the MUL_MAT_ID kernels already take), 12 KiB more in its allocation,
+and its data moved when bound so that every slot sits at the file offset's
+remainder: the aligned span around an expert, or around any aligned part of it,
+lands in place and spills only into the gap (a part's spill is the same file
+bytes its neighbouring parts write there). The expert-major path reads into a
+stage placed the same way. Unset, nothing changes.
+
 ## Applying
 
 ```bash
