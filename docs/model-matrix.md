@@ -188,6 +188,7 @@ person who wonders.
 | LFM2.5-8B-A1B | `lfm25-8b-a1b` | UD-IQ3_S | 3571 MB | **3553 MiB** | **H2 FAIL** (2026-07-30) · 32 experts / 4 active · 14.50 tok/s = the dense 3B at +1437 MiB, and ~4× worse perceived latency |
 | Qwen3.5-122B-A10B heretic | `D:\DevelopmentFiles\xllama\models\qwen35-122b-a10b-heretic-iq3s` | i1-IQ3_S | 52924 MB | ~4.1 GiB (budget) | **unmeasured** (2026-11-11) · 256 experts / 8 active, 48 layers · 2.87 GiB dense+embed resident, 9 expert slots/layer streamed from D:, output.weight on the CPU · n_ctx 4096 |
 | Qwen3.5-122B-A10B heretic | `D:\DevelopmentFiles\xllama\models\qwen35-122b-a10b-heretic-iq2m` | i1-IQ2_M | 39938 MB | ~4.1 GiB (budget) | **unmeasured** (2026-11-12) · IQ2_S experts 2.90 MiB (IQ3_S 3.87) · 1.86 GiB dense+embed on the GPU, 14 expert slots/layer streamed from D:, output.weight on the CPU · n_ctx 4096 |
+| Qwen3.5-122B-A10B heretic | `D:\DevelopmentFiles\xllama\models\qwen35-122b-a10b-heretic-iq2xxs` | i1-IQ2_XXS | 32200 MB | ~4.1 GiB (budget) | **unmeasured** (2026-11-12) · IQ2_XXS experts 2.32 MiB (IQ2_M 2.90), down of 3 layers Q2_K on the CPU · 1.26 GiB dense on the GPU, 17 expert slots/layer streamed from D:, output.weight on the CPU · n_ctx 4096 |
 
 Why it is admissible at all: the console heap ceiling was measured at 4864 MB
 committed (`phase15-ramceil`), and that is what decided IQ3_S over Q2 — a Q2 result

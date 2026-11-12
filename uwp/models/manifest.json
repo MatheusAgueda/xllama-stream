@@ -499,6 +499,24 @@
           "sha256": "3a02c47367d61577fd1ef8265516746a0c91e41f70b347274f4fb11539bd3527"
         }
       ]
+    },
+    {
+      "_comment": "2026-11-12: the same Qwen3.5-122B-A10B heretic as mradermacher i1-IQ2_XXS: gate/up experts IQ2_XXS (66-byte blocks, ggml_d3d12_m{mv,mid}_iq2_xxs), down IQ2_XXS except 3 layers in Q2_K (those MUL_MAT_IDs run on the CPU from the host-visible slots), 2.32 MiB per expert vs 2.90 for i1-IQ2_M, dense 1.26 GiB + embed 0.72 GiB. About 20% fewer bytes per expert-cache miss on the I/O-bound decode and more resident slots in the same Dev Mode GPU cap; slots start at 17 and LocalState overrides them per measurement.",
+      "name": "D:\\DevelopmentFiles\\xllama\\models\\qwen35-122b-a10b-heretic-iq2xxs",
+      "display": "Qwen3.5 122B-A10B heretic (GGUF i1-IQ2_XXS, expert cache, 32.2 GB, experimental)",
+      "kind": "gguf",
+      "n_ctx": 4096,
+      "gpu_layers": 99,
+      "expert_slots": 17,
+      "expert_swap": 0.5,
+      "hf_base_url": "https://huggingface.co/mradermacher/Qwen3.5-122B-A10B-heretic-i1-GGUF/resolve/main",
+      "files": [
+        {
+          "filename": "Qwen3.5-122B-A10B-heretic.i1-IQ2_XXS.gguf",
+          "approx_bytes": 32200189280,
+          "sha256": "ee6dabaeddcb144e25d6c82d3b9427949adb827afb8776046ba211858054fc57"
+        }
+      ]
     }
   ]
 }
