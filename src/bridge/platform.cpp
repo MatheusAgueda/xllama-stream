@@ -146,6 +146,31 @@ std::size_t avail_phys_mb() noexcept {
 #endif
 }
 
+std::size_t avail_commit_mb() noexcept {
+#ifdef XLLAMA_UWP
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof(ms);
+    if (GlobalMemoryStatusEx(&ms))
+        return static_cast<std::size_t>(ms.ullAvailPageFile / (1024 * 1024));
+    return 0;
+#else
+    return avail_phys_mb();
+#endif
+}
+
+std::size_t private_mb() noexcept {
+#ifdef XLLAMA_UWP
+    PROCESS_MEMORY_COUNTERS_EX pmc{};
+    pmc.cb = sizeof(pmc);
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc),
+                                sizeof(pmc)))
+        return pmc.PrivateUsage / (1024 * 1024);
+    return 0;
+#else
+    return 0;
+#endif
+}
+
 GpuMemInfo gpu_mem_info() noexcept {
 #ifdef XLLAMA_UWP
     // Adapter cached for process lifetime: gpu_mem_info() is called per phase

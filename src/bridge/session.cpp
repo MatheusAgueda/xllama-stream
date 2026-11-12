@@ -774,16 +774,20 @@ class LlamaSession final : public Session {
         }
         // A new buffer only with heap to spare after it: the prefill and decode that follow
         // allocate too, and a bad_alloc there ends the app (chain94, 122B: 2 x 149 MiB held, the
-        // next 2327-token prefill died with 0x8007000E). A lent buffer costs nothing.
+        // next 2327-token prefill died with 0x8007000E). A lent buffer costs nothing. The
+        // smaller of the two headrooms decides: chain96 failed a 149 MiB buffer with avail_phys
+        // at 879 MB, so the commit limit is the one heap allocations meet.
         if (ck.state.capacity() < size) {
-            const size_t avail = avail_phys_mb();
+            const size_t phys = avail_phys_mb();
+            const size_t commit = avail_commit_mb();
+            const size_t avail = phys == 0 ? commit : commit == 0 ? phys : std::min(phys, commit);
             const size_t need = size / (1024 * 1024) + rs_ckpt_reserve_mb();
             if (avail != 0 && avail < need) {
-                char sb[192];
+                char sb[224];
                 snprintf(sb, sizeof(sb),
-                         "[xllama] session: KV checkpoint at %zu tokens skipped — avail_phys %zu MB "
-                         "< %zu MB, %zu held (#170c)\n",
-                         n, avail, need, m_rs_ckpts.size());
+                         "[xllama] session: KV checkpoint at %zu tokens skipped — avail_phys %zu MB, "
+                         "commit_avail %zu MB < %zu MB, %zu held (#170c)\n",
+                         n, phys, commit, need, m_rs_ckpts.size());
                 log_output(sb);
                 return;
             }
@@ -794,8 +798,12 @@ class LlamaSession final : public Session {
         } catch (const std::bad_alloc&) {
             m_rs_ckpts.clear();
             m_rs_ckpts.shrink_to_fit();
-            log_output("[xllama] session: KV checkpoint allocation failed — checkpoints "
-                       "dropped (#170c)\n");
+            char fb[224];
+            snprintf(fb, sizeof(fb),
+                     "[xllama] session: KV checkpoint allocation failed — checkpoints dropped "
+                     "(#170c; private %zu MB, avail_phys %zu MB, commit_avail %zu MB)\n",
+                     private_mb(), avail_phys_mb(), avail_commit_mb());
+            log_output(fb);
             return;
         }
         if (llama_state_seq_get_data_ext(ctx, ck.state.data(), size, 0,

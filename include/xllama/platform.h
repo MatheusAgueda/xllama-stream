@@ -39,6 +39,16 @@ std::size_t working_set_mb() noexcept;
 // CreateFileMappingFromApp measured zero benefit; uwp-constraints.md §1).
 std::size_t avail_phys_mb() noexcept;
 
+// Commit the process can still make, in MB (0 if unavailable). UWP: GlobalMemoryStatusEx
+// ullAvailPageFile, "the maximum amount of memory the current process can commit" — the
+// limit a heap allocation actually meets (console, chain96: a 149 MiB KV checkpoint failed
+// with avail_phys at 879 MB). Linux: MemAvailable.
+std::size_t avail_commit_mb() noexcept;
+
+// The process's private commit in MB (UWP: PrivateUsage; Linux: 0). The working set also
+// counts mapped file pages, so it is not what the commit limit is spent against.
+std::size_t private_mb() noexcept;
+
 // Per-process video memory (DXGI LOCAL segment). Measured Budget on Series S
 // with the package designated Game is 3801 MB (in-app QueryVideoMemoryInfo,
 // 2026-07-07 — uwp-constraints.md §7; the older "~768 MB" figure was inferred

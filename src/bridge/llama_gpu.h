@@ -14,6 +14,8 @@
 #include "xllama/speculative.h"
 
 #include <algorithm>
+#include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -48,23 +50,65 @@ inline void llama_bridge_log(ggml_log_level level, const char* text, void*) noex
     }
 }
 
+// The memory pools in one line, written into a caller's stack buffer: it has to work
+// when the heap is what ran out.
+inline void mem_brief(char* buf, std::size_t n) noexcept {
+    const GpuMemInfo g = gpu_mem_info();
+    std::snprintf(buf, n,
+                  "ws %zu MB, private %zu MB, dxgi %zu/%zu MB, avail_phys %zu MB, commit_avail %zu MB",
+                  working_set_mb(), private_mb(), g.current_mb, g.budget_mb, avail_phys_mb(),
+                  avail_commit_mb());
+}
+
+// GGML_ABORT's message goes to stderr, which UWP never shows: 14-slot loads on the console
+// died at "prefill starting" with nothing in xllama.log (chain96, build 513). The callback
+// runs right before ggml calls abort().
+inline void ggml_abort_log(const char* msg) noexcept {
+    char mem[224];
+    mem_brief(mem, sizeof(mem));
+    char line[2400];
+    std::snprintf(line, sizeof(line), "[ggml] ABORT: %s | %s\n", msg ? msg : "?", mem);
+    log_output(line);
+}
+
+// abort() raises SIGABRT before ending the process, on any thread; the UCRT keeps the
+// SIGABRT handler process-wide (std::set_terminate is per thread there). Covers a
+// std::terminate on a worker thread, which the HTTP handler's catch(...) never sees.
+inline void sigabrt_log(int) noexcept {
+    char mem[224];
+    mem_brief(mem, sizeof(mem));
+    char line[288];
+    std::snprintf(line, sizeof(line), "[xllama] SIGABRT | %s\n", mem);
+    log_output(line);
+}
+
 // llama_log_set writes process-global llama and ggml state without a lock, so
 // it is set exactly once, before the first model load on any path (session,
-// run_inference, device train), and never swapped afterwards.
+// run_inference, device train), and never swapped afterwards. The abort hooks
+// ride the same once.
 inline void install_llama_log() {
     static std::once_flag once;
-    std::call_once(once, [] { llama_log_set(llama_bridge_log, nullptr); });
+    std::call_once(once, [] {
+        llama_log_set(llama_bridge_log, nullptr);
+        ggml_set_abort_callback(ggml_abort_log);
+        std::signal(SIGABRT, sigabrt_log);
+    });
 }
 
 // Working set at a load stage, for every GGUF load: the CPU and d3d12 runs log
 // the same stages, so a peak difference can be attributed (#309).
 inline void log_gguf_ws(const char* stage) {
-    // Two pools on the console: D3D12 resources stop at the DXGI budget, plain heap
-    // (KV checkpoints, vectors) runs out where avail_phys does.
+    // Pools on the console: D3D12 resources stop at the DXGI budget; heap allocations
+    // (KV checkpoints, vectors) stop at the commit limit, which the working set does not
+    // measure (it counts mapped pages, private does not).
     const GpuMemInfo g = gpu_mem_info();
-    log_output(std::string("[xllama] ws ") + stage + ": " + std::to_string(working_set_mb()) +
-               " MB (dxgi " + std::to_string(g.current_mb) + "/" + std::to_string(g.budget_mb) +
-               " MB, avail_phys " + std::to_string(avail_phys_mb()) + " MB)\n");
+    char line[320];
+    std::snprintf(line, sizeof(line),
+                  "[xllama] ws %s: %zu MB (private %zu MB, dxgi %zu/%zu MB, avail_phys %zu MB, "
+                  "commit_avail %zu MB)\n",
+                  stage, working_set_mb(), private_mb(), g.current_mb, g.budget_mb, avail_phys_mb(),
+                  avail_commit_mb());
+    log_output(line);
 }
 
 // token_embd's type and whether the model has its own output.weight, read from
