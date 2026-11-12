@@ -355,7 +355,7 @@ bytes its neighbouring parts write there). The expert-major path reads into a
 stage placed the same way. Unset, nothing changes.
 
 `0018-expert-cache-em-gpu.patch` (applies after 0017):
-`LLAMA_EXPERT_EM_GPU=<experts>[:<pairs>]` runs the expert-major matmuls (prompt
+`LLAMA_EXPERT_EM_GPU=<experts>[:<pairs>[:<MiB>]]` runs the expert-major matmuls (prompt
 ubatches larger than the slots take) as `MUL_MAT_ID` dispatches on the GPU of
 the slots instead of the CPU's dot products (console, 2026-11-12: the 122B's
 prefill was CPU-bound, ~69% of thread time in vec_dot, the GPU idle). The
@@ -369,8 +369,12 @@ dispatch of its previous chunk returned. Each dispatch gathers up to `<pairs>`
 (default 2048) token-expert columns of the F32 activations, which the matmul
 op then keeps as a source, and scatters the rows back; a dispatch the device
 refuses or fails is computed on the CPU from the quantized activations. A
-tensor type the device has no kernel for stays on the CPU. Unset, nothing
-changes.
+tensor type the device has no kernel for stays on the CPU. The staging and
+column buffers are only allocated while the device still reports `<MiB>`
+(default 128, max 2048) free beyond them; otherwise, and after a dispatch whose
+backend throws (caught, not the app's end), expert-major stays on the CPU for
+that load (console, 2026-11-12: at 14 slots the 2327-token prefill ended the
+app with E_OUTOFMEMORY next to the KV checkpoints). Unset, nothing changes.
 
 ## Applying
 
