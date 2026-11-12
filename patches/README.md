@@ -328,6 +328,17 @@ calls the real select, plan and load functions itself, in layer order, on the
 scores its kernel computed, so the LRU/LRFU state, the misses and the reads
 stay the cache's. Nothing calls them otherwise: the cache is unchanged.
 
+`0016-lazy-tensors-by-name-span-mapping.patch` (applies after 0015): the
+tensors named in `LLAMA_LAZY_TENSORS` (comma list) are lazy whatever the lazy
+mode and size: they stay on the CPU as views of the file mapping instead of
+heap copies. Without mmap (`load_mode` NONE) the mapping is used for nothing
+else, so on UWP it maps only the span from the first to the last lazy range,
+aligned down to the allocation granularity, and `addr()` stays the address of
+file offset 0. A title cannot map a whole 52.9 GB GGUF (its mapped views stop
+between 1.0 and 1.5 GiB per process); token_embd + output of
+Qwen3.5-122B-A10B sit at the start of the file, 920 MiB. Unset, nothing
+changes.
+
 ## Applying
 
 ```bash

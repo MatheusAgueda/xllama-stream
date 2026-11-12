@@ -141,27 +141,39 @@ inline void set_env_int(const char* name, int v) {
     put_env(name, std::to_string(v).c_str());
 }
 
+inline void set_env_str(const char* name, const char* v) {
+    auto& o = env_overrides();
+    std::lock_guard<std::mutex> lock(o.mtx);
+    for (const auto& kv : o.vars)
+        if (kv.first == name)
+            return;
+    put_env(name, v);
+}
+
 inline void apply_gguf_residency(bool stream, llama_model_params& mparams, int expert_slots = 0,
                                  float expert_swap = 0.0f, int expert_prefetch = 0,
                                  int expert_major = 0, bool expert_prefetch_ahead = false) {
+    // patch 0016: the tensors named here are read through a mapping of their span only; every load sets it again
+    set_env_str("LLAMA_LAZY_TENSORS", "");
     if (expert_slots > 0) {
 #ifdef LLAMA_HAS_EXPERT_SLOTS
-        // XLLAMA_EXPERT_MMAP=1 (a manifest env.* entry): the host-resident tensors (token_embd, and output.weight
-        // when gguf_output_cpu.txt keeps it on the CPU) stay views of the GGUF mapping instead of private copies.
-        // File-backed pages sit outside the title's ~4.8 GB commit cap; the Qwen3.5-122B-A10B IQ3_S load reached
-        // 4810 MB with 909 MiB of them copied and died allocating its 245 MiB of KV + recurrent state.
-        // The routed experts are unaffected: load_all_data binds them to the cache before the mapping is read.
+        // XLLAMA_EXPERT_MMAP=1 (a manifest env.* entry): token_embd and output.weight become lazy tensors (on the
+        // CPU), file-backed through one view of the span that holds them, instead of private heap copies. The
+        // Qwen3.5-122B-A10B IQ3_S load reached 4810 MB with those 909 MiB copied and died allocating its 245 MiB of
+        // KV + recurrent state. A whole-file view (LLAMA_LOAD_MODE_MMAP) of its 52.9 GB is refused by the title's
+        // mapped-view ceiling (MapViewOfFileFromApp: not enough memory resources, measured 2026-11-12), so the load
+        // stays NONE and only the lazy span is mapped: 920 MiB at the start of that file, under the 1.0 GiB that maps.
         const char* em = std::getenv("XLLAMA_EXPERT_MMAP");
         const bool mapped = em && em[0] == '1';
-        mparams.load_mode = mapped ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE;
+        mparams.load_mode = LLAMA_LOAD_MODE_NONE;
         if (mapped)
-            mparams.use_extra_bufts = false; // a repacked tensor is a private copy again
+            set_env_str("LLAMA_LAZY_TENSORS", "token_embd.weight,output.weight");
         mparams.n_expert_slots = static_cast<uint32_t>(expert_slots);
         mparams.expert_swap_ratio = expert_swap;
         set_env_int("LLAMA_EXPERT_PREFETCH", expert_prefetch);
         set_env_int("LLAMA_EXPERT_MAJOR", expert_major);
         set_env_int("LLAMA_EXPERT_PREFETCH_AHEAD", expert_prefetch_ahead ? 1 : 0);
-        log_output(std::string("[xllama] gguf weights: ") + (mapped ? "host tensors mapped" : "heap") +
+        log_output(std::string("[xllama] gguf weights: ") + (mapped ? "heap, token_embd + output lazy (span mapped)" : "heap") +
                    ", expert cache of " + std::to_string(expert_slots) +
                    " experts per layer, swap ratio " + std::to_string(expert_swap) + ", prefetch " +
                    std::to_string(expert_prefetch) + (expert_prefetch_ahead ? " ahead" : "") +
