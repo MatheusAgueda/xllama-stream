@@ -395,6 +395,28 @@ barrier. The `expert cache (final)` line gains `; host tier X MiB (N entries), F
 misses from it (P%, S swaps), V saved, B MiB copied in T ms`. Off with a
 prefetch or deferred plans. Unset, nothing changes.
 
+`0020-expert-cache-em-run.patch` (applies after 0019):
+`LLAMA_EXPERT_EM_RUN=<n>` (2 or more; needs `LLAMA_EXPERT_EM_GPU`) reads the
+expert-major GPU path's staged experts in spans of up to `<n>` consecutive ones. The
+reason: on the 122B, `log_c98a` showed the prefill waiting on reads, 108.7 s of
+145 s on thread 0, from one QD1 unbuffered read of ~1 MiB per expert at ~232 MB/s
+per reader thread, while the same disk streams 2.13 GB/s in 8 MiB requests
+(`diskbw`). The staged experts of each tensor whose expert size is a multiple of
+4 KiB are sorted by id and packed at their file stride in the staging halves
+(`ec_em_gpu_pos`), so the consecutive ones of a chunk are one span of the file.
+`ec_em_runs` cuts spans where the ids stop being consecutive, at a chunk's end and
+after `<n>` experts. `ec_read_run` reads the span's aligned middle in place and its
+partial end blocks through the thread's staging buffer, so it writes no byte
+outside the span's experts. The round's experts still go one by one into their
+slots. The dispatch is unchanged: same experts, same pairs, only the order of
+experts in a chunk differs. The `gpu …` part of the stats line gains `, S spans
+of M experts`. Host harness `tests/harness/expert_cache_em_run.cpp` drives the real
+queue, span builder and reader threads against a simulated thread 0 and checks
+every staged expert and slot byte for byte, plus every other byte of the halves
+and slots: 12096 cases with ASan and UBSan, OK buffered (macOS) and with O_DIRECT
+(Linux aarch64, 64055 reads in place). A spilling read and a wrong stride both
+fail it. Unset, nothing changes.
+
 ## Applying
 
 ```bash
