@@ -417,6 +417,23 @@ and slots: 12096 cases with ASan and UBSan, OK buffered (macOS) and with O_DIREC
 (Linux aarch64, 64055 reads in place). A spilling read and a wrong stride both
 fail it. Unset, nothing changes.
 
+`0021-cpu-compute-plain.patch` (applies after 0020):
+`LLAMA_CPU_COMPUTE_HOST=0` gives the CPU backend's compute buffer its own buffer
+type instead of the first device's host buffer type. The reason: the D3D12
+device hands out `D3D12_Host` as its host buffer type, so the CPU backend's
+intermediates share the device's compute allocator and count against the DXGI
+budget. On the 122B that buffer grows 0.266 MiB per ubatch token (1024: 272 MiB,
+1536: 408 MiB, `log_c98a`), and at 1536 tokens the expert-major GPU buffers no
+longer fit (139.1 MiB free against the 217.4 they need) and the prefill falls back
+to the CPU (1151 tokens in 183 s against 87 s). With the variable at 0 the CPU's
+part moves to process memory: commit is unchanged, DXGI is relieved. The cost is
+the scheduler's copy of every device input that comes from a CPU tensor
+(`host_cpy`, a memcpy into the mapped `D3D12_Host` buffer) and node placement:
+without a shared buffer type, CPU nodes are no longer upgraded to the device.
+The expert-major GPU path copies its activations into its own buffers and is not
+affected. `sched_reserve` then prints a `CPU` compute buffer line beside the
+`D3D12_Host` one. Unset, nothing changes.
+
 ## Applying
 
 ```bash

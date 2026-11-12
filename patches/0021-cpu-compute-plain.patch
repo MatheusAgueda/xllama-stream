@@ -1,0 +1,18 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -430,7 +430,13 @@
+             auto * buft = ggml_backend_get_default_buffer_type(backend.get());
+             auto backend_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
+ 
+-            if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty()) {
++            // LLAMA_CPU_COMPUTE_HOST=0: the CPU backend keeps its own buffer type for its compute buffer, so its
++            // intermediates stop counting against a unified-memory device's budget (the scheduler then copies the
++            // device's inputs that come from CPU tensors)
++            const char * cch = getenv("LLAMA_CPU_COMPUTE_HOST");
++            const bool cpu_host = cch == nullptr || *cch == '\0' || atoi(cch) != 0;
++
++            if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty() && cpu_host) {
+                 // use the host buffer of the first device CPU for faster transfer of the intermediate state
+                 const auto & dev = model.devices[0];
+                 auto * host_buft = ggml_backend_dev_host_buffer_type(dev.dev);
