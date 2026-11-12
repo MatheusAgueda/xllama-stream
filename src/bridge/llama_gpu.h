@@ -333,7 +333,12 @@ inline int apply_gguf_gpu_layers(int requested, llama_model_params& mparams,
     // n_gpu_layers >= 1 always offloads output.weight first, and on a large
     // vocabulary it is the single biggest tensor (Qwen3.5: 248K x 4096 Q6_K =
     // 796 MiB, over what one Series X allocation takes). Knob: keep it on the CPU.
-    if (have_info && has_output && gguf_output_on_cpu()) {
+    // XLLAMA_OUTPUT_CPU (a catalogue env, so per model: applied before this
+    // runs) wins over LocalState\gguf_output_cpu.txt: 1 = CPU, 0 = D3D12. The
+    // 122B needs the CPU and the 35B the device, and the file is one per app.
+    const char* oc = std::getenv("XLLAMA_OUTPUT_CPU");
+    const bool output_cpu = (oc != nullptr && *oc != '\0') ? std::atoi(oc) != 0 : gguf_output_on_cpu();
+    if (have_info && has_output && output_cpu) {
         overrides[n_overrides++] = {"^output\\.weight$", ggml_backend_cpu_buffer_type()};
         log_output("[xllama] gguf gpu layers: output.weight kept on the CPU\n");
     }
