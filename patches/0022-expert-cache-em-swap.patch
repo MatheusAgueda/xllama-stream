@@ -1,0 +1,112 @@
+diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
+--- a/src/llama-expert-cache.cpp
++++ b/src/llama-expert-cache.cpp
+@@ -297,6 +297,7 @@
+     float    swap_ratio    = 0.0f;
+     uint32_t swap_tail     = 0; // LLAMA_EXPERT_SWAP_TAIL: weakest ranks of the top-k a resident takes at any score
+     bool     swap_batch    = false; // LLAMA_EXPERT_SWAP_BATCH: a ubatch's own reads count as resident
++    float    em_swap       = 0.0f;  // LLAMA_EXPERT_EM_SWAP: the swap ratio of expert-major ubatches, 0 = exact there
+     double   lrfu_half     = 0.0;   // LLAMA_EXPERT_LRFU: eviction half-life in plan ticks, 0 = LRU
+     // LLAMA_EXPERT_RD=<window>:<weight>[:<prior>]: LRFU value + weight * P(next use within window | age)
+     uint32_t rd_window     = 0;
+@@ -325,6 +326,7 @@
+     std::atomic<uint64_t> hits    {0};
+     std::atomic<uint64_t> misses  {0};
+     std::atomic<uint64_t> swaps   {0};
++    std::atomic<uint64_t> em_swaps {0}; // of expert-major ubatches (LLAMA_EXPERT_EM_SWAP), not in swaps
+     std::atomic<uint64_t> bytes   {0};
+     std::atomic<uint64_t> read_us {0}; // wall time of the load ops (their slowest thread)
+     uint64_t n_rounds = 0; // plans of first_layer, i.e. ubatches
+@@ -500,9 +502,13 @@
+                 snprintf(gp, sizeof(gp), "; gpu %" PRIu64 " dispatches, %" PRIu64 " pairs, %.0f ms, %.0f ms waiting for reads, %" PRIu64 " on the CPU%s",
+                         em_gpu_n.load(), em_gpu_p.load(), em_gpu_us.load()/1000.0, em_gpu_wait_us.load()/1000.0, em_gpu_cpu.load(), rn);
+             }
+-            snprintf(em, sizeof(em), "; expert-major %" PRIu64 " ubatches, %" PRIu64 " read (%.1f MiB), %" PRIu64 " resident, %" PRIu64 " kept, %.0f ms, %" PRIu64 " resident read from the file (%s; stage from slots %.0f MB/s, from the file %.0f MB/s per thread)%s",
++            char es[48] = "";
++            if (em_swaps.load() > 0) {
++                snprintf(es, sizeof(es), ", %" PRIu64 " swaps", em_swaps.load());
++            }
++            snprintf(em, sizeof(em), "; expert-major %" PRIu64 " ubatches, %" PRIu64 " read (%.1f MiB), %" PRIu64 " resident, %" PRIu64 " kept, %.0f ms, %" PRIu64 " resident read from the file (%s; stage from slots %.0f MB/s, from the file %.0f MB/s per thread)%s%s",
+                     em_rounds.load(), em_reads.load(), em_bytes.load()/1024.0/1024.0, em_hits.load(), em_kept.load(), em_wall/1000.0,
+-                    em_from_file.load(), res_name[em_resident], sus ? (double) em_slot_b.load()/sus : 0.0, fus ? (double) em_file_b.load()/fus : 0.0, gp);
++                    em_from_file.load(), res_name[em_resident], sus ? (double) em_slot_b.load()/sus : 0.0, fus ? (double) em_file_b.load()/fus : 0.0, gp, es);
+         }
+         uint64_t n_direct = 0;
+         uint64_t n_staged = 0;
+@@ -1522,17 +1528,23 @@
+         C.trace_buf.clear();
+         put(head, sizeof(head));
+     }
++
++    // LLAMA_EXPERT_EM_SWAP: an expert-major ubatch swaps at its own ratio, without the tail, and always
++    // as a batch (one read of an expert serves every token of the ubatch there)
++    const bool    em    = C.em_max > 0 && n_tokens > (int64_t) llama_expert_cache_max_ubatch(C);
++    const float   ratio = em ? C.em_swap : C.swap_ratio;
++    const int64_t tail  = em ? 0 : (int64_t) C.swap_tail;
+ 
+     // LLAMA_EXPERT_SWAP_BATCH: a missing expert that some token of a multi-token ubatch keeps is read
+     // for it anyway, so a first pass collects those and the real pass counts them as resident - the
+     // other tokens keep it instead of trading it for a weaker resident (same reads, truer routing)
+     const std::vector<int32_t> * res = &L.slot_of;
+-    if (C.swap_batch && n_tokens > 1) {
++    if ((C.swap_batch || em) && n_tokens > 1) {
+         L.avail = L.slot_of;
+         for (int64_t t = 0; t < n_tokens; ++t) {
+             const float * s = (const float *) ((const char *) scores->data + t*scores->nb[1]);
+             ec_rank(order, s);
+-            ec_swap_missing(L.slot_of, order, s, n_used, C.swap_ratio, C.swap_tail);
++            ec_swap_missing(L.slot_of, order, s, n_used, ratio, tail);
+             for (int64_t k = 0; k < n_used; ++k) {
+                 L.avail[order[k]] = std::max(L.avail[order[k]], 0);
+             }
+@@ -1563,7 +1575,7 @@
+         if (defer) {
+             std::copy(order.begin(), order.begin() + n_used, L.dtop.begin());
+         }
+-        const uint64_t sw = ec_swap_missing(*res, order, s, n_used, C.swap_ratio, C.swap_tail);
++        const uint64_t sw = ec_swap_missing(*res, order, s, n_used, ratio, tail);
+         swaps += sw;
+ 
+         int32_t * out = (int32_t *) ((char *) dst->data + t*dst->nb[1]);
+@@ -1590,7 +1602,7 @@
+     }
+     L.w_ready = lrfu;
+     if (swaps > 0) {
+-        C.swaps += swaps;
++        (em ? C.em_swaps : C.swaps) += swaps;
+     }
+     if (n_tr > 0) {
+         fwrite(C.trace_buf.data(), 1, C.trace_buf.size(), C.trace);
+@@ -2959,6 +2971,18 @@
+             LLAMA_LOG_INFO("%s: expert cache: expert-major reads in spans of up to %u experts\n", __func__, cache->em_run);
+         }
+     }
++    // LLAMA_EXPERT_EM_SWAP=<ratio>: expert-major ubatches route against the cache too (0 = off, the
++    // default: exact routing there): a token's missing expert gives way to the strongest resident one
++    // outside its top-k that scores at least <ratio> x its own, and the experts the ubatch reads count
++    // as resident for all of its tokens. In (0, 1]; independent of the slot path's swap ratio
++    const char * esw = getenv("LLAMA_EXPERT_EM_SWAP");
++    if (esw != nullptr && *esw != '\0' && cache->em_max > 0) {
++        const float r = (float) atof(esw);
++        cache->em_swap = r > 0.0f && r <= 1.0f ? r : 0.0f; // NaN, negatives and > 1: off
++        if (cache->em_swap > 0.0f) {
++            LLAMA_LOG_INFO("%s: expert cache: expert-major ubatches swap at %.2f\n", __func__, cache->em_swap);
++        }
++    }
+     // LLAMA_EXPERT_EM_RESIDENT: where an expert-major ubatch's resident experts come from (slot,
+     // file, auto - the default; also 0, 1, 2)
+     const char * res = getenv("LLAMA_EXPERT_EM_RESIDENT");
+@@ -3284,7 +3308,12 @@
+ 
+ ggml_tensor * llama_expert_cache_build_select(ggml_context * ctx, ggml_tensor * w, ggml_tensor * scores, int64_t n_used) {
+     ec_layer * layer = ec_layer_of(w);
+-    if (layer == nullptr || !(layer->cache->swap_ratio > 0.0f) || llama_expert_cache_is_expert_major(w, scores->ne[1])) {
++    if (layer == nullptr) {
++        return nullptr;
++    }
++    // an expert-major ubatch swaps only with LLAMA_EXPERT_EM_SWAP (ec_select picks the ratio again)
++    const bool em = llama_expert_cache_is_expert_major(w, scores->ne[1]);
++    if (!((em ? layer->cache->em_swap : layer->cache->swap_ratio) > 0.0f)) {
+         return nullptr;
+     }
+     // one row of scores per token, one score per expert of the tensor

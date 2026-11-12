@@ -434,6 +434,27 @@ The expert-major GPU path copies its activations into its own buffers and is not
 affected. `sched_reserve` then prints a `CPU` compute buffer line beside the
 `D3D12_Host` one. Unset, nothing changes.
 
+`0022-expert-cache-em-swap.patch` (applies after 0021):
+`LLAMA_EXPERT_EM_SWAP=<ratio>` (in (0, 1]; 0 or unset = off) gives expert-major
+ubatches the cache-aware routing the slot path has. Until now `build_select`
+made no select op for them, so a long prompt routed exactly and an expert-major
+ubatch read every non-resident expert its tokens touched: on the 35B (53 slots,
+EM on D3D12) 16 ubatches read 183,624 expert tensors (78.9 GB) and the prefill
+spent 42.7 s waiting for them against 27.8 s of GPU work (`c106/log_e52g`). With
+the variable, `ec_select` runs on those ubatches too, at `<ratio>` instead of the
+swap ratio, without `LLAMA_EXPERT_SWAP_TAIL`, and always with the batch rule of
+`LLAMA_EXPERT_SWAP_BATCH` (one read of an expert serves every token of an
+expert-major ubatch, so an expert some token keeps counts as resident for the
+others). The slot path keeps its own ratio, tail and batch setting. Its swaps
+count apart: the `expert-major …` part of the stats line gains `, N swaps`, and
+the slot path's `swaps` total stays the slot path's. A swap only brings a
+resident expert in, so the reads are a subset of the exact routing's. Host
+harness `tests/harness/expert_cache_em_swap.cpp` runs the real `ec_select`
+against an independent reference on random scores (ties and zeros included),
+residency, slot counts and ubatch sizes on both sides of `max_ubatch`. It checks
+every routed expert, the subset property and which counter the swaps land in.
+Unset, nothing changes.
+
 ## Applying
 
 ```bash
