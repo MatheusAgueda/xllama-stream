@@ -146,13 +146,23 @@ inline void apply_gguf_residency(bool stream, llama_model_params& mparams, int e
                                  int expert_major = 0, bool expert_prefetch_ahead = false) {
     if (expert_slots > 0) {
 #ifdef LLAMA_HAS_EXPERT_SLOTS
-        mparams.load_mode = LLAMA_LOAD_MODE_NONE;
+        // XLLAMA_EXPERT_MMAP=1 (a manifest env.* entry): the host-resident tensors (token_embd, and output.weight
+        // when gguf_output_cpu.txt keeps it on the CPU) stay views of the GGUF mapping instead of private copies.
+        // File-backed pages sit outside the title's ~4.8 GB commit cap; the Qwen3.5-122B-A10B IQ3_S load reached
+        // 4810 MB with 909 MiB of them copied and died allocating its 245 MiB of KV + recurrent state.
+        // The routed experts are unaffected: load_all_data binds them to the cache before the mapping is read.
+        const char* em = std::getenv("XLLAMA_EXPERT_MMAP");
+        const bool mapped = em && em[0] == '1';
+        mparams.load_mode = mapped ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE;
+        if (mapped)
+            mparams.use_extra_bufts = false; // a repacked tensor is a private copy again
         mparams.n_expert_slots = static_cast<uint32_t>(expert_slots);
         mparams.expert_swap_ratio = expert_swap;
         set_env_int("LLAMA_EXPERT_PREFETCH", expert_prefetch);
         set_env_int("LLAMA_EXPERT_MAJOR", expert_major);
         set_env_int("LLAMA_EXPERT_PREFETCH_AHEAD", expert_prefetch_ahead ? 1 : 0);
-        log_output("[xllama] gguf weights: heap, expert cache of " + std::to_string(expert_slots) +
+        log_output(std::string("[xllama] gguf weights: ") + (mapped ? "host tensors mapped" : "heap") +
+                   ", expert cache of " + std::to_string(expert_slots) +
                    " experts per layer, swap ratio " + std::to_string(expert_swap) + ", prefetch " +
                    std::to_string(expert_prefetch) + (expert_prefetch_ahead ? " ahead" : "") +
                    ", expert-major " + std::to_string(expert_major) + "\n");
