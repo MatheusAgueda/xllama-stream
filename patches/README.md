@@ -376,6 +376,25 @@ backend throws (caught, not the app's end), expert-major stays on the CPU for
 that load (console, 2026-11-12: at 14 slots the 2327-token prefill ended the
 app with E_OUTOFMEMORY next to the KV checkpoints). Unset, nothing changes.
 
+`0019-expert-cache-host-tier.patch` (applies after 0018):
+`LLAMA_EXPERT_HOST=<MiB>[:<keep MB>]` adds a host tier of plain heap memory under
+the slots of each layer, for the case where the device budget stops the slot count
+before the process commit does. A layer's share of `<MiB>` holds up to
+`n_expert - slots` whole experts, sized at the layer's first plan. It is
+allocated only while `min(avail_phys, avail_page_file)` stays above `<keep>`
+(default 512); the entry count is halved when an allocation fails. A slot's evicted
+expert is saved into the tier, which takes a free entry, or else the least
+recently used one that the ubatch does not use. A miss found in the tier is
+memcpy'd into its slot instead of read from the file; when the victim also needs
+saving, the two swap places. Slot plans, miss counts and the slot bytes stay
+those of a run without the tier (host harness: 6 configurations, plans dropped
+before their load included, byte-exact slots and entries; `test_expert_cache`
+checks tokens, logits and misses against the plain run). Only bytes read from
+the file shrink. Copies run on the load threads, and the disk reads start after a
+barrier. The `expert cache (final)` line gains `; host tier X MiB (N entries), F
+misses from it (P%, S swaps), V saved, B MiB copied in T ms`. Off with a
+prefetch or deferred plans. Unset, nothing changes.
+
 ## Applying
 
 ```bash

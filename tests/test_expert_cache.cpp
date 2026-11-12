@@ -756,6 +756,37 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
             CHECK(misses_of(log.final_line) <= plain_misses);
         }
 
+        // Host tier (LLAMA_EXPERT_HOST): the slots' victims are copied to host
+        // memory and a missing expert found there is copied back instead of read.
+        // The slots change exactly as plain's (same misses), each gets the same
+        // bytes, so the same tokens and logits bit for bit; some misses come
+        // from the tier and the disk reads fewer bytes.
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            log.final_line.clear();
+        }
+        set_env_s("LLAMA_EXPERT_HOST", "256:0");
+        const EcRun hosted = run_greedy(path, c.slots, 512, c.used, 24);
+        set_env_s("LLAMA_EXPERT_HOST", nullptr);
+        REQUIRE(hosted.ok);
+        CHECK(hosted.n_ubatch == cached.n_ubatch);
+        CHECK(hosted.tokens == plain.tokens);
+        CHECK(hosted.logits == plain.logits);
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            MESSAGE(log.final_line);
+            CHECK(misses_of(log.final_line) == plain_misses);
+            const char* p = std::strstr(log.final_line.c_str(), "; host tier ");
+            REQUIRE(p != nullptr);
+            double mib = 0.0;
+            unsigned long long entries = 0, from = 0;
+            REQUIRE(std::sscanf(p, "; host tier %lf MiB (%llu entries), %llu misses from it", &mib,
+                                &entries, &from) == 3);
+            CHECK(entries > 0);
+            CHECK(from > 0);
+            CHECK(from <= static_cast<unsigned long long>(plain_misses));
+        }
+
         // Swap batch (LLAMA_EXPERT_SWAP_BATCH): in a multi-token ubatch the experts
         // one token keeps count as resident for the others. A ratio above 1 still
         // never swaps (exact routing, same tokens and misses as plain); at 0.5 the
