@@ -59,8 +59,12 @@ inline void install_llama_log() {
 // Working set at a load stage, for every GGUF load: the CPU and d3d12 runs log
 // the same stages, so a peak difference can be attributed (#309).
 inline void log_gguf_ws(const char* stage) {
+    // Two pools on the console: D3D12 resources stop at the DXGI budget, plain heap
+    // (KV checkpoints, vectors) runs out where avail_phys does.
+    const GpuMemInfo g = gpu_mem_info();
     log_output(std::string("[xllama] ws ") + stage + ": " + std::to_string(working_set_mb()) +
-               " MB\n");
+               " MB (dxgi " + std::to_string(g.current_mb) + "/" + std::to_string(g.budget_mb) +
+               " MB, avail_phys " + std::to_string(avail_phys_mb()) + " MB)\n");
 }
 
 // token_embd's type and whether the model has its own output.weight, read from

@@ -40,7 +40,7 @@ diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
  };
  
  enum ec_pf_state : int { EC_PF_QUEUED, EC_PF_RUNNING, EC_PF_DONE, EC_PF_CANCELLED };
-@@ -350,7 +361,45 @@
+@@ -350,7 +361,46 @@
      std::atomic<uint64_t> em_slot_us   {0}; //   and the time the copies took, summed over the threads
      std::atomic<uint64_t> em_file_b    {0}; // bytes read from the files to the stages (halved every ubatch)
      std::atomic<uint64_t> em_file_us   {0};
@@ -54,6 +54,7 @@ diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
 +    // the activations and results buffers. The CPU's dot products stay the fallback of a dispatch
 +    uint32_t em_gpu_chunk = 0;
 +    uint32_t em_gpu_pairs = 2048;
++    uint32_t em_gpu_keep_mb = 128; // <experts>:<pairs>:<MiB>: the device budget the buffers must leave free
 +    ggml_backend_t gpu = nullptr; // the context's backend of buft.device (llama_expert_cache_set_backend)
 +    ggml_backend_buffer_t em_gpu_stage = nullptr; // EXPERT_CACHE type: the kernel reads experts only from the cache's buffers
 +    ggml_backend_buffer_t em_gpu_io    = nullptr; // activations, ids and results (write-back: thread 0 reads the results)
@@ -86,7 +87,7 @@ diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
      void log_stats(const char * when) const {
          const uint64_t h = hits.load();
          const uint64_t m = misses.load();
-@@ -381,14 +430,19 @@
+@@ -381,14 +431,19 @@
                      n ? pf_lag_us.load()/1000.0/n : 0.0, n ? pf_run_us.load()/1000.0/n : 0.0,
                      pf_ahead ? ", ahead" : "", pf_help ? ", help" : "", prio, mode);
          }
@@ -109,7 +110,7 @@ diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
          }
          uint64_t n_direct = 0;
          uint64_t n_staged = 0;
-@@ -416,6 +470,7 @@
+@@ -416,6 +471,7 @@
          if (n_rounds > 0 || em_rounds.load() > 0) {
              log_stats("final");
          }
@@ -117,7 +118,7 @@ diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
          if (trace != nullptr) {
              fclose(trace);
          }
-@@ -1696,8 +1751,299 @@
+@@ -1696,6 +1752,327 @@
          return nullptr;
      }
      return w;
@@ -153,6 +154,21 @@ diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
 +    C.em_gpu_y    = C.em_gpu_ids + GGML_PAD(P*sizeof(int32_t), A);
 +    const size_t n_stage = 2*C.em_gpu_half + 4*A;
 +    const size_t n_io    = C.em_gpu_y + GGML_PAD(P*(size_t) max_n*sizeof(float), A) + A;
++    // the device's budget left after the buffers: what the graphs' scratch and lists grow into
++    {
++        ggml_backend_dev_t dev = ggml_backend_get_device(C.gpu);
++        size_t fr = 0, tot = 0;
++        if (dev != nullptr) {
++            ggml_backend_dev_memory(dev, &fr, &tot);
++        }
++        const size_t keep = (size_t) C.em_gpu_keep_mb << 20;
++        if (tot > 0 && fr < n_stage + n_io + keep) {
++            C.em_gpu_failed = true;
++            LLAMA_LOG_WARN("expert cache: %.1f MiB free on %s, the expert-major GPU buffers (%.1f + %.1f MiB) would leave less than %u MiB, on the CPU\n",
++                    fr/1024.0/1024.0, ggml_backend_name(C.gpu), n_stage/1024.0/1024.0, n_io/1024.0/1024.0, C.em_gpu_keep_mb);
++            return false;
++        }
++    }
 +    ggml_backend_buffer_t st = ggml_backend_buft_alloc_buffer(C.inner, n_stage);
 +    ggml_backend_buffer_t io = st != nullptr ? ggml_backend_buft_alloc_buffer(C.inner, n_io) : nullptr;
 +    if (st == nullptr || io == nullptr) {
@@ -254,7 +270,7 @@ diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
 +    auto flush = [&](int32_t P) {
 +        const int64_t t0 = ggml_time_us();
 +        ggml_init_params ip = { C.em_gpu_meta.size(), C.em_gpu_meta.data(), true };
-+        ggml_context * ctx = ggml_init(ip);
++        ggml_context * ctx = C.em_gpu_failed ? nullptr : ggml_init(ip);
 +        bool ok = ctx != nullptr;
 +        ggml_tensor * as = as_w;
 +        if (ok && as == nullptr) {
@@ -275,7 +291,22 @@ diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
 +            if (ok) {
 +                ggml_cgraph * gf = ggml_new_graph_custom(ctx, 4, false);
 +                ggml_build_forward_expand(gf, y);
-+                ok = ggml_backend_graph_compute(C.gpu, gf) == GGML_STATUS_SUCCESS;
++                // thread 0 is the caller's thread: a throw from the backend (std::bad_alloc near the
++                // memory cap) would leave the graph mid-compute and reach the app (chain94: the
++                // 2327-token prefill died with 0x8007000E). The CPU takes this and every later dispatch
++                try {
++                    ok = ggml_backend_graph_compute(C.gpu, gf) == GGML_STATUS_SUCCESS;
++                } catch (const std::exception & ex) {
++                    ok = false;
++                    C.em_gpu_failed = true;
++                    LLAMA_LOG_WARN("expert cache: a GPU expert-major dispatch on %s threw (%s), expert-major back on the CPU\n",
++                            ggml_backend_name(C.gpu), ex.what());
++                } catch (...) {
++                    ok = false;
++                    C.em_gpu_failed = true;
++                    LLAMA_LOG_WARN("expert cache: a GPU expert-major dispatch on %s threw, expert-major back on the CPU\n",
++                            ggml_backend_name(C.gpu));
++                }
 +            }
 +        }
 +        if (ctx != nullptr) {
@@ -331,8 +362,8 @@ diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
 +    if (P > 0) {
 +        flush(P);
 +    }
- }
- 
++}
++
 +// the GPU path of ec_em_mm: threads 1.. read the queue, thread 0 dispatches the slots' experts (the
 +// resident ones and, once read, the round's), then each staging chunk as soon as it is read
 +static void ec_em_mm_gpu(ggml_tensor * dst, int ith, ec_em & E, uint64_t & reads, uint64_t & hits,
@@ -412,19 +443,17 @@ diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
 +        E.gdisp.store(c + 1, std::memory_order_release);
 +    }
 +    C.em_gpu_wait_us += (uint64_t) wait_us;
-+}
-+
+ }
+ 
  // all threads: the activations b [k, ne11, n_tokens] (F32) quantized for the dot product of the
- // expert type, one row per (ne11 row, token); thread 0 also groups the ubatch's pairs by expert and,
- // for the first expert tensor of the layer, gives slots to missing experts. src = {b, ids}, dst =
-@@ -1815,6 +2161,35 @@
+@@ -1815,6 +2192,35 @@
              C.em_file_us.store(C.em_file_us.load() / 2);
          }
      }
 +
 +    // LLAMA_EXPERT_EM_GPU: the matmul's read queue, the round's experts (into their slots) first
 +    E.gpu = false;
-+    if (C.em_gpu_chunk > 0 && nth >= 2 && C.gpu != nullptr && ec_em_gpu_ok(C, C.tensors[E.tensor])) {
++    if (C.em_gpu_chunk > 0 && nth >= 2 && C.gpu != nullptr && !C.em_gpu_failed && ec_em_gpu_ok(C, C.tensors[E.tensor])) {
 +        E.gq.clear();
 +        for (int32_t e : E.list) {
 +            if (L.em_slot[e] >= 0) {
@@ -453,7 +482,7 @@ diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
      L.em_state[E.pos] = 1;
  }
  
-@@ -1888,6 +2263,9 @@
+@@ -1888,6 +2294,9 @@
      };
      const size_t  nb1 = w->nb[1];
      const int64_t blk = std::max<int64_t>(1, (int64_t) (EC_EM_BLOCK/nb1)); // rows per copy of a resident expert
@@ -463,24 +492,27 @@ diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
      for (int32_t i = E.next.fetch_add(1); i < n_list; i = E.next.fetch_add(1)) {
          const int32_t e = E.list[i];
          const int32_t v = L.em_slot[e];
-@@ -2174,6 +2552,16 @@
+@@ -2174,6 +2583,19 @@
      // LLAMA_EXPERT_PAD=1: slots padded so that experts at unaligned file offsets read in place (off by default)
      const char * pad = getenv("LLAMA_EXPERT_PAD");
      cache->io_pad = cache->io_direct && pad != nullptr && *pad != '\0' && atoi(pad) != 0;
-+    // LLAMA_EXPERT_EM_GPU=<experts>[:<pairs>]: expert-major matmuls on the GPU of the slots (0 = off)
++    // LLAMA_EXPERT_EM_GPU=<experts>[:<pairs>[:<MiB>]]: expert-major matmuls on the GPU of the slots (0 =
++    // off); <MiB> (128) of the device's budget stay free after the buffers, else the CPU keeps them
 +    const char * eg = getenv("LLAMA_EXPERT_EM_GPU");
 +    if (eg != nullptr && *eg != '\0') {
 +        unsigned ch = 0;
 +        unsigned pr = 2048;
-+        if (sscanf(eg, "%u:%u", &ch, &pr) >= 1 && ch > 0) {
-+            cache->em_gpu_chunk = std::min(ch, 256u);
-+            cache->em_gpu_pairs = std::min(std::max(pr, 64u), 16384u);
++        unsigned kp = 128;
++        if (sscanf(eg, "%u:%u:%u", &ch, &pr, &kp) >= 1 && ch > 0) {
++            cache->em_gpu_chunk   = std::min(ch, 256u);
++            cache->em_gpu_pairs   = std::min(std::max(pr, 64u), 16384u);
++            cache->em_gpu_keep_mb = std::min(kp, 2048u);
 +        }
 +    }
      // LLAMA_EXPERT_EM_RESIDENT: where an expert-major ubatch's resident experts come from (slot,
      // file, auto - the default; also 0, 1, 2)
      const char * res = getenv("LLAMA_EXPERT_EM_RESIDENT");
-@@ -2220,6 +2608,22 @@
+@@ -2220,6 +2642,22 @@
      return false;
  }
  
@@ -503,7 +535,7 @@ diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
  uint32_t llama_expert_cache_n_slots(const llama_expert_cache & cache) {
      return cache.n_slots;
  }
-@@ -2456,7 +2860,11 @@
+@@ -2456,7 +2894,11 @@
      ggml_tensor * q = ggml_custom_4d(ctx, GGML_TYPE_I8, n_q, 1, 1, 1, args, 2, ec_em_prep, GGML_N_TASKS_MAX, T.em.get());
      ggml_format_name(q, "%s-em_act", ggml_get_name(w));
  

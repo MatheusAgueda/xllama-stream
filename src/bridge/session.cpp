@@ -513,6 +513,15 @@ class LlamaSession final : public Session {
     };
     // 2 x 63 MiB on the console, whose heap has ~0.5 GB free with the model in.
     static constexpr size_t kRsCheckpoints = 2;
+    // Heap a new checkpoint must leave free (XLLAMA_RS_CKPT_RESERVE_MB, default 384):
+    // the 122B's are 149 MiB each, and the console's heap has less to spare there.
+    static size_t rs_ckpt_reserve_mb() {
+        static const size_t v = [] {
+            const char* s = std::getenv("XLLAMA_RS_CKPT_RESERVE_MB");
+            return s && *s ? static_cast<size_t>(std::strtoul(s, nullptr, 10)) : size_t(384);
+        }();
+        return v;
+    }
     // A turn's last 4 tokens are what the next request re-renders differently:
     // Qwen's "<think>\n\n</think>\n\n" generation prompt is dropped from the
     // history (upstream checkpoints at the same offset).
@@ -762,6 +771,22 @@ class LlamaSession final : public Session {
         if (m_rs_ckpts.size() >= kRsCheckpoints) {
             ck = std::move(m_rs_ckpts.front());
             m_rs_ckpts.erase(m_rs_ckpts.begin());
+        }
+        // A new buffer only with heap to spare after it: the prefill and decode that follow
+        // allocate too, and a bad_alloc there ends the app (chain94, 122B: 2 x 149 MiB held, the
+        // next 2327-token prefill died with 0x8007000E). A lent buffer costs nothing.
+        if (ck.state.capacity() < size) {
+            const size_t avail = avail_phys_mb();
+            const size_t need = size / (1024 * 1024) + rs_ckpt_reserve_mb();
+            if (avail != 0 && avail < need) {
+                char sb[192];
+                snprintf(sb, sizeof(sb),
+                         "[xllama] session: KV checkpoint at %zu tokens skipped — avail_phys %zu MB "
+                         "< %zu MB, %zu held (#170c)\n",
+                         n, avail, need, m_rs_ckpts.size());
+                log_output(sb);
+                return;
+            }
         }
         try {
             ck.state.resize(size);
@@ -1019,6 +1044,8 @@ class LlamaSession final : public Session {
         // LOGICAL batch only — the physical ubatch stays 512 (#172 optimum),
         // which is what the prefill rate was measured on.
         InferenceWatchdog wd(gp.progress(), gp.abort_flag);
+        if (n_pf >= 256)
+            log_gguf_ws("at prefill"); // both pools before a long prefill: what it has to grow into
         wd.enter_prefill(n_pf);
         const auto t_prefill0 = std::chrono::steady_clock::now();
         // MTP: the drafter holds what the target kept, and mirrors every
