@@ -198,6 +198,50 @@ inline void apply_gguf_residency(bool stream, llama_model_params& mparams, int e
 #endif
 }
 
+// XLLAMA_EXPERT_USED=<k> (a manifest env.* entry): route each token to k experts instead of the
+// GGUF's <arch>.expert_used_count, through a llama.cpp kv override (the router keeps its top k and
+// renormalises their weights over them). With the expert cache a decode reads ~k/K of the expert
+// bytes it would; quality is the price, so it is measured per model, never a default. Ignored
+// unless 0 < k < the file's count; every load sets mparams.kv_overrides again.
+inline void apply_expert_used_override(llama_model_params& mparams, const std::string& path) {
+    static llama_model_kv_override ovr[2];
+    mparams.kv_overrides = nullptr;
+    const char* s = std::getenv("XLLAMA_EXPERT_USED");
+    const int k = s && *s ? std::atoi(s) : 0;
+    if (k <= 0)
+        return;
+    gguf_init_params gp = {};
+    gp.no_alloc = true;
+    gp.ctx = nullptr;
+    gguf_context* g = gguf_init_from_file(path.c_str(), gp);
+    if (!g)
+        return;
+    std::string key;
+    int64_t have = -1;
+    const int64_t ak = gguf_find_key(g, "general.architecture");
+    if (ak >= 0 && gguf_get_kv_type(g, ak) == GGUF_TYPE_STRING) {
+        key = std::string(gguf_get_val_str(g, ak)) + ".expert_used_count";
+        const int64_t uk = gguf_find_key(g, key.c_str());
+        if (uk >= 0 && gguf_get_kv_type(g, uk) == GGUF_TYPE_UINT32)
+            have = gguf_get_val_u32(g, uk);
+        else if (uk >= 0 && gguf_get_kv_type(g, uk) == GGUF_TYPE_INT32)
+            have = gguf_get_val_i32(g, uk);
+    }
+    gguf_free(g);
+    if (have <= 0 || k >= have || key.size() >= sizeof(ovr[0].key)) {
+        log_output("[xllama] expert used " + std::to_string(k) + " ignored (" + (key.empty() ? "no arch" : key) +
+                   " = " + std::to_string(have) + ")\n");
+        return;
+    }
+    ovr[0] = {};
+    ovr[0].tag = LLAMA_KV_OVERRIDE_TYPE_INT;
+    std::memcpy(ovr[0].key, key.c_str(), key.size() + 1);
+    ovr[0].val_i64 = k;
+    ovr[1] = {}; // key[0] == 0 ends the list
+    mparams.kv_overrides = ovr;
+    log_output("[xllama] expert used " + std::to_string(k) + " of " + std::to_string(have) + " (" + key + ")\n");
+}
+
 // Sets mparams.devices / n_gpu_layers and returns the layers actually
 // offloaded: 0 when none were asked for or the device is unavailable, in
 // which case the model loads exactly as before (CPU, no GPU device listed).
