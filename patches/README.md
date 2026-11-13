@@ -461,6 +461,38 @@ residency, slot counts and ubatch sizes on both sides of `max_ubatch`. It checks
 every routed expert, both subset properties and which counter the swaps land in.
 Unset, nothing changes.
 
+`0023-expert-cache-pool.patch` (applies after 0022):
+`LLAMA_EXPERT_POOL=1` (0 or unset = off) makes every layer's expert slot tensors
+share ONE allocation instead of one set per layer. Decode walks the layers in
+order and a layer reuses nothing from the one before it, so only the current
+layer's experts must be resident; the rest occupy the same bytes in turn. In
+`llama_expert_cache_shrink` each slot tensor is keyed on its role (the name after
+`blk.N.`), type and layout; the first of each key is canonical and really
+allocated, every later layer's same-role tensor becomes a `view_src` alias of it,
+so ggml reserves one set of slots, not `n_layer` of them. On the 235B (`qwen3moe`,
+94 layers, 8 experts used per token, 7.73 MiB per expert slice) the naive 8 slots
+× 94 layers ≈ 5.8 GiB of slots alone is over the Series X Dev Mode commit ceiling,
+so the model cannot load; with the pool it is one layer's worth, ≈ 62 MiB, and the
+model fits with ~0.9 GiB to spare at `n_ctx` 2048. `ec_pool_claim(L)`, called at
+the first residency-touching op of each layer (`ec_select`, `ec_plan`,
+`ec_em_prep`, `llama_ec_route_prepare`), hands the shared slots to L and first
+evicts the previous owner — settles its reads, drops its unloaded entries, ends
+its expert-major pass and clears its slot map — so one layer is resident at a time
+(0 cache hits by design: there is no cross-layer reuse anyway, 752 misses per
+token). The router scores that first op needs depend on the previous layer's
+output, so that layer's expert matmuls are finished and its slots are free before
+the claim. `bind` clears the alias's `view_src` and re-points `t->data` into the
+shared base with the layer's own `LLAMA_EXPERT_PAD` remainder, so the D3D12 graph
+walker (`base_of`) treats each layer's slots as their own root and the padded
+windows stay disjoint. The pool is incompatible with prefetch, deferred admission
+and the host victim tier (they keep per-layer residents across tokens), so
+enabling it forces `pf_k`, `pf_ahead`, `defer_b` and the host tier off regardless
+of their own variables. Host harness `tests/harness/expert_cache_pool.cpp` drives
+the real `ec_pool_claim` on constructed layers: the first claim takes ownership
+and evicts nothing, claiming the current owner is a no-op, claiming a new layer
+fully evicts the previous one and leaves the new one's residents untouched, and
+with the pool off a claim does nothing. Unset, nothing changes.
+
 ## Applying
 
 ```bash
