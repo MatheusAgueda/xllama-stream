@@ -22,7 +22,10 @@
     #define PSAPI_VERSION 2
     #include <psapi.h>
     #include <unknwn.h>
+    #include <winrt/Windows.Foundation.h>
+    #include <winrt/Windows.Foundation.Metadata.h>
     #include <winrt/Windows.Storage.h>
+    #include <winrt/Windows.System.h>
     #include <dxgi1_4.h>
 // clang-format on
 #endif
@@ -201,6 +204,72 @@ GpuMemInfo gpu_mem_info() noexcept {
     return info;
 #else
     return {};
+#endif
+}
+
+AppMemInfo app_mem_info() noexcept {
+    AppMemInfo info;
+#ifdef XLLAMA_UWP
+    try {
+        using winrt::Windows::System::MemoryManager;
+        constexpr unsigned long long kMiB = 1024ull * 1024ull;
+        info.usage_mb = static_cast<std::size_t>(MemoryManager::AppMemoryUsage() / kMiB);
+        info.limit_mb = static_cast<std::size_t>(MemoryManager::AppMemoryUsageLimit() / kMiB);
+        info.level = static_cast<int>(MemoryManager::AppMemoryUsageLevel());
+        static const bool s_expected =
+            winrt::Windows::Foundation::Metadata::ApiInformation::IsPropertyPresent(
+                L"Windows.System.MemoryManager", L"ExpectedAppMemoryUsageLimit");
+        if (s_expected)
+            info.expected_mb =
+                static_cast<std::size_t>(MemoryManager::ExpectedAppMemoryUsageLimit() / kMiB);
+        info.available = true;
+    } catch (...) {
+    }
+#endif
+    return info;
+}
+
+void watch_app_memory() noexcept {
+#ifdef XLLAMA_UWP
+    static std::once_flag s_once;
+    try {
+        std::call_once(s_once, [] {
+            using winrt::Windows::System::MemoryManager;
+            (void)MemoryManager::AppMemoryUsageLimitChanging(
+                [](winrt::Windows::Foundation::IInspectable const&,
+                   winrt::Windows::System::AppMemoryUsageLimitChangingEventArgs const& a) {
+                    try {
+                        constexpr unsigned long long kMiB = 1024ull * 1024ull;
+                        char b[192];
+                        std::snprintf(b, sizeof(b),
+                                      "[xllama] app-mem limit changing: %llu -> %llu MB (usage %llu MB)\n",
+                                      static_cast<unsigned long long>(a.OldLimit()) / kMiB,
+                                      static_cast<unsigned long long>(a.NewLimit()) / kMiB,
+                                      static_cast<unsigned long long>(MemoryManager::AppMemoryUsage()) /
+                                          kMiB);
+                        log_output(b);
+                    } catch (...) {
+                    }
+                });
+            (void)MemoryManager::AppMemoryUsageIncreased(
+                [](winrt::Windows::Foundation::IInspectable const&,
+                   winrt::Windows::Foundation::IInspectable const&) {
+                    const AppMemInfo m = app_mem_info();
+                    char b[192];
+                    std::snprintf(b, sizeof(b),
+                                  "[xllama] app-mem usage increased: %zu/%zu MB expected %zu MB level %d\n",
+                                  m.usage_mb, m.limit_mb, m.expected_mb, m.level);
+                    log_output(b);
+                });
+            const AppMemInfo m = app_mem_info();
+            char b[192];
+            std::snprintf(b, sizeof(b),
+                          "[xllama] app-mem watch: %zu/%zu MB expected %zu MB level %d\n", m.usage_mb,
+                          m.limit_mb, m.expected_mb, m.level);
+            log_output(b);
+        });
+    } catch (...) {
+    }
 #endif
 }
 

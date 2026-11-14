@@ -101,13 +101,17 @@ inline void log_gguf_ws(const char* stage) {
     // Pools on the console: D3D12 resources stop at the DXGI budget; heap allocations
     // (KV checkpoints, vectors) stop at the commit limit, which the working set does not
     // measure (it counts mapped pages, private does not).
+    // The OS cap comes after the closing parenthesis so the existing parsers (xbox_soak R_WS)
+    // keep matching.
+    watch_app_memory();
     const GpuMemInfo g = gpu_mem_info();
-    char line[320];
+    const AppMemInfo a = app_mem_info();
+    char line[400];
     std::snprintf(line, sizeof(line),
                   "[xllama] ws %s: %zu MB (private %zu MB, dxgi %zu/%zu MB, avail_phys %zu MB, "
-                  "commit_avail %zu MB)\n",
+                  "commit_avail %zu MB) app %zu/%zu MB expected %zu MB level %d\n",
                   stage, working_set_mb(), private_mb(), g.current_mb, g.budget_mb, avail_phys_mb(),
-                  avail_commit_mb());
+                  avail_commit_mb(), a.usage_mb, a.limit_mb, a.expected_mb, a.level);
     log_output(line);
 }
 
