@@ -493,6 +493,29 @@ and evicts nothing, claiming the current owner is a no-op, claiming a new layer
 fully evicts the previous one and leaves the new one's residents untouched, and
 with the pool off a claim does nothing. Unset, nothing changes.
 
+`0024-cpu-fa-gqa.patch` (applies after 0023, touches only `ggml/src/ggml-cpu/ops.cpp`):
+decode flash attention on the CPU (`offload_kqv=false`, f16 K/V, one query row,
+`n_kv >= 512`) takes the split-KV path: each thread owns a KV chunk and walked it
+once per QUERY head, so with grouped-query attention every K and V row was loaded
+`n_head / n_head_kv` times (8 on Qwen3.5-35B-A3B, 16:2). At 10K context a thread's
+chunk is ~1.7 MB per K/V head, past a Zen 2 core's 512 KB L2, so the re-reads went
+to L3/DRAM and the per-token cost grew faster than linear in context.
+`ggml_compute_forward_flash_attn_ext_f16_gqa_chunk` walks the chunk once per K/V
+head with all its query heads together: each K/V row is loaded once and used by
+the G heads while it sits in L1. Every head keeps its own `Q_q`, fp16 `VKQ`, `M`
+and `S` and runs the f16 branch of `_one_chunk` in the same order (same mask skip,
+scale, softcap, ALiBi slope, sinks on the first chunk), so the partials and the
+output are the same bits; the reduce is untouched. Scratch is `thread_local` (G ×
+(Q row + DV fp16), 8 KiB here), so the planned work size is unchanged. Taken when
+K and V are f16, `1 < G <= 32`, `n_head == G * n_head_kv`; anything else (q8_0
+KV, MHA, f32) keeps the old loop. `GGML_CPU_FA_GQA=0` restores the old path; it is
+read on every call, so a manifest `env` honours it per load. Host harness
+`tests/harness/cpu_fa_gqa.cpp` (Linux gcc, `GGML_AVX2/FMA/F16C`, no AVX-512, Zen 4,
+6 threads, 6 layers with their own KV, 2026-11-14): BIT-EXACT in 10 of 10 cases
+(n_kv 512/1000/4096/10000/16384, 3/6/30 threads, masked holes, ALiBi 8, softcap
+30, sinks, an idle thread); time per 6 layers 57.5 → 24.4 ms at 10K (×2.36),
+140.2 → 41.7 ms at 16K (×3.36), ×0.97–1.08 at 4K and below.
+
 ## Applying
 
 ```bash

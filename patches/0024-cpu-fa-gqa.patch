@@ -1,0 +1,205 @@
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -11,6 +11,8 @@
+ #include <algorithm>
+ #include <cfloat>
+ #include <cmath>
++#include <cstdlib>
++#include <vector>
+ 
+ // ggml_compute_forward_dup
+ 
+@@ -9073,7 +9075,177 @@
+ 
+             // permute(0, 2, 1, 3)
+             memcpy((char *) dst->data + (i3*ne2*ne1 + i2 + i1*ne1)*nb1, VKQ32, nb1);
++        }
++    }
++}
++
++// Grouped-query split-KV chunk: the rk2 query heads that share one K/V head walk the chunk together, so every K and V
++// row is loaded once per K/V head instead of once per query head (Qwen3.5 16:2 re-read each row 8 times). Each head
++// keeps its own Q_q, VKQ16, M and S and goes through the f16 branch of _one_chunk in the same order, so the partials
++// are the same bits. Caller guarantees: f16 K and V, neq1 == neq3 == 1, neq2 == G*nek2, nev2 == nek2, nek3 == nev3 == 1.
++// GGML_CPU_FA_GQA=0 turns it off (per call, so a manifest env toggled between loads is honoured).
++static bool ggml_flash_attn_ext_gqa_enabled(void) {
++    const char * e = getenv("GGML_CPU_FA_GQA");
++    return !(e && e[0] == '0');
++}
++
++static constexpr int64_t GGML_FA_GQA_MAX_G = 32;
++
++static void ggml_compute_forward_flash_attn_ext_f16_gqa_chunk(
++        const ggml_compute_params * params,
++        ggml_tensor * dst,
++        int64_t ic_start, int64_t ic_end,
++        float * partials, int64_t partial_stride) {
++    GGML_UNUSED(params);
++
++    const ggml_tensor * q     = dst->src[0];
++    const ggml_tensor * k     = dst->src[1];
++    const ggml_tensor * v     = dst->src[2];
++    const ggml_tensor * mask  = dst->src[3];
++    const ggml_tensor * sinks = dst->src[4];
++
++    GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
++    GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
++    GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
++    GGML_TENSOR_LOCALS(size_t,  nbk, k,   nb)
++    GGML_TENSOR_LOCALS(int64_t, nev, v,   ne)
++    GGML_TENSOR_LOCALS(size_t,  nbv, v,   nb)
++
++    const int64_t DK = nek0;
++    const int64_t DV = nev0;
++    const int64_t G  = neq2/nek2;
++
++    float scale         = 1.0f;
++    float max_bias      = 0.0f;
++    float logit_softcap = 0.0f;
++
++    memcpy(&scale,         (float *) dst->op_params + 0, sizeof(float));
++    memcpy(&max_bias,      (float *) dst->op_params + 1, sizeof(float));
++    memcpy(&logit_softcap, (float *) dst->op_params + 2, sizeof(float));
++
++    if (logit_softcap != 0) {
++        scale /= logit_softcap;
++    }
++
++    const uint32_t n_head      = neq2;
++    const uint32_t n_head_log2 = 1u << (uint32_t) floor(log2(n_head));
++
++    const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
++    const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
++
++    ggml_type         const k_vec_dot_type = ggml_get_type_traits_cpu(k->type)->vec_dot_type;
++    ggml_from_float_t const q_to_vec_dot   = ggml_get_type_traits_cpu(k_vec_dot_type)->from_float;
++    ggml_vec_dot_t    const kq_vec_dot     = ggml_get_type_traits_cpu(k->type)->vec_dot;
++
++    GGML_ASSERT(q_to_vec_dot && "fattn: unsupported K-type");
++
++    const size_t q_row = ggml_row_size(k_vec_dot_type, DK);
++
++    thread_local std::vector<char> scratch;
++    const size_t need = G*(q_row + DV*sizeof(ggml_fp16_t));
++    if (scratch.size() < need) {
++        scratch.resize(need);
++    }
++    char        * Qs   = scratch.data();
++    ggml_fp16_t * VKQs = (ggml_fp16_t *) (scratch.data() + G*q_row);
++
++    float               M[GGML_FA_GQA_MAX_G];
++    float               S[GGML_FA_GQA_MAX_G];
++    float               slope[GGML_FA_GQA_MAX_G];
++    const ggml_fp16_t * mp[GGML_FA_GQA_MAX_G];
++
++    const int64_t iq1 = 0;
++    const int64_t iq3 = 0;
++
++    for (int64_t ik2 = 0; ik2 < nek2; ++ik2) {
++        for (int64_t g = 0; g < G; ++g) {
++            const int64_t  iq2 = ik2*G + g;
++            const uint32_t h   = iq2;
++
++            slope[g] = (max_bias > 0.0f) ? h < n_head_log2 ? powf(m0, h + 1) : powf(m1, 2*(h - n_head_log2) + 1) : 1.0f;
++            M[g]     = -INFINITY;
++            S[g]     = 0.0f;
++            memset(VKQs + g*DV, 0, DV*sizeof(ggml_fp16_t));
++
++            mp[g] = mask ? (const ggml_fp16_t *)((const char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
++
++            const float * pq = (const float *) ((const char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
++            q_to_vec_dot(pq, Qs + g*q_row, DK);
+         }
++
++        for (int64_t ic = ic_start; ic < ic_end; ++ic) {
++            const char * k_data = (const char *) k->data + (ic*nbk1 + ik2*nbk2);
++            const char * v_data = (const char *) v->data + (ic*nbv1 + ik2*nbv2);
++
++            for (int64_t g = 0; g < G; ++g) {
++                const float mv = mp[g] ? slope[g]*GGML_CPU_FP16_TO_FP32(mp[g][ic]) : 0.0f;
++                if (mv == -INFINITY) {
++                    continue;
++                }
++
++                float s; // KQ value
++
++                kq_vec_dot(DK, &s, 0, k_data, 0, Qs + g*q_row, 0, 1);
++
++                s = s*scale; // scale KQ value
++
++                if (logit_softcap != 0.0f) {
++                    s = logit_softcap*tanhf(s);
++                }
++
++                s += mv; // apply mask
++
++                const float Mold = M[g];
++
++                float ms = 1.0f; // upon new higher max val, scale VKQ and KQ sum with this value
++                float vs = 1.0f; // post-softmax KQ value, expf(s - M)
++
++                ggml_fp16_t * VKQ16 = VKQs + g*DV;
++
++                if (s > M[g]) {
++                    M[g] = s;
++                    ms = expf(Mold - M[g]);
++                    ggml_vec_scale_f16(DV, VKQ16, ms);
++                } else {
++                    vs = expf(s - M[g]);
++                }
++
++                ggml_vec_mad_f16(DV, VKQ16, (const ggml_fp16_t *) v_data, vs);
++
++                S[g] = S[g]*ms + vs; // scale and increment sum with partial sum
++            }
++        }
++
++        for (int64_t g = 0; g < G; ++g) {
++            const int64_t  iq2 = ik2*G + g;
++            const uint32_t h   = iq2;
++
++            float * partial = partials + iq2*partial_stride;
++            float * VKQ32   = partial + 2;
++            for (int64_t d = 0; d < DV; ++d) {
++                VKQ32[d] = GGML_CPU_FP16_TO_FP32(VKQs[g*DV + d]);
++            }
++
++            if (sinks && ic_start == 0) {
++                const float s = ((float *)((char *) sinks->data))[h];
++
++                float ms = 1.0f;
++                float vs = 1.0f;
++
++                if (s > M[g]) {
++                    ms = expf(M[g] - s);
++                    M[g] = s;
++                    ggml_vec_scale_f32(DV, VKQ32, ms);
++                } else {
++                    vs = expf(s - M[g]);
++                }
++
++                S[g] = S[g]*ms + vs;
++            }
++
++            partial[0] = M[g];
++            partial[1] = S[g];
++        }
+     }
+ }
+ 
+@@ -9501,7 +9673,13 @@
+         const int64_t partial_stride = nth * partial_size;
+         float *       chunk_partials = partials_base + ith * partial_size;
+ 
+-        if (ic_start < nek1) {
++        const int64_t G   = neq2/nek2;
++        const bool    gqa = k->type == GGML_TYPE_F16 && G > 1 && G <= GGML_FA_GQA_MAX_G && neq2 == G*nek2 &&
++                            nev2 == nek2 && nek3 == 1 && nev3 == 1 && ggml_flash_attn_ext_gqa_enabled();
++
++        if (ic_start < nek1 && gqa) {
++            ggml_compute_forward_flash_attn_ext_f16_gqa_chunk(params, dst, ic_start, ic_end, chunk_partials, partial_stride);
++        } else if (ic_start < nek1) {
+             for (int64_t q_head = 0; q_head < neq2; q_head++) {
+                 ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+                     params, dst, q_head, q_head + 1, ic_start, ic_end,
