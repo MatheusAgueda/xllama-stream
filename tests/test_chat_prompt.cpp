@@ -402,3 +402,47 @@ TEST_CASE("render_system_prefix is the exact head of render_prompt (#169)") {
     // prefix is empty and the caller pins only the BOS.
     CHECK(chat_format_for("gemma3-270m").render_system_prefix(sys).empty());
 }
+
+TEST_CASE("request_thinking: a Qwen3.x hybrid reasons on request, history keeps its prefill") {
+    const std::string id =
+        "D:\\DevelopmentFiles\\xllama\\models\\qwen36-ornith15-35b-a3b-abliterated-iq3s";
+    ChatFormat f = chat_format_for(id);
+    const std::string off = f.render_prompt("sys", {{"u1", "a1"}}, "u2");
+    request_thinking(f, id, true);
+    const std::string on = f.render_prompt("sys", {{"u1", "a1"}}, "u2");
+    // The Qwen3.6 Jinja with enable_thinking unset/true: the header opens the block.
+    const std::string open_hdr = "<|im_start|>assistant\n<think>\n";
+    CHECK(on.substr(on.size() - open_hdr.size()) == open_hdr);
+    // Everything before the final header is the no-think render, byte for byte.
+    CHECK(on.substr(0, on.size() - std::string("<think>\n").size()) ==
+          off.substr(0, off.size() - f.gen_suffix.size()));
+    CHECK(on.find("<|im_start|>assistant\n<think>\n\n</think>\n\na1<|im_end|>\n") !=
+          std::string::npos);
+    CHECK(f.render_delta("u3", true).substr(f.render_delta("u3", true).size() - open_hdr.size()) ==
+          open_hdr);
+    // The reply never carries the prompt's opener: the closer ends the reasoning...
+    CHECK(f.postprocess_output("Count the pairs.\n</think>\n\n738") == "738");
+    // ...and a reply cut mid-thought is no answer, not raw reasoning.
+    CHECK(f.postprocess_output("still counting, a ranges over").empty());
+}
+
+TEST_CASE(
+    "request_thinking off on a thinking id gets the empty prefill; other families untouched") {
+    const std::string id = "qwen35-9b-ds4pro-thinking";
+    ChatFormat f = chat_format_for(id);
+    CHECK(f.gen_suffix.empty());
+    request_thinking(f, id, false);
+    CHECK(f.gen_suffix == qwen_no_think_gen_suffix("qwen35-0.8b"));
+    CHECK(f.think_open.empty());
+    const std::string p = f.render_prompt("sys", {}, "u");
+    CHECK(p.substr(p.size() - f.gen_suffix.size()) == f.gen_suffix);
+    for (const char* other :
+         {"qwen25-coder-1.5b", "gemma3-270m", "smollm2-360m-cpu-int4", "lfm25-1.2b-thinking"}) {
+        ChatFormat a = chat_format_for(other);
+        const std::string before = a.render_prompt("sys", {{"u1", "a1"}}, "u2");
+        request_thinking(a, other, true);
+        CHECK(a.render_prompt("sys", {{"u1", "a1"}}, "u2") == before);
+        request_thinking(a, other, false);
+        CHECK(a.render_prompt("sys", {{"u1", "a1"}}, "u2") == before);
+    }
+}

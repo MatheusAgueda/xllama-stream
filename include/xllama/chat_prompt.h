@@ -119,6 +119,13 @@ struct ChatFormat {
     // (thinking models). Empty-think stripping for Qwen3 no-think always runs.
     bool strip_thinking_content = false;
 
+    // Final generation header only, in place of gen_suffix: "<think>\n" when a
+    // client asked a Qwen3.x hybrid to reason (request_thinking). History turns
+    // keep gen_suffix — they were answered without reasoning in the KV — and the
+    // output is read as if it began with this opener, so a reply cut mid-thought
+    // comes back empty rather than as raw reasoning.
+    std::string think_open;
+
     // Full multi-turn prompt ending with the assistant generation header +
     // gen_suffix. Completed history assistant turns carry gen_suffix too, ahead
     // of their text: the turn was generated after it, so the next full render
@@ -146,5 +153,11 @@ struct ChatFormat {
 
 // Select the chat format for a catalogue id / filename (as model_is_qwen does today).
 ChatFormat chat_format_for(const std::string& model_id);
+
+// chat_template_kwargs.enable_thinking on the plain chat path, as the Qwen3.5/3.6
+// Jinja renders it: on → the generation prompt ends "<think>\n" and the reasoning
+// is stripped from the reply; off → the empty-think prefill, also for ids named
+// "thinking". Qwen3.x ChatML only — every other format is left as it was.
+void request_thinking(ChatFormat& fmt, const std::string& model_id, bool on);
 
 } // namespace xllama

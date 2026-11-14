@@ -268,7 +268,7 @@ std::string ChatFormat::render_prompt(const std::string& system,
     }
 
     p += turn_open + user_tag + role_sep + user_content(final_user) + turn_close;
-    p += turn_open + assistant_tag + role_sep + gen_suffix;
+    p += turn_open + assistant_tag + role_sep + (think_open.empty() ? gen_suffix : think_open);
     return p;
 }
 
@@ -289,14 +289,28 @@ std::string ChatFormat::render_delta(const std::string& user, bool prev_ended_wi
         d = turn_close;
     }
     d += turn_open + user_tag + role_sep + user + turn_close;
-    d += turn_open + assistant_tag + role_sep + gen_suffix;
+    d += turn_open + assistant_tag + role_sep + (think_open.empty() ? gen_suffix : think_open);
     return d;
 }
 
 std::string ChatFormat::postprocess_output(std::string text) const {
+    if (!think_open.empty())
+        text = think_open + text; // the opener was the prompt's: rebalance the block
     if (strip_thinking_content)
         text = strip_thinking_blocks(std::move(text));
     return strip_empty_thinking_tags(std::move(text));
+}
+
+void request_thinking(ChatFormat& fmt, const std::string& model_id, bool on) {
+    if (fmt.kind != ChatFormatKind::ChatML || !model_is_qwen3(model_id))
+        return;
+    if (on) {
+        fmt.think_open = std::string(kThinkOpen) + "\n";
+        fmt.strip_thinking_content = true;
+        return;
+    }
+    fmt.think_open.clear();
+    fmt.gen_suffix = empty_think_block() + "\n\n";
 }
 
 } // namespace xllama

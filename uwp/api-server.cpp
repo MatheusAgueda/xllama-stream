@@ -57,6 +57,7 @@
     #include <filesystem>
     #include <memory>
     #include <mutex>
+    #include <optional>
     #include <stdexcept>
     #include <string>
     #include <vector>
@@ -731,6 +732,19 @@ void fill_sampling(JsonObject const& root, ::xllama::GenerateParams& gp) {
     }
 }
 
+// chat_template_kwargs.enable_thinking when it is a boolean, as the Jinja
+// templates read it; absent or any other type → the model's default.
+std::optional<bool> requested_thinking(JsonObject const& root) {
+    if (!root.HasKey(L"chat_template_kwargs") ||
+        root.GetNamedValue(L"chat_template_kwargs").ValueType() != JsonValueType::Object)
+        return std::nullopt;
+    const JsonObject kwargs = root.GetNamedObject(L"chat_template_kwargs");
+    if (!kwargs.HasKey(L"enable_thinking") ||
+        kwargs.GetNamedValue(L"enable_thinking").ValueType() != JsonValueType::Boolean)
+        return std::nullopt;
+    return kwargs.GetNamedBoolean(L"enable_thinking");
+}
+
 // "xllama_prefix_cache": true lets this request's prompt be saved to the disk
 // prefix cache when the model's catalogue entry enables it. Without it the
 // prompt is never written there (a non-boolean is ignored, like "logprobs").
@@ -830,15 +844,8 @@ std::string handle_tool_proposal_locked(JsonObject const& root, ::xllama::ToolRe
         request.messages.insert(request.messages.begin(), std::move(system));
     }
 
-    bool enable_thinking =
-        !(::xllama::model_is_qwen3(model) && !::xllama::model_is_thinking(model));
-    if (root.HasKey(L"chat_template_kwargs") &&
-        root.GetNamedValue(L"chat_template_kwargs").ValueType() == JsonValueType::Object) {
-        const JsonObject kwargs = root.GetNamedObject(L"chat_template_kwargs");
-        if (kwargs.HasKey(L"enable_thinking") &&
-            kwargs.GetNamedValue(L"enable_thinking").ValueType() == JsonValueType::Boolean)
-            enable_thinking = kwargs.GetNamedBoolean(L"enable_thinking");
-    }
+    const bool enable_thinking = requested_thinking(root).value_or(
+        !(::xllama::model_is_qwen3(model) && !::xllama::model_is_thinking(model)));
 
     ::xllama::GenerateParams gp;
     gp.reuse_kv = false;
@@ -1027,7 +1034,11 @@ std::string handle_chat_locked(const std::string& body, const char*& status,
     if (system.empty())
         system = model_is_coding ? ::xllama::kCodingSystemPrompt : ::xllama::kDefaultSystemPrompt;
 
-    const ::xllama::ChatFormat fmt = ::xllama::chat_format_for(model);
+    ::xllama::ChatFormat fmt = ::xllama::chat_format_for(model);
+    // The tool path renders the GGUF's Jinja with this flag; plain chat used to
+    // drop it, so a Qwen3.x hybrid answered without reasoning whatever was asked.
+    if (const std::optional<bool> think = requested_thinking(root))
+        ::xllama::request_thinking(fmt, model, *think);
     ::xllama::GenerateParams gp;
     gp.stop_sequences = fmt.stop_sequences;
     gp.reuse_kv = false; // OpenAI chat is stateless: messages[] carry full history
