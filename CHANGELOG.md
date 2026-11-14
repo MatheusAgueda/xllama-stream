@@ -14,7 +14,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   longer shares its history with the live cache restores the longest saved
   prefix instead of prefilling it again. Entries are evicted least recently
   used within the budget; a file whose size or token history does not match
-  is dropped and the prompt is prefilled in full. Off by default.
+  is dropped and the prompt is prefilled in full. Off by default; with it on,
+  only requests that send `"xllama_prefix_cache": true` are written (the file
+  holds the prompt's token history), while any request may restore them.
 
 ## [1.7.0] - TBD
 

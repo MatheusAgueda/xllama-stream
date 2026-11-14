@@ -246,8 +246,10 @@ The #170c checkpoints keep only the recurrent half of a hybrid cache, so they
 help a request whose prefix is still resident. API clients share one session,
 and interleaved conversations (A, B, A′) overwrite each other's attention KV.
 With `XLLAMA_PREFIX_CACHE_MIB` set (catalogue `env`; off by default), a
-full-prompt prefill also writes the full sequence state at the #170c split
-points, and a later full prompt restores the longest saved prefix that beats
+full-prompt prefill of a request that sends `"xllama_prefix_cache": true`
+(`GenerateParams::save_prefix`) also writes the full sequence state at the
+#170c split points — the file holds the prompt's token history, so nothing is
+written for a request that does not opt in — and a later full prompt restores the longest saved prefix that beats
 the in-memory paths. Knobs, file lifecycle and failure handling are documented
 at `LlamaSession::init_prefix_cache` and the `m_pc_*` members in
 `src/bridge/session.cpp`; the index is

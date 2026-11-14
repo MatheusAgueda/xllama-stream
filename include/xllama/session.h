@@ -154,6 +154,13 @@ struct GenerateParams {
     bool reuse_kv = false;
     bool reset_kv = false;
 
+    // Disk prefix cache (XLLAMA_PREFIX_CACHE_MIB): this full prompt's state —
+    // which holds its token history, i.e. the prompt text — is written to the
+    // cache only when the request opts in. Off by default, so a client whose
+    // text must not sit on the device's disk never leaves it there. Restoring
+    // a prefix an earlier opted-in request saved needs no flag.
+    bool save_prefix = false;
+
     // #169: number of leading prompt tokens pinned across context shifts —
     // the system prompt (plus BOS), which must survive any eviction. 0 = no
     // pinned head. Callers compute it once per conversation via

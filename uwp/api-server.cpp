@@ -720,6 +720,15 @@ void fill_sampling(JsonObject const& root, ::xllama::GenerateParams& gp) {
     }
 }
 
+// "xllama_prefix_cache": true lets this request's prompt be saved to the disk
+// prefix cache when the model's catalogue entry enables it. Without it the
+// prompt is never written there (a non-boolean is ignored, like "logprobs").
+void fill_prefix_cache(JsonObject const& root, ::xllama::GenerateParams& gp) {
+    if (root.HasKey(L"xllama_prefix_cache") &&
+        root.GetNamedValue(L"xllama_prefix_cache").ValueType() == JsonValueType::Boolean)
+        gp.save_prefix = root.GetNamedBoolean(L"xllama_prefix_cache");
+}
+
 // choices[0].logprobs for a scored reply: OpenAI's {"content": [{"token",
 // "logprob"}]} plus each token's id and argmax flag (an id list a later request
 // can force back as xllama_force_ids), and the reply's totals.
@@ -812,6 +821,7 @@ std::string handle_tool_proposal_locked(JsonObject const& root, ::xllama::ToolRe
     gp.reuse_kv = false;
     gp.n_predict = n_predict;
     fill_sampling(root, gp);
+    fill_prefix_cache(root, gp);
     std::vector<std::string> template_stops;
     std::vector<std::string> preserved_tokens;
     ::xllama::GrammarSpec grammar;
@@ -1053,6 +1063,7 @@ std::string handle_chat_locked(const std::string& body, const char*& status,
         gp.prompt = fit.prompt;
     }
     fill_sampling(root, gp);
+    fill_prefix_cache(root, gp);
     // Client-supplied stop: a string or an array of strings, added to the
     // format's own stops so clients can bound output.
     if (root.HasKey(L"stop")) {
