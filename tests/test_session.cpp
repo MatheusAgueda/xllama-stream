@@ -1,6 +1,7 @@
 // Copyright (c) 2024 Gianluca Mazza
 // SPDX-License-Identifier: MIT
 
+#include "xllama/chat_prompt.h"
 #include "xllama/path_utils.h"
 #include "xllama/session.h"
 #include "xllama/session_hub.h"
