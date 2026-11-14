@@ -134,9 +134,9 @@ TEST_CASE("resolve_session_params: one resolver for every surface (ADR 0007)") {
     CHECK_FALSE(resolve_session_params("moe", pf, "D:\\m\\moe", -1).kv_q8);
     pf.kv_q8 = true;
     CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).kv_q8);
-    auto ort = pf;
-    ort.gguf = false;
-    CHECK_FALSE(resolve_session_params("m", ort, "D:\\m", -1).kv_q8);
+    auto onnx = pf;
+    onnx.gguf = false;
+    CHECK_FALSE(resolve_session_params("m", onnx, "D:\\m", -1).kv_q8);
 }
 
 TEST_CASE("catalogue env: tuning names only, sorted, the last repeat wins") {
