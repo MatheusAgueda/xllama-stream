@@ -31,3 +31,7 @@ roofxo ggml_d3d12_mmv_q4_k_t64 shaders/ggml_d3d12_roofline.hlsl -D NUM_THREADS=6
 roofxo ggml_d3d12_mmv_q4_k_t128 shaders/ggml_d3d12_roofline.hlsl -D NUM_THREADS=128 -D ROOF_X=2
 roofxo ggml_d3d12_mmv_iq3_s_t64 shaders/ggml_d3d12_roofline.hlsl -D NUM_THREADS=64 -D ROOF_X=2
 roofxo ggml_d3d12_mmv_iq3_s_t128 shaders/ggml_d3d12_roofline.hlsl -D NUM_THREADS=128 -D ROOF_X=2
+wred ggml_d3d12_mmv_iq3_s_t64 shaders/ggml_d3d12_mmv_iq3_s.hlsl -D NUM_THREADS=64 -D IQ3S_WAVE_REDUCE=1
+wred ggml_d3d12_mmv_iq3_s_t128 shaders/ggml_d3d12_mmv_iq3_s.hlsl -D NUM_THREADS=128 -D IQ3S_WAVE_REDUCE=1
+wred ggml_d3d12_mmid_iq3_s_t64 shaders/ggml_d3d12_mmid_iq3_s.hlsl -D NUM_THREADS=64 -D IQ3S_WAVE_REDUCE=1
+wred ggml_d3d12_mmid_iq3_s_t128 shaders/ggml_d3d12_mmid_iq3_s.hlsl -D NUM_THREADS=128 -D IQ3S_WAVE_REDUCE=1

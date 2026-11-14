@@ -34,7 +34,7 @@ uint geom_row0(Geom g, uint gx, uint t) {
 // reduce_store per row set: each segment of seg threads sums its own rows'
 // partials with the plain tree (stride seg/2 .. 1) and its first NUM_ROWS
 // threads store them at ybase. Ends with a barrier when another tile reuses red.
-void reduce_store_geom(float acc[NUM_ROWS], uint tid, Geom g, uint row0, uint ybase) {
+void reduce_store_geom_lds(float acc[NUM_ROWS], uint tid, Geom g, uint row0, uint ybase) {
     [unroll]
     for (uint r = 0; r < NUM_ROWS; ++r)
         red[r][tid] = acc[r];
@@ -53,3 +53,63 @@ void reduce_store_geom(float acc[NUM_ROWS], uint tid, Geom g, uint row0, uint yb
     if (g.rt > 1u)
         GroupMemoryBarrierWithGroupSync();
 }
+
+#ifdef IQ3S_WAVE_REDUCE
+// The same tree with the strides below the wave width done by lane shuffles:
+// strides >= wave go through red with a barrier each, as above; the rest read
+// the partner lane with WaveReadLaneAt (every lane reads before any adds, so
+// each step adds the value the LDS tree would) and need no barrier. seg = 32
+// (ffn_down at rsl 2) then has no reduction barrier at all. Assumes thread tid
+// is lane tid % wave of its wave, which the device selftest proves per variant
+// before a model runs on it (shaders/variants.txt «wred»).
+void reduce_store_geom(float acc[NUM_ROWS], uint tid, Geom g, uint row0, uint ybase) {
+    const uint wave = WaveGetLaneCount();
+    const uint lane = tid & (g.seg - 1u);
+    precise float v[NUM_ROWS];
+    [unroll]
+    for (uint r = 0; r < NUM_ROWS; ++r)
+        v[r] = acc[r];
+    if (g.seg > wave) {
+        [unroll]
+        for (uint r = 0; r < NUM_ROWS; ++r)
+            red[r][tid] = v[r];
+        GroupMemoryBarrierWithGroupSync();
+        for (uint stride = g.seg / 2u; stride >= wave; stride >>= 1u) {
+            if (lane < stride) {
+                [unroll]
+                for (uint r = 0; r < NUM_ROWS; ++r)
+                    red[r][tid] += red[r][tid + stride];
+            }
+            GroupMemoryBarrierWithGroupSync();
+        }
+        [unroll]
+        for (uint r = 0; r < NUM_ROWS; ++r)
+            v[r] = red[r][tid];
+    }
+    const uint width = min(g.seg, wave);
+    const uint wl = WaveGetLaneIndex();
+    const uint local = wl & (width - 1u);
+    const uint base = wl - local;
+    for (uint stride = width / 2u; stride > 0u; stride >>= 1u) {
+        const uint src = base + ((local + stride) & (width - 1u));
+        [unroll]
+        for (uint r = 0; r < NUM_ROWS; ++r) {
+            const float other = WaveReadLaneAt(v[r], src);
+            if (local < stride)
+                v[r] += other;
+        }
+    }
+    if (lane == 0u) {
+        [unroll]
+        for (uint r = 0; r < NUM_ROWS; ++r)
+            if (row0 + r < n)
+                Y[ybase + row0 + r] = v[r];
+    }
+    if (g.seg > wave && g.rt > 1u)
+        GroupMemoryBarrierWithGroupSync();
+}
+#else
+void reduce_store_geom(float acc[NUM_ROWS], uint tid, Geom g, uint row0, uint ybase) {
+    reduce_store_geom_lds(acc, tid, g, row0, ybase);
+}
+#endif
