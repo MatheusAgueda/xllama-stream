@@ -254,8 +254,9 @@ the in-memory paths. Knobs, file lifecycle and failure handling are documented
 at `LlamaSession::init_prefix_cache` and the `m_pc_*` members in
 `src/bridge/session.cpp`; the index is
 `include/xllama/prefix_cache.h`. A restore that fails for any reason drops the
-file and prefills in full. Each session initialization wipes every file under
-the cache root and logs only the number removed. `XLLAMA_PREFIX_CACHE_TTL_S`
+file and prefills in full. The first session of a process to use a cache root
+wipes every file under it and logs only the number removed; later sessions in
+the same process keep the live sessions' files. `XLLAMA_PREFIX_CACHE_TTL_S`
 (default 1800 seconds) limits file age by last write: every save prunes old
 files, and lookups delete expired entries before choosing a prefix. Cache hits
 do not extend that age.

@@ -21,6 +21,8 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
+#include <set>
 #include <string>
 
 // Backend availability. A build defines XLLAMA_USE_ORT when ORT GenAI is linked.
@@ -861,7 +863,9 @@ class LlamaSession final : public Session {
     // Prefix cache: the knobs, read once at creation (after the catalogue env
     // is applied). XLLAMA_PREFIX_CACHE_DIR names the root; on the console it
     // defaults to LocalState\prefix-cache, on the host the cache is off without
-    // it. Each session wipes the root before taking its own "pc-<n>" directory.
+    // it. The first session of a process to use a root wipes it (what an earlier
+    // process wrote never reaches a new one); later sessions keep the files of
+    // the live ones. Each session then takes its own "pc-<n>" directory.
     void init_prefix_cache() {
         const char* mib = std::getenv("XLLAMA_PREFIX_CACHE_MIB");
         const uint64_t budget = mib && *mib ? std::strtoull(mib, nullptr, 10) << 20 : 0;
@@ -881,9 +885,18 @@ class LlamaSession final : public Session {
             m_pc_min = std::max<size_t>(std::strtoul(s, nullptr, 10), kRsCheckpointMinGain);
         m_pc_root = root;
         m_pc_ttl = prefix_cache_ttl(std::getenv("XLLAMA_PREFIX_CACHE_TTL_S"));
-        const size_t removed = wipe_prefix_cache_files(root);
-        log_output("[xllama] session: prefix cache start wipe — " + std::to_string(removed) +
-                   " files removed\n");
+        static std::mutex wiped_mu;
+        static std::set<std::string> wiped;
+        bool first_use = false;
+        {
+            std::lock_guard<std::mutex> lk(wiped_mu);
+            first_use = wiped.insert(root).second;
+        }
+        if (first_use) {
+            const size_t removed = wipe_prefix_cache_files(root);
+            log_output("[xllama] session: prefix cache start wipe — " + std::to_string(removed) +
+                       " files removed\n");
+        }
         static std::atomic<unsigned> serial{0};
         m_pc_dir = root + "/pc-" + std::to_string(++serial);
         m_pc_budget = budget;

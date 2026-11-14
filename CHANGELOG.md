@@ -7,7 +7,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-- **Session:** the disk prefix cache is wiped at session start. Saves and lookups
+- **Session:** the disk prefix cache root is wiped the first time a process uses
+  it; later sessions keep the files of the live ones. Saves and lookups
   remove entries older than `XLLAMA_PREFIX_CACHE_TTL_S` (default 30 minutes).
 
 - **Tools:** Qwen3 non-thinking models use the no-think template form for tool
