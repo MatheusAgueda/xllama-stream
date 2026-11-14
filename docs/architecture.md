@@ -254,7 +254,11 @@ the in-memory paths. Knobs, file lifecycle and failure handling are documented
 at `LlamaSession::init_prefix_cache` and the `m_pc_*` members in
 `src/bridge/session.cpp`; the index is
 `include/xllama/prefix_cache.h`. A restore that fails for any reason drops the
-file and prefills in full.
+file and prefills in full. Each session initialization wipes every file under
+the cache root and logs only the number removed. `XLLAMA_PREFIX_CACHE_TTL_S`
+(default 1800 seconds) limits file age by last write: every save prunes old
+files, and lookups delete expired entries before choosing a prefix. Cache hits
+do not extend that age.
 
 ### Cancel policy (`cancel_policy.h`)
 
@@ -763,6 +767,8 @@ not keep a second copy. Headers without a dedicated file are header-only RAII wr
 | Test file                        | Under test                                                                                  |
 | -------------------------------- | ------------------------------------------------------------------------------------------- |
 | `test_api_activity.cpp`          | `api_activity.h`                                                                            |
+| `test_api_auth.cpp`              | `api_auth.h` key normalization and bearer comparison                                         |
+| `test_api_timings.cpp`           | `api_timings.h` response timing numbers                                                      |
 | `test_compute_admission.cpp`     | `compute_admission.h`                                                                       |
 | `test_api_connection.cpp`        | `api_connection.h` — overlapping compute requests are 200+503; connection-gate bound        |
 | `test_debug_dashboard.cpp`       | `debug_dashboard.h`                                                                         |

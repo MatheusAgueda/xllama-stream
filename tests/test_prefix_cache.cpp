@@ -8,6 +8,9 @@
 
 #include <doctest/doctest.h>
 
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -15,6 +18,26 @@ using xllama::PrefixCacheEntry;
 using xllama::PrefixCacheIndex;
 
 namespace {
+
+struct PrefixDir {
+    std::filesystem::path path =
+        std::filesystem::temp_directory_path() /
+        ("xllama-prefix-" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    PrefixDir() {
+        std::filesystem::create_directories(path);
+    }
+    ~PrefixDir() {
+        std::error_code ec;
+        std::filesystem::remove_all(path, ec);
+    }
+    void put(const std::filesystem::path& name, std::chrono::seconds age) const {
+        const auto file = path / name;
+        std::filesystem::create_directories(file.parent_path());
+        std::ofstream(file, std::ios::binary) << "cached state";
+        std::filesystem::last_write_time(file, std::filesystem::file_time_type::clock::now() - age);
+    }
+};
 
 PrefixCacheEntry entry(std::vector<int32_t> tokens, uint64_t bytes) {
     PrefixCacheEntry e;
@@ -25,6 +48,74 @@ PrefixCacheEntry entry(std::vector<int32_t> tokens, uint64_t bytes) {
 }
 
 } // namespace
+
+TEST_CASE("prefix cache: TTL defaults to 30 minutes and accepts nonnegative seconds") {
+    CHECK(xllama::prefix_cache_ttl(nullptr).count() == 1800);
+    for (const char* invalid : {"", "-1", "12s", " 12", "2147483648"})
+        CHECK(xllama::prefix_cache_ttl(invalid).count() == 1800);
+    CHECK(xllama::prefix_cache_ttl("60").count() == 60);
+    CHECK(xllama::prefix_cache_ttl("0").count() == 0);
+}
+
+TEST_CASE("prefix cache: pruning removes expired files and leaves fresh files") {
+    const PrefixDir dir;
+    dir.put("pc-1/old.kv", std::chrono::seconds(1801));
+    dir.put("pc-1/fresh.kv", std::chrono::seconds(0));
+    dir.put("orphan.tmp", std::chrono::seconds(1801));
+    CHECK(xllama::prune_prefix_cache_files(dir.path, std::chrono::seconds(1800)) == 2);
+    CHECK_FALSE(std::filesystem::exists(dir.path / "pc-1/old.kv"));
+    CHECK_FALSE(std::filesystem::exists(dir.path / "orphan.tmp"));
+    CHECK(std::filesystem::exists(dir.path / "pc-1/fresh.kv"));
+    CHECK(xllama::prune_prefix_cache_files(dir.path, std::chrono::seconds(1800)) == 0);
+}
+
+TEST_CASE("prefix cache: expired lookup entries are deleted before selecting a fresh prefix") {
+    const PrefixDir dir;
+    PrefixCacheIndex idx;
+    const auto fresh = entry({1, 2}, 10);
+    const auto old = entry({1, 2, 3}, 20);
+    const auto missing = entry({1, 2, 3, 4}, 30);
+    idx.add(fresh, 1000);
+    idx.add(old, 1000);
+    idx.add(missing, 1000);
+    dir.put(fresh.file, std::chrono::seconds(0));
+    dir.put(old.file, std::chrono::seconds(61));
+    idx.prune(dir.path, std::chrono::seconds(60));
+    CHECK_FALSE(std::filesystem::exists(dir.path / old.file));
+    CHECK(std::filesystem::exists(dir.path / fresh.file));
+    CHECK(idx.total_bytes() == 10);
+    REQUIRE(idx.entries().size() == 1);
+    const std::vector<int32_t> prompt{1, 2, 3, 4, 5};
+    CHECK(idx.find(prompt.data(), prompt.size(), 0) == 0);
+    CHECK(idx.entries()[0].tokens == fresh.tokens);
+    CHECK(idx.find_exact(old.tokens.data(), old.tokens.size()) == -1);
+}
+
+TEST_CASE("prefix cache: every start wipe empties the root and counts files only") {
+    const PrefixDir dir;
+    dir.put("pc-1/nested/old.kv", std::chrono::seconds(1801));
+    dir.put("pc-2/fresh.kv", std::chrono::seconds(0));
+    dir.put("unrelated.tmp", std::chrono::seconds(0));
+    CHECK(xllama::wipe_prefix_cache_files(dir.path) == 3);
+    CHECK(std::filesystem::is_empty(dir.path));
+    dir.put("another.kv", std::chrono::seconds(0));
+    CHECK(xllama::wipe_prefix_cache_files(dir.path) == 1);
+    CHECK(std::filesystem::is_empty(dir.path));
+    CHECK(xllama::wipe_prefix_cache_files(dir.path / "missing") == 0);
+}
+
+TEST_CASE("prefix cache: a start wipe does not follow a directory symlink") {
+    const PrefixDir root;
+    const PrefixDir outside;
+    outside.put("keep.kv", std::chrono::seconds(0));
+    std::error_code ec;
+    std::filesystem::create_directory_symlink(outside.path, root.path / "linked", ec);
+    if (ec)
+        return; // some Windows host setups do not grant symlink creation
+    CHECK(xllama::wipe_prefix_cache_files(root.path) == 1);
+    CHECK(std::filesystem::is_empty(root.path));
+    CHECK(std::filesystem::exists(outside.path / "keep.kv"));
+}
 
 TEST_CASE("PrefixCacheIndex: file names hash the fingerprint and the tokens") {
     const std::vector<int32_t> a = {1, 2, 3};

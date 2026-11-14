@@ -555,6 +555,8 @@ class LlamaSession final : public Session {
     std::string m_pc_dir;     // this session's directory, created by the first save
     std::string m_pc_fp;      // state_fingerprint() the files were written under
     PrefixCacheIndex m_pc;
+    std::chrono::seconds m_pc_ttl{1800}; // XLLAMA_PREFIX_CACHE_TTL_S
+    std::string m_pc_root;
 
     explicit LlamaSession(LlamaModelPtr model, LlamaAdapterLoraPtr adapter, float lora_scale,
                           int n_ctx, int n_threads, int n_batch, int n_ubatch, bool kv_q8,
@@ -859,8 +861,7 @@ class LlamaSession final : public Session {
     // Prefix cache: the knobs, read once at creation (after the catalogue env
     // is applied). XLLAMA_PREFIX_CACHE_DIR names the root; on the console it
     // defaults to LocalState\prefix-cache, on the host the cache is off without
-    // it. Each session takes a "pc-<n>" directory under the root; the first
-    // session of a process removes those a killed process left behind.
+    // it. Each session wipes the root before taking its own "pc-<n>" directory.
     void init_prefix_cache() {
         const char* mib = std::getenv("XLLAMA_PREFIX_CACHE_MIB");
         const uint64_t budget = mib && *mib ? std::strtoull(mib, nullptr, 10) << 20 : 0;
@@ -878,18 +879,11 @@ class LlamaSession final : public Session {
         }
         if (const char* s = std::getenv("XLLAMA_PREFIX_CACHE_MIN"); s && *s)
             m_pc_min = std::max<size_t>(std::strtoul(s, nullptr, 10), kRsCheckpointMinGain);
-        static const bool swept = [&root] {
-            std::error_code ec;
-            std::vector<std::filesystem::path> stale;
-            for (std::filesystem::directory_iterator it(root, ec), end; !ec && it != end;
-                 it.increment(ec))
-                if (it->path().filename().string().rfind("pc-", 0) == 0)
-                    stale.push_back(it->path());
-            for (const auto& p : stale)
-                std::filesystem::remove_all(p, ec);
-            return true;
-        }();
-        (void)swept;
+        m_pc_root = root;
+        m_pc_ttl = prefix_cache_ttl(std::getenv("XLLAMA_PREFIX_CACHE_TTL_S"));
+        const size_t removed = wipe_prefix_cache_files(root);
+        log_output("[xllama] session: prefix cache start wipe — " + std::to_string(removed) +
+                   " files removed\n");
         static std::atomic<unsigned> serial{0};
         m_pc_dir = root + "/pc-" + std::to_string(++serial);
         m_pc_budget = budget;
@@ -913,7 +907,11 @@ class LlamaSession final : public Session {
     // failed write turns the cache off for the session: on the console that
     // is a full disk, and every later request would pay the failing write.
     void save_prefix_cache(llama_context* ctx, const llama_token* history, size_t n) {
-        if (m_pc_budget == 0 || n < m_pc_min || llama_n_rs_seq(ctx) > 0)
+        if (m_pc_budget == 0)
+            return;
+        prune_prefix_cache_files(m_pc_root, m_pc_ttl);
+        m_pc.prune(m_pc_dir, m_pc_ttl);
+        if (n < m_pc_min || llama_n_rs_seq(ctx) > 0)
             return;
         const std::string fp = state_fingerprint();
         if (fp != m_pc_fp) {
@@ -972,8 +970,11 @@ class LlamaSession final : public Session {
     // cache is cleared and m_kv_tokens empty, and the request prefills in full.
     size_t restore_prefix_cache(llama_context* ctx, const std::vector<llama_token>& tokens,
                                 size_t common) {
-        if (m_pc_budget == 0 || m_pc.entries().empty() || tokens.size() < 2 ||
-            llama_n_rs_seq(ctx) > 0 || state_fingerprint() != m_pc_fp)
+        if (m_pc_budget == 0)
+            return 0;
+        m_pc.prune(m_pc_dir, m_pc_ttl);
+        if (m_pc.entries().empty() || tokens.size() < 2 || llama_n_rs_seq(ctx) > 0 ||
+            state_fingerprint() != m_pc_fp)
             return 0;
         size_t keep = common;
         if (common < m_kv_tokens.size()) {

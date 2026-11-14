@@ -22,9 +22,11 @@
     #include "inference-bridge.h"
     #include "model-downloader.h"
     #include "xllama/api_activity.h"
+    #include "xllama/api_auth.h"
     #include "xllama/api_connection.h"
     #include "xllama/api_policy.h"
     #include "xllama/api_pull_policy.h"
+    #include "xllama/api_timings.h"
     #include "xllama/chat_prompt.h"
     #include "xllama/compute_admission.h"
     #include "xllama/http_framing.h"
@@ -113,10 +115,12 @@ StreamSocketListener g_listener{nullptr};
 constexpr int kDefaultPort = 11434; // Ollama default port, familiar to clients
 
 // Read and trim a small LocalState text file; empty string if absent.
-std::string read_local_text(const char* name) {
+std::string read_local_text(const char* name, bool* present = nullptr) {
     std::string out;
     const std::string p = ::xllama::resolve_local_path(name);
     FILE* f = _wfopen(winrt::to_hstring(p).c_str(), L"r");
+    if (present)
+        *present = f != nullptr;
     if (!f)
         return out;
     char buf[512];
@@ -151,6 +155,7 @@ int listen_port() {
 struct HttpRequest {
     std::string method;
     std::string path;
+    std::string authorization;
     std::string body;
     // 0 = a complete, exactly framed request. Otherwise the 4xx to answer with
     // (parse_http_head's codes, 400 for a short body, 408 past a deadline).
@@ -213,6 +218,7 @@ HttpRequest read_request(StreamSocket const& socket) {
     }
     req.method = head.method;
     req.path = head.path;
+    req.authorization = head.authorization;
 
     const auto body_deadline = clock::now() + ::xllama::kHttpBodyDeadline;
     while (data.size() - head.body_start < head.content_length) {
@@ -426,7 +432,7 @@ class SseStream {
         }
     }
 
-    void finish(const wchar_t* reason, int prompt_tokens, int completion_tokens) {
+    void finish(const wchar_t* reason, const ::xllama::InferenceResult& result) {
         if (m_finished)
             return;
         try {
@@ -438,11 +444,14 @@ class SseStream {
             return;
         try {
             JsonObject usage;
-            usage.Insert(L"prompt_tokens", JsonValue::CreateNumberValue(prompt_tokens));
-            usage.Insert(L"completion_tokens", JsonValue::CreateNumberValue(completion_tokens));
+            usage.Insert(L"prompt_tokens", JsonValue::CreateNumberValue(result.n_prompt));
+            usage.Insert(L"completion_tokens", JsonValue::CreateNumberValue(result.n_eval));
             usage.Insert(L"total_tokens",
-                         JsonValue::CreateNumberValue(prompt_tokens + completion_tokens));
-            send_chunk(JsonObject{}, JsonValue::CreateStringValue(winrt::hstring(reason)), &usage);
+                         JsonValue::CreateNumberValue(result.n_prompt + result.n_eval));
+            const JsonObject timings =
+                JsonObject::Parse(winrt::to_hstring(::xllama::api_timings_json(result)));
+            send_chunk(JsonObject{}, JsonValue::CreateStringValue(winrt::hstring(reason)), &usage,
+                       &timings);
             end();
         } catch (...) {
             stop();
@@ -488,7 +497,7 @@ class SseStream {
     }
 
     void send_chunk(JsonObject const& delta, IJsonValue const& finish_reason,
-                    JsonObject const* usage) {
+                    JsonObject const* usage, JsonObject const* timings = nullptr) {
         JsonObject choice;
         choice.Insert(L"index", JsonValue::CreateNumberValue(0));
         choice.Insert(L"delta", delta);
@@ -505,6 +514,8 @@ class SseStream {
         chunk.Insert(L"choices", choices);
         if (usage != nullptr)
             chunk.Insert(L"usage", *usage);
+        if (timings != nullptr)
+            chunk.Insert(L"timings", *timings);
         send(winrt::to_string(chunk.Stringify()));
     }
 
@@ -756,8 +767,8 @@ JsonObject logprobs_json(const std::vector<::xllama::TokenLogprob>& lps) {
 
 // One OpenAI chat.completion body. `message` is choices[0].message.
 std::string completion_json(const std::string& model, JsonObject const& message,
-                            winrt::hstring const& finish_reason, int prompt_tokens,
-                            int completion_tokens, const char*& status,
+                            winrt::hstring const& finish_reason,
+                            const ::xllama::InferenceResult& result, const char*& status,
                             const std::vector<::xllama::TokenLogprob>* logprobs = nullptr) {
     JsonObject choice;
     choice.Insert(L"index", JsonValue::CreateNumberValue(0));
@@ -773,9 +784,9 @@ std::string completion_json(const std::string& model, JsonObject const& message,
     choices.Append(choice);
 
     JsonObject usage;
-    usage.Insert(L"prompt_tokens", JsonValue::CreateNumberValue(prompt_tokens));
-    usage.Insert(L"completion_tokens", JsonValue::CreateNumberValue(completion_tokens));
-    usage.Insert(L"total_tokens", JsonValue::CreateNumberValue(prompt_tokens + completion_tokens));
+    usage.Insert(L"prompt_tokens", JsonValue::CreateNumberValue(result.n_prompt));
+    usage.Insert(L"completion_tokens", JsonValue::CreateNumberValue(result.n_eval));
+    usage.Insert(L"total_tokens", JsonValue::CreateNumberValue(result.n_prompt + result.n_eval));
 
     JsonObject resp;
     const std::string id =
@@ -786,6 +797,8 @@ std::string completion_json(const std::string& model, JsonObject const& message,
     resp.Insert(L"model", JsonValue::CreateStringValue(winrt::to_hstring(model)));
     resp.Insert(L"choices", choices);
     resp.Insert(L"usage", usage);
+    resp.Insert(L"timings",
+                JsonObject::Parse(winrt::to_hstring(::xllama::api_timings_json(result))));
     status = "200 OK";
     return winrt::to_string(resp.Stringify());
 }
@@ -817,6 +830,16 @@ std::string handle_tool_proposal_locked(JsonObject const& root, ::xllama::ToolRe
         request.messages.insert(request.messages.begin(), std::move(system));
     }
 
+    bool enable_thinking =
+        !(::xllama::model_is_qwen3(model) && !::xllama::model_is_thinking(model));
+    if (root.HasKey(L"chat_template_kwargs") &&
+        root.GetNamedValue(L"chat_template_kwargs").ValueType() == JsonValueType::Object) {
+        const JsonObject kwargs = root.GetNamedObject(L"chat_template_kwargs");
+        if (kwargs.HasKey(L"enable_thinking") &&
+            kwargs.GetNamedValue(L"enable_thinking").ValueType() == JsonValueType::Boolean)
+            enable_thinking = kwargs.GetNamedBoolean(L"enable_thinking");
+    }
+
     ::xllama::GenerateParams gp;
     gp.reuse_kv = false;
     gp.n_predict = n_predict;
@@ -833,7 +856,8 @@ std::string handle_tool_proposal_locked(JsonObject const& root, ::xllama::ToolRe
             [&](const std::vector<::xllama::ChatMessage>& messages,
                 const std::vector<::xllama::ToolSpec>& tools) {
                 const ::xllama::ToolTemplateResult rendered = ::xllama::render_tool_prompt(
-                    llama_model, "", messages, tools, request.choice, request.forced_name);
+                    llama_model, "", messages, tools, request.choice, request.forced_name,
+                    enable_thinking);
                 if (!rendered.ok)
                     throw std::runtime_error(rendered.error);
                 template_stops = rendered.stop_sequences;
@@ -871,7 +895,7 @@ std::string handle_tool_proposal_locked(JsonObject const& root, ::xllama::ToolRe
     const bool hit_cap = generated.n_eval >= gp.n_predict;
     const ::xllama::ToolParseResult parsed = ::xllama::parse_tool_generation(
         session->resident_llama_model(), "", fit.messages, request.tools, request.choice,
-        request.forced_name, generated.output_text, hit_cap);
+        request.forced_name, generated.output_text, hit_cap, enable_thinking);
     const ::xllama::ChoiceAssembly assembly =
         ::xllama::assemble_choice(generated.output_text, parsed.content, parsed.calls, hit_cap,
                                   ::xllama::model_is_thinking(model));
@@ -899,7 +923,7 @@ std::string handle_tool_proposal_locked(JsonObject const& root, ::xllama::ToolRe
         message.Insert(L"tool_calls", calls);
     }
     return completion_json(model, message, winrt::to_hstring(assembly.finish_reason),
-                           generated.n_prompt, generated.n_eval, status);
+                           generated, status);
 }
 
 // Handles one chat request under session_hub().mtx (already locked by the caller).
@@ -1131,7 +1155,7 @@ std::string handle_chat_locked(const std::string& body, const char*& status,
             if (!tail.empty())
                 sse->write_delta(tail);
             const bool streamed_cap = r.n_eval >= gp.n_predict;
-            sse->finish(streamed_cap ? L"length" : L"stop", r.n_prompt, r.n_eval);
+            sse->finish(streamed_cap ? L"length" : L"stop", r);
             status = "200 OK";
         } catch (...) {
             // Generation or JSON serialization failed after the head was sent.
@@ -1157,8 +1181,7 @@ std::string handle_chat_locked(const std::string& body, const char*& status,
     // EOS token before the cap stops naturally, which ended_with_stop (a textual
     // stop-sequence match) does not capture — deduce it from the token count.
     const bool hit_cap = r.n_eval >= gp.n_predict;
-    return completion_json(model, message, hit_cap ? L"length" : L"stop", r.n_prompt, r.n_eval,
-                           status,
+    return completion_json(model, message, hit_cap ? L"length" : L"stop", r, status,
                            gp.logprobs || !gp.forced_tokens.empty() ? &r.logprobs : nullptr);
 }
 
@@ -2007,7 +2030,8 @@ const char* framing_status(int code) {
 // every subsequent LAN request (console 1.6.0.1284). The compute permit is
 // a stack RAII handle; a client drop mid-SSE aborts generate() and this
 // frame unwinds, which releases the slot.
-void handle_connection(StreamSocket const& socket, uint64_t generation) {
+void handle_connection(StreamSocket const& socket, uint64_t generation,
+                       const std::string& api_key) {
     try {
         const HttpRequest req = read_request(socket);
         if (req.status != 0) {
@@ -2026,6 +2050,13 @@ void handle_connection(StreamSocket const& socket, uint64_t generation) {
         // Health probe (also the spike gate: curl http://<ip>:<port>/ -> 200).
         if (req.method == "GET" && (req.path == "/" || req.path == "/health")) {
             write_response(socket, "200 OK", "{\"status\":\"ok\",\"service\":\"xllama\"}");
+            return;
+        }
+
+        if (!api_key.empty() && !::xllama::bearer_matches(req.authorization, api_key)) {
+            ::xllama::log_output("[api] unauthorized: " + req.method + " " + req.path + "\n");
+            write_response(socket, "401 Unauthorized",
+                           "{\"error\":{\"message\":\"unauthorized\",\"type\":\"auth\"}}");
             return;
         }
 
@@ -2226,7 +2257,8 @@ void handle_connection(StreamSocket const& socket, uint64_t generation) {
 
 // Return from ConnectionReceived immediately after queueing. A write on this
 // thread is only the bounded-gate 503; every other reply runs on the work item.
-void dispatch_connection(StreamSocket const& socket, uint64_t generation) {
+void dispatch_connection(StreamSocket const& socket, uint64_t generation,
+                         const std::string& api_key) {
     auto slot = ::xllama::process_api_connection_gate().try_acquire();
     if (!slot) {
         try {
@@ -2239,9 +2271,9 @@ void dispatch_connection(StreamSocket const& socket, uint64_t generation) {
     auto held = std::make_shared<::xllama::ApiConnectionGate::Handle>(std::move(slot));
     try {
         winrt::Windows::System::Threading::ThreadPool::RunAsync(
-            [socket, generation, held](winrt::Windows::Foundation::IAsyncAction const&) {
+            [socket, generation, held, api_key](winrt::Windows::Foundation::IAsyncAction const&) {
                 auto client = activity().client();
-                handle_connection(socket, generation);
+                handle_connection(socket, generation, api_key);
                 (void)held;
                 (void)client;
             });
@@ -2312,10 +2344,20 @@ void start_server(int requested_port) {
     }
     try {
         StreamSocketListener listener;
+        bool key_present = false;
+        const std::string key_text = read_local_text("api.key", &key_present);
+        const std::string api_key = ::xllama::api_key_from_text(key_text);
+        if (api_key.empty()) {
+            if (key_present)
+                ::xllama::log_output("[api] api.key ignored: shorter than 32 characters\n");
+            ::xllama::log_output("[api] no api.key: the LAN endpoint is unauthenticated\n");
+        } else {
+            ::xllama::log_output("[api] api.key loaded: bearer required\n");
+        }
         listener.ConnectionReceived(
-            [generation](StreamSocketListener const&,
-                         StreamSocketListenerConnectionReceivedEventArgs const& a) {
-                dispatch_connection(a.Socket(), generation);
+            [generation, api_key](StreamSocketListener const&,
+                                  StreamSocketListenerConnectionReceivedEventArgs const& a) {
+                dispatch_connection(a.Socket(), generation, api_key);
             });
         listener.BindServiceNameAsync(winrt::to_hstring(std::to_string(port))).get();
         {

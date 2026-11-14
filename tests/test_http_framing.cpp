@@ -44,6 +44,16 @@ TEST_CASE("http head: Content-Length is one exact decimal (F02)") {
     CHECK(parse_http_head(head("X-Content-Length: 9\r\n")).content_length == 0);
 }
 
+TEST_CASE("http head: Authorization has a complete case-insensitive name and trimmed value") {
+    CHECK(parse_http_head(head("")).authorization.empty());
+    CHECK(parse_http_head(head("aUtHoRiZaTiOn:\t Bearer secret \t\r\n")).authorization ==
+          "Bearer secret");
+    CHECK(parse_http_head(head("Authorization: \t\r\n")).authorization.empty());
+    CHECK(parse_http_head(head("X-Authorization: Bearer secret\r\n")).authorization.empty());
+    CHECK(parse_http_head(head("Authorization: Bearer a\r\nauthorization: Bearer b\r\n"))
+              .status == 400);
+}
+
 TEST_CASE("http head: limits are refusals, not clamps") {
     CHECK(parse_http_head(head("Content-Length: 8388608\r\n")).status == 0);
     CHECK(parse_http_head(head("Content-Length: 8388609\r\n")).status == 413);

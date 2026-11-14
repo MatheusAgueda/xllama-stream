@@ -6,13 +6,73 @@
 #pragma once
 
 #include <algorithm>
+#include <charconv>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace xllama {
+
+inline std::chrono::seconds prefix_cache_ttl(const char* value) {
+    constexpr std::chrono::seconds fallback{1800};
+    if (!value || !*value)
+        return fallback;
+    const std::string_view text(value);
+    int seconds = 0;
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), seconds);
+    return parsed.ec == std::errc() && parsed.ptr == text.data() + text.size() && seconds >= 0
+               ? std::chrono::seconds(seconds)
+               : fallback;
+}
+
+inline bool prefix_cache_file_expired(const std::filesystem::path& path, std::chrono::seconds ttl) {
+    std::error_code ec;
+    const auto written = std::filesystem::last_write_time(path, ec);
+    return ec || std::filesystem::file_time_type::clock::now() - written > ttl;
+}
+
+// No TTL means a start wipe. Do not follow directory symlinks out of the root.
+inline size_t remove_prefix_cache_files(const std::filesystem::path& root,
+                                       std::optional<std::chrono::seconds> ttl) {
+    std::error_code ec;
+    std::vector<std::filesystem::path> files, dirs;
+    for (std::filesystem::recursive_directory_iterator it(
+             root, std::filesystem::directory_options::skip_permission_denied, ec), end;
+         !ec && it != end; it.increment(ec)) {
+        std::error_code status_ec;
+        const auto status = it->symlink_status(status_ec);
+        if (status_ec)
+            continue;
+        if (std::filesystem::is_directory(status)) {
+            if (!ttl)
+                dirs.push_back(it->path());
+        } else if (!ttl || prefix_cache_file_expired(it->path(), *ttl)) {
+            files.push_back(it->path());
+        }
+    }
+    size_t removed = 0;
+    for (const auto& path : files)
+        if (std::filesystem::remove(path, ec))
+            ++removed;
+    for (auto it = dirs.rbegin(); it != dirs.rend(); ++it)
+        std::filesystem::remove(*it, ec);
+    return removed;
+}
+
+inline size_t wipe_prefix_cache_files(const std::filesystem::path& root) {
+    return remove_prefix_cache_files(root, std::nullopt);
+}
+
+inline size_t prune_prefix_cache_files(const std::filesystem::path& root,
+                                      std::chrono::seconds ttl) {
+    return remove_prefix_cache_files(root, ttl);
+}
 
 // One saved sequence state: the token history it absorbed and the file
 // holding it. Like a KvStore snapshot it is cached work, never a source of
@@ -105,6 +165,20 @@ class PrefixCacheIndex {
         m_total -= m_entries[i].bytes;
         m_entries.erase(m_entries.begin() + static_cast<std::ptrdiff_t>(i));
         return file;
+    }
+
+    // Drop stale and missing entries before choosing a prefix or reusing a save.
+    void prune(const std::filesystem::path& dir, std::chrono::seconds ttl) {
+        for (size_t i = 0; i < m_entries.size();) {
+            const auto path = dir / m_entries[i].file;
+            if (prefix_cache_file_expired(path, ttl)) {
+                std::error_code ec;
+                std::filesystem::remove(path, ec);
+                remove(i);
+            } else {
+                ++i;
+            }
+        }
     }
 
     void clear() {

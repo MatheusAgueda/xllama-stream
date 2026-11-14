@@ -112,6 +112,34 @@ std::string render_marked(const std::vector<xllama::ChatMessage>& messages,
 
 } // namespace
 
+TEST_CASE("tool template: Qwen3 no-think prefill follows enable_thinking") {
+    const std::string jinja = std::string(kToolTemplate) + R"(
+{%- if add_generation_prompt and enable_thinking is defined and enable_thinking == false -%}
+{{ '<think>\n\n</think>\n\n' }}
+{%- endif -%})";
+    const std::vector<xllama::ChatMessage> messages{message(xllama::ChatRole::User, "ping please")};
+    const std::vector<xllama::ToolSpec> tools{ping_tool()};
+    const std::string no_think = "<think>\n\n</think>\n\n";
+    for (bool thinking : {false, true}) {
+        const auto rendered = xllama::render_tool_prompt(
+            nullptr, jinja, messages, tools, xllama::ToolChoice::Auto, "", thinking);
+        REQUIRE_MESSAGE(rendered.ok, rendered.error);
+        if (thinking) {
+            CHECK(rendered.prompt.find(no_think) == std::string::npos);
+        } else {
+            REQUIRE(rendered.prompt.size() >= no_think.size());
+            CHECK(rendered.prompt.substr(rendered.prompt.size() - no_think.size()) == no_think);
+        }
+        const auto parsed = xllama::parse_tool_generation(
+            nullptr, jinja, messages, tools, xllama::ToolChoice::Auto, "",
+            "<tool_call>\n{\"name\":\"ping\",\"arguments\":{\"text\":\"pong\"}}\n</tool_call>",
+            false, thinking);
+        CHECK_FALSE(parsed.parser_threw);
+        REQUIRE(parsed.calls.size() == 1);
+        CHECK(parsed.calls[0].name == "ping");
+    }
+}
+
 TEST_CASE("tool policy classifies proposals instead of rejecting every key") {
     xllama::ApiToolFields absent;
     CHECK(xllama::classify_api_tools(absent).disposition == xllama::ApiToolDisposition::None);

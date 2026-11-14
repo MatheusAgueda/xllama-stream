@@ -7,6 +7,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+- **Session:** the disk prefix cache is wiped at session start. Saves and lookups
+  remove entries older than `XLLAMA_PREFIX_CACHE_TTL_S` (default 30 minutes).
+
+- **Tools:** Qwen3 non-thinking models use the no-think template form for tool
+  proposals too; a boolean `chat_template_kwargs.enable_thinking` overrides it.
+
+- **LAN API:** normal completions and final SSE chunks include prefill/decode
+  timings and evaluated-token counts alongside the existing usage.
+
+- **LAN API:** `LocalState/api.key` optionally requires a bearer key on data routes;
+  preflight and liveness remain open. See [Bearer key](docs/api-endpoint.md#bearer-key).
+
 - **Session (hybrid models):** opt-in disk prefix cache for LAN API clients
   that interleave conversations. With `XLLAMA_PREFIX_CACHE_MIB` set, the
   prompt prefill saves the sequence state at its #170c checkpoints to

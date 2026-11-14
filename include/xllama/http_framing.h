@@ -27,6 +27,7 @@ struct HttpHead {
     std::string error;
     std::string method;
     std::string path; // query string removed
+    std::string authorization;
     size_t content_length = 0;
     size_t body_start = 0; // offset of the body in the bytes parsed
 };

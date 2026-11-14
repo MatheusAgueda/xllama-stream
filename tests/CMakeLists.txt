@@ -29,6 +29,8 @@ add_executable(xllama-tests
     test_session_spec.cpp
     test_api_policy.cpp
     test_http_framing.cpp
+    test_api_auth.cpp
+    test_api_timings.cpp
     test_sse.cpp
     test_stop_filter.cpp
     test_tool_proposal.cpp

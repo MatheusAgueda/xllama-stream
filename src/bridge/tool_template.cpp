@@ -121,7 +121,7 @@ GrammarSpec grammar_spec(const common_chat_params& params) {
 
 Applied apply_template(const void* llama_model, const std::string& jinja_override,
                        const std::vector<ChatMessage>& messages, const std::vector<ToolSpec>& tools,
-                       ToolChoice choice, const std::string& forced_name) {
+                       ToolChoice choice, const std::string& forced_name, bool enable_thinking) {
     Applied applied;
     if (llama_model == nullptr && jinja_override.empty()) {
         applied.error = "tools require a GGUF chat template";
@@ -164,7 +164,7 @@ Applied apply_template(const void* llama_model, const std::string& jinja_overrid
     inputs.use_jinja = true;
     inputs.parallel_tool_calls = true;
     inputs.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
-    inputs.enable_thinking = true;
+    inputs.enable_thinking = enable_thinking;
     inputs.tool_choice = map_choice(choice);
     for (const ToolSpec& tool : offered) {
         common_chat_tool spec;
@@ -219,10 +219,11 @@ std::string parsed_content(const common_chat_msg& message) {
 ToolTemplateResult render_tool_prompt(const void* llama_model, const std::string& jinja_override,
                                       const std::vector<ChatMessage>& messages,
                                       const std::vector<ToolSpec>& tools, ToolChoice choice,
-                                      const std::string& forced_name) {
+                                      const std::string& forced_name, bool enable_thinking) {
     ToolTemplateResult out;
     const Applied applied =
-        apply_template(llama_model, jinja_override, messages, tools, choice, forced_name);
+        apply_template(llama_model, jinja_override, messages, tools, choice, forced_name,
+                       enable_thinking);
     if (!applied.ok) {
         out.error = applied.error;
         return out;
@@ -239,10 +240,11 @@ ToolParseResult parse_tool_generation(const void* llama_model, const std::string
                                       const std::vector<ChatMessage>& messages,
                                       const std::vector<ToolSpec>& tools, ToolChoice choice,
                                       const std::string& forced_name, const std::string& raw_text,
-                                      bool hit_cap) {
+                                      bool hit_cap, bool enable_thinking) {
     ToolParseResult out;
     const Applied applied =
-        apply_template(llama_model, jinja_override, messages, tools, choice, forced_name);
+        apply_template(llama_model, jinja_override, messages, tools, choice, forced_name,
+                       enable_thinking);
     if (!applied.ok) {
         log_output(std::string("[xllama] api: tool template unavailable after generation: ") +
                    applied.error + "\n");
@@ -281,7 +283,7 @@ namespace xllama {
 
 ToolTemplateResult render_tool_prompt(const void*, const std::string&,
                                       const std::vector<ChatMessage>&, const std::vector<ToolSpec>&,
-                                      ToolChoice, const std::string&) {
+                                      ToolChoice, const std::string&, bool) {
     ToolTemplateResult out;
     out.error = "tools require a GGUF chat template";
     return out;
@@ -289,7 +291,8 @@ ToolTemplateResult render_tool_prompt(const void*, const std::string&,
 
 ToolParseResult parse_tool_generation(const void*, const std::string&,
                                       const std::vector<ChatMessage>&, const std::vector<ToolSpec>&,
-                                      ToolChoice, const std::string&, const std::string&, bool) {
+                                      ToolChoice, const std::string&, const std::string&, bool,
+                                      bool) {
     ToolParseResult out;
     out.parser_threw = true;
     return out;
