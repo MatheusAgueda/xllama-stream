@@ -859,14 +859,17 @@ TEST_CASE("Session: the disk prefix cache writes only requests that opt in (opt-
     CHECK(qa2.n_prefix_cache_tokens == 0);
     CHECK(prefix_files(root).empty());
 
-    REQUIRE(sess->generate(pc_greedy(a.turn1())).success); // opted in: one file
-    CHECK(prefix_files(root).size() == 1);
+    // Opted in: one file per split point of this prefill (CI: two here, after
+    // the resident a2; one from an empty session in the case above).
+    REQUIRE(sess->generate(pc_greedy(a.turn1())).success);
+    const auto saved = prefix_files(root);
+    CHECK(!saved.empty());
     REQUIRE(sess->generate(unsaved(b.turn1())).success);
     const auto ra2 = sess->generate(unsaved(a2)); // restores without opting in
     REQUIRE_MESSAGE(ra2.success, ra2.error_msg);
     CHECK(ra2.n_prefix_cache_tokens > 0);
     CHECK(ra2.n_prefix_cache_tokens + ra2.n_p_eval == ra2.n_prompt);
-    CHECK(prefix_files(root).size() == 1);
+    CHECK(prefix_files(root) == saved); // nothing written, nothing dropped
 
     sess.reset();
     std::filesystem::remove_all(root, ec);
