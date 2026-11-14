@@ -728,6 +728,7 @@ static xllama::GenerateParams pc_greedy(const std::string& prompt) {
     gp.prompt = prompt;
     gp.n_predict = 12;
     gp.temperature = 0.0f;
+    gp.save_prefix = true;
     return gp;
 }
 
@@ -818,6 +819,56 @@ TEST_CASE("Session: an interleaved API turn restores its prefix from disk (opt-i
 
     sess.reset(); // the session's files go with it
     CHECK(prefix_files(root).empty());
+    std::filesystem::remove_all(root, ec);
+}
+
+// The file holds the prompt's token history, so with the cache on only a
+// request that opts in (GenerateParams::save_prefix, the API's
+// "xllama_prefix_cache": true) writes one. Any request may restore it.
+TEST_CASE("Session: the disk prefix cache writes only requests that opt in (opt-in: "
+          "XLLAMA_TEST_MODEL)") {
+    const char* model = std::getenv("XLLAMA_TEST_MODEL");
+    if (!model)
+        return;
+    const auto root = std::filesystem::temp_directory_path() / "xllama-prefix-cache-optin";
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    const PcConversation a = pc_conversation("a logistics clerk", "mobile home in bay");
+    const PcConversation b = pc_conversation("a harbour inspector", "container on quay");
+    const auto unsaved = [](const std::string& prompt) {
+        xllama::GenerateParams gp = pc_greedy(prompt);
+        gp.save_prefix = false;
+        return gp;
+    };
+
+    xllama::SessionParams sp;
+    sp.model_path = model;
+    sp.n_ctx = 1024;
+    sp.env = pc_env(root, 256);
+    std::string err;
+    auto sess = xllama::Session::create(sp, &err);
+    REQUIRE_MESSAGE(sess, err);
+    const auto qa = sess->generate(unsaved(a.turn1()));
+    REQUIRE_MESSAGE(qa.success, qa.error_msg);
+    const auto qb = sess->generate(unsaved(b.turn1()));
+    REQUIRE_MESSAGE(qb.success, qb.error_msg);
+    CHECK(prefix_files(root).empty());
+    const std::string a2 = a.turn2(qa.output_text);
+    const auto qa2 = sess->generate(unsaved(a2));
+    REQUIRE_MESSAGE(qa2.success, qa2.error_msg);
+    CHECK(qa2.n_prefix_cache_tokens == 0);
+    CHECK(prefix_files(root).empty());
+
+    REQUIRE(sess->generate(pc_greedy(a.turn1())).success); // opted in: one file
+    CHECK(prefix_files(root).size() == 1);
+    REQUIRE(sess->generate(unsaved(b.turn1())).success);
+    const auto ra2 = sess->generate(unsaved(a2)); // restores without opting in
+    REQUIRE_MESSAGE(ra2.success, ra2.error_msg);
+    CHECK(ra2.n_prefix_cache_tokens > 0);
+    CHECK(ra2.n_prefix_cache_tokens + ra2.n_p_eval == ra2.n_prompt);
+    CHECK(prefix_files(root).size() == 1);
+
+    sess.reset();
     std::filesystem::remove_all(root, ec);
 }
 

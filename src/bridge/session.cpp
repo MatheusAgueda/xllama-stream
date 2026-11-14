@@ -542,12 +542,14 @@ class LlamaSession final : public Session {
     // several clients through one session, and their conversations interleave
     // (A, B, A'): B overwrites A's attention KV, and A' re-prefilled from token
     // 0 — 27.8 s for a 1500-token code prompt on the console. At the same
-    // split points as the checkpoints, a full-prompt prefill also writes the
-    // FULL sequence state (attention + recurrent) to a file, streamed by
-    // llama.cpp with no whole-state heap buffer; a later full prompt restores
-    // the longest saved prefix that beats the in-memory paths. Each session
-    // writes only its own directory, removed with the session, so a file is
-    // never read by another model or context shape.
+    // split points as the checkpoints, a full-prompt prefill of a request that
+    // opts in (GenerateParams::save_prefix: the file holds the prompt's token
+    // history) also writes the FULL sequence state (attention + recurrent) to
+    // a file, streamed by llama.cpp with no whole-state heap buffer; a later
+    // full prompt (opted in or not) restores the longest saved prefix that
+    // beats the in-memory paths. Each session writes only its own directory,
+    // removed with the session, so a file is never read by another model or
+    // context shape.
     uint64_t m_pc_budget = 0; // bytes on disk; 0 = off
     size_t m_pc_min = 256;    // shortest history worth a file (XLLAMA_PREFIX_CACHE_MIN)
     std::string m_pc_dir;     // this session's directory, created by the first save
@@ -1303,7 +1305,7 @@ class LlamaSession final : public Session {
             }
             n_done += seg;
             save_rs_checkpoint(ctx, rs_hist, at);
-            if (full_prompt)
+            if (full_prompt && gp.save_prefix)
                 save_prefix_cache(ctx, rs_hist, at);
         }
         if (prefilled)
