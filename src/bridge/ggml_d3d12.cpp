@@ -8177,6 +8177,9 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
             out->push_back(run_mmid_case(backend, wtype, 2048, 512, 8, 1));
             out->push_back(run_mmid_case(backend, wtype, 512, 2048, 1, 5));
             out->push_back(run_mmid_case(backend, wtype, 2048, 512, 8, 5));
+            // Qwen3-Coder-30B-A3B down 768 -> 2048: 3 chunks, IQ2/IQ3 rows 2 mod 4 bytes.
+            out->push_back(run_mmid_case(backend, wtype, 2048, 768, 8, 1));
+            out->push_back(run_mmid_case(backend, wtype, 2048, 768, 8, 5));
         }
     if (gpu().moe_ok) {
         // Qwen3.6-35B-A3B: n_embd 2048, 8 routed experts; decode and a prefill ubatch.

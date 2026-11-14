@@ -95,7 +95,11 @@ inline bool d3d12_mmid_plan(const ggml_tensor* dst, D3d12MmidPlan* plan,
         return false;
     if (dst->ne[0] != n || dst->ne[1] != n_ids || dst->ne[2] != n_tok)
         return false;
-    if (as->nb[0] != ggml_type_size(as->type) || as->nb[1] % 4 != 0 || as->nb[2] % 4 != 0 ||
+    // IQ3_S / IQ2_S / IQ2_XXS blocks (110 / 82 / 66 B) already sit on 2-byte boundaries inside a
+    // row, and their kernels read through ld16 / ld32 or a slab from the dword below: any even row
+    // stride runs (Qwen3-Coder-30B-A3B's ffn_down, K = 768: 330 B rows). IQ4_XS: aligned Load2s.
+    const std::size_t row_align = d3d12_geom_type(as->type) ? 2u : 4u;
+    if (as->nb[0] != ggml_type_size(as->type) || as->nb[1] % row_align != 0 || as->nb[2] % 4 != 0 ||
         b->nb[0] != sizeof(float) || ids->nb[0] != sizeof(std::int32_t) || ids->nb[1] % 4 != 0 ||
         dst->nb[0] != sizeof(float) || dst->nb[1] % 4 != 0 || dst->nb[2] % 4 != 0)
         return false;

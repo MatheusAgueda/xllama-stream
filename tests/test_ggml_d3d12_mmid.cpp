@@ -204,6 +204,24 @@ TEST_CASE("ggml_d3d12 mmid: constants from a MUL_MAT_ID node") {
         CHECK(p.params.expert_stride == 450560);
         CHECK(p.params.x_col_stride == 2 * 292);
     }
+    // Qwen3-Coder-30B-A3B i1-IQ3_S down: 768 -> 2048, 330 B rows (2 mod 4), 29 slots.
+    {
+        MmidGraph g;
+        build(g, {768, 2048, 29, 8, 8, 2, 8}, GGML_TYPE_IQ3_S, true);
+        D3d12MmidPlan p;
+        REQUIRE(d3d12_mmid_plan(g.out, &p));
+        CHECK(p.params.w_row_bytes == 3 * 110);
+        CHECK(p.params.expert_stride == 675840);
+        CHECK(p.params.nchunk == 3);
+        CHECK(p.params.x_col_stride == 3 * 292);
+    }
+    {
+        MmidGraph g; // one-block rows (110 B) too: every block stays on a 2-byte boundary
+        build(g, {256, 512, 41, 8, 1, 1, 8}, GGML_TYPE_IQ3_S, true);
+        D3d12MmidPlan p;
+        REQUIRE(d3d12_mmid_plan(g.out, &p));
+        CHECK(p.params.w_row_bytes == 110);
+    }
 }
 
 TEST_CASE("ggml_d3d12 mmid: nodes the kernel does not take") {
@@ -215,8 +233,8 @@ TEST_CASE("ggml_d3d12 mmid: nodes the kernel does not take") {
         CHECK_FALSE(d3d12_mmid_plan(g.out, &p));
     }
     {
-        MmidGraph g; // IQ3_S rows of one block (110 B) are not 4-byte multiples
-        build(g, {256, 512, 41, 8, 1, 1, 8}, GGML_TYPE_IQ3_S, true);
+        MmidGraph g; // 3 one-block rows: a 330 B expert stride puts odd experts off a dword
+        build(g, {256, 3, 41, 8, 1, 1, 8}, GGML_TYPE_IQ3_S, true);
         CHECK_FALSE(d3d12_mmid_plan(g.out, &p));
     }
     {
@@ -253,6 +271,8 @@ TEST_CASE("ggml_d3d12 mmid: kernel emulation matches ggml's CPU mul_mat_id") {
         {1024, 37, 11, 8, 8, 5, 16},
         // K = 4096 (16 chunks), 4 ids per token, shared columns.
         {4096, 13, 9, 4, 1, 3, 4},
+        // Qwen3-Coder-30B-A3B down: K = 768 (3 chunks), rows 2 mod 4 bytes for the IQ2/IQ3 types.
+        {768, 64, 29, 8, 8, 2, 8},
     };
     for (const ggml_type wtype :
          {GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XXS})
