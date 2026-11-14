@@ -129,6 +129,14 @@ TEST_CASE("resolve_session_params: one resolver for every surface (ADR 0007)") {
     CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).n_ubatch == 0);
     pf.n_ubatch = 100000;
     CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).n_ubatch == 2048);
+
+    // kv_q8: a GGUF entry's opt-in, off by default; an ORT GenAI entry never reads it.
+    CHECK_FALSE(resolve_session_params("moe", pf, "D:\\m\\moe", -1).kv_q8);
+    pf.kv_q8 = true;
+    CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).kv_q8);
+    auto ort = pf;
+    ort.gguf = false;
+    CHECK_FALSE(resolve_session_params("m", ort, "D:\\m", -1).kv_q8);
 }
 
 TEST_CASE("catalogue env: tuning names only, sorted, the last repeat wins") {
@@ -164,7 +172,7 @@ TEST_CASE("same_load: an adapter, context or GPU split is a different model in R
     other.n_threads = 6; // a tuning knob, not the load
     other.n_batch = 256;
     CHECK(same_load(base, other));
-    for (int field = 0; field < 12; ++field) {
+    for (int field = 0; field < 13; ++field) {
         auto changed = base;
         switch (field) {
         case 0:
@@ -202,6 +210,9 @@ TEST_CASE("same_load: an adapter, context or GPU split is a different model in R
             break;
         case 11:
             changed.env = {{"XLLAMA_CPU_POLL", "0"}}; // read at load
+            break;
+        case 12:
+            changed.kv_q8 = true; // the KV cache's type is fixed when the context is built
             break;
         }
         CHECK_MESSAGE(!same_load(base, changed), field);

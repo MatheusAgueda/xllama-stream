@@ -30,6 +30,7 @@ struct CatalogueLoad {
     int expert_major = 0;     // "expert_major": largest expert-major prompt ubatch (SessionParams)
     bool expert_prefetch_ahead = false; // "expert_prefetch_ahead": predict a layer early
     int n_ubatch = 0;                   // "n_ubatch": physical prefill chunk (0 = llama default)
+    bool kv_q8 = false;                 // "kv_q8": q8_0 KV + flash attention (SessionParams, #171)
     std::vector<std::pair<std::string, std::string>> env; // "env": {NAME: value} (SessionParams)
 };
 
@@ -86,6 +87,9 @@ inline SessionParams resolve_session_params(const std::string& model, const Cata
     // to max(slots / experts used, expert_major). Down to 1: a prompt prefilled in
     // k-token ubatches times a k-row batch, the cost a speculative verify pays.
     sp.n_ubatch = c.n_ubatch > 0 ? std::clamp(c.n_ubatch, 1, 2048) : 0;
+    // The session forces flash attention for it and falls back to f16 KV when the
+    // context cannot be built that way, so the opt-in never stops a load.
+    sp.kv_q8 = c.kv_q8;
     sp.env = resolve_env(c.env);
     // A streamed model is larger than any GPU budget: d3d12 layers would copy
     // its experts into video memory, so the knob does not apply to it. The

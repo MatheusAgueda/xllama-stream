@@ -119,6 +119,9 @@ struct ManifestEntry {
     // "n_ubatch": llama.cpp physical prefill chunk (0 = default 512). With
     // expert_major, each expert is read once per ubatch: a larger one reads less.
     int n_ubatch = 0;
+    // "kv_q8": q8_0 KV cache with flash attention (SessionParams::kv_q8, #171):
+    // half the bytes of f16 KV, so a long context fits and reads less per token.
+    bool kv_q8 = false;
     // "env": {NAME: number | bool | string}, tuning variables set for the load
     // (SessionParams::env); numbers as integers, booleans as 1 / 0.
     std::vector<std::pair<std::wstring, std::wstring>> env;
