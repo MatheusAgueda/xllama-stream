@@ -44,7 +44,12 @@ double emulate_rel_err(ggml_type t, int n, int k, int ncols, std::size_t x_pad, 
         v = uni(rng);
     const std::size_t row_bytes = ggml_row_size(t, k);
     std::vector<std::uint8_t> q(row_bytes * n + 8); // slack: 2-byte-aligned dword reads
-    ggml_quantize_chunk(t, wf.data(), q.data(), 0, n, k, nullptr);
+    // ggml asserts an importance matrix for IQ2_XXS (GGML_ASSERT -> abort under
+    // ASan since the IQ2_XXS cases): a flat one, as the device selftest's st_quantize.
+    std::vector<float> ones;
+    if (ggml_quantize_requires_imatrix(t))
+        ones.assign(static_cast<std::size_t>(k), 1.0f);
+    ggml_quantize_chunk(t, wf.data(), q.data(), 0, n, k, ones.empty() ? nullptr : ones.data());
 
     const std::size_t x_stride = static_cast<std::size_t>(k) + x_pad;
     const std::size_t y_stride = static_cast<std::size_t>(n) + y_pad;
