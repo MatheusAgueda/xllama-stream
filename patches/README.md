@@ -509,12 +509,30 @@ output are the same bits; the reduce is untouched. Scratch is `thread_local` (G 
 (Q row + DV fp16), 8 KiB here), so the planned work size is unchanged. Taken when
 K and V are f16, `1 < G <= 32`, `n_head == G * n_head_kv`; anything else (q8_0
 KV, MHA, f32) keeps the old loop. `GGML_CPU_FA_GQA=0` restores the old path; it is
-read on every call, so a manifest `env` honours it per load. Host harness
-`tests/harness/cpu_fa_gqa.cpp` (Linux gcc, `GGML_AVX2/FMA/F16C`, no AVX-512, Zen 4,
-6 threads, 6 layers with their own KV, 2026-11-14): BIT-EXACT in 10 of 10 cases
-(n_kv 512/1000/4096/10000/16384, 3/6/30 threads, masked holes, ALiBi 8, softcap
-30, sinks, an idle thread); time per 6 layers 57.5 → 24.4 ms at 10K (×2.36),
-140.2 → 41.7 ms at 16K (×3.36), ×0.97–1.08 at 4K and below.
+read on every call, so a manifest `env` honours it per load.
+
+`GGML_CPU_FA_GQA=2` (opt-in; unset or 1 stays on the bit-exact chunk) takes
+`ggml_compute_forward_flash_attn_ext_f16_gqa_fused_chunk` instead, built only with
+AVX2+FMA+F16C (MSVC gets the last two from `ggml-cpu-impl.h`): blocks of 8 query
+heads per K/V head, each K and V row converted from f16 once for the 8 heads, the
+8 scores reduced by one `hadd` tree and exponentiated by one `ggml_v_expf`, and Q
+and the V accumulators kept in f32. Same maths, not the same bits: the per-head loop
+rounds Q to f16 and accumulates V in f16, so its error grows with the context.
+Taken when DK and DV are multiples of 8, there is no logit softcap and the mask is
+broadcast over heads (`ne[2] == 1`, so a row is masked for all heads or none);
+otherwise mode 2 falls back to the bit-exact chunk.
+
+Host harness `tests/harness/cpu_fa_gqa.cpp` (Linux gcc `-O3`, `GGML_AVX2/FMA/F16C`,
+no AVX-512, Ryzen Z1 Extreme = Zen 4, 6 layers with their own KV, 2026-11-14): the
+bit-exact chunk equals the per-head loop byte for byte in 16 of 16 cases (n_kv
+512–16384, 1/2/3/6/30 threads, masked holes, ALiBi 8, softcap 30, sinks, an idle
+thread). Error against an f64 reference, per-head loop → fused: max 4–5e-4 → 5–7e-8,
+rms 1.4e-3 at 512 rising to 7.6e-3 at 16K → ≤1e-6. Time per 6 layers at 6 threads,
+per-head / bit-exact / fused: 10K 52.6 / 25.7 / 17.2 ms, 16K 130.4 / 36.6 / 25.9 ms,
+4K 5.2 / 4.9 / 3.4 ms. The handheld's clocks follow its power cap, so its thread
+scaling is not the console's (1 → 2 threads was ×5–7 for every path).
+Single-thread cost of one (head, row) pair of the per-head loop on L2-resident rows:
+f16 dot 9.3 ns, f16 mad 9.7 ns, expf 2.6 ns.
 
 ## Applying
 

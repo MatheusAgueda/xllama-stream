@@ -10,11 +10,10 @@ diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
  
  // ggml_compute_forward_dup
  
-@@ -9073,7 +9075,177 @@
- 
+@@ -9074,9 +9076,371 @@
              // permute(0, 2, 1, 3)
              memcpy((char *) dst->data + (i3*ne2*ne1 + i2 + i1*ne1)*nb1, VKQ32, nb1);
-+        }
+         }
 +    }
 +}
 +
@@ -23,10 +22,15 @@ diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
 +// keeps its own Q_q, VKQ16, M and S and goes through the f16 branch of _one_chunk in the same order, so the partials
 +// are the same bits. Caller guarantees: f16 K and V, neq1 == neq3 == 1, neq2 == G*nek2, nev2 == nek2, nek3 == nev3 == 1.
 +// GGML_CPU_FA_GQA=0 turns it off (per call, so a manifest env toggled between loads is honoured).
-+static bool ggml_flash_attn_ext_gqa_enabled(void) {
++// GGML_CPU_FA_GQA, read per call: 0 = the per-head loop, unset or 1 = the grouped chunk below (bit-exact with the
++// per-head loop), 2 = the fused chunk after it (f32 Q and accumulators: same maths, not bit-exact).
++static int ggml_flash_attn_ext_gqa_mode(void) {
 +    const char * e = getenv("GGML_CPU_FA_GQA");
-+    return !(e && e[0] == '0');
-+}
++    if (!e || !e[0]) {
++        return 1;
+     }
++    return e[0] == '0' ? 0 : e[0] == '2' ? 2 : 1;
+ }
 +
 +static constexpr int64_t GGML_FA_GQA_MAX_G = 32;
 +
@@ -61,7 +65,7 @@ diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
 +    memcpy(&scale,         (float *) dst->op_params + 0, sizeof(float));
 +    memcpy(&max_bias,      (float *) dst->op_params + 1, sizeof(float));
 +    memcpy(&logit_softcap, (float *) dst->op_params + 2, sizeof(float));
-+
+ 
 +    if (logit_softcap != 0) {
 +        scale /= logit_softcap;
 +    }
@@ -110,7 +114,7 @@ diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
 +
 +            const float * pq = (const float *) ((const char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
 +            q_to_vec_dot(pq, Qs + g*q_row, DK);
-         }
++        }
 +
 +        for (int64_t ic = ic_start; ic < ic_end; ++ic) {
 +            const char * k_data = (const char *) k->data + (ic*nbk1 + ik2*nbk2);
@@ -185,19 +189,224 @@ diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
 +            partial[0] = M[g];
 +            partial[1] = S[g];
 +        }
-     }
- }
- 
-@@ -9501,7 +9673,13 @@
++    }
++}
++
++#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
++#define GGML_FA_GQA_FUSED 1
++
++// lane l of the result = the horizontal sum of a_l
++static inline __m256 ggml_fa_hsum8(__m256 a0, __m256 a1, __m256 a2, __m256 a3,
++                                   __m256 a4, __m256 a5, __m256 a6, __m256 a7) {
++    const __m256 u0 = _mm256_hadd_ps(_mm256_hadd_ps(a0, a1), _mm256_hadd_ps(a2, a3));
++    const __m256 u1 = _mm256_hadd_ps(_mm256_hadd_ps(a4, a5), _mm256_hadd_ps(a6, a7));
++    return _mm256_add_ps(_mm256_permute2f128_ps(u0, u1, 0x20), _mm256_permute2f128_ps(u0, u1, 0x31));
++}
++
++// The grouped chunk's online softmax for blocks of 8 query heads sharing one K/V head, with the per-pair work cut:
++// each K and V row is converted from f16 once for the 8 heads, the 8 scores and their exponentials are one vector,
++// and Q and the V accumulators stay f32 (the per-head loop rounds Q to f16 and accumulates V in f16).
++// Caller: f16 K/V, DK and DV multiples of 8, no logit softcap, and a mask broadcast over heads (ne[2] == 1), so a
++// row is masked for every head or for none. Lanes past G run on a zero Q and are dropped.
++static void ggml_compute_forward_flash_attn_ext_f16_gqa_fused_chunk(
++        const ggml_compute_params * params,
++        ggml_tensor * dst,
++        int64_t ic_start, int64_t ic_end,
++        float * partials, int64_t partial_stride) {
++    GGML_UNUSED(params);
++
++    const ggml_tensor * q     = dst->src[0];
++    const ggml_tensor * k     = dst->src[1];
++    const ggml_tensor * v     = dst->src[2];
++    const ggml_tensor * mask  = dst->src[3];
++    const ggml_tensor * sinks = dst->src[4];
++
++    GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
++    GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
++    GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
++    GGML_TENSOR_LOCALS(size_t,  nbk, k,   nb)
++    GGML_TENSOR_LOCALS(int64_t, nev, v,   ne)
++    GGML_TENSOR_LOCALS(size_t,  nbv, v,   nb)
++
++    const int64_t DK = nek0;
++    const int64_t DV = nev0;
++    const int64_t G  = neq2/nek2;
++
++    float scale    = 1.0f;
++    float max_bias = 0.0f;
++
++    memcpy(&scale,    (float *) dst->op_params + 0, sizeof(float));
++    memcpy(&max_bias, (float *) dst->op_params + 1, sizeof(float));
++
++    const uint32_t n_head      = neq2;
++    const uint32_t n_head_log2 = 1u << (uint32_t) floor(log2(n_head));
++
++    const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
++    const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
++
++    thread_local std::vector<float> scratch;
++    const size_t need = 8*(DK + DV);
++    if (scratch.size() < need) {
++        scratch.resize(need);
++    }
++    float * Qf = scratch.data();
++    float * A  = scratch.data() + 8*DK;
++
++    // decode: iq1 = iq3 = 0, and the mask row is shared by every head
++    const ggml_fp16_t * mrow = mask ? (const ggml_fp16_t *) mask->data : NULL;
++
++    for (int64_t ik2 = 0; ik2 < nek2; ++ik2) {
++        for (int64_t g0 = 0; g0 < G; g0 += 8) {
++            const int64_t hb = std::min<int64_t>(8, G - g0);
++
++            float slope[8];
++            for (int64_t l = 0; l < 8; ++l) {
++                const uint32_t h = ik2*G + g0 + std::min<int64_t>(l, hb - 1);
++                slope[l] = (max_bias > 0.0f) ? h < n_head_log2 ? powf(m0, h + 1) : powf(m1, 2*(h - n_head_log2) + 1) : 1.0f;
++                if (l < hb) {
++                    memcpy(Qf + l*DK, (const char *) q->data + h*nbq2, DK*sizeof(float));
++                } else {
++                    memset(Qf + l*DK, 0, DK*sizeof(float));
++                }
++            }
++            memset(A, 0, 8*DV*sizeof(float));
++
++            const __m256 vslope = _mm256_loadu_ps(slope);
++            const __m256 vscale = _mm256_set1_ps(scale);
++            __m256 M = _mm256_set1_ps(-INFINITY);
++            __m256 S = _mm256_setzero_ps();
++
++            for (int64_t ic = ic_start; ic < ic_end; ++ic) {
++                const float mval = mrow ? GGML_CPU_FP16_TO_FP32(mrow[ic]) : 0.0f;
++                if (mval == -INFINITY) {
++                    continue;
++                }
++
++                const ggml_fp16_t * kd = (const ggml_fp16_t *) ((const char *) k->data + ic*nbk1 + ik2*nbk2);
++                const ggml_fp16_t * vd = (const ggml_fp16_t *) ((const char *) v->data + ic*nbv1 + ik2*nbv2);
++
++                __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps(), a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
++                __m256 a4 = _mm256_setzero_ps(), a5 = _mm256_setzero_ps(), a6 = _mm256_setzero_ps(), a7 = _mm256_setzero_ps();
++                for (int64_t j = 0; j < DK; j += 8) {
++                    const __m256 kv = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *) (kd + j)));
++                    a0 = _mm256_fmadd_ps(kv, _mm256_loadu_ps(Qf + 0*DK + j), a0);
++                    a1 = _mm256_fmadd_ps(kv, _mm256_loadu_ps(Qf + 1*DK + j), a1);
++                    a2 = _mm256_fmadd_ps(kv, _mm256_loadu_ps(Qf + 2*DK + j), a2);
++                    a3 = _mm256_fmadd_ps(kv, _mm256_loadu_ps(Qf + 3*DK + j), a3);
++                    a4 = _mm256_fmadd_ps(kv, _mm256_loadu_ps(Qf + 4*DK + j), a4);
++                    a5 = _mm256_fmadd_ps(kv, _mm256_loadu_ps(Qf + 5*DK + j), a5);
++                    a6 = _mm256_fmadd_ps(kv, _mm256_loadu_ps(Qf + 6*DK + j), a6);
++                    a7 = _mm256_fmadd_ps(kv, _mm256_loadu_ps(Qf + 7*DK + j), a7);
++                }
++
++                // as the per-head loop: s = qk*scale + slope*mask, then the online max
++                const __m256 s  = _mm256_add_ps(_mm256_mul_ps(ggml_fa_hsum8(a0, a1, a2, a3, a4, a5, a6, a7), vscale),
++                                                _mm256_mul_ps(vslope, _mm256_set1_ps(mval)));
++                const __m256 Mn = _mm256_max_ps(M, s);
++                const __m256 vs = ggml_v_expf(_mm256_sub_ps(s, Mn));
++                const int    up = _mm256_movemask_ps(_mm256_cmp_ps(s, M, _CMP_GT_OQ));
++
++                if (up) {
++                    // a new max: rescale those lanes' sum and accumulator by expf(Mold - Mnew), 0 on the first row
++                    const __m256 ms = ggml_v_expf(_mm256_sub_ps(M, Mn));
++                    S = _mm256_mul_ps(S, ms);
++                    float msa[8];
++                    _mm256_storeu_ps(msa, ms);
++                    for (int l = 0; l < 8; ++l) {
++                        if (up & (1 << l)) {
++                            ggml_vec_scale_f32(DV, A + l*DV, msa[l]);
++                        }
++                    }
++                }
++                S = _mm256_add_ps(S, vs);
++                M = Mn;
++
++                const __m256 b0 = _mm256_permutevar8x32_ps(vs, _mm256_set1_epi32(0));
++                const __m256 b1 = _mm256_permutevar8x32_ps(vs, _mm256_set1_epi32(1));
++                const __m256 b2 = _mm256_permutevar8x32_ps(vs, _mm256_set1_epi32(2));
++                const __m256 b3 = _mm256_permutevar8x32_ps(vs, _mm256_set1_epi32(3));
++                const __m256 b4 = _mm256_permutevar8x32_ps(vs, _mm256_set1_epi32(4));
++                const __m256 b5 = _mm256_permutevar8x32_ps(vs, _mm256_set1_epi32(5));
++                const __m256 b6 = _mm256_permutevar8x32_ps(vs, _mm256_set1_epi32(6));
++                const __m256 b7 = _mm256_permutevar8x32_ps(vs, _mm256_set1_epi32(7));
++                for (int64_t j = 0; j < DV; j += 8) {
++                    const __m256 vv = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *) (vd + j)));
++                    float * a = A + j;
++                    _mm256_storeu_ps(a + 0*DV, _mm256_fmadd_ps(vv, b0, _mm256_loadu_ps(a + 0*DV)));
++                    _mm256_storeu_ps(a + 1*DV, _mm256_fmadd_ps(vv, b1, _mm256_loadu_ps(a + 1*DV)));
++                    _mm256_storeu_ps(a + 2*DV, _mm256_fmadd_ps(vv, b2, _mm256_loadu_ps(a + 2*DV)));
++                    _mm256_storeu_ps(a + 3*DV, _mm256_fmadd_ps(vv, b3, _mm256_loadu_ps(a + 3*DV)));
++                    _mm256_storeu_ps(a + 4*DV, _mm256_fmadd_ps(vv, b4, _mm256_loadu_ps(a + 4*DV)));
++                    _mm256_storeu_ps(a + 5*DV, _mm256_fmadd_ps(vv, b5, _mm256_loadu_ps(a + 5*DV)));
++                    _mm256_storeu_ps(a + 6*DV, _mm256_fmadd_ps(vv, b6, _mm256_loadu_ps(a + 6*DV)));
++                    _mm256_storeu_ps(a + 7*DV, _mm256_fmadd_ps(vv, b7, _mm256_loadu_ps(a + 7*DV)));
++                }
++            }
++
++            float Ma[8];
++            float Sa[8];
++            _mm256_storeu_ps(Ma, M);
++            _mm256_storeu_ps(Sa, S);
++            for (int64_t l = 0; l < hb; ++l) {
++                const int64_t iq2 = ik2*G + g0 + l;
++
++                float * partial = partials + iq2*partial_stride;
++                float * VKQ32   = partial + 2;
++                memcpy(VKQ32, A + l*DV, DV*sizeof(float));
++
++                if (sinks && ic_start == 0) {
++                    const float s = ((const float *) sinks->data)[iq2];
++
++                    float ms = 1.0f;
++                    float vs = 1.0f;
++
++                    if (s > Ma[l]) {
++                        ms = expf(Ma[l] - s);
++                        Ma[l] = s;
++                        ggml_vec_scale_f32(DV, VKQ32, ms);
++                    } else {
++                        vs = expf(s - Ma[l]);
++                    }
++
++                    Sa[l] = Sa[l]*ms + vs;
++                }
++
++                partial[0] = Ma[l];
++                partial[1] = Sa[l];
++            }
++        }
++    }
++}
++#endif
++
+ static void ggml_compute_forward_flash_attn_ext_tiled(
+         const ggml_compute_params * params,
+         ggml_tensor * dst,
+@@ -9501,7 +9865,28 @@
          const int64_t partial_stride = nth * partial_size;
          float *       chunk_partials = partials_base + ith * partial_size;
  
 -        if (ic_start < nek1) {
-+        const int64_t G   = neq2/nek2;
-+        const bool    gqa = k->type == GGML_TYPE_F16 && G > 1 && G <= GGML_FA_GQA_MAX_G && neq2 == G*nek2 &&
-+                            nev2 == nek2 && nek3 == 1 && nev3 == 1 && ggml_flash_attn_ext_gqa_enabled();
++        const int64_t G    = neq2/nek2;
++        const int     mode = k->type == GGML_TYPE_F16 && G > 1 && G <= GGML_FA_GQA_MAX_G && neq2 == G*nek2 &&
++                             nev2 == nek2 && nek3 == 1 && nev3 == 1 ? ggml_flash_attn_ext_gqa_mode() : 0;
++        const bool    gqa  = mode != 0;
 +
-+        if (ic_start < nek1 && gqa) {
++        bool fused = false;
++#ifdef GGML_FA_GQA_FUSED
++        if (mode == 2) {
++            float softcap = 0.0f;
++            memcpy(&softcap, (float *) dst->op_params + 2, sizeof(float));
++            const ggml_tensor * mask = dst->src[3];
++            fused = DK % 8 == 0 && DV % 8 == 0 && softcap == 0.0f && (!mask || mask->ne[2] == 1);
++        }
++#endif
++
++        if (ic_start < nek1 && fused) {
++#ifdef GGML_FA_GQA_FUSED
++            ggml_compute_forward_flash_attn_ext_f16_gqa_fused_chunk(params, dst, ic_start, ic_end, chunk_partials, partial_stride);
++#endif
++        } else if (ic_start < nek1 && gqa) {
 +            ggml_compute_forward_flash_attn_ext_f16_gqa_chunk(params, dst, ic_start, ic_end, chunk_partials, partial_stride);
 +        } else if (ic_start < nek1) {
              for (int64_t q_head = 0; q_head < neq2; q_head++) {
