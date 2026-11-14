@@ -7,6 +7,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+- **Session (hybrid models):** opt-in disk prefix cache for LAN API clients
+  that interleave conversations. With `XLLAMA_PREFIX_CACHE_MIB` set, the
+  prompt prefill saves the sequence state at its #170c checkpoints to
+  `prefix-cache/` (host: `XLLAMA_PREFIX_CACHE_DIR`), and a prompt that no
+  longer shares its history with the live cache restores the longest saved
+  prefix instead of prefilling it again. Entries are evicted least recently
+  used within the budget; a file whose size or token history does not match
+  is dropped and the prompt is prefilled in full. Off by default.
+
 ## [1.7.0] - TBD
 
 User-facing notes: [docs/releases/v1.7.0.md](docs/releases/v1.7.0.md).

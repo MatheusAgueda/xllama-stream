@@ -13,7 +13,9 @@ on:
     paths:
       - src/bridge/session.cpp
       - src/bridge/decode_loop.h
+      - include/xllama/prefix_cache.h
       - tests/test_session.cpp
+      - tests/test_prefix_cache.cpp
       - .github/workflows/session-hybrid.yml
   workflow_dispatch:
 
@@ -63,11 +65,13 @@ jobs:
           XLLAMA_TEST_MODEL: ${{ runner.temp }}/model.gguf
         run: |
           set -o pipefail
-          ./build/linux-release/tests/xllama-tests --test-case='Session: *' 2>&1 |
+          ./build/linux-release/tests/xllama-tests --test-case='Session: *,PrefixCacheIndex*' 2>&1 |
             tee "$RUNNER_TEMP/session.log"
-          # The restore path must have run, not only the fallbacks around it.
+          # The restore paths must have run, not only the fallbacks around them.
           grep -q 'KV checkpoint restore' "$RUNNER_TEMP/session.log"
-          grep -E '\(#170c?\)|context shift|can_shift' "$RUNNER_TEMP/session.log" >> "$GITHUB_STEP_SUMMARY" || true
+          grep -q 'prefix cache restore —' "$RUNNER_TEMP/session.log"
+          grep -q 'prefix cache restore of .* refused' "$RUNNER_TEMP/session.log"
+          grep -E '\(#170c?\)|context shift|can_shift|prefix cache' "$RUNNER_TEMP/session.log" >> "$GITHUB_STEP_SUMMARY" || true
 
       - name: Keep the log
         if: always()

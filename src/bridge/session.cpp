@@ -9,11 +9,13 @@
 #include "xllama/inference_params.h"
 #include "xllama/path_utils.h"
 #include "xllama/platform.h"
+#include "xllama/prefix_cache.h"
 #include "xllama/routing_policy.h"
 #include "xllama/session_hub.h"
 #include "xllama/utf8_utils.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -534,6 +536,24 @@ class LlamaSession final : public Session {
     // a checkpoint taken then carries the approximation the resident cache
     // already serves #170a's pure extensions with — no stricter, no looser.
 
+    // Prefix cache on disk (XLLAMA_PREFIX_CACHE_MIB, off by default). The
+    // #170c checkpoints hold the recurrent half only, so they help a request
+    // that shares its prefix with the RESIDENT history. The LAN API serves
+    // several clients through one session, and their conversations interleave
+    // (A, B, A'): B overwrites A's attention KV, and A' re-prefilled from token
+    // 0 — 27.8 s for a 1500-token code prompt on the console. At the same
+    // split points as the checkpoints, a full-prompt prefill also writes the
+    // FULL sequence state (attention + recurrent) to a file, streamed by
+    // llama.cpp with no whole-state heap buffer; a later full prompt restores
+    // the longest saved prefix that beats the in-memory paths. Each session
+    // writes only its own directory, removed with the session, so a file is
+    // never read by another model or context shape.
+    uint64_t m_pc_budget = 0; // bytes on disk; 0 = off
+    size_t m_pc_min = 256;    // shortest history worth a file (XLLAMA_PREFIX_CACHE_MIN)
+    std::string m_pc_dir;     // this session's directory, created by the first save
+    std::string m_pc_fp;      // state_fingerprint() the files were written under
+    PrefixCacheIndex m_pc;
+
     explicit LlamaSession(LlamaModelPtr model, LlamaAdapterLoraPtr adapter, float lora_scale,
                           int n_ctx, int n_threads, int n_batch, int n_ubatch, bool kv_q8,
                           bool prompt_lookup, int gpu_layers, int mtp_n = 0, float mtp_p_min = 0.0f)
@@ -541,6 +561,10 @@ class LlamaSession final : public Session {
           m_n_ctx(n_ctx), m_n_threads(n_threads), m_n_batch(n_batch), m_n_ubatch(n_ubatch),
           m_mtp_n(mtp_n), m_mtp_p_min(mtp_p_min), m_kv_q8(kv_q8), m_prompt_lookup(prompt_lookup),
           m_gpu_layers(gpu_layers) {}
+
+    ~LlamaSession() override {
+        drop_prefix_files();
+    }
 
     const void* resident_llama_model() const override {
         return m_model.get();
@@ -560,8 +584,7 @@ class LlamaSession final : public Session {
             // MoE router + expert reads and a few tiny ops, where every node
             // pays a barrier across the pool.
             const char* tg = std::getenv("XLLAMA_CPU_THREADS_TG");
-            cparams.n_threads =
-                tg && *tg ? std::clamp(std::atoi(tg), 1, m_n_threads) : m_n_threads;
+            cparams.n_threads = tg && *tg ? std::clamp(std::atoi(tg), 1, m_n_threads) : m_n_threads;
             // Prefill (any ubatch > 1 token) runs on n_threads_batch, whose
             // default is GGML_DEFAULT_N_THREADS (4) regardless of n_threads —
             // left unset it caps prefill at 4 threads while decode gets 6 (#168).
@@ -719,12 +742,9 @@ class LlamaSession final : public Session {
         log_output(cb);
     }
 
-    // #170c: restore the longest checkpoint whose history is a prefix of
-    // tokens[0, limit) and erase the attention tail past it. Returns the
-    // restored length, 0 when none fits or the restore failed — then the
-    // recurrent half may be half-written and the caller must clear the cache.
-    size_t restore_rs_checkpoint(llama_context* ctx, const std::vector<llama_token>& tokens,
-                                 size_t limit) {
+    // #170c: the longest checkpoint whose history is a prefix of
+    // tokens[0, limit); m_rs_ckpts.size() when none fits.
+    size_t best_rs_checkpoint(const std::vector<llama_token>& tokens, size_t limit) const {
         size_t best = m_rs_ckpts.size();
         for (size_t i = 0; i < m_rs_ckpts.size(); ++i) {
             const std::vector<llama_token>& h = m_rs_ckpts[i].tokens;
@@ -734,6 +754,16 @@ class LlamaSession final : public Session {
             if (std::equal(h.begin(), h.end(), tokens.begin()))
                 best = i;
         }
+        return best;
+    }
+
+    // #170c: restore the longest checkpoint whose history is a prefix of
+    // tokens[0, limit) and erase the attention tail past it. Returns the
+    // restored length, 0 when none fits or the restore failed — then the
+    // recurrent half may be half-written and the caller must clear the cache.
+    size_t restore_rs_checkpoint(llama_context* ctx, const std::vector<llama_token>& tokens,
+                                 size_t limit) {
+        const size_t best = best_rs_checkpoint(tokens, limit);
         if (best == m_rs_ckpts.size())
             return 0;
         // Most recently used goes last; the restored state is the newest use.
@@ -784,10 +814,11 @@ class LlamaSession final : public Session {
             const size_t need = size / (1024 * 1024) + rs_ckpt_reserve_mb();
             if (avail != 0 && avail < need) {
                 char sb[224];
-                snprintf(sb, sizeof(sb),
-                         "[xllama] session: KV checkpoint at %zu tokens skipped — avail_phys %zu MB, "
-                         "commit_avail %zu MB < %zu MB, %zu held (#170c)\n",
-                         n, phys, commit, need, m_rs_ckpts.size());
+                snprintf(
+                    sb, sizeof(sb),
+                    "[xllama] session: KV checkpoint at %zu tokens skipped — avail_phys %zu MB, "
+                    "commit_avail %zu MB < %zu MB, %zu held (#170c)\n",
+                    n, phys, commit, need, m_rs_ckpts.size());
                 log_output(sb);
                 return;
             }
@@ -821,6 +852,177 @@ class LlamaSession final : public Session {
                      .count(),
                  m_rs_ckpts.size());
         log_output(cb);
+    }
+
+    // Prefix cache: the knobs, read once at creation (after the catalogue env
+    // is applied). XLLAMA_PREFIX_CACHE_DIR names the root; on the console it
+    // defaults to LocalState\prefix-cache, on the host the cache is off without
+    // it. Each session takes a "pc-<n>" directory under the root; the first
+    // session of a process removes those a killed process left behind.
+    void init_prefix_cache() {
+        const char* mib = std::getenv("XLLAMA_PREFIX_CACHE_MIB");
+        const uint64_t budget = mib && *mib ? std::strtoull(mib, nullptr, 10) << 20 : 0;
+        if (budget == 0)
+            return;
+        const char* dir = std::getenv("XLLAMA_PREFIX_CACHE_DIR");
+        std::string root = dir && *dir ? dir : "";
+    #ifdef XLLAMA_UWP
+        if (root.empty())
+            root = resolve_local_path("prefix-cache");
+    #endif
+        if (root.empty()) {
+            log_output("[xllama] session: prefix cache off — XLLAMA_PREFIX_CACHE_DIR unset\n");
+            return;
+        }
+        if (const char* s = std::getenv("XLLAMA_PREFIX_CACHE_MIN"); s && *s)
+            m_pc_min = std::max<size_t>(std::strtoul(s, nullptr, 10), kRsCheckpointMinGain);
+        static const bool swept = [&root] {
+            std::error_code ec;
+            std::vector<std::filesystem::path> stale;
+            for (std::filesystem::directory_iterator it(root, ec), end; !ec && it != end;
+                 it.increment(ec))
+                if (it->path().filename().string().rfind("pc-", 0) == 0)
+                    stale.push_back(it->path());
+            for (const auto& p : stale)
+                std::filesystem::remove_all(p, ec);
+            return true;
+        }();
+        (void)swept;
+        static std::atomic<unsigned> serial{0};
+        m_pc_dir = root + "/pc-" + std::to_string(++serial);
+        m_pc_budget = budget;
+        char lb[96];
+        snprintf(lb, sizeof(lb), "[xllama] session: prefix cache on — %llu MiB, min %zu tokens, ",
+                 static_cast<unsigned long long>(budget >> 20), m_pc_min);
+        log_output(lb + m_pc_dir + "\n");
+    }
+
+    void drop_prefix_files() {
+        m_pc.clear();
+        if (m_pc_dir.empty())
+            return;
+        std::error_code ec;
+        std::filesystem::remove_all(m_pc_dir, ec);
+    }
+
+    // Prefix cache: write the full state of history[0, n), at a #170c split
+    // point of a full-prompt prefill (the cells there are exactly that
+    // history). An identical history already on disk is only marked used. A
+    // failed write turns the cache off for the session: on the console that
+    // is a full disk, and every later request would pay the failing write.
+    void save_prefix_cache(llama_context* ctx, const llama_token* history, size_t n) {
+        if (m_pc_budget == 0 || n < m_pc_min || llama_n_rs_seq(ctx) > 0)
+            return;
+        const std::string fp = state_fingerprint();
+        if (fp != m_pc_fp) {
+            drop_prefix_files();
+            m_pc_fp = fp;
+        }
+        if (const int i = m_pc.find_exact(history, n); i >= 0) {
+            m_pc.touch(static_cast<size_t>(i));
+            return;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        const std::string name = PrefixCacheIndex::file_name(fp, history, n);
+        const std::string path = m_pc_dir + "/" + name;
+        const std::string tmp = path + ".tmp";
+        std::error_code ec;
+        std::filesystem::create_directories(m_pc_dir, ec);
+        // A rename, so a crash never leaves a half file under a live name.
+        const size_t bytes = ec ? 0 : llama_state_seq_save_file(ctx, tmp.c_str(), 0, history, n);
+        if (bytes > 0)
+            std::filesystem::rename(tmp, path, ec);
+        if (bytes == 0 || ec) {
+            std::filesystem::remove(tmp, ec);
+            drop_prefix_files();
+            m_pc_budget = 0;
+            char fb[128];
+            snprintf(fb, sizeof(fb),
+                     "[xllama] session: prefix cache save at %zu tokens failed — off for this "
+                     "session\n",
+                     n);
+            log_output(fb);
+            return;
+        }
+        PrefixCacheEntry e;
+        e.tokens.assign(history, history + n);
+        e.file = name;
+        e.bytes = bytes;
+        for (const std::string& f : m_pc.add(std::move(e), m_pc_budget))
+            std::filesystem::remove(m_pc_dir + "/" + f, ec);
+        char cb[192];
+        snprintf(cb, sizeof(cb),
+                 "[xllama] session: prefix cache save — %zu tokens, %.1f MiB in %.1f ms, %zu files "
+                 "/ %.1f MiB held\n",
+                 n, (double)bytes / (1024.0 * 1024.0),
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                     .count(),
+                 m_pc.entries().size(), (double)m_pc.total_bytes() / (1024.0 * 1024.0));
+        log_output(cb);
+    }
+
+    // Prefix cache: on a full prompt, restore the longest saved history that
+    // is a prefix of tokens[0, size-1) when it keeps at least
+    // kRsCheckpointMinGain more tokens than the in-memory paths would — all of
+    // the common prefix on a pure extension, else the best #170c checkpoint
+    // inside it. Returns the restored length (m_kv_tokens is that history).
+    // 0 leaves the cache untouched, except after a refused load: then the
+    // cache is cleared and m_kv_tokens empty, and the request prefills in full.
+    size_t restore_prefix_cache(llama_context* ctx, const std::vector<llama_token>& tokens,
+                                size_t common) {
+        if (m_pc_budget == 0 || m_pc.entries().empty() || tokens.size() < 2 ||
+            llama_n_rs_seq(ctx) > 0 || state_fingerprint() != m_pc_fp)
+            return 0;
+        size_t keep = common;
+        if (common < m_kv_tokens.size()) {
+            const size_t ck = best_rs_checkpoint(tokens, common);
+            keep = ck < m_rs_ckpts.size() ? m_rs_ckpts[ck].tokens.size() : 0;
+        }
+        const int found = m_pc.find(tokens.data(), tokens.size() - 1, keep + kRsCheckpointMinGain);
+        if (found < 0)
+            return 0;
+        const auto t0 = std::chrono::steady_clock::now();
+        const size_t i = static_cast<size_t>(found);
+        const PrefixCacheEntry& e = m_pc.entries()[i];
+        const std::string path = m_pc_dir + "/" + e.file;
+        std::error_code ec;
+        const uintmax_t on_disk = std::filesystem::file_size(path, ec);
+        std::vector<llama_token> got;
+        size_t n_got = 0, read = 0;
+        if (!ec && on_disk == e.bytes) {
+            got.resize(e.tokens.size());
+            llama_memory_clear(llama_get_memory(ctx), true);
+            m_kv_tokens.clear();
+            read = llama_state_seq_load_file(ctx, path.c_str(), 0, got.data(), got.size(), &n_got);
+        }
+        if (read != e.bytes || n_got != e.tokens.size() ||
+            !std::equal(got.begin(), got.end(), e.tokens.begin())) {
+            char fb[160];
+            snprintf(fb, sizeof(fb),
+                     "[xllama] session: prefix cache restore of %zu tokens refused — file "
+                     "dropped, %s\n",
+                     e.tokens.size(), got.empty() ? "size mismatch" : "full re-prefill");
+            log_output(fb);
+            std::filesystem::remove(path, ec);
+            m_pc.remove(i);
+            if (!got.empty())
+                llama_memory_clear(llama_get_memory(ctx), true);
+            return 0;
+        }
+        m_pc.touch(i);
+        m_kv_tokens = std::move(got);
+        // The file holds the target's cells only: the drafter restarts empty.
+        m_mtp.keep_prefix(0);
+        char cb[192];
+        snprintf(cb, sizeof(cb),
+                 "[xllama] session: prefix cache restore — %zu of %zu prompt tokens from disk in "
+                 "%.1f ms (in memory: %zu)\n",
+                 m_kv_tokens.size(), tokens.size(),
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                     .count(),
+                 keep);
+        log_output(cb);
+        return m_kv_tokens.size();
     }
 
     InferenceResult generate(const GenerateParams& gp) override {
@@ -899,7 +1101,14 @@ class LlamaSession final : public Session {
             while (kv_keep < m_kv_tokens.size() && kv_keep < max_keep &&
                    m_kv_tokens[kv_keep] == tokens[kv_keep])
                 ++kv_keep;
-            if (kv_keep > 0) {
+            // Prefix cache: a saved prefix longer than the in-memory paths keep
+            // replaces the resident history; a refused load emptied it.
+            const size_t from_disk = restore_prefix_cache(ctx, tokens, kv_keep);
+            res.n_prefix_cache_tokens = static_cast<int>(from_disk);
+            kv_keep = std::min(kv_keep, m_kv_tokens.size());
+            if (from_disk > 0) {
+                kv_keep = from_disk;
+            } else if (kv_keep > 0) {
                 // Pure extension (no divergent tail) needs no removal. When a
                 // tail must go, honor seq_rm's result: hybrid caches (LFM2's
                 // attn+recurrent) refuse a partial tail erase — the recurrent
@@ -1094,6 +1303,8 @@ class LlamaSession final : public Session {
             }
             n_done += seg;
             save_rs_checkpoint(ctx, rs_hist, at);
+            if (full_prompt)
+                save_prefix_cache(ctx, rs_hist, at);
         }
         if (prefilled)
             prefilled = prefill_chunked(ctx, pf + n_done, n_pf - n_done, &wd, n_done, after_chunk);
@@ -1711,9 +1922,11 @@ std::unique_ptr<Session> create_llama(const SessionParams& sp, std::string* err)
     int n_threads = sp.n_threads > 0 ? sp.n_threads : detect_threads_llama();
     int n_ctx = sp.n_ctx > 0 ? sp.n_ctx : kDefaultNCtx;
     log_output("[xllama] Session: GGUF model loaded via llama.cpp (persistent)\n");
-    return std::make_unique<LlamaSession>(LlamaModelPtr(raw_model), std::move(adapter),
-                                          sp.lora_scale, n_ctx, n_threads, sp.n_batch, sp.n_ubatch,
-                                          sp.kv_q8, sp.prompt_lookup, gpu_layers, mtp_n, mtp_p_min);
+    auto session = std::make_unique<LlamaSession>(
+        LlamaModelPtr(raw_model), std::move(adapter), sp.lora_scale, n_ctx, n_threads, sp.n_batch,
+        sp.n_ubatch, sp.kv_q8, sp.prompt_lookup, gpu_layers, mtp_n, mtp_p_min);
+    session->init_prefix_cache();
+    return session;
 }
 } // namespace detail
 

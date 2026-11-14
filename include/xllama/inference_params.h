@@ -225,6 +225,10 @@ struct InferenceResult {
     /// This is what an API reports as usage.prompt_tokens (#335).
     int n_prompt = 0;
 
+    /// Prompt tokens restored from the session's on-disk prefix cache
+    /// (XLLAMA_PREFIX_CACHE_MIB) instead of prefilled; 0 when unused.
+    int n_prefix_cache_tokens = 0;
+
     /// Number of decode tokens generated.
     int n_eval = 0;
 

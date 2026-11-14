@@ -240,6 +240,20 @@ the full prompt safely. Snapshot restoration alone is not a delta-reuse guarante
 A conversation that is stripped to empty (thinking model truncated to no answer)
 takes no KV snapshot (#170b).
 
+### Prefix cache on disk (hybrid models, LAN API)
+
+The #170c checkpoints keep only the recurrent half of a hybrid cache, so they
+help a request whose prefix is still resident. API clients share one session,
+and interleaved conversations (A, B, A′) overwrite each other's attention KV.
+With `XLLAMA_PREFIX_CACHE_MIB` set (catalogue `env`; off by default), a
+full-prompt prefill also writes the full sequence state at the #170c split
+points, and a later full prompt restores the longest saved prefix that beats
+the in-memory paths. Knobs, file lifecycle and failure handling are documented
+at `LlamaSession::init_prefix_cache` and the `m_pc_*` members in
+`src/bridge/session.cpp`; the index is
+`include/xllama/prefix_cache.h`. A restore that fails for any reason drops the
+file and prefills in full.
+
 ### Cancel policy (`cancel_policy.h`)
 
 The UI has one Cancel affordance and three jobs that can be running behind it —
@@ -782,6 +796,7 @@ not keep a second copy. Headers without a dedicated file are header-only RAII wr
 | `test_path.cpp`                  | `path_utils.h`                                                                              |
 | `test_personalize.cpp`           | `personalize.h`                                                                             |
 | `test_preference_capture.cpp`    | `preference_capture.h`                                                                      |
+| `test_prefix_cache.cpp`          | `prefix_cache.h` (session behaviour: `test_session.cpp`, opt-in model)                      |
 | `test_prompt_budget.cpp`         | `prompt_budget.h`                                                                           |
 | `test_ramceil.cpp`               | `ramceil.h`                                                                                 |
 | `test_routing_policy.cpp`        | `routing_policy.h`                                                                          |

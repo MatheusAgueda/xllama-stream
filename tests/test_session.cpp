@@ -9,8 +9,10 @@
 #include <doctest/doctest.h>
 
 #include <climits>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <map>
 
 TEST_CASE("SessionHub: failed create leaves the hub empty and bumps generation") {
     auto& hub = xllama::session_hub();
@@ -706,4 +708,213 @@ TEST_CASE("Session: a forced reply reproduces the greedy logprobs (opt-in: XLLAM
     const auto bad = other->generate(op);
     CHECK_FALSE(bad.success);
     CHECK(bad.error_msg.find("outside the vocabulary") != std::string::npos);
+}
+
+// --- Prefix cache on disk (XLLAMA_PREFIX_CACHE_MIB) ---------------------------
+
+// The *.kv files under a prefix-cache root, with their sizes.
+static std::map<std::string, uintmax_t> prefix_files(const std::filesystem::path& root) {
+    std::map<std::string, uintmax_t> out;
+    std::error_code ec;
+    for (std::filesystem::recursive_directory_iterator it(root, ec), end; !ec && it != end;
+         it.increment(ec))
+        if (it->path().extension() == ".kv")
+            out[it->path().string()] = std::filesystem::file_size(it->path(), ec);
+    return out;
+}
+
+static xllama::GenerateParams pc_greedy(const std::string& prompt) {
+    xllama::GenerateParams gp;
+    gp.prompt = prompt;
+    gp.n_predict = 12;
+    gp.temperature = 0.0f;
+    return gp;
+}
+
+// Two unrelated API conversations, each a ~300-token first turn (past
+// XLLAMA_PREFIX_CACHE_MIN) and a second turn that re-sends the first.
+struct PcConversation {
+    std::string sys, user;
+    std::string turn1() const {
+        return sys + "<|im_start|>user\n" + user +
+               "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+    }
+    std::string turn2(const std::string& reply) const {
+        return sys + "<|im_start|>user\n" + user + "<|im_end|>\n<|im_start|>assistant\n" + reply +
+               "<|im_end|>\n<|im_start|>user\nNow say it in five words.<|im_end|>\n"
+               "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+    }
+};
+
+static PcConversation pc_conversation(const std::string& role, const std::string& thing) {
+    PcConversation c;
+    c.sys = "<|im_start|>system\nYou are " + role + ". Answer in one sentence.<|im_end|>\n";
+    c.user = "Summarise these notes.\n";
+    for (int i = 1; i <= 12; ++i)
+        c.user += "Note " + std::to_string(i) + ": the " + thing + " checked on day " +
+                  std::to_string(i * 3) + " showed no damage and the crew signed the log.\n";
+    return c;
+}
+
+static std::vector<std::pair<std::string, std::string>> pc_env(const std::filesystem::path& root,
+                                                               uint64_t mib) {
+    return {{"XLLAMA_PREFIX_CACHE_MIB", std::to_string(mib)},
+            {"XLLAMA_PREFIX_CACHE_MIN", "64"},
+            {"XLLAMA_PREFIX_CACHE_DIR", root.string()}};
+}
+
+// The case the cache exists for: API clients interleave on one session (A, B,
+// A'), B overwrites A's attention KV, and A' used to re-prefill from token 0.
+// With the cache A' restores A's prefix from disk. The reference is the same
+// A' served by the #170c checkpoint while A is still resident: the same state
+// at the same position and the same batch shapes after it, so the generation
+// must be byte-identical (the silent-corruption check).
+TEST_CASE("Session: an interleaved API turn restores its prefix from disk (opt-in: "
+          "XLLAMA_TEST_MODEL)") {
+    const char* model = std::getenv("XLLAMA_TEST_MODEL");
+    if (!model)
+        return;
+    const auto root = std::filesystem::temp_directory_path() / "xllama-prefix-cache-a";
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    const PcConversation a = pc_conversation("a logistics clerk", "mobile home in bay");
+    const PcConversation b = pc_conversation("a harbour inspector", "container on quay");
+
+    xllama::SessionParams sp;
+    sp.model_path = model;
+    sp.n_ctx = 1024;
+    std::string err;
+    auto ref = xllama::Session::create(sp, &err); // no knobs: the cache is off
+    REQUIRE_MESSAGE(ref, err);
+    const auto ra = ref->generate(pc_greedy(a.turn1()));
+    REQUIRE_MESSAGE(ra.success, ra.error_msg);
+    REQUIRE(!ra.output_text.empty());
+    const std::string a2 = a.turn2(ra.output_text);
+    const auto ra2 = ref->generate(pc_greedy(a2));
+    REQUIRE_MESSAGE(ra2.success, ra2.error_msg);
+    CHECK(ra2.n_prefix_cache_tokens == 0);
+    CHECK(ra2.n_p_eval < ref->count_tokens(a2) - 200); // the #170c restore did run
+    CHECK_FALSE(std::filesystem::exists(root));
+    ref.reset();
+
+    sp.env = pc_env(root, 256);
+    auto sess = xllama::Session::create(sp, &err);
+    REQUIRE_MESSAGE(sess, err);
+    const auto pa = sess->generate(pc_greedy(a.turn1()));
+    REQUIRE_MESSAGE(pa.success, pa.error_msg);
+    CHECK(pa.output_text == ra.output_text);
+    CHECK(prefix_files(root).size() == 1);
+    const auto pb = sess->generate(pc_greedy(b.turn1()));
+    REQUIRE_MESSAGE(pb.success, pb.error_msg);
+    CHECK(pb.n_prefix_cache_tokens == 0);
+    CHECK(prefix_files(root).size() == 2);
+
+    const auto pa2 = sess->generate(pc_greedy(a2));
+    REQUIRE_MESSAGE(pa2.success, pa2.error_msg);
+    CHECK(pa2.n_prefix_cache_tokens > 0);
+    CHECK(pa2.n_prefix_cache_tokens + pa2.n_p_eval == pa2.n_prompt);
+    CHECK(pa2.n_p_eval == ra2.n_p_eval);
+    CHECK(pa2.output_text == ra2.output_text);
+
+    sess.reset(); // the session's files go with it
+    CHECK(prefix_files(root).empty());
+    std::filesystem::remove_all(root, ec);
+}
+
+// What can go wrong around the cache must cost a prefill, never a request or a
+// wrong state: a file whose content was altered (the load runs and is refused
+// on its token history), a truncated file (refused before loading), another
+// session with another context shape (never sees these files), and a budget
+// that holds one file (the older one is evicted; disk use stays within it).
+TEST_CASE("Session: the disk prefix cache drops bad files and keeps its budget (opt-in: "
+          "XLLAMA_TEST_MODEL)") {
+    const char* model = std::getenv("XLLAMA_TEST_MODEL");
+    if (!model)
+        return;
+    const auto root = std::filesystem::temp_directory_path() / "xllama-prefix-cache-b";
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    const PcConversation a = pc_conversation("a logistics clerk", "mobile home in bay");
+    const PcConversation b = pc_conversation("a harbour inspector", "container on quay");
+
+    xllama::SessionParams sp;
+    sp.model_path = model;
+    sp.n_ctx = 1024;
+    sp.env = pc_env(root, 256);
+    std::string err;
+    auto sess = xllama::Session::create(sp, &err);
+    REQUIRE_MESSAGE(sess, err);
+    const auto ra = sess->generate(pc_greedy(a.turn1()));
+    REQUIRE_MESSAGE(ra.success, ra.error_msg);
+    const auto after_a = prefix_files(root);
+    REQUIRE(after_a.size() == 1);
+    const std::string file_a = after_a.begin()->first;
+    const uintmax_t size_a = after_a.begin()->second;
+    const auto rb = sess->generate(pc_greedy(b.turn1()));
+    REQUIRE_MESSAGE(rb.success, rb.error_msg);
+    auto after_b = prefix_files(root);
+    REQUIRE(after_b.size() == 2);
+    after_b.erase(file_a);
+    const std::string file_b = after_b.begin()->first;
+    const uintmax_t size_b = after_b.begin()->second;
+    const std::string a2 = a.turn2(ra.output_text);
+    const std::string b2 = b.turn2(rb.output_text);
+
+    {
+        xllama::SessionParams sp2 = sp;
+        sp2.n_ctx = 512;
+        auto other = xllama::Session::create(sp2, &err);
+        REQUIRE_MESSAGE(other, err);
+        const auto r = other->generate(pc_greedy(a2));
+        REQUIRE_MESSAGE(r.success, r.error_msg);
+        CHECK(r.n_prefix_cache_tokens == 0);
+    }
+    CHECK(std::filesystem::exists(file_a));
+
+    {
+        // The first token id, right after the 12-byte header.
+        std::fstream f(file_a, std::ios::in | std::ios::out | std::ios::binary);
+        REQUIRE(f.is_open());
+        const int32_t bad = -7;
+        f.seekp(12);
+        f.write(reinterpret_cast<const char*>(&bad), sizeof(bad));
+    }
+    const auto r_alt = sess->generate(pc_greedy(a2));
+    REQUIRE_MESSAGE(r_alt.success, r_alt.error_msg);
+    CHECK(r_alt.n_prefix_cache_tokens == 0);
+    CHECK(r_alt.n_p_eval == sess->count_tokens(a2));
+    CHECK_FALSE(std::filesystem::exists(file_a));
+
+    std::filesystem::resize_file(file_b, size_b / 2, ec);
+    REQUIRE_FALSE(ec);
+    const auto r_cut = sess->generate(pc_greedy(b2));
+    REQUIRE_MESSAGE(r_cut.success, r_cut.error_msg);
+    CHECK(r_cut.n_prefix_cache_tokens == 0);
+    CHECK(r_cut.n_p_eval == sess->count_tokens(b2));
+    CHECK_FALSE(std::filesystem::exists(file_b));
+    sess.reset();
+
+    // Room for the larger of the two first-turn files, not for both.
+    const uint64_t mib = (size_a + size_b - 1) >> 20;
+    REQUIRE((mib << 20) >= std::max(size_a, size_b));
+    sp.env = pc_env(root, mib);
+    auto small = xllama::Session::create(sp, &err);
+    REQUIRE_MESSAGE(small, err);
+    REQUIRE(small->generate(pc_greedy(a.turn1())).success);
+    REQUIRE(small->generate(pc_greedy(b.turn1())).success);
+    auto held = prefix_files(root);
+    CHECK(held.size() == 1);
+    uint64_t total = 0;
+    for (const auto& kv : held)
+        total += kv.second;
+    CHECK(total <= (mib << 20));
+    const auto r_evicted = small->generate(pc_greedy(a2));
+    REQUIRE_MESSAGE(r_evicted.success, r_evicted.error_msg);
+    CHECK(r_evicted.n_prefix_cache_tokens == 0);
+    total = 0;
+    for (const auto& kv : prefix_files(root))
+        total += kv.second;
+    CHECK(total <= (mib << 20));
+    small.reset();
+    std::filesystem::remove_all(root, ec);
 }
