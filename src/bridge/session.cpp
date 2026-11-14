@@ -611,6 +611,9 @@ class LlamaSession final : public Session {
             if (mtp_on) {
                 cparams.n_rs_seq = static_cast<uint32_t>(m_mtp_n);
                 outputs_max = std::max(outputs_max, 1u + static_cast<uint32_t>(m_mtp_n));
+                // llama-batch asserts n_ubatch > n_rs_seq + 1 (the kept tail): a
+                // catalogue n_ubatch below that would abort the first prefill.
+                cparams.n_ubatch = std::max(cparams.n_ubatch, cparams.n_rs_seq + 2);
             }
             apply_gguf_gpu_context(m_gpu_layers, cparams, outputs_max);
     #ifdef XLLAMA_UWP

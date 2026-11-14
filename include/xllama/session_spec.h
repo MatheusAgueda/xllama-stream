@@ -83,8 +83,9 @@ inline SessionParams resolve_session_params(const std::string& model, const Cata
     sp.expert_major = sp.expert_slots > 0 ? std::clamp(c.expert_major, 0, 65536) : 0;
     sp.expert_prefetch_ahead = sp.expert_prefetch > 0 && c.expert_prefetch_ahead;
     // llama.cpp clamps n_ubatch to n_batch (default 2048), and the expert cache
-    // to max(slots / experts used, expert_major).
-    sp.n_ubatch = c.n_ubatch > 0 ? std::clamp(c.n_ubatch, 32, 2048) : 0;
+    // to max(slots / experts used, expert_major). Down to 1: a prompt prefilled in
+    // k-token ubatches times a k-row batch, the cost a speculative verify pays.
+    sp.n_ubatch = c.n_ubatch > 0 ? std::clamp(c.n_ubatch, 1, 2048) : 0;
     sp.env = resolve_env(c.env);
     // A streamed model is larger than any GPU budget: d3d12 layers would copy
     // its experts into video memory, so the knob does not apply to it. The

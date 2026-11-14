@@ -117,12 +117,16 @@ TEST_CASE("resolve_session_params: one resolver for every surface (ADR 0007)") {
     pf.expert_slots = 0;
     CHECK_FALSE(resolve_session_params("moe", pf, "D:\\m\\moe", -1).expert_prefetch_ahead);
 
-    // n_ubatch: 0 keeps llama.cpp's default, the rest is clamped to [32, 2048].
+    // n_ubatch: 0 keeps llama.cpp's default, the rest is clamped to [1, 2048].
     CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).n_ubatch == 0);
     pf.n_ubatch = 1024;
     CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).n_ubatch == 1024);
     pf.n_ubatch = 9;
-    CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).n_ubatch == 32);
+    CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).n_ubatch == 9);
+    pf.n_ubatch = 1;
+    CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).n_ubatch == 1);
+    pf.n_ubatch = -4;
+    CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).n_ubatch == 0);
     pf.n_ubatch = 100000;
     CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).n_ubatch == 2048);
 }
