@@ -257,6 +257,12 @@ struct InferenceResult {
     /// Speculative drafts accepted.
     int n_spec_accepted = 0;
 
+    /// Thinking budget armed (GenerateParams::think_budget): generated tokens up
+    /// to and including "</think>" (all of them when it never closed), and
+    /// whether the budget wrote the close. 0 / false when no budget was armed.
+    int n_think = 0;
+    bool think_forced = false;
+
     /// Generated text output.
     std::string output_text;
 

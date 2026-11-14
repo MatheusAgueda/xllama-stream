@@ -710,6 +710,51 @@ TEST_CASE("Session: a forced reply reproduces the greedy logprobs (opt-in: XLLAM
     CHECK(bad.error_msg.find("outside the vocabulary") != std::string::npos);
 }
 
+// The Qwen3 thinking budget: the prompt opens the reasoning, the budget is far
+// below what the model would think, so the loop writes the stop-thinking closer
+// itself after exactly think_budget tokens and the model then answers. Without
+// a budget nothing is counted or forced.
+TEST_CASE("Session: a thinking budget closes the reasoning and the model answers (opt-in: "
+          "XLLAMA_TEST_MODEL)") {
+    const char* model = std::getenv("XLLAMA_TEST_MODEL");
+    if (!model)
+        return;
+    xllama::SessionParams sp;
+    sp.model_path = model;
+    sp.n_ctx = 1024;
+    sp.n_threads = 2;
+    std::string error;
+    auto session = xllama::Session::create(sp, &error);
+    REQUIRE_MESSAGE(session, error);
+    xllama::GenerateParams gp;
+    gp.prompt = "<|im_start|>user\nA train leaves at 9:40 and arrives at 13:15. How long is the "
+                "trip? Check your work carefully.<|im_end|>\n<|im_start|>assistant\n<think>\n";
+    gp.n_predict = 160;
+    gp.temperature = 0;
+    gp.think_budget = 24;
+    const auto r = session->generate(gp);
+    REQUIRE_MESSAGE(r.success, r.error_msg);
+    const int n_close = session->count_tokens(xllama::kThinkBudgetClose);
+    REQUIRE(n_close > 2);
+    CHECK(r.think_forced);
+    CHECK(r.n_think > gp.think_budget);
+    CHECK(r.n_think <= gp.think_budget + n_close);
+    CHECK(r.output_text.find("Considering the limited time by the user") != std::string::npos);
+    const size_t close_at = r.output_text.find(xllama::kThinkEndTag);
+    REQUIRE(close_at != std::string::npos);
+    CHECK(r.n_eval > r.n_think); // it answered after the closer
+    MESSAGE("thinking budget reply: " << r.output_text.substr(close_at));
+
+    xllama::GenerateParams off = gp;
+    off.think_budget = 0;
+    off.n_predict = 32;
+    const auto plain = session->generate(off);
+    REQUIRE_MESSAGE(plain.success, plain.error_msg);
+    CHECK_FALSE(plain.think_forced);
+    CHECK(plain.n_think == 0);
+    CHECK(plain.output_text.find("Considering the limited time") == std::string::npos);
+}
+
 // --- Prefix cache on disk (XLLAMA_PREFIX_CACHE_MIB) ---------------------------
 
 // The *.kv files under a prefix-cache root, with their sizes.

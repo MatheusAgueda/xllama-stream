@@ -129,6 +129,14 @@ struct GenerateParams {
     bool logprobs = false;
     std::vector<int32_t> forced_tokens;
 
+    // Thinking budget (llama.cpp sessions, Qwen3.x with the reasoning opened by
+    // the prompt — request_thinking): after this many generated tokens with no
+    // "</think>" sampled, the loop feeds kThinkBudgetClose itself and samples the
+    // answer, instead of spending n_predict on reasoning a cut reply then drops.
+    // 0 = off. Ignored with a grammar or forced ids; drafting is off while armed.
+    // Must leave room for the answer: callers keep it below n_predict.
+    int think_budget = 0;
+
     // Continuous decoding / KV-cache reuse. Honored by BOTH backends now: the
     // ORT path (persistent generator) and the llama.cpp path (persistent
     // llama_context, KV cache retained across turns — turn-2 prefill 4.07×).

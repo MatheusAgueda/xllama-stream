@@ -1435,8 +1435,33 @@ class LlamaSession final : public Session {
             res.logprobs.reserve(static_cast<size_t>(dlp.n_predict));
             dlp.logprobs = &res.logprobs;
         }
+        // Thinking budget: the closer as ids (its "</think>" a special token, so
+        // parse_special) and the end tag, which must be one token to be watched.
+        std::vector<llama_token> think_close;
+        if (gp.think_budget > 0 && !dlp.grammar && !dlp.forced) {
+            llama_token end_id = -1;
+            const std::string closer = kThinkBudgetClose;
+            const int32_t n_close =
+                -llama_tokenize(vocab, closer.c_str(), static_cast<int32_t>(closer.size()), nullptr,
+                                0, false, true);
+            if (llama_tokenize(vocab, kThinkEndTag, static_cast<int32_t>(sizeof(kThinkEndTag) - 1),
+                               &end_id, 1, false, true) == 1 &&
+                n_close > 0) {
+                think_close.resize(static_cast<size_t>(n_close));
+                if (llama_tokenize(vocab, closer.c_str(), static_cast<int32_t>(closer.size()),
+                                   think_close.data(), n_close, false, true) == n_close) {
+                    dlp.think_budget = gp.think_budget;
+                    dlp.think_end = end_id;
+                    dlp.think_close = &think_close;
+                }
+            }
+            if (!dlp.think_close)
+                log_output("[xllama] thinking budget ignored: this vocabulary has no single "
+                           "</think> token\n");
+        }
         wd.enter_decode(dlp.n_predict);
-        const bool use_mtp = m_mtp.usable() && !dlp.grammar && !dlp.forced && !dlp.logprobs;
+        const bool use_mtp = m_mtp.usable() && !dlp.grammar && !dlp.forced && !dlp.logprobs &&
+                             !think_budget_armed(dlp);
         const DecodeLoopResult dlr = use_mtp ? decode_loop_mtp(dlp, m_mtp, res.output_text)
                                              : decode_loop(dlp, res.output_text);
         // A classic turn (grammar, scoring) leaves the drafter without its
@@ -1454,6 +1479,8 @@ class LlamaSession final : public Session {
         res.ended_with_stop = stopped_by_seq;
         res.n_drafted = dlr.n_drafted;
         res.n_spec_accepted = dlr.n_accepted;
+        res.n_think = dlr.n_think;
+        res.think_forced = dlr.think_forced;
         if (dlr.rewind_failed) {
             // History and KV are untrustworthy — same class as a decode failure.
             m_kv_tokens.clear();

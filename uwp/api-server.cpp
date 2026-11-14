@@ -369,6 +369,8 @@ SseHeadStatus write_sse_head(StreamSocket const& socket) {
     }
 }
 
+void add_reasoning_usage(JsonObject& usage, const ::xllama::InferenceResult& result);
+
 // Streamed chat completion (docs/api-endpoint.md): each token piece leaves as one
 // `chat.completion.chunk` event, then the finish chunk, then `[DONE]`. A streamed
 // response carries no Content-Length, so the events travel in HTTP/1.1 chunks
@@ -449,6 +451,7 @@ class SseStream {
             usage.Insert(L"completion_tokens", JsonValue::CreateNumberValue(result.n_eval));
             usage.Insert(L"total_tokens",
                          JsonValue::CreateNumberValue(result.n_prompt + result.n_eval));
+            add_reasoning_usage(usage, result);
             const JsonObject timings =
                 JsonObject::Parse(winrt::to_hstring(::xllama::api_timings_json(result)));
             send_chunk(JsonObject{}, JsonValue::CreateStringValue(winrt::hstring(reason)), &usage,
@@ -699,15 +702,21 @@ void append_client_stops(JsonObject const& root, std::vector<std::string>& stops
 
 // Sampling numbers, validated before any model load (F01). Ranges are
 // OpenAI's: temperature 0..2, top_p 0..1. A seed is a whole number; a negative
-// one (llama.cpp's "-1 = random") keeps the default seed.
+// one (llama.cpp's "-1 = random") keeps the default seed. top_k and
+// repetition_penalty are llama-server's (0 = that stage off); a model card's
+// recommended sampler (Qwen3.6 thinking: 0.6 / 0.95 / 20 / 1.0) needs both.
+// thinking_budget is checked against max_tokens where both are known.
 std::string check_sampling(JsonObject const& root) {
     struct Range {
         const char* key;
         double lo, hi;
         bool whole;
     };
-    for (const Range& r : {Range{"temperature", 0.0, 2.0, false}, Range{"top_p", 0.0, 1.0, false},
-                           Range{"seed", -2147483648.0, 4294967295.0, true}}) {
+    for (const Range& r :
+         {Range{"temperature", 0.0, 2.0, false}, Range{"top_p", 0.0, 1.0, false},
+          Range{"seed", -2147483648.0, 4294967295.0, true}, Range{"top_k", 0.0, 1000000.0, true},
+          Range{"repetition_penalty", 0.0, 2.0, false},
+          Range{"thinking_budget", 1.0, 2147483647.0, true}}) {
         const winrt::hstring name = winrt::to_hstring(r.key);
         if (!root.HasKey(name))
             continue;
@@ -730,6 +739,31 @@ void fill_sampling(JsonObject const& root, ::xllama::GenerateParams& gp) {
         if (seed >= 0)
             gp.seed = static_cast<uint32_t>(seed);
     }
+    if (root.HasKey(L"top_k"))
+        gp.top_k = static_cast<int>(root.GetNamedNumber(L"top_k"));
+    if (root.HasKey(L"repetition_penalty"))
+        gp.repetition_penalty = static_cast<float>(root.GetNamedNumber(L"repetition_penalty"));
+}
+
+// "thinking_budget" (the name Qwen's own API gives it): with the reasoning opened
+// (chat_template_kwargs.enable_thinking), at most this many reply tokens of it
+// before the session closes it and the model answers. 0 = none asked. Range
+// already checked by check_sampling.
+int requested_think_budget(JsonObject const& root) {
+    return root.HasKey(L"thinking_budget")
+               ? static_cast<int>(root.GetNamedNumber(L"thinking_budget"))
+               : 0;
+}
+
+// usage.completion_tokens_details.reasoning_tokens (OpenAI's field) when a
+// thinking budget was armed, plus whether the budget closed the reasoning.
+void add_reasoning_usage(JsonObject& usage, const ::xllama::InferenceResult& result) {
+    if (result.n_think <= 0)
+        return;
+    JsonObject details;
+    details.Insert(L"reasoning_tokens", JsonValue::CreateNumberValue(result.n_think));
+    usage.Insert(L"completion_tokens_details", details);
+    usage.Insert(L"xllama_thinking_forced", JsonValue::CreateBooleanValue(result.think_forced));
 }
 
 // chat_template_kwargs.enable_thinking when it is a boolean, as the Jinja
@@ -801,6 +835,7 @@ std::string completion_json(const std::string& model, JsonObject const& message,
     usage.Insert(L"prompt_tokens", JsonValue::CreateNumberValue(result.n_prompt));
     usage.Insert(L"completion_tokens", JsonValue::CreateNumberValue(result.n_eval));
     usage.Insert(L"total_tokens", JsonValue::CreateNumberValue(result.n_prompt + result.n_eval));
+    add_reasoning_usage(usage, result);
 
     JsonObject resp;
     const std::string id =
@@ -1045,6 +1080,16 @@ std::string handle_chat_locked(const std::string& body, const char*& status,
     // Validated above, before the model load: the budget below needs to know how
     // much room the reply asks for.
     gp.n_predict = n_predict;
+    // A thinking budget only means something with the reasoning opened by the
+    // prompt, and must leave the answer room inside max_tokens.
+    if (const int budget = requested_think_budget(root); budget > 0 && !fmt.think_open.empty()) {
+        if (budget >= gp.n_predict) {
+            status = "400 Bad Request";
+            return error_json(
+                "thinking_budget must be below max_tokens (the answer comes after it)");
+        }
+        gp.think_budget = budget;
+    }
 
     // Scoring (research API): "logprobs": true reports each reply token's log
     // probability; "xllama_force_ids": [ids] makes the reply those ids (a

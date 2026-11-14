@@ -160,4 +160,15 @@ ChatFormat chat_format_for(const std::string& model_id);
 // "thinking". Qwen3.x ChatML only — every other format is left as it was.
 void request_thinking(ChatFormat& fmt, const std::string& model_id, bool on);
 
+// What a thinking budget (GenerateParams::think_budget) writes for the model once
+// the budget is spent with the reasoning still open: the stop-thinking sentence
+// the Qwen3 technical report (§4.3, "thinking budget") inserts, then the closer
+// in the template's own "</think>\n\n" shape. The model was trained to answer
+// from its partial reasoning after it. The leading blank line ends whatever
+// sentence the budget cut.
+inline constexpr char kThinkBudgetClose[] =
+    "\n\nConsidering the limited time by the user, I have to give the solution based on the "
+    "thinking directly now.\n</think>\n\n";
+inline constexpr char kThinkEndTag[] = "</think>";
+
 } // namespace xllama

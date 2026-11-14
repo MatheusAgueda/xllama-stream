@@ -143,6 +143,16 @@ struct DecodeLoopParams {
     // logprobs = one entry per reply token. Either turns drafting off.
     const std::vector<llama_token>* forced = nullptr;
     std::vector<TokenLogprob>* logprobs = nullptr;
+
+    // Thinking budget (GenerateParams::think_budget): once think_budget tokens are
+    // generated and think_end has not been, think_close is fed in order as if
+    // sampled (accepted into the chain, so penalties see it), then sampling
+    // resumes for the answer. Off unless all three are set; never with forced
+    // ids or a grammar; turns prompt-lookup drafting off (a draft could carry
+    // think_end past the count).
+    int think_budget = 0;
+    llama_token think_end = -1;
+    const std::vector<llama_token>* think_close = nullptr;
 };
 
 struct DecodeLoopResult {
@@ -165,7 +175,18 @@ struct DecodeLoopResult {
     double mirror_ms = 0.0;
     int n_rounds = 0;        // verify batches (one target decode each)
     bool mtp_failed = false; // the drafter's context refused a decode; drafting stopped
+    // Thinking budget armed: tokens through think_end (all generated ones when it
+    // never came), and whether the loop fed think_close itself.
+    int n_think = 0;
+    bool think_forced = false;
 };
+
+// The budget is armed only when it can do what it says: a free reply (no forced
+// ids, no grammar) with the closer tokenized and its end tag one token.
+inline bool think_budget_armed(const DecodeLoopParams& p) {
+    return p.think_budget > 0 && p.think_end >= 0 && p.think_close && !p.think_close->empty() &&
+           p.forced == nullptr && p.grammar == nullptr;
+}
 
 namespace detail {
 
@@ -359,8 +380,13 @@ inline bool classic_step(const DecodeLoopParams& p, llama_token token, std::stri
 // single-token decode of lead on this stack. Commit lead first, then speculate.
 inline DecodeLoopResult decode_loop(const DecodeLoopParams& p, std::string& output_text) {
     DecodeLoopResult out;
+    const bool budget = think_budget_armed(p);
     bool spec_enabled = p.prompt_lookup && p.token_history != nullptr && p.spec_k > 0 &&
-                        p.grammar == nullptr && p.forced == nullptr && p.logprobs == nullptr;
+                        p.grammar == nullptr && p.forced == nullptr && p.logprobs == nullptr &&
+                        !budget;
+    bool thinking = budget; // inside the reasoning the prompt opened
+    size_t n_fed = 0;       // think_close tokens already fed
+    const size_t n_close = budget ? p.think_close->size() : 0;
 
     while (out.n_generated < p.n_predict) {
         if (p.abort_flag && p.abort_flag->load())
@@ -370,14 +396,29 @@ inline DecodeLoopResult decode_loop(const DecodeLoopParams& p, std::string& outp
         if (p.forced && out.n_generated >= static_cast<int>(p.forced->size()))
             break;
 
+        // Feeding starts when the budget is spent inside the reasoning and, once
+        // started, runs to the end of the closer (its "</think>" ends `thinking`
+        // before the trailing blank line is fed).
+        const bool closing =
+            n_fed < n_close && (n_fed > 0 || (thinking && out.n_generated >= p.think_budget));
         const auto ts0 = std::chrono::steady_clock::now();
-        llama_token token = p.forced    ? (*p.forced)[static_cast<size_t>(out.n_generated)]
-                            : p.grammar ? detail::sample_with_grammar(p)
-                                        : llama_sampler_sample(p.sampler, p.ctx, -1);
+        llama_token token;
+        if (closing) {
+            token = (*p.think_close)[n_fed++];
+            llama_sampler_accept(p.sampler, token);
+            if (!out.think_forced)
+                log_output("[xllama] thinking budget spent after " +
+                           std::to_string(out.n_generated) + " tokens: closing the reasoning\n");
+            out.think_forced = true;
+        } else {
+            token = p.forced    ? (*p.forced)[static_cast<size_t>(out.n_generated)]
+                    : p.grammar ? detail::sample_with_grammar(p)
+                                : llama_sampler_sample(p.sampler, p.ctx, -1);
+        }
         out.sample_ms +=
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts0)
                 .count();
-        if (!p.forced && detail::stops_at_eog(p, token)) {
+        if (!p.forced && !closing && detail::stops_at_eog(p, token)) {
             log_output("[xllama] EOG after " + std::to_string(out.n_generated) + " tokens\n");
             break;
         }
@@ -395,7 +436,12 @@ inline DecodeLoopResult decode_loop(const DecodeLoopParams& p, std::string& outp
                                          .count();
             }
             bool stop = false, decode_ok = true;
-            if (!detail::classic_step(p, token, output_text, out, stop, decode_ok))
+            const bool stepped = detail::classic_step(p, token, output_text, out, stop, decode_ok);
+            if (thinking && token == p.think_end) {
+                thinking = false;
+                out.n_think = out.n_generated;
+            }
+            if (!stepped)
                 break;
         }
         if (p.watchdog)
@@ -562,6 +608,8 @@ inline DecodeLoopResult decode_loop(const DecodeLoopParams& p, std::string& outp
             p.watchdog->on_decode_token(out.n_generated);
         // All drafts accepted: logits after the last draft are ready for -1.
     }
+    if (thinking)
+        out.n_think = out.n_generated; // the reasoning never closed: all of it
     return out;
 }
 
