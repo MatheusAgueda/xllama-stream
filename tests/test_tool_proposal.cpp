@@ -121,8 +121,8 @@ TEST_CASE("tool template: Qwen3 no-think prefill follows enable_thinking") {
     const std::vector<xllama::ToolSpec> tools{ping_tool()};
     const std::string no_think = "<think>\n\n</think>\n\n";
     for (bool thinking : {false, true}) {
-        const auto rendered = xllama::render_tool_prompt(
-            nullptr, jinja, messages, tools, xllama::ToolChoice::Auto, "", thinking);
+        const auto rendered = xllama::render_tool_prompt(nullptr, jinja, messages, tools,
+                                                         xllama::ToolChoice::Auto, "", thinking);
         REQUIRE_MESSAGE(rendered.ok, rendered.error);
         if (thinking) {
             CHECK(rendered.prompt.find(no_think) == std::string::npos);

@@ -855,9 +855,9 @@ std::string handle_tool_proposal_locked(JsonObject const& root, ::xllama::ToolRe
             request.messages, request.tools, policy_n_ctx, gp.n_predict,
             [&](const std::vector<::xllama::ChatMessage>& messages,
                 const std::vector<::xllama::ToolSpec>& tools) {
-                const ::xllama::ToolTemplateResult rendered = ::xllama::render_tool_prompt(
-                    llama_model, "", messages, tools, request.choice, request.forced_name,
-                    enable_thinking);
+                const ::xllama::ToolTemplateResult rendered =
+                    ::xllama::render_tool_prompt(llama_model, "", messages, tools, request.choice,
+                                                 request.forced_name, enable_thinking);
                 if (!rendered.ok)
                     throw std::runtime_error(rendered.error);
                 template_stops = rendered.stop_sequences;
@@ -922,8 +922,8 @@ std::string handle_tool_proposal_locked(JsonObject const& root, ::xllama::ToolRe
         }
         message.Insert(L"tool_calls", calls);
     }
-    return completion_json(model, message, winrt::to_hstring(assembly.finish_reason),
-                           generated, status);
+    return completion_json(model, message, winrt::to_hstring(assembly.finish_reason), generated,
+                           status);
 }
 
 // Handles one chat request under session_hub().mtx (already locked by the caller).

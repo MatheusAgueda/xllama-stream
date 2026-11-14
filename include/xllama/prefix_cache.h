@@ -39,11 +39,12 @@ inline bool prefix_cache_file_expired(const std::filesystem::path& path, std::ch
 
 // No TTL means a start wipe. Do not follow directory symlinks out of the root.
 inline size_t remove_prefix_cache_files(const std::filesystem::path& root,
-                                       std::optional<std::chrono::seconds> ttl) {
+                                        std::optional<std::chrono::seconds> ttl) {
     std::error_code ec;
     std::vector<std::filesystem::path> files, dirs;
-    for (std::filesystem::recursive_directory_iterator it(
-             root, std::filesystem::directory_options::skip_permission_denied, ec), end;
+    for (std::filesystem::recursive_directory_iterator
+             it(root, std::filesystem::directory_options::skip_permission_denied, ec),
+         end;
          !ec && it != end; it.increment(ec)) {
         std::error_code status_ec;
         const auto status = it->symlink_status(status_ec);
@@ -70,7 +71,7 @@ inline size_t wipe_prefix_cache_files(const std::filesystem::path& root) {
 }
 
 inline size_t prune_prefix_cache_files(const std::filesystem::path& root,
-                                      std::chrono::seconds ttl) {
+                                       std::chrono::seconds ttl) {
     return remove_prefix_cache_files(root, ttl);
 }
 

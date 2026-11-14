@@ -13,7 +13,8 @@
 namespace xllama {
 
 inline std::string api_timings_json(const InferenceResult& result) {
-    // inf/nan print as words JSON cannot parse: the caller's JsonObject::Parse would throw and drop the reply
+    // inf/nan print as words JSON cannot parse: the caller's JsonObject::Parse would throw and drop
+    // the reply
     const auto ms = [](double v) { return std::isfinite(v) ? v : 0.0; };
     std::ostringstream out;
     // JSON numbers always use a decimal point, whatever the console locale.

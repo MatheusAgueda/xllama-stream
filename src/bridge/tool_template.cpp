@@ -221,9 +221,8 @@ ToolTemplateResult render_tool_prompt(const void* llama_model, const std::string
                                       const std::vector<ToolSpec>& tools, ToolChoice choice,
                                       const std::string& forced_name, bool enable_thinking) {
     ToolTemplateResult out;
-    const Applied applied =
-        apply_template(llama_model, jinja_override, messages, tools, choice, forced_name,
-                       enable_thinking);
+    const Applied applied = apply_template(llama_model, jinja_override, messages, tools, choice,
+                                           forced_name, enable_thinking);
     if (!applied.ok) {
         out.error = applied.error;
         return out;
@@ -242,9 +241,8 @@ ToolParseResult parse_tool_generation(const void* llama_model, const std::string
                                       const std::string& forced_name, const std::string& raw_text,
                                       bool hit_cap, bool enable_thinking) {
     ToolParseResult out;
-    const Applied applied =
-        apply_template(llama_model, jinja_override, messages, tools, choice, forced_name,
-                       enable_thinking);
+    const Applied applied = apply_template(llama_model, jinja_override, messages, tools, choice,
+                                           forced_name, enable_thinking);
     if (!applied.ok) {
         log_output(std::string("[xllama] api: tool template unavailable after generation: ") +
                    applied.error + "\n");

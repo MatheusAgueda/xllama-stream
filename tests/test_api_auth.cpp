@@ -23,9 +23,9 @@ TEST_CASE("api auth: bearer scheme is case insensitive and key is exact") {
         wrong[i] ^= 1;
         CHECK_FALSE(xllama::bearer_matches("Bearer " + wrong, key));
     }
-    for (const std::string& bad : {key, "Basic " + key, "Bearer  " + key, "Bearer\t" + key,
-                                   " Bearer " + key, "Bearer " + key + " ",
-                                   "Bearer " + key.substr(1), "Bearer " + key + "x"})
+    for (const std::string& bad :
+         {key, "Basic " + key, "Bearer  " + key, "Bearer\t" + key, " Bearer " + key,
+          "Bearer " + key + " ", "Bearer " + key.substr(1), "Bearer " + key + "x"})
         CHECK_FALSE(xllama::bearer_matches(bad, key));
     CHECK_FALSE(xllama::bearer_matches("", key));
     CHECK_FALSE(xllama::bearer_matches("Bearer ", ""));

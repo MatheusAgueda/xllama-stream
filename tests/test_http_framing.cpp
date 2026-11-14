@@ -50,8 +50,8 @@ TEST_CASE("http head: Authorization has a complete case-insensitive name and tri
           "Bearer secret");
     CHECK(parse_http_head(head("Authorization: \t\r\n")).authorization.empty());
     CHECK(parse_http_head(head("X-Authorization: Bearer secret\r\n")).authorization.empty());
-    CHECK(parse_http_head(head("Authorization: Bearer a\r\nauthorization: Bearer b\r\n"))
-              .status == 400);
+    CHECK(parse_http_head(head("Authorization: Bearer a\r\nauthorization: Bearer b\r\n")).status ==
+          400);
 }
 
 TEST_CASE("http head: limits are refusals, not clamps") {
