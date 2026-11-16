@@ -220,14 +220,42 @@ groupshared float s_v[256];
 groupshared uint s_i[256];
 groupshared int s_sum[256];
 
+// NORMQ_HOIST=1 (variant nqh, shaders/variants.txt): decode runs this kernel as
+// one group, so its time is memory latency, not bandwidth: the loops below wait
+// for each load before the next (ne0 / 256 times for the sum, twice that for
+// dst). The variant issues every load of the row and of the weight before the
+// first use (ne0 <= 4096: at most 16 per thread), clamps the index to the row
+// (root UAVs have no bounds check) and skips the clamped copies with a uniform
+// test (ne0 % 256 == 0): the same adds in the same order, so the same bytes.
+#ifndef NORMQ_HOIST
+#define NORMQ_HOIST 0
+#endif
+
 [numthreads(256, 1, 1)]
 void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
     const uint r = gid.x;
     float s = 0.0f;
+#if NORMQ_HOIST
+    const uint nk = c0 >> 8;
+    float xv[16];
+    float wv[16];
+    [unroll]
+    for (uint k = 0; k < 16u; ++k) {
+        const uint i = min(tid + 256u * k, c0 - 1u);
+        xv[k] = lda(r * c1 + i);
+        wv[k] = asfloat(B.Load(4u * i));
+    }
+    [unroll]
+    for (uint k2 = 0; k2 < 16u; ++k2) {
+        if (k2 < nk)
+            s += xv[k2] * xv[k2];
+    }
+#else
     for (uint i = tid; i < c0; i += 256u) {
         const float x = lda(r * c1 + i);
         s += x * x;
     }
+#endif
     red[tid] = s;
     GroupMemoryBarrierWithGroupSync();
     [unroll]
@@ -238,6 +266,19 @@ void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
     }
     const float mean = red[0] / (float)c0;
     const float scale = 1.0f / sqrt(mean + asfloat(c3));
+#if NORMQ_HOIST
+    [unroll]
+    for (uint k3 = 0; k3 < 16u; ++k3) {
+        if (k3 < nk) {
+            const uint j = tid + 256u * k3;
+            const float y = xv[k3] * scale;
+            const float z = y * wv[k3];
+            D.Store(4u * (r * c2 + j), asuint(y));
+            D2.Store(4u * (r * c4 + j), asuint(z)); // dst2 may alias dst: written last
+            zs[j] = z;
+        }
+    }
+#else
     for (uint j = tid; j < c0; j += 256u) {
         const float y = lda(r * c1 + j) * scale;
         const float z = y * asfloat(B.Load(4u * j));
@@ -245,6 +286,7 @@ void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
         D2.Store(4u * (r * c4 + j), asuint(z)); // dst2 may alias dst: written last
         zs[j] = z;
     }
+#endif
     GroupMemoryBarrierWithGroupSync();
     const uint lb = tid >> 6; // block of this pass
     const uint lt = tid & 63u;

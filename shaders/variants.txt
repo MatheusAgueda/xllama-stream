@@ -31,3 +31,6 @@ roofxo ggml_d3d12_mmv_q4_k_t64 shaders/ggml_d3d12_roofline.hlsl -D NUM_THREADS=6
 roofxo ggml_d3d12_mmv_q4_k_t128 shaders/ggml_d3d12_roofline.hlsl -D NUM_THREADS=128 -D ROOF_X=2
 roofxo ggml_d3d12_mmv_iq3_s_t64 shaders/ggml_d3d12_roofline.hlsl -D NUM_THREADS=64 -D ROOF_X=2
 roofxo ggml_d3d12_mmv_iq3_s_t128 shaders/ggml_d3d12_roofline.hlsl -D NUM_THREADS=128 -D ROOF_X=2
+# nqh: KERNEL 4 with every row and weight load issued before the first use (decode = one group: latency-bound);
+# bytes as the built-in, checked by the selftest normq case before a model runs on it
+nqh ggml_d3d12_elt_norm_quant shaders/ggml_d3d12_elt.hlsl -D KERNEL=4 -D NORMQ_HOIST=1
