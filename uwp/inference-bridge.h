@@ -31,6 +31,11 @@ void run_membw();
 // Pins the sandboxed file-read rate any weight-streaming scheme would divide by.
 void run_diskbw();
 
+// Round 4 (16/11): LAN round trip from inside the app (UDP 64/4096 B, TCP 4096 B) to the
+// targets in LocalState\netrtt.cfg. Triggered by netrtt.flag; writes netrtt-result.csv
+// (+ netrtt-samples.csv, .done). Decides the LAN expert peer (decisions_20261116 §15a).
+void run_netrtt();
+
 // Phase 15 W3 (#211): own D3D12 compute STREAM read (~1 GB VRAM) + checksum.
 // Triggered by LocalFolder\gpubw.flag; writes gpubw-result.csv (+ .done).
 // Kill criterion 100 GB/s is documented in docs/phase15-re-opt.md — not invented here.

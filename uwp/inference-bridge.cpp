@@ -34,6 +34,18 @@
 #include <vector>
 
 #ifdef XLLAMA_UWP
+    // netrtt probe (run_netrtt): Winsock is in the UWP API set; WIN32_LEAN_AND_MEAN
+    // (project-wide) keeps windows.h from pulling the old winsock.h first.
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+    #pragma comment(lib, "ws2_32.lib")
+
+    #include <atomic>
+    #include <cstdint>
+    #include <cstring>
+    #include <memory>
+    #include <thread>
+
     // WS-F microphone probe (run_mic_probe). Universal contract, so no
     // SDKReference is needed — but per uwp-constraints.md §10b that says
     // nothing about activation, which is what the probe measures.
@@ -495,6 +507,277 @@ void run_diskbw() {
         log_output("[xllama] diskbw: cannot open diskbw-result.csv\n");
     }
     _wremove(utf8_to_wstring(path).c_str());
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// run_netrtt (netrtt.flag, headless): LAN round trip from inside the app
+// ---------------------------------------------------------------------------
+// Round 4 (16/11, decisions §15a): a LAN peer computing the experts a token is
+// missing pays one round trip per layer (blocking) or lands its output a few
+// layers late (late binding). Either way the number is the round trip the app
+// itself sees: Winsock in the game partition, the virtual switch, the wire and
+// the peer. netrtt.cfg in LocalState, one target per line "label host port";
+// "loop 127.0.0.1 0" = an echo inside this process (socket overhead alone).
+// Per target: UDP echo of 64 B and 4096 B, then TCP_NODELAY echo of 4096 B,
+// 50 warm-ups + N (netrtt-n.txt, default 1000), 200 ms timeout = lost.
+// Writes netrtt-samples.csv (label,proto,size,i,us; -1 = lost) and
+// netrtt-result.csv (label,proto,size,n,lost,min,p10,p50,p90,p99,max in µs) +
+// netrtt-result.csv.done. Peer side: sims/brief16/r4/netecho.py.
+
+#ifdef XLLAMA_UWP
+namespace {
+
+double netrtt_now_us() {
+    static const double inv = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return 1e6 / double(f.QuadPart);
+    }();
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return double(t.QuadPart) * inv;
+}
+
+bool netrtt_addr(const std::string& host, int port, sockaddr_in* out) {
+    addrinfo hints{};
+    hints.ai_family = AF_INET;
+    addrinfo* res = nullptr;
+    if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res) != 0 || !res)
+        return false;
+    std::memcpy(out, res->ai_addr, sizeof(sockaddr_in));
+    freeaddrinfo(res);
+    return true;
+}
+
+void netrtt_timeout(SOCKET s, DWORD ms) {
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&ms), sizeof(ms));
+}
+
+// In-process echo: one UDP socket and one TCP listener on 127.0.0.1.
+struct NetrttLoop {
+    SOCKET u = INVALID_SOCKET, l = INVALID_SOCKET;
+    int uport = 0, tport = 0;
+    std::atomic<bool> stop{false};
+    std::thread tu, tt;
+
+    static int bound_port(SOCKET s) {
+        sockaddr_in a{};
+        int len = sizeof(a);
+        getsockname(s, reinterpret_cast<sockaddr*>(&a), &len);
+        return ntohs(a.sin_port);
+    }
+    bool start() {
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        u = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        l = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (u == INVALID_SOCKET || l == INVALID_SOCKET ||
+            bind(u, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0 ||
+            bind(l, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0 || listen(l, 1) != 0)
+            return false;
+        uport = bound_port(u);
+        tport = bound_port(l);
+        netrtt_timeout(u, 200);
+        tu = std::thread([this] {
+            std::vector<char> b(65536);
+            while (!stop.load()) {
+                sockaddr_in from{};
+                int fl = sizeof(from);
+                int r = recvfrom(u, b.data(), int(b.size()), 0, reinterpret_cast<sockaddr*>(&from), &fl);
+                if (r > 0)
+                    sendto(u, b.data(), r, 0, reinterpret_cast<sockaddr*>(&from), fl);
+            }
+        });
+        tt = std::thread([this] {
+            SOCKET c = accept(l, nullptr, nullptr);
+            if (c == INVALID_SOCKET)
+                return;
+            BOOL one = TRUE;
+            setsockopt(c, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof(one));
+            std::vector<char> b(65536);
+            int r;
+            while ((r = recv(c, b.data(), int(b.size()), 0)) > 0)
+                if (send(c, b.data(), r, 0) != r)
+                    break;
+            closesocket(c);
+        });
+        return true;
+    }
+    ~NetrttLoop() {
+        stop.store(true);
+        if (l != INVALID_SOCKET)
+            closesocket(l);  // unblocks accept when the TCP case never connected
+        if (tt.joinable())
+            tt.join();
+        if (tu.joinable())
+            tu.join();
+        if (u != INVALID_SOCKET)
+            closesocket(u);
+    }
+};
+
+std::vector<double> netrtt_udp(const sockaddr_in& to, int size, int n, int warm) {
+    std::vector<double> out;
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET)
+        return out;
+    netrtt_timeout(s, 200);
+    if (connect(s, reinterpret_cast<const sockaddr*>(&to), sizeof(to)) != 0) {
+        closesocket(s);
+        return out;
+    }
+    std::vector<char> b(size, 'x'), rb(size + 64);
+    for (int i = -warm; i < n; ++i) {
+        const std::uint32_t seq = std::uint32_t(i + warm);
+        std::memcpy(b.data(), &seq, 4);
+        const double t0 = netrtt_now_us();
+        double us = -1.0;
+        if (send(s, b.data(), size, 0) == size) {
+            for (;;) {  // a late echo of an earlier lost probe is skipped, not counted
+                const int r = recv(s, rb.data(), int(rb.size()), 0);
+                if (r <= 0)
+                    break;
+                std::uint32_t got;
+                std::memcpy(&got, rb.data(), 4);
+                if (r == size && got == seq) {
+                    us = netrtt_now_us() - t0;
+                    break;
+                }
+            }
+        }
+        if (i >= 0)
+            out.push_back(us);
+    }
+    closesocket(s);
+    return out;
+}
+
+std::vector<double> netrtt_tcp(const sockaddr_in& to, int size, int n, int warm) {
+    std::vector<double> out;
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET)
+        return out;
+    BOOL one = TRUE;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof(one));
+    netrtt_timeout(s, 1000);
+    if (connect(s, reinterpret_cast<const sockaddr*>(&to), sizeof(to)) != 0) {
+        closesocket(s);
+        return out;
+    }
+    std::vector<char> b(size, 'y'), rb(size);
+    for (int i = -warm; i < n; ++i) {
+        const double t0 = netrtt_now_us();
+        int got = 0;
+        if (send(s, b.data(), size, 0) == size)
+            while (got < size) {
+                const int r = recv(s, rb.data() + got, size - got, 0);
+                if (r <= 0)
+                    break;
+                got += r;
+            }
+        if (got < size) {  // a timed-out stream is out of step: stop this case
+            if (i >= 0)
+                out.push_back(-1.0);
+            break;
+        }
+        if (i >= 0)
+            out.push_back(netrtt_now_us() - t0);
+    }
+    closesocket(s);
+    return out;
+}
+
+}  // namespace
+#endif
+
+void run_netrtt() {
+#ifdef XLLAMA_UWP
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        log_output("[xllama] netrtt FAIL: WSAStartup\n");
+        return;
+    }
+    const int n = std::max(10, read_local_int("netrtt-n.txt", 1000));
+    const std::string cfg = read_local_file("netrtt.cfg");
+    FILE* fs = _wfopen(utf8_to_wstring(resolve_local_path("netrtt-samples.csv")).c_str(), L"w");
+    FILE* fr = _wfopen(utf8_to_wstring(resolve_local_path("netrtt-result.csv")).c_str(), L"w");
+    if (!fs || !fr) {
+        log_output("[xllama] netrtt FAIL: cannot open the result files\n");
+        if (fs)
+            fclose(fs);
+        if (fr)
+            fclose(fr);
+        WSACleanup();
+        return;
+    }
+    fputs("label,proto,size,i,us\n", fs);
+    fputs("label,proto,size,n,lost,min,p10,p50,p90,p99,max\n", fr);
+    std::size_t pos = 0;
+    while (pos < cfg.size()) {
+        std::size_t eol = cfg.find('\n', pos);
+        if (eol == std::string::npos)
+            eol = cfg.size();
+        std::string line = cfg.substr(pos, eol - pos);
+        pos = eol + 1;
+        char label[64] = {}, host[128] = {};
+        int port = -1;
+        if (std::sscanf(line.c_str(), "%63s %127s %d", label, host, &port) != 3)
+            continue;
+        std::unique_ptr<NetrttLoop> loop;
+        int uport = port, tport = port;
+        if (port == 0) {
+            loop = std::make_unique<NetrttLoop>();
+            if (!loop->start()) {
+                log_output("[xllama] netrtt FAIL: in-app loopback echo did not start\n");
+                continue;
+            }
+            uport = loop->uport;
+            tport = loop->tport;
+        }
+        sockaddr_in ua{}, ta{};
+        if (!netrtt_addr(host, uport, &ua) || !netrtt_addr(host, tport, &ta)) {
+            log_output(("[xllama] netrtt FAIL: cannot resolve target " + std::string(label) + "\n").c_str());
+            continue;
+        }
+        struct Case {
+            const char* proto;
+            int size;
+        };
+        for (const Case c : {Case{"udp", 64}, Case{"udp", 4096}, Case{"tcp", 4096}}) {
+            std::vector<double> v = std::strcmp(c.proto, "udp") == 0 ? netrtt_udp(ua, c.size, n, 50)
+                                                                     : netrtt_tcp(ta, c.size, n, 50);
+            std::vector<double> ok;
+            for (std::size_t i = 0; i < v.size(); ++i) {
+                fprintf(fs, "%s,%s,%d,%zu,%.1f\n", label, c.proto, c.size, i, v[i]);
+                if (v[i] >= 0.0)
+                    ok.push_back(v[i]);
+            }
+            std::sort(ok.begin(), ok.end());
+            auto q = [&](double p) {
+                return ok.empty() ? -1.0 : ok[std::min(ok.size() - 1, std::size_t(p * double(ok.size())))];
+            };
+            const int lost = n - int(ok.size());  // a TCP case cut short counts its unsent probes
+            fprintf(fr, "%s,%s,%d,%zu,%d,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f\n", label, c.proto, c.size, ok.size(),
+                    lost, q(0.0), q(0.1), q(0.5), q(0.9), q(0.99), ok.empty() ? -1.0 : ok.back());
+            char lb[256];
+            snprintf(lb, sizeof(lb), "[xllama] netrtt %s %s %d B: n=%zu lost=%d p50=%.1f p90=%.1f us\n", label,
+                     c.proto, c.size, ok.size(), lost, q(0.5), q(0.9));
+            log_output(lb);
+            fflush(fs);
+            fflush(fr);
+        }
+    }
+    fclose(fs);
+    fclose(fr);
+    FILE* done = _wfopen(utf8_to_wstring(resolve_local_path("netrtt-result.csv.done")).c_str(), L"w");
+    if (done) {
+        fputs("done\n", done);
+        fclose(done);
+    }
+    log_output("[xllama] netrtt-result.csv written\n");
+    WSACleanup();
 #endif
 }
 
