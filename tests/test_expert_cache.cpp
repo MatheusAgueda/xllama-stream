@@ -86,6 +86,16 @@ long long misses_of(const std::string& line) {
     return static_cast<long long>(misses);
 }
 
+// The "late K: N terms" count of a stats line (LLAMA_EXPERT_LATE_K), or -1 when it is off.
+long long late_terms_of(const std::string& line) {
+    const char* p = std::strstr(line.c_str(), "; late ");
+    int k = 0;
+    unsigned long long terms = 0;
+    if (!p || std::sscanf(p, "; late %d: %llu terms", &k, &terms) != 2)
+        return -1;
+    return static_cast<long long>(terms);
+}
+
 // The "N swaps" count of a stats line, or -1 when it is not one.
 long long swaps_of(const std::string& line) {
     const char* p = std::strstr(line.c_str(), " hit), ");
@@ -238,7 +248,8 @@ struct EcRun {
     bool ok = false;
     uint32_t n_ubatch = 0;
     std::vector<llama_token> tokens;
-    std::vector<float> logits; // after the prompt
+    std::vector<float> logits;      // after the prompt
+    std::vector<float> last_logits; // after the last generated token (a one-token decode)
 };
 
 // used_override > 0 replaces the model's experts-per-token, which is what bounds
@@ -307,6 +318,10 @@ EcRun run_greedy(const char* path, uint32_t slots, uint32_t n_ubatch, int64_t us
                         best = v;
                 r.tokens.push_back(best);
                 ok = llama_decode(ctx, llama_batch_get_one(&r.tokens.back(), 1)) == 0;
+            }
+            if (ok && n_gen > 0) {
+                const float* lg = llama_get_logits_ith(ctx, -1);
+                r.last_logits.assign(lg, lg + n_vocab);
             }
             r.ok = ok;
         }
@@ -1037,6 +1052,77 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
         std::lock_guard<std::mutex> lock(log.mtx);
         CHECK(log.final_line.empty());
     }
+
+    llama_log_set(nullptr, nullptr);
+}
+
+// LLAMA_EXPERT_LATE_K (patch 0025, a quality probe of residual late-binding): in a
+// one-token ubatch the router weights split into the resident experts' and the
+// missing ones', two weighted sums. k = 0 adds both in the same layer, so it decodes
+// like the plain cache up to the summation order; k = 2 adds the missing experts'
+// sum two layers late, which changes the decode but not what the cache reads. With
+// 2 or 3 slots and 2 used the ubatch is one token, the prompt's too.
+TEST_CASE("expert cache: late binding (opt-in: XLLAMA_EC_TEST_MODEL)") {
+    const char* path = std::getenv("XLLAMA_EC_TEST_MODEL");
+    if (!path)
+        return;
+    llama_backend_init();
+    EcLog log;
+    llama_log_set(ec_log_cb, &log);
+    auto take_final = [&log]() {
+        std::lock_guard<std::mutex> lock(log.mtx);
+        std::string line = log.final_line;
+        log.final_line.clear();
+        return line;
+    };
+
+    for (const uint32_t slots : {2u, 3u}) {
+        CAPTURE(slots);
+        take_final();
+        const EcRun plain = run_greedy(path, slots, 512, 0, 24);
+        REQUIRE(plain.ok);
+        CHECK(plain.n_ubatch == 1);
+        const std::string plain_line = take_final();
+        MESSAGE(plain_line);
+        const long long plain_misses = misses_of(plain_line);
+        CHECK(plain_misses > 0);
+        CHECK(late_terms_of(plain_line) == -1);
+
+        set_env_k("LLAMA_EXPERT_LATE_K", 0);
+        const EcRun k0 = run_greedy(path, slots, 512, 0, 24);
+        set_env_k("LLAMA_EXPERT_LATE_K", -1);
+        REQUIRE(k0.ok);
+        const std::string k0_line = take_final();
+        MESSAGE(k0_line);
+        // the same reads: the split changes the arithmetic's order, not the plans
+        CHECK(misses_of(k0_line) == plain_misses);
+        const long long k0_terms = late_terms_of(k0_line);
+        CHECK(k0_terms > 0);
+        CHECK(k0_terms <= plain_misses);
+        CHECK(k0.tokens == plain.tokens);
+        REQUIRE(k0.logits.size() == plain.logits.size());
+        CHECK(max_abs_diff(k0.logits, plain.logits) <= 1e-4f);
+        REQUIRE(k0.last_logits.size() == plain.last_logits.size());
+        CHECK(max_abs_diff(k0.last_logits, plain.last_logits) <= 1e-4f);
+
+        set_env_k("LLAMA_EXPERT_LATE_K", 2);
+        const EcRun k2 = run_greedy(path, slots, 512, 0, 24);
+        set_env_k("LLAMA_EXPERT_LATE_K", -1);
+        REQUIRE(k2.ok);
+        const std::string k2_line = take_final();
+        MESSAGE(k2_line);
+        CHECK(late_terms_of(k2_line) > 0);
+        REQUIRE(k2.logits.size() == plain.logits.size());
+        // late terms really reach a later layer: the prompt's logits move
+        CHECK(max_abs_diff(k2.logits, plain.logits) > 1e-3f);
+    }
+
+    // not an integer 0..64: ignored, the plain graph
+    set_env_s("LLAMA_EXPERT_LATE_K", "x");
+    const EcRun bad = run_greedy(path, 2, 512, 0, 4);
+    set_env_s("LLAMA_EXPERT_LATE_K", nullptr);
+    REQUIRE(bad.ok);
+    CHECK(late_terms_of(take_final()) == -1);
 
     llama_log_set(nullptr, nullptr);
 }

@@ -534,6 +534,37 @@ scaling is not the console's (1 → 2 threads was ×5–7 for every path).
 Single-thread cost of one (head, row) pair of the per-head loop on L2-resident rows:
 f16 dot 9.3 ns, f16 mad 9.7 ns, expf 2.6 ns.
 
+`0025-expert-cache-late-k.patch` (applies after 0024, touches `src/llama-expert-cache.{cpp,h}`
+and `src/llama-graph.{cpp,h}`): `LLAMA_EXPERT_LATE_K=<k>` (0..64, unset = off), a
+quality probe of residual late-binding. Nothing gets faster: the reads still block.
+In a one-token ubatch the plan records the routed experts it found missing. A CPU
+custom op after the load op (`ffn_moe_late_mask-<il>`, F32 `[1, n_used, 1]`) turns
+that list into a mask. `build_moe_ffn` then splits the router weights into the
+resident experts' (`weights − weights·mask`, exact in float) and the missing ones'
+(`weights·mask`). Each split gets its own MUL over the down outputs and its own
+view/ADD chain, back to back, so the D3D12 combine can fuse either one. The resident
+sum is the layer's MoE output. The missing sum waits in `moe_late` and joins the MoE
+output of layer `il + k`, or the last layer's if the stack ends first.
+
+So a missing expert still computes on its own layer's input, the same as a late
+expert in RLB would. Only the layers in between miss its contribution. `k = 0` adds
+the missing sum in the same layer. It is the control: it decodes like the plain
+cache up to the summation order.
+
+With the flag set, `llama_ec_route_query` answers 0, so the routing stays on the
+CPU (`XLLAMA_D3D12_GPUROUTE` skips the plan on a hit). Run the reference arm with the
+GPU route off too. The mask op clears the list it consumed. The final stats line
+gains `; late <k>: <n> terms`.
+
+Host test `expert cache: late binding` (stories15M MoE, 2 and 3 slots, one-token
+ubatches) checks three things:
+
+- `k = 0` gives the plain cache's misses, tokens, and logits within 1e-4.
+- `k = 2` moves the logits.
+- An invalid value is ignored.
+
+Unset, the graph is unchanged.
+
 ## Applying
 
 ```bash
