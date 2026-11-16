@@ -506,7 +506,8 @@ void run_gpubw() {
 #ifdef XLLAMA_UWP
     log_output("[xllama] gpubw: measuring GPU STREAM bandwidth (own CS, no Agility)\n");
     // ~1 GiB default (issue #211). If alloc fails, measure_gpubw reports error.
-    const ::xllama::GpubwResult r = ::xllama::measure_gpubw(::xllama::kGpubwDefaultBufferBytes, 3);
+    const ::xllama::GpubwResult r =
+        ::xllama::measure_gpubw(::xllama::kGpubwDefaultBufferBytes, 3, /*sweep=*/true);
 
     char lb[320];
     snprintf(lb, sizeof(lb),
@@ -516,6 +517,21 @@ void run_gpubw() {
              ::xllama::gpubw_passes_kill_gate(r) ? 1 : 0, r.buffer_bytes / (1024 * 1024),
              r.error_msg.empty() ? "-" : r.error_msg.c_str());
     log_output(lb);
+
+    // Before the result CSV, whose .done marker is what the operator polls.
+    if (!r.sweep.empty()) {
+        std::string rows = ::xllama::gpubw_sweep_csv_header();
+        for (const auto& row : r.sweep) {
+            const std::string line = ::xllama::format_gpubw_sweep_row(row);
+            log_output("[xllama] gpubw sweep " + line);
+            rows += line;
+        }
+        FILE* sf = _wfopen(utf8_to_wstring(resolve_local_path("gpubw-sweep.csv")).c_str(), L"w");
+        if (sf) {
+            fputs(rows.c_str(), sf);
+            fclose(sf);
+        }
+    }
 
     const std::string csv = resolve_local_path("gpubw-result.csv");
     FILE* fp = _wfopen(utf8_to_wstring(csv).c_str(), L"w");
@@ -690,7 +706,8 @@ void run_gpustep(bool inproc) {
 
 void run_d3d12_selftest() {
 #if defined(XLLAMA_UWP) && defined(XLLAMA_USE_LLAMA)
-    log_output("[xllama] d3d12be: backend selftest (Q4_0/Q4_K/Q5_K/Q6_K/IQ2_XXS/IQ2_S/IQ3_S/IQ4_XS vs ggml)\n");
+    log_output("[xllama] d3d12be: backend selftest (Q4_0/Q4_K/Q5_K/Q6_K/IQ2_XXS/IQ2_S/IQ3_S/IQ4_XS "
+               "vs ggml)\n");
     std::vector<::xllama::D3d12SelftestRow> rows;
     ::xllama::run_d3d12_selftest(&rows);
     const std::string csv = resolve_local_path("d3d12be-result.csv");

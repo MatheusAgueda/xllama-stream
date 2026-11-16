@@ -131,9 +131,47 @@ std::string format_gpubw_row(const GpubwResult& r, const char* host_label) {
     return std::string(buf);
 }
 
+std::vector<GpubwSweepCase> gpubw_sweep_plan(std::size_t buffer_bytes) {
+    std::vector<GpubwSweepCase> plan;
+    constexpr std::size_t kKiB = 1024;
+    // 16 KiB ≈ a norm/elementwise dispatch, 1-2 MiB ≈ an expert or mixer GEMV,
+    // 64 MiB ≈ the streaming asymptote (the head reads 417 MB in one).
+    constexpr std::size_t sizes[] = {16 * kKiB,       256 * kKiB,      1024 * kKiB,
+                                     2 * 1024 * kKiB, 8 * 1024 * kKiB, 64 * 1024 * kKiB};
+    if (buffer_bytes >= sizes[0])
+        plan.push_back({sizes[0], 1u, false, 20});
+    for (std::size_t s : sizes) {
+        const std::size_t fit = buffer_bytes / s;
+        if (fit == 0)
+            continue;
+        const auto n =
+            static_cast<std::uint32_t>(std::min<std::size_t>(fit, kGpubwSweepMaxDispatches));
+        plan.push_back({s, n, true, 5});
+        plan.push_back({s, n, false, 5});
+    }
+    return plan;
+}
+
+const char* gpubw_sweep_csv_header() {
+    return "dispatch_kib,dispatches,barriers,reps,best_ms,median_ms,us_per_dispatch,read_gbs,"
+           "checksum_ok\n";
+}
+
+std::string format_gpubw_sweep_row(const GpubwSweepRow& row) {
+    const double n = row.c.dispatches ? static_cast<double>(row.c.dispatches) : 1.0;
+    const double us = row.best_ms * 1000.0 / n;
+    const double gbs =
+        row.best_ms > 0.0 ? n * static_cast<double>(row.c.dispatch_bytes) / 1e6 / row.best_ms : 0.0;
+    char buf[256];
+    std::snprintf(buf, sizeof(buf), "%zu,%u,%d,%d,%.4f,%.4f,%.3f,%.2f,%d\n",
+                  row.c.dispatch_bytes / 1024, row.c.dispatches, row.c.barriers ? 1 : 0, row.c.reps,
+                  row.best_ms, row.median_ms, us, gbs, row.checksum_ok ? 1 : 0);
+    return std::string(buf);
+}
+
 #if !defined(_WIN32)
 
-GpubwResult measure_gpubw(std::size_t buffer_bytes, int iterations) {
+GpubwResult measure_gpubw(std::size_t buffer_bytes, int iterations, bool /*sweep*/) {
     GpubwResult r;
     const std::size_t n_words = std::max<std::size_t>(buffer_bytes / sizeof(std::uint32_t), 1);
     r.buffer_bytes = n_words * sizeof(std::uint32_t);
@@ -244,7 +282,7 @@ ComPtr<ID3D12Resource> create_buffer(ID3D12Device* device, UINT64 size, D3D12_HE
 
 } // namespace
 
-GpubwResult measure_gpubw(std::size_t buffer_bytes, int iterations) {
+GpubwResult measure_gpubw(std::size_t buffer_bytes, int iterations, bool sweep) {
     GpubwResult r;
     if (iterations < 1)
         iterations = 1;
@@ -550,6 +588,119 @@ GpubwResult measure_gpubw(std::size_t buffer_bytes, int iterations) {
             output_readback->Unmap(0, nullptr);
         }
         any_ok = true;
+    }
+
+    // Dispatch-size sweep on the same device and input. Slice k of a case has
+    // its own descriptor triple (CBV, SRV at k*wpd words, UAV at k*gpd
+    // partials), so slices never re-read cached lines and never share outputs.
+    ComPtr<ID3D12DescriptorHeap> sheap;
+    if (sweep && any_ok) {
+        D3D12_DESCRIPTOR_HEAP_DESC sd = heap_desc;
+        sd.NumDescriptors = 3 * kGpubwSweepMaxDispatches;
+        if (FAILED(device->CreateDescriptorHeap(&sd, IID_PPV_ARGS(&sheap))))
+            sheap.Reset();
+    }
+    for (const GpubwSweepCase& c :
+         sheap ? gpubw_sweep_plan(r.buffer_bytes) : std::vector<GpubwSweepCase>{}) {
+        const std::size_t wpd = c.dispatch_bytes / sizeof(std::uint32_t);
+        const GpubwDispatch sp = gpubw_plan_dispatch(wpd);
+        const UINT gpd = sp.n_groups;
+        if (!gpubw_dispatch_dims_legal(sp) || static_cast<UINT64>(c.dispatches) * gpd > groups ||
+            static_cast<std::size_t>(c.dispatches) * wpd > n_words)
+            continue;
+        struct Params {
+            std::uint32_t n_words, dispatch_x, dispatch_y, threads_per_group;
+        } sparams{static_cast<std::uint32_t>(wpd), sp.groups_x, sp.groups_y, kGpubwThreadsPerGroup};
+        void* mapped = nullptr;
+        if (FAILED(cb_upload->Map(0, nullptr, &mapped)))
+            break;
+        std::memcpy(mapped, &sparams, sizeof(sparams));
+        cb_upload->Unmap(0, nullptr);
+        const D3D12_CPU_DESCRIPTOR_HANDLE sbase = sheap->GetCPUDescriptorHandleForHeapStart();
+        for (UINT k = 0; k < c.dispatches; ++k) {
+            D3D12_CPU_DESCRIPTOR_HANDLE h = sbase;
+            h.ptr += static_cast<SIZE_T>(3) * k * incr;
+            device->CreateConstantBufferView(&cbv, h);
+            h.ptr += incr;
+            D3D12_SHADER_RESOURCE_VIEW_DESC s = srv;
+            s.Buffer.FirstElement = static_cast<UINT64>(k) * wpd;
+            s.Buffer.NumElements = static_cast<UINT>(wpd);
+            device->CreateShaderResourceView(input_default.Get(), &s, h);
+            h.ptr += incr;
+            D3D12_UNORDERED_ACCESS_VIEW_DESC u = uav;
+            u.Buffer.FirstElement = static_cast<UINT64>(k) * gpd;
+            u.Buffer.NumElements = gpd;
+            device->CreateUnorderedAccessView(output_default.Get(), nullptr, &u, h);
+        }
+        const D3D12_GPU_DESCRIPTOR_HANDLE gbase = sheap->GetGPUDescriptorHandleForHeapStart();
+        std::vector<double> ms;
+        bool ok = true;
+        for (int rep = 0; rep < c.reps && ok; ++rep) {
+            alloc->Reset();
+            cl->Reset(alloc.Get(), pso.Get());
+            cl->SetComputeRootSignature(root.Get());
+            ID3D12DescriptorHeap* sh[] = {sheap.Get()};
+            cl->SetDescriptorHeaps(1, sh);
+            for (UINT k = 0; k < c.dispatches; ++k) {
+                if (k > 0 && c.barriers) {
+                    D3D12_RESOURCE_BARRIER ub = {};
+                    ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                    ub.UAV.pResource = output_default.Get();
+                    cl->ResourceBarrier(1, &ub);
+                }
+                D3D12_GPU_DESCRIPTOR_HANDLE g = gbase;
+                g.ptr += static_cast<UINT64>(3) * k * incr;
+                cl->SetComputeRootDescriptorTable(0, g);
+                cl->Dispatch(sp.groups_x, sp.groups_y, sp.groups_z);
+            }
+            cl->Close();
+            const auto t0 = std::chrono::steady_clock::now();
+            ID3D12CommandList* lists[] = {cl.Get()};
+            queue->ExecuteCommandLists(1, lists);
+            ok = wait_gpu();
+            ms.push_back(
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                    .count());
+        }
+        if (!ok)
+            break;
+        // Checksum of what the last rep read: every slice's partials, XORed.
+        const UINT64 part_bytes = static_cast<UINT64>(c.dispatches) * gpd * sizeof(std::uint32_t);
+        alloc->Reset();
+        cl->Reset(alloc.Get(), nullptr);
+        D3D12_RESOURCE_BARRIER b = {};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = output_default.Get();
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cl->ResourceBarrier(1, &b);
+        cl->CopyBufferRegion(output_readback.Get(), 0, output_default.Get(), 0, part_bytes);
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        cl->ResourceBarrier(1, &b);
+        cl->Close();
+        ID3D12CommandList* lists[] = {cl.Get()};
+        queue->ExecuteCommandLists(1, lists);
+        if (!wait_gpu())
+            break;
+        GpubwSweepRow row;
+        row.c = c;
+        std::sort(ms.begin(), ms.end());
+        row.best_ms = ms.front();
+        row.median_ms = ms[ms.size() / 2];
+        D3D12_RANGE range = {0, static_cast<SIZE_T>(part_bytes)};
+        if (SUCCEEDED(output_readback->Map(0, &range, &mapped))) {
+            const auto* partials = static_cast<const std::uint32_t*>(mapped);
+            std::uint32_t x = 0;
+            for (UINT64 i = 0; i < part_bytes / sizeof(std::uint32_t); ++i)
+                x ^= partials[i];
+            output_readback->Unmap(0, nullptr);
+            row.checksum_ok =
+                x ==
+                gpubw_checksum_words(host_in.data(), static_cast<std::size_t>(c.dispatches) * wpd);
+        }
+        r.sweep.push_back(row);
     }
 
     CloseHandle(fence_event);

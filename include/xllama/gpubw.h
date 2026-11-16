@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace xllama {
 
@@ -28,6 +29,34 @@ inline constexpr std::size_t kGpubwDefaultBufferBytes = static_cast<std::size_t>
 inline constexpr std::uint32_t kGpubwMaxGroupsPerDim = 65535u;
 inline constexpr std::uint32_t kGpubwThreadsPerGroup = 256u;
 
+// Dispatch-size sweep: `dispatches` back-to-back dispatches in one command
+// list, each reading its own `dispatch_bytes` slice of the input, with or
+// without a UAV barrier between consecutive ones. A decode token is ~1230
+// dispatches of 0.01-2 MB (gpuprof 15/11), so per-dispatch cost against slice
+// size says whether fusing dispatches or reshaping kernels is worth more.
+// dispatches == 1 times one submission round trip (ExecuteCommandLists to
+// fence wake), the wait a token pays ~55 times.
+struct GpubwSweepCase {
+    std::size_t dispatch_bytes = 0;
+    std::uint32_t dispatches = 0;
+    bool barriers = false;
+    int reps = 0;
+};
+
+struct GpubwSweepRow {
+    GpubwSweepCase c;
+    double best_ms = 0.0; // whole list, ExecuteCommandLists to fence wake
+    double median_ms = 0.0;
+    bool checksum_ok = false; // XOR of every slice read == CPU XOR of the covered words
+};
+
+inline constexpr std::uint32_t kGpubwSweepMaxDispatches = 2048u;
+
+// Pure: the cases for an input of `buffer_bytes` (host-testable). Every case
+// covers at most the buffer, at most kGpubwSweepMaxDispatches slices, and
+// slices of a power-of-two multiple of 1 KiB (whole groups, exact plans).
+std::vector<GpubwSweepCase> gpubw_sweep_plan(std::size_t buffer_bytes);
+
 struct GpubwResult {
     std::size_t buffer_bytes = 0;
     int iterations = 0;
@@ -36,7 +65,8 @@ struct GpubwResult {
     std::uint32_t expected_checksum = 0;
     bool checksum_ok = false;
     bool d3d12_ran = false;
-    std::string error_msg; // empty on full success
+    std::string error_msg;            // empty on full success
+    std::vector<GpubwSweepRow> sweep; // filled only when measure_gpubw(…, sweep=true)
 };
 
 // Pure: plan a Dispatch(x,y,z) so every dim is ≤ kGpubwMaxGroupsPerDim and
@@ -76,7 +106,9 @@ inline bool gpubw_dispatch_dims_legal(const GpubwDispatch& d) {
 
 // Windows/UWP: D3D12 system device (never Agility), timed CS STREAM read +
 // checksum. Non-Windows: d3d12_ran=false, error_msg set, no throw.
-GpubwResult measure_gpubw(std::size_t buffer_bytes = kGpubwDefaultBufferBytes, int iterations = 3);
+// sweep=true also runs gpubw_sweep_plan on the same device and input buffer.
+GpubwResult measure_gpubw(std::size_t buffer_bytes = kGpubwDefaultBufferBytes, int iterations = 3,
+                          bool sweep = false);
 
 // Verdict helper for SSOT / scripts (does not invent numbers).
 inline bool gpubw_passes_kill_gate(const GpubwResult& r) {
@@ -86,5 +118,9 @@ inline bool gpubw_passes_kill_gate(const GpubwResult& r) {
 const char* gpubw_csv_header();
 // buffer_mb,iterations,read_gbs,checksum_ok,d3d12_ran,checksum,expected,host,date,error
 std::string format_gpubw_row(const GpubwResult& r, const char* host_label);
+
+const char* gpubw_sweep_csv_header();
+// dispatch_kib,dispatches,barriers,reps,best_ms,median_ms,us_per_dispatch,read_gbs,checksum_ok
+std::string format_gpubw_sweep_row(const GpubwSweepRow& row);
 
 } // namespace xllama

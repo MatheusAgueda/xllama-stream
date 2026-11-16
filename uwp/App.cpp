@@ -20,6 +20,7 @@
 #endif
 // clang-format on
 
+    #include <chrono>
     #include <thread>
     #include <utility>
 
@@ -29,6 +30,15 @@
 static std::wstring flag_path_if_present(const wchar_t* name);
 static void run_gpustep_headless() {
     ::xllama::bridge::run_gpustep(/*inproc=*/false);
+}
+// api-headless.flag: the LAN API with no XAML tree and no compositor device.
+// run_server() returns once the listener is bound and the StreamSocketListener
+// serves on thread-pool callbacks, so this thread parks for the process
+// lifetime: HeadlessView exits the app as soon as its entry returns.
+static void run_api_headless() {
+    ::xllama::api::run_server();
+    for (;;)
+        std::this_thread::sleep_for(std::chrono::hours(24));
 }
     #endif
 
@@ -558,6 +568,16 @@ int __stdcall wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             winrt::Windows::ApplicationModel::Core::CoreApplication::Run(
                 winrt::make<HeadlessView>(&::xllama::bridge::run_train, "train"));
             return 0; // not reached: CoreApplication::Exit terminates the process
+        }
+        // Persistent, NOT consumed (like api.flag), and checked after the
+        // one-shot probes so a probe flag still wins its single boot. Serving
+        // without the XAML compositor: the A/B against XAML + api.flag measures
+        // what the compositor costs a decoded token.
+        if (!flag_path_if_present(L"api-headless.flag").empty()) {
+            ::xllama::log_output("[xllama] api-headless.flag detected -> LAN API without XAML\n");
+            winrt::Windows::ApplicationModel::Core::CoreApplication::Run(
+                winrt::make<HeadlessView>(&run_api_headless, "api"));
+            return 0; // not reached: run_api_headless never returns
         }
     #endif // !XLLAMA_STORE_SKU
         // Keep the MTA from init_apartment() through Application::Start.

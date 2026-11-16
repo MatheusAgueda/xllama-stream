@@ -148,3 +148,47 @@ TEST_CASE("gpubw: plan_dispatch is 1D when groups fit in one axis") {
         CHECK(static_cast<std::uint64_t>(d.n_groups) >= need);
     }
 }
+
+TEST_CASE("gpubw: sweep plan fits the buffer with exact whole-group slices") {
+    const auto plan = gpubw_sweep_plan(kGpubwDefaultBufferBytes);
+    REQUIRE(plan.size() == 13u); // round trip + 6 sizes x {barriers, none}
+    CHECK(plan[0].dispatches == 1u);
+    CHECK_FALSE(plan[0].barriers);
+    for (const GpubwSweepCase& c : plan) {
+        CHECK(c.dispatches >= 1u);
+        CHECK(c.dispatches <= kGpubwSweepMaxDispatches);
+        CHECK(c.reps >= 5);
+        CHECK(static_cast<std::size_t>(c.dispatches) * c.dispatch_bytes <=
+              kGpubwDefaultBufferBytes);
+        const std::size_t wpd = c.dispatch_bytes / sizeof(std::uint32_t);
+        CHECK(wpd % kGpubwThreadsPerGroup == 0u);
+        const GpubwDispatch d = gpubw_plan_dispatch(wpd);
+        CHECK(gpubw_dispatch_dims_legal(d));
+        CHECK(static_cast<std::size_t>(d.n_groups) * kGpubwThreadsPerGroup == wpd);
+    }
+    // The 1 GiB input covers 2048 slices of 16 KiB, 16 of 64 MiB.
+    CHECK(plan[1].dispatch_bytes == 16u * 1024u);
+    CHECK(plan[1].dispatches == kGpubwSweepMaxDispatches);
+    CHECK(plan.back().dispatch_bytes == 64u * 1024u * 1024u);
+    CHECK(plan.back().dispatches == 16u);
+    CHECK(gpubw_sweep_plan(8 * 1024).empty());
+}
+
+TEST_CASE("gpubw: sweep CSV row matches header and derives us/dispatch and GB/s") {
+    GpubwSweepRow row;
+    row.c = {1024 * 1024, 1000u, true, 5};
+    row.best_ms = 10.0; // 1000 x 1 MiB in 10 ms
+    row.median_ms = 11.0;
+    row.checksum_ok = true;
+    const std::string line = format_gpubw_sweep_row(row);
+    const std::string header = gpubw_sweep_csv_header();
+    auto commas = [](const std::string& s) {
+        int n = 0;
+        for (char c : s)
+            if (c == ',')
+                ++n;
+        return n;
+    };
+    CHECK(commas(header) == commas(line));
+    CHECK(line == "1024,1000,1,5,10.0000,11.0000,10.000,104.86,1\n");
+}
