@@ -41,6 +41,15 @@ struct GpubwSweepCase {
     std::uint32_t dispatches = 0;
     bool barriers = false;
     int reps = 0;
+    // Predication probe (one-submission-per-token design): the list is cut
+    // into pred_ranges ranges, each bracketed by SetPredication on a GPU flag
+    // that holds 0. pred_mode 0 = none, 1 = run (NOT_EQUAL_ZERO, executes),
+    // 2 = run after a GPU write of the flag (copy + PREDICATION transitions),
+    // 3 = skip control (EQUAL_ZERO: nothing runs, so the checksum must fail).
+    std::uint32_t pred_ranges = 0;
+    std::uint32_t pred_mode = 0;
+    // First output partial of slice 0: a skipped dispatch leaves stale data.
+    std::uint32_t out_offset = 0;
 };
 
 struct GpubwSweepRow {
@@ -56,6 +65,14 @@ inline constexpr std::uint32_t kGpubwSweepMaxDispatches = 2048u;
 // covers at most the buffer, at most kGpubwSweepMaxDispatches slices, and
 // slices of a power-of-two multiple of 1 KiB (whole groups, exact plans).
 std::vector<GpubwSweepCase> gpubw_sweep_plan(std::size_t buffer_bytes);
+
+// Predication probe: a decode token's shape (1229 barriered 16 KiB dispatches,
+// 39 predicated ranges) in ABBA order none, run, write+run, write+run, run,
+// none, then the skip control. Each case writes its own output region, past
+// the sweep's 16 KiB region. Empty when the buffer cannot hold it.
+inline constexpr std::uint32_t kGpubwPredRanges = 39u;
+inline constexpr std::uint32_t kGpubwPredDispatches = 1229u;
+std::vector<GpubwSweepCase> gpubw_pred_plan(std::size_t buffer_bytes);
 
 struct GpubwResult {
     std::size_t buffer_bytes = 0;
@@ -120,7 +137,8 @@ const char* gpubw_csv_header();
 std::string format_gpubw_row(const GpubwResult& r, const char* host_label);
 
 const char* gpubw_sweep_csv_header();
-// dispatch_kib,dispatches,barriers,reps,best_ms,median_ms,us_per_dispatch,read_gbs,checksum_ok
+// dispatch_kib,dispatches,barriers,reps,best_ms,median_ms,us_per_dispatch,read_gbs,checksum_ok,
+// pred_ranges,pred_mode
 std::string format_gpubw_sweep_row(const GpubwSweepRow& row);
 
 } // namespace xllama

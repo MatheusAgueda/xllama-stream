@@ -152,9 +152,36 @@ std::vector<GpubwSweepCase> gpubw_sweep_plan(std::size_t buffer_bytes) {
     return plan;
 }
 
+std::vector<GpubwSweepCase> gpubw_pred_plan(std::size_t buffer_bytes) {
+    constexpr std::size_t kSlice = 16 * 1024;
+    constexpr std::uint32_t kGpd = kSlice / sizeof(std::uint32_t) / kGpubwThreadsPerGroup;
+    // Region j starts past the 16 KiB sweep case's partials; regions never overlap.
+    constexpr std::uint32_t kStride = kGpubwSweepMaxDispatches * kGpd;
+    constexpr std::uint32_t kModes[] = {0u, 1u, 2u, 2u, 1u, 0u, 3u};
+    const std::size_t groups = buffer_bytes / sizeof(std::uint32_t) / kGpubwThreadsPerGroup;
+    std::vector<GpubwSweepCase> plan;
+    if (buffer_bytes / kSlice < kGpubwPredDispatches)
+        return plan;
+    for (std::uint32_t j = 0; j < sizeof(kModes) / sizeof(kModes[0]); ++j) {
+        GpubwSweepCase c;
+        c.dispatch_bytes = kSlice;
+        c.dispatches = kGpubwPredDispatches;
+        c.barriers = true;
+        c.reps = kModes[j] == 3u ? 20 : 100;
+        c.pred_ranges = kModes[j] ? kGpubwPredRanges : 0u;
+        c.pred_mode = kModes[j];
+        c.out_offset = (j + 1u) * kStride;
+        if (static_cast<std::size_t>(c.out_offset) + static_cast<std::size_t>(c.dispatches) * kGpd >
+            groups)
+            return {};
+        plan.push_back(c);
+    }
+    return plan;
+}
+
 const char* gpubw_sweep_csv_header() {
     return "dispatch_kib,dispatches,barriers,reps,best_ms,median_ms,us_per_dispatch,read_gbs,"
-           "checksum_ok\n";
+           "checksum_ok,pred_ranges,pred_mode\n";
 }
 
 std::string format_gpubw_sweep_row(const GpubwSweepRow& row) {
@@ -163,9 +190,10 @@ std::string format_gpubw_sweep_row(const GpubwSweepRow& row) {
     const double gbs =
         row.best_ms > 0.0 ? n * static_cast<double>(row.c.dispatch_bytes) / 1e6 / row.best_ms : 0.0;
     char buf[256];
-    std::snprintf(buf, sizeof(buf), "%zu,%u,%d,%d,%.4f,%.4f,%.3f,%.2f,%d\n",
+    std::snprintf(buf, sizeof(buf), "%zu,%u,%d,%d,%.4f,%.4f,%.3f,%.2f,%d,%u,%u\n",
                   row.c.dispatch_bytes / 1024, row.c.dispatches, row.c.barriers ? 1 : 0, row.c.reps,
-                  row.best_ms, row.median_ms, us, gbs, row.checksum_ok ? 1 : 0);
+                  row.best_ms, row.median_ms, us, gbs, row.checksum_ok ? 1 : 0, row.c.pred_ranges,
+                  row.c.pred_mode);
     return std::string(buf);
 }
 
@@ -600,14 +628,60 @@ GpubwResult measure_gpubw(std::size_t buffer_bytes, int iterations, bool sweep) 
         if (FAILED(device->CreateDescriptorHeap(&sd, IID_PPV_ARGS(&sheap))))
             sheap.Reset();
     }
-    for (const GpubwSweepCase& c :
-         sheap ? gpubw_sweep_plan(r.buffer_bytes) : std::vector<GpubwSweepCase>{}) {
+    std::vector<GpubwSweepCase> cases;
+    if (sheap)
+        cases = gpubw_sweep_plan(r.buffer_bytes);
+    // Predication probe: a GPU-resident 64-bit flag holding 0, resting in
+    // PREDICATION, and an upload source of zeros for the write+run arm.
+    ComPtr<ID3D12Resource> pflag, pzero;
+    const std::vector<GpubwSweepCase> pplan =
+        sheap ? gpubw_pred_plan(r.buffer_bytes) : std::vector<GpubwSweepCase>{};
+    if (!pplan.empty()) {
+        GpubwResult scratch;
+        pflag = create_buffer(device.Get(), 256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+                              D3D12_RESOURCE_STATE_COPY_DEST, scratch, "pred_flag");
+        pzero = create_buffer(device.Get(), 256, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
+                              D3D12_RESOURCE_STATE_GENERIC_READ, scratch, "pred_zero");
+        void* zp = nullptr;
+        if (pflag && pzero && SUCCEEDED(pzero->Map(0, nullptr, &zp))) {
+            std::memset(zp, 0, 256);
+            pzero->Unmap(0, nullptr);
+            alloc->Reset();
+            cl->Reset(alloc.Get(), nullptr);
+            cl->CopyBufferRegion(pflag.Get(), 0, pzero.Get(), 0, 256);
+            D3D12_RESOURCE_BARRIER b = {};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition.pResource = pflag.Get();
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            b.Transition.StateAfter = D3D12_RESOURCE_STATE_PREDICATION;
+            b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            cl->ResourceBarrier(1, &b);
+            cl->Close();
+            ID3D12CommandList* lists[] = {cl.Get()};
+            queue->ExecuteCommandLists(1, lists);
+            if (wait_gpu())
+                cases.insert(cases.end(), pplan.begin(), pplan.end());
+        }
+    }
+    auto flag_transition = [&](D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
+        D3D12_RESOURCE_BARRIER b = {};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = pflag.Get();
+        b.Transition.StateBefore = from;
+        b.Transition.StateAfter = to;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cl->ResourceBarrier(1, &b);
+    };
+    for (const GpubwSweepCase& c : cases) {
         const std::size_t wpd = c.dispatch_bytes / sizeof(std::uint32_t);
         const GpubwDispatch sp = gpubw_plan_dispatch(wpd);
         const UINT gpd = sp.n_groups;
-        if (!gpubw_dispatch_dims_legal(sp) || static_cast<UINT64>(c.dispatches) * gpd > groups ||
+        if (!gpubw_dispatch_dims_legal(sp) ||
+            static_cast<UINT64>(c.out_offset) + static_cast<UINT64>(c.dispatches) * gpd > groups ||
             static_cast<std::size_t>(c.dispatches) * wpd > n_words)
             continue;
+        const UINT per_range =
+            c.pred_ranges ? (c.dispatches + c.pred_ranges - 1) / c.pred_ranges : 0u;
         struct Params {
             std::uint32_t n_words, dispatch_x, dispatch_y, threads_per_group;
         } sparams{static_cast<std::uint32_t>(wpd), sp.groups_x, sp.groups_y, kGpubwThreadsPerGroup};
@@ -628,7 +702,8 @@ GpubwResult measure_gpubw(std::size_t buffer_bytes, int iterations, bool sweep) 
             device->CreateShaderResourceView(input_default.Get(), &s, h);
             h.ptr += incr;
             D3D12_UNORDERED_ACCESS_VIEW_DESC u = uav;
-            u.Buffer.FirstElement = static_cast<UINT64>(k) * gpd;
+            u.Buffer.FirstElement =
+                static_cast<UINT64>(c.out_offset) + static_cast<UINT64>(k) * gpd;
             u.Buffer.NumElements = gpd;
             device->CreateUnorderedAccessView(output_default.Get(), nullptr, &u, h);
         }
@@ -642,17 +717,35 @@ GpubwResult measure_gpubw(std::size_t buffer_bytes, int iterations, bool sweep) 
             ID3D12DescriptorHeap* sh[] = {sheap.Get()};
             cl->SetDescriptorHeaps(1, sh);
             for (UINT k = 0; k < c.dispatches; ++k) {
+                const bool range_start = per_range && k % per_range == 0;
+                if (range_start && k > 0)
+                    cl->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
                 if (k > 0 && c.barriers) {
                     D3D12_RESOURCE_BARRIER ub = {};
                     ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
                     ub.UAV.pResource = output_default.Get();
                     cl->ResourceBarrier(1, &ub);
                 }
+                if (range_start) {
+                    if (c.pred_mode == 2u) {
+                        // The GPU writes the flag, then the command processor reads it.
+                        flag_transition(D3D12_RESOURCE_STATE_PREDICATION,
+                                        D3D12_RESOURCE_STATE_COPY_DEST);
+                        cl->CopyBufferRegion(pflag.Get(), 0, pzero.Get(), 0, 8);
+                        flag_transition(D3D12_RESOURCE_STATE_COPY_DEST,
+                                        D3D12_RESOURCE_STATE_PREDICATION);
+                    }
+                    cl->SetPredication(pflag.Get(), 0,
+                                       c.pred_mode == 3u ? D3D12_PREDICATION_OP_EQUAL_ZERO
+                                                         : D3D12_PREDICATION_OP_NOT_EQUAL_ZERO);
+                }
                 D3D12_GPU_DESCRIPTOR_HANDLE g = gbase;
                 g.ptr += static_cast<UINT64>(3) * k * incr;
                 cl->SetComputeRootDescriptorTable(0, g);
                 cl->Dispatch(sp.groups_x, sp.groups_y, sp.groups_z);
             }
+            if (per_range)
+                cl->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
             cl->Close();
             const auto t0 = std::chrono::steady_clock::now();
             ID3D12CommandList* lists[] = {cl.Get()};
@@ -675,7 +768,8 @@ GpubwResult measure_gpubw(std::size_t buffer_bytes, int iterations, bool sweep) 
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
         b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         cl->ResourceBarrier(1, &b);
-        cl->CopyBufferRegion(output_readback.Get(), 0, output_default.Get(), 0, part_bytes);
+        cl->CopyBufferRegion(output_readback.Get(), 0, output_default.Get(),
+                             static_cast<UINT64>(c.out_offset) * sizeof(std::uint32_t), part_bytes);
         b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         cl->ResourceBarrier(1, &b);

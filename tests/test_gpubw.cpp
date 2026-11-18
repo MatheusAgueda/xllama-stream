@@ -190,5 +190,45 @@ TEST_CASE("gpubw: sweep CSV row matches header and derives us/dispatch and GB/s"
         return n;
     };
     CHECK(commas(header) == commas(line));
-    CHECK(line == "1024,1000,1,5,10.0000,11.0000,10.000,104.86,1\n");
+    CHECK(line == "1024,1000,1,5,10.0000,11.0000,10.000,104.86,1,0,0\n");
+
+    GpubwSweepRow pr;
+    pr.c = gpubw_pred_plan(kGpubwDefaultBufferBytes).at(1);
+    pr.best_ms = 12.0;
+    pr.median_ms = 12.5;
+    const std::string pline = format_gpubw_sweep_row(pr);
+    CHECK(commas(header) == commas(pline));
+    CHECK(pline.substr(pline.size() - 6) == ",39,1\n");
+}
+
+TEST_CASE("gpubw: predication plan is ABBA, skip control last, disjoint regions in bounds") {
+    const auto plan = gpubw_pred_plan(kGpubwDefaultBufferBytes);
+    REQUIRE(plan.size() == 7u);
+    const std::uint32_t modes[] = {0u, 1u, 2u, 2u, 1u, 0u, 3u};
+    const std::size_t groups =
+        kGpubwDefaultBufferBytes / sizeof(std::uint32_t) / kGpubwThreadsPerGroup;
+    int reps[4] = {0, 0, 0, 0};
+    for (std::size_t j = 0; j < plan.size(); ++j) {
+        const GpubwSweepCase& c = plan[j];
+        CHECK(c.pred_mode == modes[j]);
+        CHECK(c.pred_ranges == (c.pred_mode ? kGpubwPredRanges : 0u));
+        CHECK(c.dispatches == kGpubwPredDispatches);
+        CHECK(c.dispatch_bytes == 16u * 1024u);
+        CHECK(c.barriers);
+        reps[c.pred_mode] += c.reps;
+        const std::size_t wpd = c.dispatch_bytes / sizeof(std::uint32_t);
+        const GpubwDispatch d = gpubw_plan_dispatch(wpd);
+        const std::size_t span = static_cast<std::size_t>(c.dispatches) * d.n_groups;
+        // Past the 16 KiB sweep case (2048 slices) so stale data never matches.
+        CHECK(c.out_offset >= kGpubwSweepMaxDispatches * d.n_groups);
+        CHECK(c.out_offset + span <= groups);
+        if (j > 0)
+            CHECK(plan[j - 1].out_offset + span <= c.out_offset);
+    }
+    // >= 200 timed lists per arm.
+    CHECK(reps[0] >= 200);
+    CHECK(reps[1] >= 200);
+    CHECK(reps[2] >= 200);
+    CHECK(reps[3] >= 1);
+    CHECK(gpubw_pred_plan(1u << 20).empty());
 }
