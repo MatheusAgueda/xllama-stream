@@ -357,10 +357,13 @@ TEST_CASE("ggml_d3d12 fap: emulation matches a double reference and ggml's CPU o
     }
 }
 
+// the bridge's split-K scratch (ensure_fad); namespace scope: GCC rejects a
+// local in a lambda's default argument
+constexpr std::size_t kFadScratch = std::size_t(4) << 20;
+
 TEST_CASE("ggml_d3d12 fap: split-K chunks for decode, none for prefill") {
     Ctx c(0, true);
-    constexpr std::size_t kScratch = std::size_t(4) << 20;
-    auto chunk_of = [&](int n, int n_kv, std::size_t scratch = kScratch) {
+    auto chunk_of = [&](int n, int n_kv, std::size_t scratch = kFadScratch) {
         Shape s;
         s.n = n;
         s.n_kv = n_kv;
