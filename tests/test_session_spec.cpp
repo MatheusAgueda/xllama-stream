@@ -117,7 +117,8 @@ TEST_CASE("resolve_session_params: one resolver for every surface (ADR 0007)") {
     pf.expert_slots = 0;
     CHECK_FALSE(resolve_session_params("moe", pf, "D:\\m\\moe", -1).expert_prefetch_ahead);
 
-    // n_ubatch: 0 keeps llama.cpp's default, the rest is clamped to [1, 2048].
+    // n_ubatch: 0 keeps llama.cpp's default, the rest is clamped to [1, max(2048, n_ctx)];
+    // n_batch stays llama.cpp's default unless the ubatch needs more.
     CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).n_ubatch == 0);
     pf.n_ubatch = 1024;
     CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).n_ubatch == 1024);
@@ -129,6 +130,23 @@ TEST_CASE("resolve_session_params: one resolver for every surface (ADR 0007)") {
     CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).n_ubatch == 0);
     pf.n_ubatch = 100000;
     CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).n_ubatch == 2048);
+    CHECK(resolve_session_params("moe", pf, "D:\\m\\moe", -1).n_batch == 0);
+    {
+        CatalogueLoad wide = pf;
+        wide.n_ctx = 4096;
+        wide.n_ubatch = 4096;
+        const xllama::SessionParams w4 = resolve_session_params("moe", wide, "D:\\m\\moe", -1);
+        CHECK(w4.n_ubatch == 4096);
+        CHECK(w4.n_batch == 4096);
+        wide.n_ubatch = 100000;
+        const xllama::SessionParams wc = resolve_session_params("moe", wide, "D:\\m\\moe", -1);
+        CHECK(wc.n_ubatch == 4096);
+        CHECK(wc.n_batch == 4096);
+        wide.n_ubatch = 2048;
+        const xllama::SessionParams w2 = resolve_session_params("moe", wide, "D:\\m\\moe", -1);
+        CHECK(w2.n_ubatch == 2048);
+        CHECK(w2.n_batch == 0);
+    }
 
     // kv_q8: a GGUF entry's opt-in, off by default; an ORT GenAI entry never reads it.
     CHECK_FALSE(resolve_session_params("moe", pf, "D:\\m\\moe", -1).kv_q8);
