@@ -708,6 +708,8 @@ void run_d3d12_memprobe(const std::function<void(const std::string&)>& emit) {
         #include "ggml_d3d12_elt_norm_quant_dxil.h"
         #include "ggml_d3d12_elt_quant_q8_k_dxil.h"
         #include "ggml_d3d12_elt_rms_norm_dxil.h"
+        #include "ggml_d3d12_fap_dxil.h"
+        #include "ggml_d3d12_fap_emu.h"
         #include "ggml_d3d12_get_rows_q6_k_dxil.h"
         #include "ggml_d3d12_mmid_emu.h"
         #include "ggml_d3d12_mmid_iq2_s_t128_dxil.h"
@@ -934,6 +936,17 @@ struct Gpu {
     // state copies); without them those stay on the CPU.
     ComPtr<ID3D12PipelineState> pso_ssm[kSsmCount];
     bool ssm_ok = false;
+    // FLASH_ATTN_EXT of a prefill ubatch (shaders/ggml_d3d12_fap.hlsl). Read
+    // when a backend is created: XLLAMA_FA_PREFILL=1 lets supports_op take the
+    // node, so the scheduler copies q, the K / V views and the mask into this
+    // backend's compute buffer (the upload is the price); only for ubatches of
+    // at least XLLAMA_FA_PREFILL_MIN tokens (default 64, the CPU's Q tile: a
+    // shorter ubatch and every decode token keep the CPU kernels).
+    ComPtr<ID3D12PipelineState> pso_fap;
+    bool fap_ok = false;
+    bool fa_prefill = false;
+    std::int64_t fa_prefill_min = 64;
+    std::uint64_t n_fap = 0, n_fap_host = 0;
     // KERNEL 5 reading and writing the recurrent cache rows itself, without
     // build_rs's GET_ROWS and the CPY back (d3d12_gdn_fuse_plan). Read when a
     // backend is created: XLLAMA_D3D12_SSM_FUSE=0 keeps both copies.
@@ -1105,6 +1118,7 @@ std::vector<PsoSlot> pso_slots(Gpu& g) {
         s.push_back({std::string("ggml_d3d12_ssm_") + ssm[i], std::addressof(g.pso_ssm[i])});
     for (int i = 0; i < kRouteCount; ++i)
         s.push_back({std::string("ggml_d3d12_route_") + route[i], std::addressof(g.pso_route[i])});
+    s.push_back({"ggml_d3d12_fap", std::addressof(g.pso_fap)});
     return s;
 }
 
@@ -1407,6 +1421,17 @@ bool init_gpu(Gpu& g) {
                 g.ssm_ok = false;
             }
         }
+    }
+    {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
+        pd.pRootSignature = g.root.Get();
+        pd.CS.pShaderBytecode = kGgmlD3d12FapDxil;
+        pd.CS.BytecodeLength = kGgmlD3d12FapDxilSize;
+        hr = g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.pso_fap));
+        g.fap_ok = SUCCEEDED(hr);
+        if (!g.fap_ok)
+            log_output("[xllama] d3d12: " + d3d12c::hr_message("CreateComputePipelineState (fap)", hr) +
+                       " — prefill attention stays on the CPU\n");
     }
     if (SUCCEEDED(g.queue->GetTimestampFrequency(&g.ts_freq)) && g.ts_freq > 0) {
         D3D12_QUERY_HEAP_DESC qhd = {};
@@ -2060,6 +2085,8 @@ std::string pso_name(const Gpu& g, const ID3D12PipelineState* p) {
         return "route";
     if (g.pso_route[kRouteEmit].Get() == p)
         return "route emit";
+    if (g.pso_fap.Get() == p)
+        return "flash attn prefill";
     return "?";
 }
 
@@ -2103,6 +2130,14 @@ void backend_free(ggml_backend_t b) {
                           static_cast<unsigned long long>(g.n_normq));
             log_output(msg);
             g.n_normq = 0;
+        }
+        if (g.n_fap || g.n_fap_host) {
+            std::snprintf(msg, sizeof(msg),
+                          "[xllama] d3d12: %llu prefill attention dispatches planned, %llu on the host\n",
+                          static_cast<unsigned long long>(g.n_fap),
+                          static_cast<unsigned long long>(g.n_fap_host));
+            log_output(msg);
+            g.n_fap = g.n_fap_host = 0;
         }
         if (g.n_binq) {
             std::snprintf(msg, sizeof(msg),
@@ -3759,6 +3794,7 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
         case GGML_OP_SUM_ROWS:
         case GGML_OP_CLAMP:
         case GGML_OP_DIV:
+        case GGML_OP_FLASH_ATTN_EXT:
             nodes.push_back(node);
             node_idx.push_back(i);
             break;
@@ -4872,6 +4908,52 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
             }
             break;
         }
+        case GGML_OP_FLASH_ATTN_EXT: {
+            // A prefill ubatch's attention (ggml_d3d12_fap_emu.h): q and the f16
+            // mask straight from the CPU split's compute buffer (D3D12_Host), K and
+            // V as the scheduler's copies of the cache views.
+            D3d12FapPlan p;
+            GGML_ASSERT(d3d12_fap_plan(node, &p));
+            auto fap_operand = [&](const ggml_tensor* t) {
+                return t && t->buffer && t->buffer->buft == &kHostBuft &&
+                       reinterpret_cast<std::uintptr_t>(t->data) % 4 == 0 &&
+                       ggml_nbytes(t) <= 0xffffffffull && !overlaps(rng_of(t), rng_of(node));
+            };
+            const bool gpu_ok = g.fap_ok && node->buffer && node->buffer->buft == &kHostBuft &&
+                                reinterpret_cast<std::uintptr_t>(node->data) % 4 == 0 &&
+                                fap_operand(p.q) && fap_operand(p.k) && fap_operand(p.v) &&
+                                (!p.mask || fap_operand(p.mask));
+            if (!gpu_ok) {
+                // Never expected (supports_op took the node, the allocator placed
+                // it): the scalar emulation, correct and slow.
+                if (!flush())
+                    return GGML_STATUS_FAILED;
+                if (g.n_fap_host++ == 0)
+                    log_output("[xllama] d3d12: FLASH_ATTN_EXT on the host (operands outside D3D12_Host)\n");
+                d3d12_fap_emulate(p.params, p.groups_x, p.groups_y, static_cast<const float*>(p.q->data),
+                                  static_cast<const ggml_fp16_t*>(p.k->data),
+                                  static_cast<const ggml_fp16_t*>(p.v->data),
+                                  p.mask ? static_cast<const ggml_fp16_t*>(p.mask->data) : nullptr,
+                                  static_cast<float*>(node->data));
+                break;
+            }
+            Op op;
+            op.pso = g.pso_fap.Get();
+            std::memcpy(op.c, &p.params, sizeof(p.params));
+            op.t0 = tensor_va(p.k);
+            op.t1 = tensor_va(p.v);
+            op.u[0] = tensor_va(node);
+            op.u[1] = tensor_va(p.q);
+            op.u[2] = p.mask ? tensor_va(p.mask) : op.u[0];
+            op.gx = p.groups_x;
+            op.gy = p.groups_y;
+            if (p.mask)
+                record(op, {rng_of(p.q), rng_of(p.k), rng_of(p.v), rng_of(p.mask)}, {rng_of(node)});
+            else
+                record(op, {rng_of(p.q), rng_of(p.k), rng_of(p.v)}, {rng_of(node)});
+            ++g.n_fap;
+            break;
+        }
         default:
             GGML_ABORT("d3d12: unsupported op %s", ggml_op_desc(node));
         }
@@ -5065,6 +5147,24 @@ ggml_backend_t dev_init_backend(ggml_backend_dev_t dev, const char*) {
         g.gdn_fuse = !(f && *f == '0');
         if (!g.gdn_fuse)
             log_output("[xllama] d3d12: delta-net state copies kept (XLLAMA_D3D12_SSM_FUSE=0)\n");
+        const char* fa = std::getenv("XLLAMA_FA_PREFILL");
+        g.fa_prefill = g.fap_ok && fa && *fa && *fa != '0';
+        const char* fam = std::getenv("XLLAMA_FA_PREFILL_MIN");
+        g.fa_prefill_min = 64;
+        if (fam && *fam) {
+            char* end = nullptr;
+            const long long v = std::strtoll(fam, &end, 10);
+            if (end != fam && v >= 1 && v <= 65535)
+                g.fa_prefill_min = v;
+        }
+        if (g.fa_prefill) {
+            char m[160];
+            std::snprintf(m, sizeof(m),
+                          "[xllama] d3d12: prefill attention on the GPU from %lld tokens per ubatch "
+                          "(XLLAMA_FA_PREFILL)\n",
+                          static_cast<long long>(g.fa_prefill_min));
+            log_output(m);
+        }
         const char* wv = std::getenv("XLLAMA_D3D12_WAVES");
         g.waves = wv && *wv && *wv != '0';
         if (g.waves)
@@ -5305,6 +5405,14 @@ bool dev_supports_op(ggml_backend_dev_t, const ggml_tensor* op) {
             if (!ssm_f32(t))
                 return false;
         return true;
+    }
+    case GGML_OP_FLASH_ATTN_EXT: {
+        // A prefill ubatch only (q ne[1] = tokens): decode and short ubatches
+        // keep the CPU's split-kv and untiled kernels. Operands in other
+        // buffers (the KV cache in CPU memory) reach D3D12_Host as split inputs.
+        const Gpu& g = gpu();
+        return g.fa_prefill && op->src[0] && op->src[0]->ne[1] >= g.fa_prefill_min &&
+               (!op->buffer || op->buffer->buft == &kHostBuft) && d3d12_fap_plan(op, nullptr);
     }
     case GGML_OP_MUL_MAT_ID: {
         // The routed experts of a MoE layer, read in place from the expert
@@ -6853,6 +6961,199 @@ D3d12SelftestRow run_ssm_case(ggml_backend_t backend, int kind) {
     return row;
 }
 
+// FLASH_ATTN_EXT of a prefill ubatch (shaders/ggml_d3d12_fap.hlsl) on llama's
+// layout: f16 K / V caches [D * kv heads, kv_size] viewed and permuted, q
+// [D, heads, N] permuted, an f16 causal mask with the N tokens at the end of
+// the n_kv positions. rel_err against the host emulation over the first
+// check_groups groups of q rows (0 = all of them); gpu_ms the median kernel
+// time. cpu_threads > 0 also runs ggml-cpu on the same node (one run, every
+// row checked against it): packed_gbs = the CPU's ms, so the row is a
+// crossover sample, and a "fap_upload" row follows with gpu_ms = the host ms
+// to copy the K and V views into D3D12_Host (what the scheduler pays per
+// layer before the kernel) and packed_gbs = its GB/s.
+void run_fap_case(ggml_backend_t backend, std::vector<D3d12SelftestRow>* out, int d, int heads,
+                  int kv_heads, int n_tok, int n_kv, int kv_size, bool masked, int check_groups,
+                  int cpu_threads) {
+    D3d12SelftestRow row;
+    char name[48];
+    std::snprintf(name, sizeof(name), "fap_d%d_g%d%s", d, heads / kv_heads, masked ? "" : "_nomask");
+    row.type = name;
+    row.n = n_tok;
+    row.k = n_kv;
+    row.ncols = d;
+    const std::int64_t gqa = static_cast<std::int64_t>(d) * kv_heads;
+    auto build = [&](ggml_context* ctx, ggml_tensor** kc, ggml_tensor** vc, ggml_tensor** qc,
+                     ggml_tensor** mk) {
+        *kc = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, gqa, kv_size);
+        *vc = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, gqa, kv_size);
+        *qc = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, heads, n_tok);
+        *mk = masked ? ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_tok, 1, 1) : nullptr;
+    };
+    auto attn = [&](ggml_context* ctx, ggml_tensor* kc, ggml_tensor* vc, ggml_tensor* qc,
+                    ggml_tensor* mk) {
+        auto view = [&](ggml_tensor* c) {
+            return ggml_permute(ctx,
+                                ggml_view_4d(ctx, c, d, kv_heads, n_kv, 1, ggml_row_size(c->type, d),
+                                             ggml_row_size(c->type, gqa),
+                                             ggml_row_size(c->type, gqa * kv_size), 0),
+                                0, 2, 1, 3);
+        };
+        return ggml_flash_attn_ext(ctx, ggml_permute(ctx, qc, 0, 2, 1, 3), view(kc), view(vc), mk,
+                                   1.0f / std::sqrt(static_cast<float>(d)), 0.0f, 0.0f);
+    };
+
+    // Values: the first n_kv cells of each cache, the rest zeros (never read).
+    std::mt19937 rng(777u + static_cast<unsigned>(n_tok) * 31u + static_cast<unsigned>(n_kv));
+    std::uniform_real_distribution<float> uni(-1.f, 1.f);
+    const std::size_t cache_halves = static_cast<std::size_t>(gqa) * kv_size;
+    const std::size_t view_halves = static_cast<std::size_t>(gqa) * n_kv;
+    std::vector<ggml_fp16_t> kh(cache_halves, ggml_fp32_to_fp16(0.0f));
+    std::vector<ggml_fp16_t> vh(cache_halves, ggml_fp32_to_fp16(0.0f));
+    for (std::size_t i = 0; i < view_halves; ++i) {
+        kh[i] = ggml_fp32_to_fp16(uni(rng));
+        vh[i] = ggml_fp32_to_fp16(uni(rng));
+    }
+    std::vector<float> qh(static_cast<std::size_t>(d) * heads * n_tok);
+    for (float& x : qh)
+        x = uni(rng);
+    std::vector<ggml_fp16_t> mh;
+    if (masked) {
+        mh.resize(static_cast<std::size_t>(n_kv) * n_tok);
+        const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t ninf = ggml_fp32_to_fp16(-std::numeric_limits<float>::infinity());
+        const int p0 = n_kv - n_tok;
+        for (int i = 0; i < n_tok; ++i)
+            for (int j = 0; j < n_kv; ++j)
+                mh[static_cast<std::size_t>(i) * n_kv + j] = j <= p0 + i ? zero : ninf;
+    }
+
+    ggml_init_params ip = {};
+    ip.mem_size = 16 * ggml_tensor_overhead() + ggml_graph_overhead();
+    ip.no_alloc = true;
+    ggml_context* ctx_x = ggml_init(ip);
+    ggml_context* ctx_g = ggml_init(ip);
+    ggml_tensor *kc = nullptr, *vc = nullptr, *qc = nullptr, *mk = nullptr;
+    build(ctx_x, &kc, &vc, &qc, &mk);
+    ggml_backend_buffer_t xbuf = ggml_backend_alloc_ctx_tensors_from_buft(ctx_x, &kHostBuft);
+    ggml_gallocr_t galloc = nullptr;
+    auto cleanup = [&] {
+        if (galloc)
+            ggml_gallocr_free(galloc);
+        if (xbuf)
+            ggml_backend_buffer_free(xbuf);
+        ggml_free(ctx_g);
+        ggml_free(ctx_x);
+    };
+    auto fail = [&](const char* e) {
+        row.error = e;
+        cleanup();
+        out->push_back(std::move(row));
+    };
+    if (n_kv < n_tok || !xbuf)
+        return fail(n_kv < n_tok ? "n_kv below the ubatch" : "buffer allocation failed");
+    ggml_backend_tensor_set(kc, kh.data(), 0, kh.size() * sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(vc, vh.data(), 0, vh.size() * sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(qc, qh.data(), 0, qh.size() * sizeof(float));
+    if (mk)
+        ggml_backend_tensor_set(mk, mh.data(), 0, mh.size() * sizeof(ggml_fp16_t));
+    // The scheduler's copy of the two views, on memory already written once.
+    const auto tu = std::chrono::steady_clock::now();
+    ggml_backend_tensor_set(kc, kh.data(), 0, view_halves * sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(vc, vh.data(), 0, view_halves * sizeof(ggml_fp16_t));
+    const double upload_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tu).count();
+
+    ggml_tensor* o = attn(ctx_g, kc, vc, qc, mk);
+    ggml_cgraph* gf = ggml_new_graph(ctx_g);
+    ggml_build_forward_expand(gf, o);
+    galloc = ggml_gallocr_new(&kHostBuft);
+    if (!ggml_gallocr_alloc_graph(galloc, gf))
+        return fail("graph allocation failed");
+    D3d12FapPlan p;
+    if (!d3d12_fap_plan(o, &p))
+        return fail("no flash-attention plan for the graph");
+    const std::uint64_t f0 = gpu().n_fap, h0 = gpu().n_fap_host;
+    ggml_status st = ggml_backend_graph_compute(backend, gf);
+    std::vector<double> ms;
+    for (int i = 0; i < kSelftestTimedRuns && st == GGML_STATUS_SUCCESS; ++i) {
+        st = ggml_backend_graph_compute(backend, gf);
+        ms.push_back(gpu().last_gpu_ms);
+    }
+    row.d3d12_ran = st == GGML_STATUS_SUCCESS;
+    if (!row.d3d12_ran)
+        return fail("graph_compute failed");
+    std::nth_element(ms.begin(), ms.begin() + ms.size() / 2, ms.end());
+    row.gpu_ms = ms[ms.size() / 2];
+    const bool on_gpu = gpu().n_fap > f0 && gpu().n_fap_host == h0;
+
+    std::vector<float> got(static_cast<std::size_t>(ggml_nelements(o)));
+    ggml_backend_tensor_get(o, got.data(), 0, got.size() * sizeof(float));
+    const std::uint32_t gx = check_groups > 0
+                                 ? std::min(p.groups_x, static_cast<std::uint32_t>(check_groups))
+                                 : p.groups_x;
+    const std::size_t tokens =
+        std::min<std::size_t>(n_tok, static_cast<std::size_t>(gx) * (kD3d12FapRows / (heads / kv_heads)));
+    const std::size_t n_chk = tokens * heads * d;
+    std::vector<float> ref(got.size(), 0.0f);
+    d3d12_fap_emulate(p.params, gx, p.groups_y, qh.data(), kh.data(), vh.data(),
+                      masked ? mh.data() : nullptr, ref.data());
+    row.rel_err = d3d12_ssm_max_err(got.data(), ref.data(), n_chk);
+    row.ok = on_gpu && row.rel_err <= 1e-4;
+    if (!on_gpu)
+        row.error = "not dispatched on the GPU";
+    else if (!row.ok)
+        row.error = "mismatch vs the host emulation";
+
+    double cpu_err = 0.0;
+    if (cpu_threads > 0) {
+        ggml_cpu_init();
+        ggml_init_params cp = {};
+        cp.mem_size = ggml_graph_overhead() + 32 * ggml_tensor_overhead() +
+                      (kh.size() + vh.size() + mh.size()) * sizeof(ggml_fp16_t) +
+                      (qh.size() + got.size()) * sizeof(float) + (std::size_t(64) << 20);
+        cp.no_alloc = false;
+        ggml_context* cc = ggml_init(cp);
+        if (cc) {
+            ggml_tensor *ck = nullptr, *cv = nullptr, *cq = nullptr, *cm = nullptr;
+            build(cc, &ck, &cv, &cq, &cm);
+            std::memcpy(ck->data, kh.data(), kh.size() * sizeof(ggml_fp16_t));
+            std::memcpy(cv->data, vh.data(), vh.size() * sizeof(ggml_fp16_t));
+            std::memcpy(cq->data, qh.data(), qh.size() * sizeof(float));
+            if (cm)
+                std::memcpy(cm->data, mh.data(), mh.size() * sizeof(ggml_fp16_t));
+            ggml_tensor* co = attn(cc, ck, cv, cq, cm);
+            ggml_cgraph* cg = ggml_new_graph(cc);
+            ggml_build_forward_expand(cg, co);
+            const auto tc = std::chrono::steady_clock::now();
+            if (ggml_graph_compute_with_ctx(cc, cg, cpu_threads) == GGML_STATUS_SUCCESS) {
+                row.packed_gbs = std::chrono::duration<double, std::milli>(
+                                     std::chrono::steady_clock::now() - tc)
+                                     .count();
+                cpu_err = d3d12_ssm_max_err(got.data(), static_cast<const float*>(co->data),
+                                            got.size());
+            }
+            ggml_free(cc);
+        }
+        if (row.ok && !(cpu_err <= 1e-3)) {
+            row.ok = false;
+            row.error = "mismatch vs the CPU backend: " + std::to_string(cpu_err);
+        }
+    }
+    cleanup();
+    out->push_back(std::move(row));
+    if (cpu_threads > 0) {
+        D3d12SelftestRow up;
+        up.type = "fap_upload";
+        up.n = n_tok;
+        up.k = n_kv;
+        up.ncols = d;
+        up.gpu_ms = upload_ms;
+        up.packed_gbs = upload_ms > 0.0 ? 2.0 * view_halves * sizeof(ggml_fp16_t) / 1e6 / upload_ms : 0.0;
+        up.d3d12_ran = up.ok = true;
+        out->push_back(std::move(up));
+    }
+}
+
 // ggml-cpu's own soft_max (one row) or sigmoid of n floats, one thread.
 bool route_cpu_ref(bool softmax, const float* x, int n, float* y) {
     ggml_cpu_init();
@@ -8208,6 +8509,19 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
     if (gpu().ssm_ok)
         for (int kind = 0; kind < 8; ++kind)
             out->push_back(run_ssm_case(backend, kind));
+    if (gpu().fap_ok) {
+        // Qwen3.6-35B-A3B's full-attention shape with a part-full last group;
+        // G 1 without a mask and a one-position last tile; a 13K prefill's last
+        // ubatch, checked over its first tokens and against ggml-cpu (6 threads).
+        run_fap_case(backend, out, 256, 16, 2, 67, 300, 512, true, 0, 0);
+        run_fap_case(backend, out, 128, 4, 4, 64, 129, 256, false, 0, 0);
+        run_fap_case(backend, out, 256, 16, 2, 1024, 13312, 16384, true, 2, 6);
+        // XLLAMA_FA_XPROBE=1: the crossover grid, GPU + upload against the CPU.
+        if (const char* xp = std::getenv("XLLAMA_FA_XPROBE"); xp && std::atoi(xp) > 0)
+            for (const int n : {64, 128, 256, 512, 1024})
+                for (const int kv : {1024, 4096, 8192})
+                    run_fap_case(backend, out, 256, 16, 2, n, kv, 16384, true, 2, 6);
+    }
     if (gpu().route_ok) {
         out->push_back(run_route_sig_case());
         out->push_back(run_route_case());
