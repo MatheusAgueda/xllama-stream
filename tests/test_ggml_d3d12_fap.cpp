@@ -168,7 +168,9 @@ struct Errors {
     double ref_max = 0.0;
 };
 
-Errors run(const Shape& s, unsigned seed) {
+// chunk > 0: the split and reduce dispatches (d3d12_fap_emulate_chunked)
+// instead of the one-pass kernel.
+Errors run(const Shape& s, unsigned seed, std::uint32_t chunk = 0) {
     const std::size_t bytes = 4 * static_cast<std::size_t>(s.d) * s.kv_heads * s.kv_size +
                               4 * static_cast<std::size_t>(s.d) * s.heads * s.n * 2 +
                               2 * static_cast<std::size_t>(s.n_kv) * s.n + (16u << 20);
@@ -185,9 +187,14 @@ Errors run(const Shape& s, unsigned seed) {
     D3d12FapPlan p;
     REQUIRE(d3d12_fap_plan(l.out, &p));
     std::vector<float> emu(static_cast<std::size_t>(ggml_nelements(l.out)), -7.f);
-    d3d12_fap_emulate(p.params, p.groups_x, p.groups_y, static_cast<const float*>(p.q->data),
-                      static_cast<const ggml_fp16_t*>(p.k->data), static_cast<const ggml_fp16_t*>(p.v->data),
-                      p.mask ? static_cast<const ggml_fp16_t*>(p.mask->data) : nullptr, emu.data());
+    const auto* qd = static_cast<const float*>(p.q->data);
+    const auto* kd = static_cast<const ggml_fp16_t*>(p.k->data);
+    const auto* vd = static_cast<const ggml_fp16_t*>(p.v->data);
+    const auto* md = p.mask ? static_cast<const ggml_fp16_t*>(p.mask->data) : nullptr;
+    if (chunk)
+        d3d12_fap_emulate_chunked(p.params, chunk, p.groups_x, p.groups_y, qd, kd, vd, md, emu.data());
+    else
+        d3d12_fap_emulate(p.params, p.groups_x, p.groups_y, qd, kd, vd, md, emu.data());
 
     ggml_cgraph* gf = ggml_new_graph(c.ctx);
     ggml_build_forward_expand(gf, l.out);
@@ -217,7 +224,8 @@ Errors run(const Shape& s, unsigned seed) {
                 CHECK(row(s.lone_token, h)[x] == ggml_fp16_to_fp32(vc[(h / g) * s.d + x]));
     }
     MESSAGE("d=" << s.d << " heads=" << s.heads << "/" << s.kv_heads << " n=" << s.n << " n_kv=" << s.n_kv
-                 << ": vs double " << e.vs_ref << ", vs ggml cpu " << e.vs_cpu << ", |ref| max " << e.ref_max);
+                 << " chunk=" << chunk << ": vs double " << e.vs_ref << ", vs ggml cpu " << e.vs_cpu
+                 << ", |ref| max " << e.ref_max);
     return e;
 }
 
@@ -346,5 +354,86 @@ TEST_CASE("ggml_d3d12 fap: emulation matches a double reference and ggml's CPU o
         s.lone_token = 4;
         const Errors e = run(s, 4);
         CHECK(e.vs_ref < kRef);
+    }
+}
+
+TEST_CASE("ggml_d3d12 fap: split-K chunks for decode, none for prefill") {
+    Ctx c(0, true);
+    constexpr std::size_t kScratch = std::size_t(4) << 20;
+    auto chunk_of = [&](int n, int n_kv, std::size_t scratch = kScratch) {
+        Shape s;
+        s.n = n;
+        s.n_kv = n_kv;
+        s.kv_size = n_kv;
+        D3d12FapPlan p;
+        REQUIRE(d3d12_fap_plan(build(c.ctx, s).out, &p));
+        return d3d12_fap_chunk(p, scratch);
+    };
+    // one decode token: 2 groups (one per kv head) -> 64 chunks of 256 at 16K
+    CHECK(chunk_of(1, 16384) == 256u);
+    CHECK(d3d12_fap_chunks(16384, 256) == 64u);
+    // the chunk floor of 64 positions bounds the count at short contexts
+    CHECK(chunk_of(1, 1024) == 64u);
+    CHECK(chunk_of(1, 300) == 80u); // 4 chunks, the last one 60 positions
+    CHECK(d3d12_fap_chunks(300, 80) == 4u);
+    CHECK(chunk_of(1, 100) == 0u); // one chunk: the one-pass kernel
+    // eight draft tokens: 8 groups -> 16 chunks
+    CHECK(chunk_of(8, 8192) == 512u);
+    // the scratch bounds the chunks: 8 tokens x 16 heads x 260 floats = 130 KiB a chunk
+    CHECK(chunk_of(8, 8192, std::size_t(1) << 20) == 1184u); // 7 chunks fit
+    CHECK(d3d12_fap_chunks(8192, 1184) == 7u);
+    CHECK(chunk_of(8, 8192, 100000) == 0u);
+    // prefill ubatches have groups enough
+    CHECK(chunk_of(64, 4096) == 0u);
+    CHECK(chunk_of(1024, 13312) == 0u);
+}
+
+TEST_CASE("ggml_d3d12 fap: split-K emulation matches a double reference and ggml's CPU op") {
+    // the chunks' partials are combined in f32 after an exp rescale: the same
+    // bounds as the one-pass kernel over a longer range
+    constexpr double kRef = 5e-5, kCpu = 4e-3;
+    SUBCASE("a decode token at position 700 of a 1024-cell window (masked tail chunks)") {
+        Shape s;
+        s.n = 1;
+        s.p0 = 700;
+        s.n_kv = 1024;
+        s.kv_size = 1024;
+        const Errors e = run(s, 11, 64);
+        CHECK(e.vs_ref < kRef);
+        CHECK(e.vs_cpu < kCpu);
+    }
+    SUBCASE("a decode token over 4096 cells, uneven last chunk") {
+        Shape s;
+        s.n = 1;
+        s.p0 = 4000;
+        s.n_kv = 4000 + 1;
+        s.kv_size = 4096;
+        const Errors e = run(s, 12, 256);
+        CHECK(e.vs_ref < kRef);
+        CHECK(e.vs_cpu < kCpu);
+    }
+    SUBCASE("three draft tokens, a blind one and one that sees cell 0 only") {
+        Shape s;
+        s.n = 3;
+        s.p0 = 500;
+        s.n_kv = 512;
+        s.kv_size = 512;
+        s.blind_token = 1;
+        s.lone_token = 2;
+        const Errors e = run(s, 13, 64);
+        CHECK(e.vs_ref < kRef);
+    }
+    SUBCASE("16 heads on one kv head, D 64, no mask") {
+        Shape s;
+        s.d = 64;
+        s.heads = 16;
+        s.kv_heads = 1;
+        s.n = 1;
+        s.n_kv = 333;
+        s.kv_size = 336;
+        s.mask = false;
+        const Errors e = run(s, 14, 80);
+        CHECK(e.vs_ref < kRef);
+        CHECK(e.vs_cpu < kCpu);
     }
 }

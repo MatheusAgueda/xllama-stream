@@ -1,7 +1,8 @@
-// ggml backend d3d12: FLASH_ATTN_EXT for prefill ubatches (src/bridge/ggml_d3d12_fap_emu.h
-// matches the node and emulates the kernel). The decode path (one token) stays on the
-// CPU's split-kv kernel; a ubatch of tokens runs here, so the KV cache is read once per
-// group of 16 q rows instead of once per token.
+// ggml backend d3d12: FLASH_ATTN_EXT (src/bridge/ggml_d3d12_fap_emu.h matches the node and
+// emulates the kernel). A prefill ubatch reads the KV cache once per group of 16 q rows
+// instead of once per token. A decode token (or a few) has a group per kv head only, so
+// the positions split into chunks (split-K, grid z, c11 & 2): each (group, chunk) writes
+// its rows' M, S and unnormalised O to u3, and a second dispatch (c11 & 4) combines them.
 //
 // A group owns 16 q rows: 16 / G tokens of one kv head, each with that head's G q heads
 // (row r = token * G + head). It walks the kv range in tiles of 16 positions:
@@ -19,8 +20,11 @@
 //
 // c0 = D | G << 16, c1 = n_kv, c2 = N | n_head << 16, c3 / c4 = q token / head stride
 // (floats), c5 / c6 = k cell / head stride (32-bit words), c7 / c8 = v's, c9 = mask row
-// stride (halves), c10 = scale bits, c11 = 1 with a mask. u1 = q (f32), t0 = k, t1 = v
-// (f16), u2 = mask (f16), u0 = dst [D, n_head, N] (f32). Grid (ceil(N * G / 16), kv heads).
+// stride (halves), c10 = scale bits, c11 = 1 with a mask | 2 split | 4 reduce, c12 = the
+// chunk (positions, a multiple of 16; split and reduce). u1 = q (f32), t0 = k, t1 = v
+// (f16), u2 = mask (f16), u0 = dst [D, n_head, N] (f32), u3 = partials: record
+// ((token * n_head + head) * chunks + chunk) of D + 4 floats, M, S, 2 pad, O[D].
+// Grid (ceil(N * G / 16), kv heads[, chunks]); reduce (n_head, N).
 // D a multiple of 4 up to 256, G in 1, 2, 4, 8, 16. Root signature: ggml_d3d12.cpp
 // make_root_sig (13 constants, root SRVs t0 t1, root UAVs u0..u5).
 
@@ -45,6 +49,7 @@ ByteAddressBuffer T1 : register(t1);
 RWByteAddressBuffer D : register(u0);
 RWByteAddressBuffer U1 : register(u1);
 RWByteAddressBuffer U2 : register(u2);
+RWByteAddressBuffer U3 : register(u3);
 
 #define NEG_INF_BITS 0xff800000u
 #define FAP_ROWS 16u
@@ -76,6 +81,37 @@ void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
     const uint dk = c0 & 0xffffu, G = c0 >> 16;
     const uint n_kv = c1;
     const uint N = c2 & 0xffffu, n_head = c2 >> 16;
+    const uint rec = dk + 4u;
+
+    if ((c11 & 4u) != 0u) {
+        // reduce: group (head x, token y), thread e < D owns dim e; the chunks' max, then
+        // in chunk order w = exp(M_z - max) (0 for a chunk the row never saw), S and O
+        const uint chunks = (n_kv + c12 - 1u) / c12;
+        const uint r0 = (gid.y * n_head + gid.x) * chunks * rec;
+        float mx = asfloat(NEG_INF_BITS);
+        for (uint z = 0u; z < chunks; ++z)
+            mx = max(mx, asfloat(U3.Load(4u * (r0 + z * rec))));
+        float sum = 0.0f, o = 0.0f;
+        for (uint z = 0u; z < chunks; ++z) {
+            const uint rb = r0 + z * rec;
+            const float mz = asfloat(U3.Load(4u * rb));
+            if (is_neg_inf(mz))
+                continue;
+            const float w = exp(mz - mx);
+            sum += w * asfloat(U3.Load(4u * (rb + 1u)));
+            if (tid < dk)
+                o += w * asfloat(U3.Load(4u * (rb + 4u + tid)));
+        }
+        if (tid < dk) {
+            const float inv = sum == 0.0f ? 0.0f : 1.0f / sum;
+            D.Store(4u * ((gid.y * n_head + gid.x) * dk + tid), asuint(o * inv));
+        }
+        return; // uniform (a constant): no barrier below is skipped by part of the group
+    }
+
+    const bool split = (c11 & 2u) != 0u;
+    const uint pb = split ? gid.z * c12 : 0u;
+    const uint pe = split ? min(n_kv, pb + c12) : n_kv;
     const uint half_d = dk >> 1;
     const uint BT = FAP_ROWS / G; // tokens per group
     const uint r = tid >> 4, l = tid & 15u;
@@ -105,8 +141,8 @@ void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
     }
 
     uint it = 0u;
-    for (uint pos0 = 0u; pos0 < n_kv; pos0 += FAP_TILE, ++it) {
-        const uint np = min(FAP_TILE, n_kv - pos0);
+    for (uint pos0 = pb; pos0 < pe; pos0 += FAP_TILE, ++it) {
+        const uint np = min(FAP_TILE, pe - pos0);
         const uint f = it % 3u;
         // A: this thread's mask entry; the flag two tiles ahead was last read before the
         // previous barrier, so clearing it here races with nobody
@@ -192,7 +228,17 @@ void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
         // the next tile's barrier (A) orders these reads before its K tile overwrites kv
     }
 
-    if (live) {
+    if (live && split) {
+        const uint rb = ((tok * n_head + head) * ((n_kv + c12 - 1u) / c12) + gid.z) * rec;
+        if (l == 0u)
+            U3.Store2(4u * rb, uint2(asuint(M), asuint(S)));
+        [unroll] for (uint j = 0u; j < FAP_MAX_D / 32u; ++j) {
+            const uint e = l + 16u * j;
+            if (e < half_d) {
+                U3.Store2(4u * (rb + 4u + 2u * e), uint2(asuint(acc[j][0]), asuint(acc[j][1])));
+            }
+        }
+    } else if (live) {
         const float inv = S == 0.0f ? 0.0f : 1.0f / S;
         const uint ob = (tok * n_head + head) * dk;
         [unroll] for (uint j = 0u; j < FAP_MAX_D / 32u; ++j) {

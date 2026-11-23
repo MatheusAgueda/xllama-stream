@@ -936,17 +936,26 @@ struct Gpu {
     // state copies); without them those stay on the CPU.
     ComPtr<ID3D12PipelineState> pso_ssm[kSsmCount];
     bool ssm_ok = false;
-    // FLASH_ATTN_EXT of a prefill ubatch (shaders/ggml_d3d12_fap.hlsl). Read
-    // when a backend is created: XLLAMA_FA_PREFILL=1 lets supports_op take the
-    // node, so the scheduler copies q, the K / V views and the mask into this
-    // backend's compute buffer (the upload is the price); only for ubatches of
-    // at least XLLAMA_FA_PREFILL_MIN tokens (default 64, the CPU's Q tile: a
-    // shorter ubatch and every decode token keep the CPU kernels).
+    // FLASH_ATTN_EXT (shaders/ggml_d3d12_fap.hlsl). Read when a backend is
+    // created: XLLAMA_FA_PREFILL=1 lets supports_op take the node of a ubatch
+    // of at least XLLAMA_FA_PREFILL_MIN tokens (default 64), XLLAMA_FA_DECODE_KV
+    // = T the node of any ubatch (decode tokens) once the cache view has T
+    // positions. With the KV cache in CPU memory the scheduler copies q, the
+    // K / V views and the mask into this backend's compute buffer (the upload
+    // is the price); with patch 0026 (LLAMA_KV_ON_DEVICE) the cache is already
+    // here. A plan of few groups is split over the positions (split-K) through
+    // the fad scratch, write-back D3D12_Host; XLLAMA_FA_SPLITK=0 keeps one pass.
     ComPtr<ID3D12PipelineState> pso_fap;
     bool fap_ok = false;
     bool fa_prefill = false;
     std::int64_t fa_prefill_min = 64;
-    std::uint64_t n_fap = 0, n_fap_host = 0;
+    std::int64_t fa_decode_kv = 0;
+    bool fa_split = true;
+    ComPtr<ID3D12Resource> fad_res;
+    std::uint8_t* fad_ptr = nullptr;
+    D3D12_GPU_VIRTUAL_ADDRESS fad_va = 0;
+    std::size_t fad_bytes = 0;
+    std::uint64_t n_fap = 0, n_fap_host = 0, n_fad = 0;
     // KERNEL 5 reading and writing the recurrent cache rows itself, without
     // build_rs's GET_ROWS and the CPY back (d3d12_gdn_fuse_plan). Read when a
     // backend is created: XLLAMA_D3D12_SSM_FUSE=0 keeps both copies.
@@ -2133,11 +2142,13 @@ void backend_free(ggml_backend_t b) {
         }
         if (g.n_fap || g.n_fap_host) {
             std::snprintf(msg, sizeof(msg),
-                          "[xllama] d3d12: %llu prefill attention dispatches planned, %llu on the host\n",
+                          "[xllama] d3d12: %llu attention dispatches planned (%llu split-K), %llu on "
+                          "the host\n",
                           static_cast<unsigned long long>(g.n_fap),
+                          static_cast<unsigned long long>(g.n_fad),
                           static_cast<unsigned long long>(g.n_fap_host));
             log_output(msg);
-            g.n_fap = g.n_fap_host = 0;
+            g.n_fap = g.n_fap_host = g.n_fad = 0;
         }
         if (g.n_binq) {
             std::snprintf(msg, sizeof(msg),
@@ -2962,6 +2973,27 @@ bool ensure_route_bufs(Gpu& g) {
     g.pred_res = pc.res;
     g.pred_ptr = pc.host;
     g.pred_va = pc.va;
+    return true;
+}
+
+// The split-K partials (u3 of the attention kernel), write-back D3D12_Host,
+// once: 4 MiB = 252 (token, chunk) records of 16 heads at D 256, so 64 chunks
+// up to 3 tokens, 31 at 8; d3d12_fap_chunk fits the chunks to what is here.
+bool ensure_fad(Gpu& g) {
+    if (g.fad_res)
+        return true;
+    constexpr std::size_t kBytes = std::size_t(4) << 20;
+    BufCtx c;
+    std::string err;
+    if (!create_host_res(g, kBytes, false, &c, &err)) {
+        log_output("[xllama] d3d12: split-K scratch failed, attention stays one pass: " + err + "\n");
+        return false;
+    }
+    std::memset(c.host, 0, kBytes);
+    g.fad_res = c.res;
+    g.fad_ptr = c.host;
+    g.fad_va = c.va;
+    g.fad_bytes = kBytes;
     return true;
 }
 
@@ -4967,11 +4999,13 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
             break;
         }
         case GGML_OP_FLASH_ATTN_EXT: {
-            // A prefill ubatch's attention (ggml_d3d12_fap_emu.h): q and the f16
-            // mask straight from the CPU split's compute buffer (D3D12_Host), K and
-            // V as the scheduler's copies of the cache views.
+            // Attention (ggml_d3d12_fap_emu.h): q and the f16 mask straight from the
+            // CPU split's compute buffer (D3D12_Host), K and V as the scheduler's
+            // copies of the cache views or the cache itself (patch 0026). Few
+            // groups: split-K, the chunks' partials to fad, then the reduce.
             D3d12FapPlan p;
             GGML_ASSERT(d3d12_fap_plan(node, &p));
+            const std::uint32_t chunk = g.fa_split && g.fad_ptr ? d3d12_fap_chunk(p, g.fad_bytes) : 0;
             auto fap_operand = [&](const ggml_tensor* t) {
                 return t && t->buffer && t->buffer->buft == &kHostBuft &&
                        reinterpret_cast<std::uintptr_t>(t->data) % 4 == 0 &&
@@ -4988,11 +5022,16 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
                     return GGML_STATUS_FAILED;
                 if (g.n_fap_host++ == 0)
                     log_output("[xllama] d3d12: FLASH_ATTN_EXT on the host (operands outside D3D12_Host)\n");
-                d3d12_fap_emulate(p.params, p.groups_x, p.groups_y, static_cast<const float*>(p.q->data),
-                                  static_cast<const ggml_fp16_t*>(p.k->data),
-                                  static_cast<const ggml_fp16_t*>(p.v->data),
-                                  p.mask ? static_cast<const ggml_fp16_t*>(p.mask->data) : nullptr,
-                                  static_cast<float*>(node->data));
+                const float* hq = static_cast<const float*>(p.q->data);
+                const auto* hk = static_cast<const ggml_fp16_t*>(p.k->data);
+                const auto* hv = static_cast<const ggml_fp16_t*>(p.v->data);
+                const auto* hm = p.mask ? static_cast<const ggml_fp16_t*>(p.mask->data) : nullptr;
+                if (chunk)
+                    d3d12_fap_emulate_chunked(p.params, chunk, p.groups_x, p.groups_y, hq, hk, hv, hm,
+                                              static_cast<float*>(node->data));
+                else
+                    d3d12_fap_emulate(p.params, p.groups_x, p.groups_y, hq, hk, hv, hm,
+                                      static_cast<float*>(node->data));
                 break;
             }
             Op op;
@@ -5005,11 +5044,32 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
             op.u[2] = p.mask ? tensor_va(p.mask) : op.u[0];
             op.gx = p.groups_x;
             op.gy = p.groups_y;
-            if (p.mask)
-                record(op, {rng_of(p.q), rng_of(p.k), rng_of(p.v), rng_of(p.mask)}, {rng_of(node)});
-            else
-                record(op, {rng_of(p.q), rng_of(p.k), rng_of(p.v)}, {rng_of(node)});
+            auto record_qkvm = [&](const Op& o, const Rng& w) {
+                if (p.mask)
+                    record(o, {rng_of(p.q), rng_of(p.k), rng_of(p.v), rng_of(p.mask)}, {w});
+                else
+                    record(o, {rng_of(p.q), rng_of(p.k), rng_of(p.v)}, {w});
+            };
+            if (!chunk) {
+                record_qkvm(op, rng_of(node));
+                ++g.n_fap;
+                break;
+            }
+            const auto fad_lo = reinterpret_cast<std::uintptr_t>(g.fad_ptr);
+            const Rng fad{fad_lo, fad_lo + g.fad_bytes};
+            op.c[11] |= kD3d12FapSplit;
+            op.c[12] = chunk;
+            op.u[3] = g.fad_va;
+            op.gz = d3d12_fap_chunks(p.params.n_kv, chunk);
+            record_qkvm(op, fad);
+            Op red = op; // same constants: n_kv and the chunk give the records
+            red.c[11] = (p.params.flags & kD3d12FapMask) | kD3d12FapReduce;
+            red.gx = p.params.n_head >> 16;
+            red.gy = p.params.n_head & 0xffffu;
+            red.gz = 1;
+            record(red, {fad}, {rng_of(node)});
             ++g.n_fap;
+            ++g.n_fad;
             break;
         }
         default:
@@ -5222,6 +5282,28 @@ ggml_backend_t dev_init_backend(ggml_backend_dev_t dev, const char*) {
                           "(XLLAMA_FA_PREFILL)\n",
                           static_cast<long long>(g.fa_prefill_min));
             log_output(m);
+        }
+        const char* fdk = std::getenv("XLLAMA_FA_DECODE_KV");
+        g.fa_decode_kv = 0;
+        if (g.fap_ok && fdk && *fdk) {
+            char* end = nullptr;
+            const long long v = std::strtoll(fdk, &end, 10);
+            if (end != fdk && v >= 1 && v <= 0x7fffffffLL)
+                g.fa_decode_kv = v;
+        }
+        const char* sk = std::getenv("XLLAMA_FA_SPLITK");
+        g.fa_split = !(sk && *sk == '0');
+        if (g.fa_split && (g.fa_prefill || g.fa_decode_kv) && !ensure_fad(g))
+            g.fa_split = false;
+        if (g.fa_decode_kv) {
+            char m[200];
+            std::snprintf(m, sizeof(m),
+                          "[xllama] d3d12: decode attention on the GPU from %lld cache positions "
+                          "(XLLAMA_FA_DECODE_KV), split-K %s\n",
+                          static_cast<long long>(g.fa_decode_kv), g.fa_split ? "on" : "off");
+            log_output(m);
+        } else if (g.fa_prefill && !g.fa_split) {
+            log_output("[xllama] d3d12: attention split-K off (XLLAMA_FA_SPLITK=0)\n");
         }
         const char* wv = std::getenv("XLLAMA_D3D12_WAVES");
         g.waves = wv && *wv && *wv != '0';
@@ -5465,12 +5547,18 @@ bool dev_supports_op(ggml_backend_dev_t, const ggml_tensor* op) {
         return true;
     }
     case GGML_OP_FLASH_ATTN_EXT: {
-        // A prefill ubatch only (q ne[1] = tokens): decode and short ubatches
-        // keep the CPU's split-kv and untiled kernels. Operands in other
-        // buffers (the KV cache in CPU memory) reach D3D12_Host as split inputs.
+        // A prefill ubatch (q ne[1] = tokens) of fa_prefill_min tokens, or any
+        // ubatch over a cache view (k ne[1] = n_kv) of fa_decode_kv positions:
+        // the measured crossover. llama reuses a graph only at the same n_kv,
+        // so the choice never outlives the n_kv it was made at. Operands in
+        // other buffers (the KV cache in CPU memory) reach D3D12_Host as split
+        // inputs.
         const Gpu& g = gpu();
-        return g.fa_prefill && op->src[0] && op->src[0]->ne[1] >= g.fa_prefill_min &&
-               (!op->buffer || op->buffer->buft == &kHostBuft) && d3d12_fap_plan(op, nullptr);
+        if (!op->src[0] || !op->src[1] || (op->buffer && op->buffer->buft != &kHostBuft))
+            return false;
+        const bool prefill = g.fa_prefill && op->src[0]->ne[1] >= g.fa_prefill_min;
+        const bool decode = g.fa_decode_kv > 0 && op->src[1]->ne[1] >= g.fa_decode_kv;
+        return (prefill || decode) && d3d12_fap_plan(op, nullptr);
     }
     case GGML_OP_MUL_MAT_ID: {
         // The routed experts of a MoE layer, read in place from the expert
@@ -7078,18 +7166,34 @@ D3d12SelftestRow run_ssm_case(ggml_backend_t backend, int kind, std::int64_t t =
 // [D, heads, N] permuted, an f16 causal mask with the N tokens at the end of
 // the n_kv positions. rel_err against the host emulation over the first
 // check_groups groups of q rows (0 = all of them); gpu_ms the median kernel
-// time. cpu_threads > 0 also runs ggml-cpu on the same node (one run, every
-// row checked against it): packed_gbs = the CPU's ms, so the row is a
-// crossover sample, and a "fap_upload" row follows with gpu_ms = the host ms
-// to copy the K and V views into D3D12_Host (what the scheduler pays per
-// layer before the kernel) and packed_gbs = its GB/s.
+// time. split: the bridge's split-K policy on (the row is "..._sk" when the
+// plan did split; the reference then is the chunked emulation), off = one
+// pass. cpu_threads > 0 also runs ggml-cpu on the same node (a warm-up, then
+// the median of kSelftestTimedRuns on one persistent threadpool, as llama's
+// decode pool; every row checked against it): packed_gbs = the CPU's ms, so
+// the row is a crossover sample, and a "fap_upload" row follows with gpu_ms =
+// the host ms to copy the K and V views into D3D12_Host (what the scheduler
+// pays per layer before the kernel while the cache is in CPU memory; 0 with
+// patch 0026) and packed_gbs = its GB/s.
 void run_fap_case(ggml_backend_t backend, std::vector<D3d12SelftestRow>* out, int d, int heads,
                   int kv_heads, int n_tok, int n_kv, int kv_size, bool masked, int check_groups,
-                  int cpu_threads) {
+                  int cpu_threads, bool split = false) {
     D3d12SelftestRow row;
-    char name[48];
-    std::snprintf(name, sizeof(name), "fap_d%d_g%d%s", d, heads / kv_heads, masked ? "" : "_nomask");
-    row.type = name;
+    Gpu& g = gpu();
+    const bool split_was = g.fa_split;
+    g.fa_split = split && ensure_fad(g);
+    struct Restore {
+        Gpu& g;
+        bool v;
+        ~Restore() { g.fa_split = v; }
+    } restore{g, split_was};
+    const auto row_name = [&](bool sk) {
+        char name[48];
+        std::snprintf(name, sizeof(name), "fap_d%d_g%d%s%s", d, heads / kv_heads,
+                      masked ? "" : "_nomask", sk ? "_sk" : "");
+        return std::string(name);
+    };
+    row.type = row_name(false);
     row.n = n_tok;
     row.k = n_kv;
     row.ncols = d;
@@ -7184,7 +7288,9 @@ void run_fap_case(ggml_backend_t backend, std::vector<D3d12SelftestRow>* out, in
     D3d12FapPlan p;
     if (!d3d12_fap_plan(o, &p))
         return fail("no flash-attention plan for the graph");
-    const std::uint64_t f0 = gpu().n_fap, h0 = gpu().n_fap_host;
+    const std::uint32_t chunk = g.fa_split && g.fad_ptr ? d3d12_fap_chunk(p, g.fad_bytes) : 0;
+    row.type = row_name(chunk != 0);
+    const std::uint64_t f0 = gpu().n_fap, h0 = gpu().n_fap_host, s0 = gpu().n_fad;
     ggml_status st = ggml_backend_graph_compute(backend, gf);
     // gpu_ms is the kernel's timestamp span; wall the whole graph_compute
     // (record, submit, fence): at a few tokens the round trip, not the kernel,
@@ -7203,7 +7309,8 @@ void run_fap_case(ggml_backend_t backend, std::vector<D3d12SelftestRow>* out, in
     row.gpu_ms = ms[ms.size() / 2];
     std::nth_element(wall.begin(), wall.begin() + wall.size() / 2, wall.end());
     const double wall_ms = wall[wall.size() / 2];
-    const bool on_gpu = gpu().n_fap > f0 && gpu().n_fap_host == h0;
+    const bool on_gpu =
+        gpu().n_fap > f0 && gpu().n_fap_host == h0 && (chunk == 0) == (gpu().n_fad == s0);
 
     std::vector<float> got(static_cast<std::size_t>(ggml_nelements(o)));
     ggml_backend_tensor_get(o, got.data(), 0, got.size() * sizeof(float));
@@ -7214,12 +7321,16 @@ void run_fap_case(ggml_backend_t backend, std::vector<D3d12SelftestRow>* out, in
         std::min<std::size_t>(n_tok, static_cast<std::size_t>(gx) * (kD3d12FapRows / (heads / kv_heads)));
     const std::size_t n_chk = tokens * heads * d;
     std::vector<float> ref(got.size(), 0.0f);
-    d3d12_fap_emulate(p.params, gx, p.groups_y, qh.data(), kh.data(), vh.data(),
-                      masked ? mh.data() : nullptr, ref.data());
+    if (chunk)
+        d3d12_fap_emulate_chunked(p.params, chunk, gx, p.groups_y, qh.data(), kh.data(), vh.data(),
+                                  masked ? mh.data() : nullptr, ref.data());
+    else
+        d3d12_fap_emulate(p.params, gx, p.groups_y, qh.data(), kh.data(), vh.data(),
+                          masked ? mh.data() : nullptr, ref.data());
     row.rel_err = d3d12_ssm_max_err(got.data(), ref.data(), n_chk);
     row.ok = on_gpu && row.rel_err <= 1e-4;
     if (!on_gpu)
-        row.error = "not dispatched on the GPU";
+        row.error = chunk ? "not dispatched on the GPU as split-K" : "not dispatched on the GPU";
     else if (!row.ok)
         row.error = "mismatch vs the host emulation";
 
@@ -7243,13 +7354,28 @@ void run_fap_case(ggml_backend_t backend, std::vector<D3d12SelftestRow>* out, in
             ggml_tensor* co = attn(cc, ck, cv, cq, cm);
             ggml_cgraph* cg = ggml_new_graph(cc);
             ggml_build_forward_expand(cg, co);
-            const auto tc = std::chrono::steady_clock::now();
-            if (ggml_graph_compute_with_ctx(cc, cg, cpu_threads) == GGML_STATUS_SUCCESS) {
-                row.packed_gbs = std::chrono::duration<double, std::milli>(
-                                     std::chrono::steady_clock::now() - tc)
-                                     .count();
-                cpu_err = d3d12_ssm_max_err(got.data(), static_cast<const float*>(co->data),
-                                            got.size());
+            ggml_threadpool_params tpp = ggml_threadpool_params_default(cpu_threads);
+            ggml_threadpool* tp = ggml_threadpool_new(&tpp);
+            if (tp) {
+                ggml_cplan cpl = ggml_graph_plan(cg, cpu_threads, tp);
+                std::vector<std::uint8_t> work(cpl.work_size);
+                cpl.work_data = work.data();
+                bool cok = ggml_graph_compute(cg, &cpl) == GGML_STATUS_SUCCESS; // warm-up
+                std::vector<double> cms;
+                for (int i = 0; i < kSelftestTimedRuns && cok; ++i) {
+                    const auto tc = std::chrono::steady_clock::now();
+                    cok = ggml_graph_compute(cg, &cpl) == GGML_STATUS_SUCCESS;
+                    cms.push_back(std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - tc)
+                                      .count());
+                }
+                ggml_threadpool_free(tp);
+                if (cok && !cms.empty()) {
+                    std::nth_element(cms.begin(), cms.begin() + cms.size() / 2, cms.end());
+                    row.packed_gbs = cms[cms.size() / 2];
+                    cpu_err = d3d12_ssm_max_err(got.data(), static_cast<const float*>(co->data),
+                                                got.size());
+                }
             }
             ggml_free(cc);
         }
@@ -8653,6 +8779,13 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
         run_fap_case(backend, out, 256, 16, 2, 67, 300, 512, true, 0, 0);
         run_fap_case(backend, out, 128, 4, 4, 64, 129, 256, false, 0, 0);
         run_fap_case(backend, out, 256, 16, 2, 1024, 13312, 16384, true, 2, 6);
+        // Split-K: a decode token over a part-full last chunk, three tokens
+        // (two groups per kv head, 4 chunks), G 16 without a mask, and the 13K
+        // decode token against ggml-cpu.
+        run_fap_case(backend, out, 256, 16, 2, 1, 4001, 4096, true, 0, 0, true);
+        run_fap_case(backend, out, 256, 16, 2, 3, 300, 512, true, 0, 0, true);
+        run_fap_case(backend, out, 64, 16, 1, 1, 333, 512, false, 0, 0, true);
+        run_fap_case(backend, out, 256, 16, 2, 1, 13312, 16384, true, 0, 6, true);
         // XLLAMA_FA_XPROBE=1: the crossover grid, GPU + upload against the CPU;
         // XLLAMA_FA_XPROBE_N / _KV = comma lists replacing the default axes.
         auto axis = [](const char* env, std::vector<int> dflt, int hi) {
@@ -8669,11 +8802,22 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
             }
             return v.empty() ? dflt : v;
         };
-        if (const char* xp = std::getenv("XLLAMA_FA_XPROBE"); xp && std::atoi(xp) > 0)
+        // XLLAMA_FA_XPROBE bit 1 = the prefill grid, bit 2 = the decode grid:
+        // N 1..8 over n_kv 512..16K, split-K and one pass, each against ggml-cpu.
+        const char* xp = std::getenv("XLLAMA_FA_XPROBE");
+        const int xbits = xp ? std::atoi(xp) : 0;
+        if (xbits & 1)
             for (const int n : axis("XLLAMA_FA_XPROBE_N", {64, 128, 256, 512, 1024}, 1024))
                 for (const int kv : axis("XLLAMA_FA_XPROBE_KV", {1024, 4096, 8192}, 16384))
                     if (kv >= n)
                         run_fap_case(backend, out, 256, 16, 2, n, kv, 16384, true, 2, 6);
+        if (xbits & 2)
+            for (const int n : axis("XLLAMA_FA_XPROBE_DN", {1, 2, 4, 8}, 64))
+                for (const int kv :
+                     axis("XLLAMA_FA_XPROBE_DKV", {512, 1024, 2048, 4096, 8192, 13312, 16384}, 16384))
+                    for (const bool sk : {true, false})
+                        if (kv >= n)
+                            run_fap_case(backend, out, 256, 16, 2, n, kv, 16384, true, 0, 6, sk);
     }
     if (gpu().route_ok) {
         out->push_back(run_route_sig_case());

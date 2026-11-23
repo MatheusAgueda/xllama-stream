@@ -556,6 +556,22 @@ fused`. Host test: `expert cache: expert-major prompts…` runs every case again
 with the variable and checks the same reads and kept experts, the same tokens and
 logits within 1e-4 of the resident model. Unset, nothing changes.
 
+`0026-kv-cache-on-device.patch` (independent of the others; `src/llama-kv-cache.cpp`):
+with `LLAMA_KV_ON_DEVICE` set (and not `0`), `llama_kv_cache` puts each layer's K
+and V cache in that layer's device buffer type even when `offload_kqv` is off,
+as 0010 does for the recurrent states. xllama keeps `offload_kqv` off on D3D12
+(`apply_gguf_gpu_context`), so without it the cache is CPU memory and a
+FLASH_ATTN_EXT the d3d12 backend takes (`XLLAMA_FA_PREFILL`,
+`XLLAMA_FA_DECODE_KV`) gets the K and V views copied into D3D12_Host by the
+scheduler before every ubatch: 2 KiB a position per layer for Qwen3.6-35B-A3B
+(D 256, 2 kv heads, f16), 26 MiB per layer per decoded token at 13K. With it the
+cache is D3D12_Host, CPU-visible: the kernel reads it in place and the CPU's
+attention, where the GPU does not take the node, reads it as host memory. Keep
+`XLLAMA_D3D12_WC_MIB` above the cache's size (10 layers x n_ctx x 2 KiB: 80 MiB
+at 4K, 320 MiB at 16K), or the buffer is write-combined and CPU reads of it
+crawl. The memory moves from the CPU heap to D3D12_Host. Unset, the placement is
+upstream's.
+
 ## Applying
 
 ```bash
