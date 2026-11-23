@@ -7074,9 +7074,14 @@ void run_fap_case(ggml_backend_t backend, std::vector<D3d12SelftestRow>* out, in
         return fail("no flash-attention plan for the graph");
     const std::uint64_t f0 = gpu().n_fap, h0 = gpu().n_fap_host;
     ggml_status st = ggml_backend_graph_compute(backend, gf);
-    std::vector<double> ms;
+    // gpu_ms is the kernel's timestamp span; wall the whole graph_compute
+    // (record, submit, fence): at a few tokens the round trip, not the kernel,
+    // is what the GPU costs against the CPU.
+    std::vector<double> ms, wall;
     for (int i = 0; i < kSelftestTimedRuns && st == GGML_STATUS_SUCCESS; ++i) {
+        const auto tw = std::chrono::steady_clock::now();
         st = ggml_backend_graph_compute(backend, gf);
+        wall.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw).count());
         ms.push_back(gpu().last_gpu_ms);
     }
     row.d3d12_ran = st == GGML_STATUS_SUCCESS;
@@ -7084,6 +7089,8 @@ void run_fap_case(ggml_backend_t backend, std::vector<D3d12SelftestRow>* out, in
         return fail("graph_compute failed");
     std::nth_element(ms.begin(), ms.begin() + ms.size() / 2, ms.end());
     row.gpu_ms = ms[ms.size() / 2];
+    std::nth_element(wall.begin(), wall.begin() + wall.size() / 2, wall.end());
+    const double wall_ms = wall[wall.size() / 2];
     const bool on_gpu = gpu().n_fap > f0 && gpu().n_fap_host == h0;
 
     std::vector<float> got(static_cast<std::size_t>(ggml_nelements(o)));
@@ -7151,6 +7158,14 @@ void run_fap_case(ggml_backend_t backend, std::vector<D3d12SelftestRow>* out, in
         up.packed_gbs = upload_ms > 0.0 ? 2.0 * view_halves * sizeof(ggml_fp16_t) / 1e6 / upload_ms : 0.0;
         up.d3d12_ran = up.ok = true;
         out->push_back(std::move(up));
+        D3d12SelftestRow wr;
+        wr.type = "fap_wall";
+        wr.n = n_tok;
+        wr.k = n_kv;
+        wr.ncols = d;
+        wr.gpu_ms = wall_ms;
+        wr.d3d12_ran = wr.ok = true;
+        out->push_back(std::move(wr));
     }
 }
 
@@ -8516,11 +8531,27 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
         run_fap_case(backend, out, 256, 16, 2, 67, 300, 512, true, 0, 0);
         run_fap_case(backend, out, 128, 4, 4, 64, 129, 256, false, 0, 0);
         run_fap_case(backend, out, 256, 16, 2, 1024, 13312, 16384, true, 2, 6);
-        // XLLAMA_FA_XPROBE=1: the crossover grid, GPU + upload against the CPU.
+        // XLLAMA_FA_XPROBE=1: the crossover grid, GPU + upload against the CPU;
+        // XLLAMA_FA_XPROBE_N / _KV = comma lists replacing the default axes.
+        auto axis = [](const char* env, std::vector<int> dflt, int hi) {
+            const char* s = std::getenv(env);
+            if (!s || !*s)
+                return dflt;
+            std::vector<int> v;
+            for (char* end = nullptr; *s; s = *end ? end + 1 : end) {
+                const long x = std::strtol(s, &end, 10);
+                if (end == s)
+                    break;
+                if (x >= 1 && x <= hi)
+                    v.push_back(static_cast<int>(x));
+            }
+            return v.empty() ? dflt : v;
+        };
         if (const char* xp = std::getenv("XLLAMA_FA_XPROBE"); xp && std::atoi(xp) > 0)
-            for (const int n : {64, 128, 256, 512, 1024})
-                for (const int kv : {1024, 4096, 8192})
-                    run_fap_case(backend, out, 256, 16, 2, n, kv, 16384, true, 2, 6);
+            for (const int n : axis("XLLAMA_FA_XPROBE_N", {64, 128, 256, 512, 1024}, 1024))
+                for (const int kv : axis("XLLAMA_FA_XPROBE_KV", {1024, 4096, 8192}, 16384))
+                    if (kv >= n)
+                        run_fap_case(backend, out, 256, 16, 2, n, kv, 16384, true, 2, 6);
     }
     if (gpu().route_ok) {
         out->push_back(run_route_sig_case());
