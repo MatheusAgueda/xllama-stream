@@ -534,6 +534,28 @@ scaling is not the console's (1 → 2 threads was ×5–7 for every path).
 Single-thread cost of one (head, row) pair of the per-head loop on L2-resident rows:
 f16 dot 9.3 ns, f16 mad 9.7 ns, expf 2.6 ns.
 
+`0025-expert-cache-em-wsum.patch` (applies after 0024; `src/llama-expert-cache.{cpp,h}`,
+`src/llama-graph.cpp`): `LLAMA_EXPERT_EM_WSUM=1` (needs `LLAMA_EXPERT_MAJOR`)
+fuses an expert-major ubatch's down projection with the routing weights and the
+sum over each token's experts. Unfused, `build_moe_ffn` builds the products
+`[n_embd, n_used, U]`, their weighted copy of the same size and `n_used - 1` adds;
+on the 35B (n_embd 2048, 8 used) that is 2 × 32 MiB per 512 tokens in the CPU
+compute buffer, which the app is charged for and which sets how many expert slots
+fit at a given `n_ubatch`. `llama_expert_cache_build_mm_id_wsum` builds the
+expert-major pair with `weights` as a third source and an F32 `[n_embd, U]`
+output: each expert's rows for its tokens (GPU dispatch or CPU `mm_rows` into a
+per-thread scratch) are multiplied by the token's weight and added into a double
+accumulator `[n_embd, U]` under one of 16 mutex stripes by token; the last thread
+out rounds it into `dst`. Double accumulation makes the sum independent of the
+order the experts finish in, so the output is deterministic but not the bits of
+the float adds (a different rounding of the same sum). Taken only when the graph
+would weight after the FFN with no down scale/bias, no LoRA, no slot ids, not
+Mistral 4, and the layer's `n_expert_used` is the graph's; otherwise the unfused
+ops are built. The stats line's `expert-major …` part gains `, N down x weights
+fused`. Host test: `expert cache: expert-major prompts…` runs every case again
+with the variable and checks the same reads and kept experts, the same tokens and
+logits within 1e-4 of the resident model. Unset, nothing changes.
+
 ## Applying
 
 ```bash

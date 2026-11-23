@@ -1132,6 +1132,36 @@ TEST_CASE(
         CHECK(em.tokens == full.tokens);
         REQUIRE(em.logits.size() == full.logits.size());
         CHECK(max_abs_diff(em.logits, full.logits) <= 1e-4f);
+
+        // LLAMA_EXPERT_EM_WSUM=1: the down projection, the routing weights and
+        // the sum over a token's experts as one op (double accumulation, so not
+        // bit-equal to the float adds): the same experts and reads, the same
+        // tokens, the logits within the expert-major tolerance of the resident
+        // model.
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            log.final_line.clear();
+        }
+        set_expert_major(64);
+        set_env_s("LLAMA_EXPERT_EM_WSUM", "1");
+        const EcRun wsum = run_greedy(path, c.slots, 512, c.used, 24, 0.0f, c.split);
+        set_env_s("LLAMA_EXPERT_EM_WSUM", nullptr);
+        set_expert_major(-1);
+        REQUIRE(wsum.ok);
+        std::string wsum_line;
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            wsum_line = log.final_line;
+        }
+        MESSAGE(wsum_line);
+        CHECK(wsum_line.find("down x weights fused") != std::string::npos);
+        const EmStats w = em_of(wsum_line);
+        CHECK(w.ubatches == s.ubatches);
+        CHECK(w.reads == s.reads);
+        CHECK(w.kept == s.kept);
+        CHECK(wsum.tokens == full.tokens);
+        REQUIRE(wsum.logits.size() == full.logits.size());
+        CHECK(max_abs_diff(wsum.logits, full.logits) <= 1e-4f);
     }
 
     llama_log_set(nullptr, nullptr);
