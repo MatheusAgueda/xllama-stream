@@ -56,35 +56,41 @@ inline constexpr std::uint32_t kD3d12SsmSilu = 3;
 
 static_assert(kD3d12SsmThreads == kD3d12MoeThreads, "moe_detail::groups sizes the grids");
 
-// KERNEL 1, unary. u1 = src (may be dst), u0 = dst. Grid (ceil(ne0 / 256), rows).
+// KERNEL 1, unary. u1 = src (may be dst), u0 = dst. Grid (ceil(ne0 / 256), rows),
+// or past kD3d12MaxGroups rows (ceil(ne0 / 256), rows_per_z, groups_z).
 struct D3d12SsmUnaryParams {
     std::uint32_t ne0 = 0;
     std::uint32_t src_row_stride = 0;
     std::uint32_t dst_row_stride = 0;
     std::uint32_t op = 0;
     std::uint32_t scale_bits = 0; // kD3d12SsmScale: the float's bits
+    std::uint32_t rows_per_z = 0; // 0: the grid is not folded
+    std::uint32_t rows = 0;       // folded: rows past it are skipped
 };
 
 struct D3d12SsmUnaryPlan {
     D3d12SsmUnaryParams params;
     std::uint32_t groups_x = 0;
     std::uint32_t groups_y = 0;
+    std::uint32_t groups_z = 1;
     const ggml_tensor* src = nullptr;
 };
 
 // KERNEL 2, copy: a 4-d block, strides in floats. u1 = src, u0 = the node's
-// data + dst_offset bytes. Grid (groups_x).
+// data + dst_offset bytes. Grid (groups_x), or past kD3d12MaxGroups groups
+// (groups_x, groups_y) with row_groups = groups_x.
 struct D3d12SsmCopyParams {
     std::uint32_t ne[4] = {};
     std::uint32_t src_stride[4] = {};
     std::uint32_t dst_stride[4] = {};
-    std::uint32_t pad0 = 0;
+    std::uint32_t row_groups = 0; // 0: the grid is not folded
 };
 static_assert(sizeof(D3d12SsmCopyParams) == 13 * sizeof(std::uint32_t), "13 root constants");
 
 struct D3d12SsmCopy {
     D3d12SsmCopyParams params;
     std::uint32_t groups_x = 0;
+    std::uint32_t groups_y = 1;
     const ggml_tensor* src = nullptr;
     std::uint64_t dst_offset = 0;
 };
@@ -207,6 +213,20 @@ inline bool f32_strided(const ggml_tensor* t) {
     return true;
 }
 
+// g groups along one dimension past the kD3d12MaxGroups a dispatch dimension
+// takes, as *outer rows of *inner groups (inner * outer >= g, the last row
+// partly idle); false past kD3d12MaxGroups^2. A prefill ubatch of 2048 tokens
+// has (3 + 2048) x 8192 conv input floats, 65540 groups of 256.
+inline bool fold(std::uint64_t g, std::uint32_t* inner, std::uint32_t* outer) {
+    const std::uint64_t lim = kD3d12MaxGroups;
+    const std::uint64_t o = (g + lim - 1) / lim;
+    if (g == 0 || o > lim)
+        return false;
+    *outer = static_cast<std::uint32_t>(o);
+    *inner = static_cast<std::uint32_t>((g + o - 1) / o);
+    return true;
+}
+
 // The last float touched, +1, over a block of ne with strides st, fits 32-bit.
 inline bool span_fits(const std::uint32_t* ne, const std::uint32_t* st) {
     std::uint64_t last = 0;
@@ -238,7 +258,9 @@ inline bool block(const ggml_tensor* src, const std::int64_t* dst_ne, const std:
         *out = c;
         return true;
     }
-    if (n > static_cast<std::uint64_t>(kD3d12MaxGroups) * kD3d12SsmThreads)
+    // The shader's flat index and n itself are 32-bit, with a folded grid's
+    // idle tail past n.
+    if (n >= (std::uint64_t(1) << 31))
         return false;
     auto packed = [](const std::int64_t* ne, int k) {
         std::uint64_t s = 1;
@@ -284,7 +306,14 @@ inline bool block(const ggml_tensor* src, const std::int64_t* dst_ne, const std:
     if (!span_fits(c.params.ne, c.params.src_stride) ||
         !span_fits(c.params.ne, c.params.dst_stride))
         return false;
-    c.groups_x = static_cast<std::uint32_t>((n + kD3d12SsmThreads - 1) / kD3d12SsmThreads);
+    const std::uint64_t g = (n + kD3d12SsmThreads - 1) / kD3d12SsmThreads;
+    if (g <= kD3d12MaxGroups) {
+        c.groups_x = static_cast<std::uint32_t>(g);
+    } else {
+        if (!fold(g, &c.groups_x, &c.groups_y))
+            return false;
+        c.params.row_groups = c.groups_x;
+    }
     *out = c;
     return true;
 }
@@ -344,10 +373,22 @@ inline bool d3d12_ssm_unary_plan(const ggml_tensor* node, D3d12SsmUnaryPlan* pla
     std::uint32_t ss = 0, ds = 0;
     const std::uint64_t rows = static_cast<std::uint64_t>(ggml_nrows(node));
     const std::uint64_t w = static_cast<std::uint64_t>(node->ne[0]);
+    const std::uint64_t gx = (w + kD3d12SsmThreads - 1) / kD3d12SsmThreads;
     if (!moe_detail::row_stride(p.src, &ss) || !moe_detail::row_stride(node, &ds) ||
-        !moe_detail::rows_fit(rows, ss, w) || !moe_detail::rows_fit(rows, ds, w) ||
-        !moe_detail::groups(node->ne[0], static_cast<std::int64_t>(rows), &p.groups_x, &p.groups_y))
+        !moe_detail::rows_fit(rows, ss, w) || !moe_detail::rows_fit(rows, ds, w) || w == 0 ||
+        gx > kD3d12MaxGroups)
         return false;
+    p.groups_x = static_cast<std::uint32_t>(gx);
+    if (rows <= kD3d12MaxGroups) {
+        p.groups_y = static_cast<std::uint32_t>(rows);
+    } else {
+        // A prefill ubatch's SILU(z), [128, 32 x T], once T x 4096 floats are
+        // past the flat grid (T >= 4096): rows over a third grid dimension.
+        if (!fold(rows, &p.groups_y, &p.groups_z))
+            return false;
+        p.params.rows_per_z = p.groups_y;
+        p.params.rows = static_cast<std::uint32_t>(rows);
+    }
     p.params.ne0 = static_cast<std::uint32_t>(w);
     p.params.src_row_stride = ss;
     p.params.dst_row_stride = ds;
@@ -751,11 +792,16 @@ bool d3d12_gdn_fuse_plan(ggml_cgraph* cgraph, int gdn_idx, const Uses& uses,
 // the copies and get_rows are exact. Pointers are the bindings' bases.
 
 inline void d3d12_ssm_unary_emulate(const D3d12SsmUnaryParams& p, std::uint32_t groups_x,
-                                    std::uint32_t groups_y, const float* src, float* dst) {
+                                    std::uint32_t groups_y, const float* src, float* dst,
+                                    std::uint32_t groups_z = 1) {
     using namespace moe_detail;
     float s = 0.0f;
     std::memcpy(&s, &p.scale_bits, sizeof(s));
-    for (std::uint32_t r = 0; r < groups_y; ++r)
+    for (std::uint32_t z = 0; z < groups_z; ++z)
+    for (std::uint32_t y = 0; y < groups_y; ++y) {
+        const std::uint32_t r = z * p.rows_per_z + y;
+        if (p.rows_per_z != 0 && r >= p.rows)
+            continue;
         for (std::uint32_t c = 0; c < groups_x * kD3d12SsmThreads && c < p.ne0; ++c) {
             const float x = src[r * p.src_row_stride + c];
             float y;
@@ -769,13 +815,18 @@ inline void d3d12_ssm_unary_emulate(const D3d12SsmUnaryParams& p, std::uint32_t 
                 y = x / add_rn(1.0f, std::exp(-x));
             dst[r * p.dst_row_stride + c] = y;
         }
+    }
 }
 
 inline void d3d12_ssm_copy_emulate(const D3d12SsmCopyParams& p, std::uint32_t groups_x,
-                                   const float* src, float* dst) {
+                                   const float* src, float* dst, std::uint32_t groups_y = 1) {
     const std::uint64_t n = static_cast<std::uint64_t>(p.ne[0]) * p.ne[1] * p.ne[2] * p.ne[3];
-    for (std::uint64_t f = 0; f < n && f < static_cast<std::uint64_t>(groups_x) * kD3d12SsmThreads;
-         ++f) {
+    for (std::uint64_t y = 0; y < groups_y; ++y)
+    for (std::uint64_t t = 0; t < static_cast<std::uint64_t>(groups_x) * kD3d12SsmThreads; ++t) {
+        // The shader's 32-bit (gid.y * c12 + gid.x) * 256 + tid.
+        const std::uint64_t f = y * p.row_groups * kD3d12SsmThreads + t;
+        if (f >= n)
+            break;
         std::uint32_t i = static_cast<std::uint32_t>(f);
         const std::uint32_t i0 = i % p.ne[0];
         i /= p.ne[0];

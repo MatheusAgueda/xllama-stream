@@ -137,7 +137,8 @@ void check_unary(const ggml_tensor* node, double tol) {
     D3d12SsmUnaryPlan p;
     REQUIRE(d3d12_ssm_unary_plan(node, &p));
     std::vector<float> out = poisoned(node);
-    d3d12_ssm_unary_emulate(p.params, p.groups_x, p.groups_y, fdata(p.src), out.data());
+    d3d12_ssm_unary_emulate(p.params, p.groups_x, p.groups_y, fdata(p.src), out.data(),
+                            p.groups_z);
     check_out(node, out, tol);
 }
 
@@ -148,7 +149,7 @@ void check_copy(const ggml_tensor* node) {
     for (const D3d12SsmCopy& c : p.copies) {
         REQUIRE(c.dst_offset % sizeof(float) == 0);
         d3d12_ssm_copy_emulate(c.params, c.groups_x, fdata(c.src),
-                               out.data() + c.dst_offset / sizeof(float));
+                               out.data() + c.dst_offset / sizeof(float), c.groups_y);
     }
     check_out(node, out, 0.0);
 }
@@ -367,7 +368,8 @@ TEST_CASE("ggml_d3d12 ssm: constants from a qwen35moe linear-attention layer") {
         CHECK(b.params.dst_stride[1] == 4);
         CHECK(b.dst_offset == 3 * sizeof(float));
         CHECK(b.groups_x == 32);
-        CHECK(b.params.pad0 == 0);
+        CHECK(b.params.row_groups == 0); // 32 groups: not folded
+        CHECK(b.groups_y == 1);
         REQUIRE(d3d12_ssm_copy_plan(L.conv_cpy, &cp)); // [3, 8192] at 1 -> packed cache row
         REQUIRE(cp.copies.size() == 1);
         CHECK(cp.copies[0].params.ne[0] == 3);
@@ -895,4 +897,70 @@ TEST_CASE("ggml_d3d12 ssm: strided rows and copies") {
     REQUIRE(cp.copies.size() == 2);
     CHECK(cp.copies[1].dst_offset == 2 * cat1->nb[1]);
     check_copy(cat1);
+}
+
+// A prefill ubatch's delta-net shapes past the 65535 groups of one grid
+// dimension, which the kernels fold into another: the conv CONCAT at 2048
+// tokens ((3 + 2048) x 8192 floats, the qkv part alone 65536 groups) and
+// SILU over more than 65535 rows (z is [128, 32 x T]; 70001 rows of a wider
+// buffer, so the last folded row is partly idle and a write past it lands
+// outside the poisoned buffer).
+TEST_CASE("ggml_d3d12 ssm: grids folded past 65535 groups") {
+    constexpr std::int64_t kCh = 8192, kT = 2048, kRows = 70001;
+    const ggml_type f = GGML_TYPE_F32;
+    Ctx c((3 * kCh + 2 * kCh * kT + 3 * kCh + 2 * 130 * kRows) * sizeof(float) + (16u << 20),
+          false);
+    ggml_context* ctx = c.ctx;
+    std::mt19937 rng(7u);
+    ggml_tensor* states = ggml_new_tensor_2d(ctx, f, 3, kCh);
+    ggml_tensor* qkv = ggml_new_tensor_2d(ctx, f, kCh, kT);
+    fill(states, &rng, -1.f, 1.f);
+    fill(qkv, &rng, -1.f, 1.f);
+    ggml_tensor* cat = ggml_concat(ctx, states, ggml_transpose(ctx, qkv), 0); // [2051, 8192]
+    ggml_tensor* wide = ggml_new_tensor_2d(ctx, f, 130, kRows);
+    fill(wide, &rng, -6.f, 6.f);
+    ggml_tensor* z = ggml_view_2d(ctx, wide, 128, kRows, wide->nb[1], ggml_row_size(f, 1));
+    ggml_tensor* sl = ggml_silu(ctx, z);
+    ggml_cgraph* gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, cat);
+    ggml_build_forward_expand(gf, sl);
+    compute(ctx, gf);
+
+    D3d12SsmCopyPlan cp;
+    REQUIRE(d3d12_ssm_copy_plan(cat, &cp));
+    REQUIRE(cp.copies.size() == 2);
+    CHECK(cp.copies[0].groups_y == 1);
+    CHECK(cp.copies[0].params.row_groups == 0);
+    const D3d12SsmCopy& q = cp.copies[1];
+    CHECK(q.params.ne[0] == kT);
+    CHECK(q.params.ne[1] == kCh);
+    CHECK(q.groups_x == 32768); // 65536 groups as 2 rows of 32768
+    CHECK(q.groups_y == 2);
+    CHECK(q.params.row_groups == 32768);
+    check_copy(cat);
+
+    D3d12SsmUnaryPlan u;
+    REQUIRE(d3d12_ssm_unary_plan(sl, &u));
+    CHECK(u.params.op == kD3d12SsmSilu);
+    CHECK(u.params.src_row_stride == 130);
+    CHECK(u.params.dst_row_stride == 128);
+    CHECK(u.groups_x == 1);
+    CHECK(u.groups_y == 35001); // 70001 rows as 2 x 35001, the last row idle
+    CHECK(u.groups_z == 2);
+    CHECK(u.params.rows_per_z == 35001);
+    CHECK(u.params.rows == kRows);
+    check_unary(sl, 1e-5);
+
+    std::uint32_t in = 0, out = 0;
+    CHECK(ssm_detail::fold(65536, &in, &out));
+    CHECK(in == 32768);
+    CHECK(out == 2);
+    CHECK(ssm_detail::fold(131072, &in, &out)); // SILU(z) of 4096 tokens' rows
+    CHECK(in == 43691);
+    CHECK(out == 3);
+    CHECK(ssm_detail::fold(std::uint64_t(65535) * 65535, &in, &out));
+    CHECK(in == 65535);
+    CHECK(out == 65535);
+    CHECK_FALSE(ssm_detail::fold(std::uint64_t(65535) * 65535 + 1, &in, &out));
+    CHECK_FALSE(ssm_detail::fold(0, &in, &out));
 }

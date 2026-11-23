@@ -47,13 +47,16 @@ RWByteAddressBuffer U4 : register(u4);
 #if KERNEL == 1
 // c0 = ne0, c1 = src row stride, c2 = dst row stride, c3 = op (0 scale,
 // 1 sigmoid, 2 softplus, 3 silu), c4 = the scale's bits (op 0). u1 = src
-// (may be dst: in place). Grid (ceil(ne0 / 256), rows).
+// (may be dst: in place). Grid (ceil(ne0 / 256), rows), or past 65535 rows
+// (a prefill ubatch's [128, 32 x T] z) folded: (ceil(ne0 / 256), c5, ceil(c6 / c5)),
+// c5 = rows per z, c6 = rows; c5 = 0 is the unfolded grid.
 [numthreads(256, 1, 1)]
 void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
     const uint c = gid.x * 256u + tid;
-    if (c >= c0)
+    const uint row = gid.z * c5 + gid.y;
+    if (c >= c0 || (c5 != 0u && row >= c6))
         return;
-    const float x = asfloat(U1.Load(4u * (gid.y * c1 + c)));
+    const float x = asfloat(U1.Load(4u * (row * c1 + c)));
     precise float y;
     if (c3 == 0u) {
         y = x * asfloat(c4);
@@ -70,15 +73,16 @@ void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
         precise float den = 1.0f + e;
         y = x / den;
     }
-    D.Store(4u * (gid.y * c2 + c), asuint(y));
+    D.Store(4u * (row * c2 + c), asuint(y));
 }
 #elif KERNEL == 2
 // c0..c3 = ne0..ne3 of the copied block, c4..c7 = its src strides, c8..c11
-// = its dst strides (dims 0..3); c12 = 0. u1 = src. Grid (ceil(n / 256)),
-// n = ne0 * ne1 * ne2 * ne3.
+// = its dst strides (dims 0..3); c12 = groups per grid row. u1 = src. Grid
+// (ceil(n / 256)), n = ne0 * ne1 * ne2 * ne3, or past 65535 groups (a prefill
+// ubatch's conv input, (3 + T) x 8192 floats) folded: (c12, ceil(groups / c12)).
 [numthreads(256, 1, 1)]
 void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
-    uint i = gid.x * 256u + tid;
+    uint i = (gid.y * c12 + gid.x) * 256u + tid;
     if (i >= c0 * c1 * c2 * c3)
         return;
     const uint i0 = i % c0;

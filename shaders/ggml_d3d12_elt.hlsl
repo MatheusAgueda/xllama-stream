@@ -9,8 +9,11 @@
 //   3 quant:    f32 columns -> block_q8_K, ggml's quantize_row_q8_K_ref
 //   4 norm_quant: 2 with the weight, then 3 on dst2's rows (into u4), one dispatch
 //   5 bin_quant:  1, then 3 on its result (into u4), one dispatch
-// Root signature: 8 constants at b0, root UAVs u0 (dst), u1 (a), u2 (b / w),
-// u3 (dst2). Every buffer is D3D12_Host (UNORDERED_ACCESS), so all are raw UAVs.
+// Root signature: 13 constants at b0 (10 read here), root UAVs u0 (dst), u1 (a),
+// u2 (b / w), u3 (dst2). Every buffer is D3D12_Host (UNORDERED_ACCESS), so all
+// are raw UAVs. Kernels 1 and 2 fold more than 65535 rows (the delta net's
+// [128, 32 x T] gated norm of a prefill ubatch past 2047 tokens) into a second
+// grid dimension; a zero fold constant is the unfolded grid.
 
 #ifndef KERNEL
 #define KERNEL 1
@@ -25,6 +28,8 @@ cbuffer Params : register(b0) {
     uint c5;
     uint c6;
     uint c7;
+    uint c8;
+    uint c9;
 };
 
 RWByteAddressBuffer D : register(u0);
@@ -38,13 +43,14 @@ float lda(uint i) {
 
 #if KERNEL == 1
 // c0 = ne0, c1 = rows, c2 = a row stride, c3 = b row stride (0: one row for
-// all), c4 = dst row stride (floats), c5 = op (0 add, 1 mul, 2 swiglu: silu(a) * b).
+// all), c4 = dst row stride (floats), c5 = op (0 add, 1 mul, 2 swiglu: silu(a) * b),
+// c6 = rows per grid z (0: grid (ceil(ne0 / 256), rows)).
 [numthreads(256, 1, 1)]
 void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
     const uint i = gid.x * 256u + tid;
-    if (i >= c0)
+    const uint r = gid.z * c6 + gid.y;
+    if (i >= c0 || r >= c1)
         return;
-    const uint r = gid.y;
     const float a = lda(r * c2 + i);
     const float b = asfloat(B.Load(4u * (r * c3 + i)));
     float y;
@@ -59,14 +65,21 @@ void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
 #elif KERNEL == 2
 // One group per row. c0 = ne0, c1 = a row stride, c2 = dst row stride,
 // c3 = eps (f32 bits), c4 = 1: also write dst2 = dst * w, c5 = dst2 row stride.
+// Grid (rows), or folded (c6, ceil(c7 / c6)): c6 = groups per grid row (0:
+// unfolded), c7 = rows. c8 != 0: a's rows are planes of c8 rows c9 floats
+// apart (the delta net's q and k, [128, 16] heads of each token of a prefill
+// ubatch's conv output), row r at (r % c8) * c1 + (r / c8) * c9.
 groupshared float red[256];
 
 [numthreads(256, 1, 1)]
 void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
-    const uint r = gid.x;
+    const uint r = gid.y * c6 + gid.x;
+    if (c6 != 0u && r >= c7) // the whole group: before any barrier
+        return;
+    const uint ar = c8 != 0u ? (r % c8) * c1 + (r / c8) * c9 : r * c1;
     float s = 0.0f;
     for (uint i = tid; i < c0; i += 256u) {
-        const float x = lda(r * c1 + i);
+        const float x = lda(ar + i);
         s += x * x;
     }
     red[tid] = s;
@@ -80,7 +93,7 @@ void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
     const float mean = red[0] / (float)c0;
     const float scale = 1.0f / sqrt(mean + asfloat(c3));
     for (uint j = tid; j < c0; j += 256u) {
-        const float y = lda(r * c1 + j) * scale;
+        const float y = lda(ar + j) * scale;
         D.Store(4u * (r * c2 + j), asuint(y));
         if (c4 != 0u) // dst2 may alias dst (an in-place MUL): written last
             D2.Store(4u * (r * c5 + j), asuint(y * asfloat(B.Load(4u * j))));

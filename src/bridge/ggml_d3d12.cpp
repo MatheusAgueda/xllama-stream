@@ -2387,10 +2387,51 @@ std::int64_t flat_rows(const ggml_tensor* t) {
 // The elementwise kernels' limits over flat rows of any width: the delta net's
 // [32, T] gates and [128, heads] q, k and outputs are narrower than
 // kD3d12EltMinRow, which keeps the CPU's small ops off the GPU elsewhere.
+// Past kD3d12MaxGroups rows (the gated norm's 32 x T from T = 2048) kernels 1
+// and 2 fold the rows into a second grid dimension (elt_fold).
 bool flat_ok(const ggml_tensor* t) {
     const std::int64_t rows = flat_rows(t);
-    return t->ne[0] >= 1 && rows >= 1 && rows <= kD3d12MaxGroups &&
+    return t->ne[0] >= 1 && rows >= 1 &&
+           rows <= std::int64_t(kD3d12MaxGroups) * kD3d12MaxGroups &&
            (t->ne[0] + 255) / 256 <= kD3d12MaxGroups && t->ne[0] * rows <= (std::int64_t(1) << 28);
+}
+
+// Rows the RMS_NORM kernel reads as planes of ne1 rows, nb1 apart within a
+// plane and nb2 between planes: the delta net's q and k of a prefill ubatch,
+// [128, 16, T] views of the conv output (a token's heads packed, tokens 8192
+// floats apart), which flat_rows cannot walk. 0 when t is not so laid out.
+std::int64_t plane_rows(const ggml_tensor* t) {
+    if (t->ne[0] < 1 || t->ne[1] < 1 || t->ne[2] < 1 || t->ne[3] < 1 ||
+        t->nb[1] % sizeof(float) != 0 || t->nb[2] % sizeof(float) != 0 ||
+        (t->ne[3] > 1 && t->nb[3] != t->ne[2] * t->nb[2]) ||
+        t->nb[2] / sizeof(float) > 0xffffffffull)
+        return 0;
+    const std::int64_t rows = t->ne[1] * t->ne[2] * t->ne[3];
+    return rows <= std::int64_t(kD3d12MaxGroups) * kD3d12MaxGroups &&
+                   (t->ne[0] + 255) / 256 <= kD3d12MaxGroups &&
+                   t->ne[0] * rows <= (std::int64_t(1) << 28)
+               ? rows
+               : 0;
+}
+
+// The grid of `rows` along one dimension: (rows, 1) and fold constant 0 up to
+// kD3d12MaxGroups, else (inner, outer) with inner the fold constant.
+bool elt_fold(std::int64_t rows, UINT* inner, UINT* outer, std::uint32_t* fold_c) {
+    if (rows < 1)
+        return false;
+    if (rows <= kD3d12MaxGroups) {
+        *inner = static_cast<UINT>(rows);
+        *outer = 1;
+        *fold_c = 0;
+        return true;
+    }
+    std::uint32_t in = 0, out = 0;
+    if (!ssm_detail::fold(static_cast<std::uint64_t>(rows), &in, &out))
+        return false;
+    *inner = in;
+    *outer = out;
+    *fold_c = in;
+    return true;
 }
 
 // An operand of the delta-net kernels: f32 in D3D12_Host, 32-bit offsets.
@@ -4593,7 +4634,7 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
                     return GGML_STATUS_FAILED;
                 d3d12_ssm_unary_emulate(p.params, p.groups_x, p.groups_y,
                                         static_cast<const float*>(s->data),
-                                        static_cast<float*>(node->data));
+                                        static_cast<float*>(node->data), p.groups_z);
                 break;
             }
             Op op;
@@ -4603,6 +4644,7 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
             op.u[1] = tensor_va(s);
             op.gx = p.groups_x;
             op.gy = p.groups_y;
+            op.gz = p.groups_z;
             record(op, {rng_of(s)}, {rng_of(node)});
             break;
         }
@@ -4624,7 +4666,8 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
                         return GGML_STATUS_FAILED;
                     d3d12_ssm_copy_emulate(
                         c.params, c.groups_x, static_cast<const float*>(c.src->data),
-                        reinterpret_cast<float*>(static_cast<char*>(node->data) + c.dst_offset));
+                        reinterpret_cast<float*>(static_cast<char*>(node->data) + c.dst_offset),
+                        c.groups_y);
                     continue;
                 }
                 Op op;
@@ -4633,7 +4676,7 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
                 op.u[0] = tensor_va(node) + c.dst_offset;
                 op.u[1] = tensor_va(c.src);
                 op.gx = c.groups_x;
-                op.gy = 1;
+                op.gy = c.groups_y;
                 record(op, {rng_of(c.src)}, {copy_rng(node, c)});
             }
             break;
@@ -4762,19 +4805,23 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
                                  (glu && glu_rows(node) && glu_rows(a) && glu_rows(b) &&
                                   ggml_are_same_shape(node, b));
             const std::int64_t rows = glu ? node->ne[1] * node->ne[2] : flat_rows(node);
-            if (g.elt_ok && rows_ok && elt_operand(node) && elt_operand(a) && elt_operand(b) &&
-                same_or_apart(node, a) && same_or_apart(node, b)) {
+            UINT fy = 0, fz = 0;
+            std::uint32_t per_z = 0; // rows past kD3d12MaxGroups: folded over grid z
+            if (g.elt_ok && rows_ok && elt_fold(rows, &fy, &fz, &per_z) && elt_operand(node) &&
+                elt_operand(a) && elt_operand(b) && same_or_apart(node, a) &&
+                same_or_apart(node, b)) {
                 Op e;
                 e.pso = g.pso_elt[kEltBinary].Get();
                 set_c(e, {static_cast<std::uint64_t>(node->ne[0]), static_cast<std::uint64_t>(rows),
                           a->nb[1] / sizeof(float),
                           ggml_nrows(b) == 1 && !glu ? 0 : b->nb[1] / sizeof(float),
-                          node->nb[1] / sizeof(float), static_cast<std::uint64_t>(kind)});
+                          node->nb[1] / sizeof(float), static_cast<std::uint64_t>(kind), per_z});
                 e.u[0] = tensor_va(node);
                 e.u[1] = tensor_va(a);
                 e.u[2] = tensor_va(b);
                 e.gx = static_cast<UINT>((node->ne[0] + 255) / 256);
-                e.gy = static_cast<UINT>(rows);
+                e.gy = fy;
+                e.gz = fz;
                 // A q8_K matmul of this call reads the result (the SwiGLUs before
                 // ffn_down, the gated norm before ssm_out, the attention gate
                 // before wo): KERNEL 5 also writes its q8_K copy, which quantize()
@@ -4812,6 +4859,7 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
                     e.u[4] = xq_va(qoff);
                     e.gx = static_cast<UINT>(qk / kD3d12Chunk);
                     e.gy = static_cast<UINT>(qrows);
+                    e.gz = 1; // kernel 5 does not fold: qrows fit
                     record(e, {rng_of(a), rng_of(b)}, {rng_of(node), xq_rng(qoff, qbytes)});
                     // After record, which drops the copies of what it writes.
                     done.push_back({qx->data, qx->nb[1], GGML_TYPE_Q8_K, qoff, qrow,
@@ -4844,20 +4892,29 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
                               flat_ok(m) && ggml_nrows(w) == 1 && w->ne[0] == node->ne[0] &&
                               same_or_apart(m, node) && same_or_apart(m, a) &&
                               !overlaps(rng_of(m), rng_of(w));
-            // The delta net's: q and k by head ([128, 16] views of the conv
-            // output), its output by head before the gated norm.
-            const bool ssm = g.ssm_ok && flat_ok(node) && flat_ok(a);
-            if (g.elt_ok && (elt_rows(node) || ssm) && elt_operand(node) && elt_operand(a) &&
+            // The delta net's: q and k by head ([128, 16, T] views of the conv
+            // output: planes when T > 1), its output by head before the gated
+            // norm (32 x T rows, folded past kD3d12MaxGroups).
+            const std::int64_t nrows = flat_rows(node);
+            const bool pl = nrows > 0 && flat_rows(a) == 0 && plane_rows(a) == nrows;
+            const bool ssm = g.ssm_ok && flat_ok(node) && (flat_ok(a) || pl);
+            UINT fx = 0, fy = 0;
+            std::uint32_t per_y = 0; // groups per grid row when folded
+            if (g.elt_ok && (elt_rows(node) || ssm) && (flat_rows(a) == nrows || pl) &&
+                elt_fold(nrows, &fx, &fy, &per_y) && elt_operand(node) && elt_operand(a) &&
                 same_or_apart(node, a)) {
                 Op e;
                 e.pso = g.pso_elt[kEltRmsNorm].Get();
                 set_c(e, {static_cast<std::uint64_t>(node->ne[0]), a->nb[1] / sizeof(float),
                           node->nb[1] / sizeof(float), eps_bits, fuse ? 1u : 0u,
-                          fuse ? m->nb[1] / sizeof(float) : 0u});
+                          fuse ? m->nb[1] / sizeof(float) : 0u, per_y,
+                          static_cast<std::uint64_t>(nrows),
+                          pl ? static_cast<std::uint64_t>(a->ne[1]) : 0u,
+                          pl ? a->nb[2] / sizeof(float) : 0u});
                 e.u[0] = tensor_va(node);
                 e.u[1] = tensor_va(a);
-                e.gx = static_cast<UINT>(flat_rows(node));
-                e.gy = 1;
+                e.gx = fx;
+                e.gy = fy;
                 if (fuse) {
                     e.u[2] = tensor_va(w);
                     e.u[3] = tensor_va(m);
@@ -4868,8 +4925,9 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
                     const ggml_tensor* qx = g.normq && g.pso_elt[kEltNormQuant] && elt_rows(node)
                                                 ? q8k_reader(m, i + 2)
                                                 : nullptr;
-                    const bool nq = qx && qx->nb[1] == m->nb[1] && qx->ne[0] == m->ne[0] &&
-                                    node->ne[0] % kD3d12Chunk == 0 && node->ne[0] <= 4096;
+                    const bool nq = qx && per_y == 0 && !pl && qx->nb[1] == m->nb[1] &&
+                                    qx->ne[0] == m->ne[0] && node->ne[0] % kD3d12Chunk == 0 &&
+                                    node->ne[0] <= 4096;
                     // Sized only then: ggml_row_size asserts whole q8_K blocks
                     // (asserts are on in this build; the delta net's norms are 128).
                     const int rows = nq ? static_cast<int>(flat_rows(node)) : 0;
@@ -5441,9 +5499,12 @@ bool dev_supports_op(ggml_backend_dev_t, const ggml_tensor* op) {
             // one combine, or binary kernels over the views when it cannot fuse.
             return gpu().elt_ok && elt_rows(op) && elt_f32(op) && elt_f32(a) && elt_f32(b) &&
                    ggml_are_same_shape(op, a) && ggml_are_same_shape(op, b);
-        // The delta net's: rows of any width, flat over ne1..ne3; b a's shape
-        // or one row (ssm_dt, ssm_a, the gated norm's weight).
-        if (op->op != GGML_OP_GLU && a && gpu().ssm_ok && flat_ok(op) && flat_ok(a) &&
+        // The delta net's: rows of any width, flat over ne1..ne3 (an RMS_NORM's
+        // a also in planes: q and k of a prefill ubatch); b a's shape or one row
+        // (ssm_dt, ssm_a, the gated norm's weight).
+        if (op->op != GGML_OP_GLU && a && gpu().ssm_ok && flat_ok(op) &&
+            (flat_ok(a) || (op->op == GGML_OP_RMS_NORM && flat_rows(a) == 0 &&
+                            plane_rows(a) == flat_rows(op))) &&
             ggml_are_same_shape(op, a) && elt_f32(op) && ssm_f32(op) && elt_f32(a) && ssm_f32(a) &&
             (op->op == GGML_OP_RMS_NORM ||
              (b && elt_f32(b) && ssm_f32(b) && b->ne[0] == op->ne[0] &&
@@ -6771,13 +6832,23 @@ D3d12SelftestRow run_binq_case(ggml_backend_t backend, int kind, int ne0, int ne
 // bit, the rest within the emulation tests' tolerances. kind 0 SIGMOID [32]
 // (beta), 1 SOFTPLUS [32] (the gate), 2 SILU [128, 32] (z), 3 SCALE [128, 16]
 // (q), 4 CONCAT of the conv states and the transposed qkv, 5 GET_ROWS of a
-// conv state, 6 SILU(SSM_CONV), 7 GATED_DELTA_NET.
-D3d12SelftestRow run_ssm_case(ggml_backend_t backend, int kind) {
-    static const char* const kNames[] = {"ssm_sigmoid", "ssm_softplus", "ssm_silu", "ssm_scale",
-                                         "ssm_concat",  "ssm_get_rows", "ssm_conv", "ssm_gdn"};
+// conv state, 6 SILU(SSM_CONV), 7 GATED_DELTA_NET, 8 RMS_NORM of q by head
+// ([128, 16, t] views of a [8192, t] conv output: planes once t > 1), 9 the
+// gated norm MUL(MUL(RMS_NORM(o), w), z) over 32 x t rows (kinds 8 and 9
+// against a direct loop). t > 1 is a prefill ubatch's: SILU at 4096 tokens and
+// CONCAT at 2048 pass the 65535 groups of a grid dimension (folded grids), as
+// kind 9's 32 x 2048 rows do.
+D3d12SelftestRow run_ssm_case(ggml_backend_t backend, int kind, std::int64_t t = 1) {
+    static const char* const kNames[] = {"ssm_sigmoid", "ssm_softplus", "ssm_silu",
+                                         "ssm_scale",   "ssm_concat",   "ssm_get_rows",
+                                         "ssm_conv",    "ssm_gdn",      "ssm_qk_norm",
+                                         "ssm_gated_norm"};
     constexpr std::int64_t kCh = 8192, kConv = 4, kSv = kD3d12GdnSv, kHk = 16, kHv = 32;
+    constexpr float kEps = 1e-6f;
     D3d12SelftestRow row;
     row.type = kNames[kind];
+    if (t > 1)
+        row.type += "_t" + std::to_string(t);
     row.ncols = 1;
 
     ggml_init_params ip = {};
@@ -6797,14 +6868,22 @@ D3d12SelftestRow run_ssm_case(ggml_backend_t backend, int kind) {
         add(kHv, 1);
         break;
     case 2:
-        add(kSv, kHv);
+        add(kSv, kHv, t);
         break;
     case 3:
         add(kSv, kHk);
         break;
     case 4:
         add(kConv - 1, kCh); // conv states
-        add(kCh, 1);         // qkv
+        add(kCh, t);         // qkv
+        break;
+    case 8:
+        add(kCh, t); // the conv output, q its first 16 x 128 floats a token
+        break;
+    case 9:
+        add(kSv, kHv * t); // the delta net's output by head
+        add(kSv, 1);       // ssm_norm
+        add(kSv, kHv * t); // SILU(z)
         break;
     case 5:
         add((kConv - 1) * kCh, 2); // two cells' conv states
@@ -6875,6 +6954,15 @@ D3d12SelftestRow run_ssm_case(ggml_backend_t backend, int kind) {
     case 6:
         out = ggml_silu(ctx_g, ggml_ssm_conv(ctx_g, in[0], in[1]));
         break;
+    case 8:
+        out = ggml_rms_norm(ctx_g,
+                            ggml_view_3d(ctx_g, in[0], kSv, kHk, t, kSv * sizeof(float),
+                                         in[0]->nb[1], 0),
+                            kEps);
+        break;
+    case 9:
+        out = ggml_mul(ctx_g, ggml_mul(ctx_g, ggml_rms_norm(ctx_g, in[0], kEps), in[1]), in[2]);
+        break;
     default:
         out = ggml_gated_delta_net(ctx_g, in[0], in[1], in[2], in[3], in[4], in[5], 1);
         break;
@@ -6909,7 +6997,8 @@ D3d12SelftestRow run_ssm_case(ggml_backend_t backend, int kind) {
         D3d12SsmUnaryPlan p;
         planned = d3d12_ssm_unary_plan(out, &p);
         if (planned)
-            d3d12_ssm_unary_emulate(p.params, p.groups_x, p.groups_y, vals[0].data(), ref.data());
+            d3d12_ssm_unary_emulate(p.params, p.groups_x, p.groups_y, vals[0].data(), ref.data(),
+                                    p.groups_z);
         tol = kind == 3 ? 0.0 : 1e-5;
     } else if (kind == 4) {
         D3d12SsmCopyPlan p;
@@ -6918,7 +7007,7 @@ D3d12SelftestRow run_ssm_case(ggml_backend_t backend, int kind) {
             for (const D3d12SsmCopy& c : p.copies)
                 d3d12_ssm_copy_emulate(c.params, c.groups_x,
                                        (base_of(c.src) == in[0] ? vals[0] : vals[1]).data(),
-                                       ref.data() + c.dst_offset / sizeof(float));
+                                       ref.data() + c.dst_offset / sizeof(float), c.groups_y);
         want = 2;
     } else if (kind == 5) {
         D3d12SsmGetRowsPlan p;
@@ -6932,6 +7021,29 @@ D3d12SelftestRow run_ssm_case(ggml_backend_t backend, int kind) {
         if (planned)
             d3d12_ssm_conv_emulate(p.params, p.groups_x, p.groups_y, p.groups_z, vals[0].data(),
                                    vals[1].data(), ref.data());
+        tol = 1e-5;
+    } else if (kind >= 8) {
+        // Rows of kSv: the norm in double, scaled in f32 as the kernel does;
+        // kind 9 then times the weight, then times z (the fused MUL, then the
+        // binary kernel's).
+        const std::int64_t rows = (kind == 8 ? kHk : kHv) * t;
+        for (std::int64_t r = 0; r < rows; ++r) {
+            const float* x = kind == 8 ? vals[0].data() + (r / kHk) * kCh + (r % kHk) * kSv
+                                       : vals[0].data() + r * kSv;
+            float* y = ref.data() + r * kSv;
+            double ss = 0.0;
+            for (std::int64_t i = 0; i < kSv; ++i)
+                ss += static_cast<double>(x[i]) * x[i];
+            const float sc = static_cast<float>(1.0 / std::sqrt(ss / kSv + kEps));
+            for (std::int64_t i = 0; i < kSv; ++i) {
+                y[i] = x[i] * sc;
+                if (kind == 9)
+                    y[i] = y[i] * vals[1][static_cast<std::size_t>(i)] *
+                           vals[2][static_cast<std::size_t>(r * kSv + i)];
+            }
+        }
+        planned = gpu().elt_ok;
+        want = kind == 8 ? 1 : 2; // kind 9: the norm with its weight, then z
         tol = 1e-5;
     } else {
         D3d12GdnPlan p;
@@ -8521,9 +8633,19 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
         if (gpu().ssm_ok) // [128, 32] rows only take the delta net's flat path
             out->push_back(run_binq_case(backend, 1, 128, 32, 4096, false, false));
     }
-    if (gpu().ssm_ok)
+    if (gpu().ssm_ok) {
         for (int kind = 0; kind < 8; ++kind)
             out->push_back(run_ssm_case(backend, kind));
+        // A prefill ubatch's: past a grid dimension's 65535 groups (folded),
+        // and q / k by head read as planes of the conv output.
+        out->push_back(run_ssm_case(backend, 2, 4096));
+        out->push_back(run_ssm_case(backend, 4, 2048));
+        if (gpu().elt_ok) {
+            out->push_back(run_ssm_case(backend, 8));
+            out->push_back(run_ssm_case(backend, 8, 512));
+            out->push_back(run_ssm_case(backend, 9, 2048));
+        }
+    }
     if (gpu().fap_ok) {
         // Qwen3.6-35B-A3B's full-attention shape with a part-full last group;
         // G 1 without a mask and a one-position last tile; a 13K prefill's last
