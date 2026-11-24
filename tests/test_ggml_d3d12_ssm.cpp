@@ -983,7 +983,8 @@ struct RopeCase {
 
 void check_rope(const RopeCase& rc, std::uint32_t seed, bool libm = false, double tol = 1e-5) {
     const std::int64_t wide = rc.strided ? rc.ne0 + 44 : rc.ne0;
-    Ctx c(static_cast<std::size_t>(3 * wide * rc.heads * rc.T + 8 * rc.T) * sizeof(float) + (4u << 20),
+    Ctx c(static_cast<std::size_t>(3 * wide * rc.heads * rc.T + 8 * rc.T) * sizeof(float) +
+              (4u << 20),
           false);
     ggml_context* ctx = c.ctx;
     std::mt19937 rng(seed);
@@ -1010,8 +1011,8 @@ void check_rope(const RopeCase& rc, std::uint32_t seed, bool libm = false, doubl
     ggml_tensor* r = nullptr;
     if (multi)
         r = (rc.in_place ? ggml_rope_multi_inplace : ggml_rope_multi)(
-            ctx, a, pos, nullptr, rc.n_dims, sections, rc.mode, 262144, rc.freq_base,
-            rc.freq_scale, 0.f, rc.attn_factor, 32.f, 1.f);
+            ctx, a, pos, nullptr, rc.n_dims, sections, rc.mode, 262144, rc.freq_base, rc.freq_scale,
+            0.f, rc.attn_factor, 32.f, 1.f);
     else
         r = (rc.in_place ? ggml_rope_ext_inplace : ggml_rope_ext)(
             ctx, a, pos, nullptr, rc.n_dims, rc.mode, 262144, rc.freq_base, rc.freq_scale, 0.f,
@@ -1048,8 +1049,7 @@ void check_rope(const RopeCase& rc, std::uint32_t seed, bool libm = false, doubl
 }
 
 // Every n-th float bit pattern, both signs, NaNs aside.
-template <class F>
-void sweep_floats(std::uint32_t step, F&& f) {
+template <class F> void sweep_floats(std::uint32_t step, F&& f) {
     for (std::uint64_t x = 0; x < (std::uint64_t(1) << 32); x += step) {
         const auto u = static_cast<std::uint32_t>(x);
         if ((u & 0x7fffffffu) <= 0x7f800000u)
@@ -1119,26 +1119,36 @@ TEST_CASE("ggml_d3d12 ssm: rope emulation matches ggml's CPU op") {
     const float b7 = 1e7f, b6 = 1e6f;
     // qwen35moe's full-attention q and k at decode and in a prefill ubatch,
     // 64 of 256 dims rotated, IMROPE {11, 11, 10, 0}, text positions (t = h = w).
-    check_rope({GGML_ROPE_TYPE_IMROPE, 256, 16, 1, 64, b7, 1.f, 1.f, 12735, false, false, false, 0}, 1);
-    check_rope({GGML_ROPE_TYPE_IMROPE, 256, 2, 1, 64, b7, 1.f, 1.f, 12735, false, false, false, 0}, 2);
-    check_rope({GGML_ROPE_TYPE_IMROPE, 256, 16, 37, 64, b6, 1.f, 1.f, 4000, false, false, false, 0}, 3);
+    check_rope({GGML_ROPE_TYPE_IMROPE, 256, 16, 1, 64, b7, 1.f, 1.f, 12735, false, false, false, 0},
+               1);
+    check_rope({GGML_ROPE_TYPE_IMROPE, 256, 2, 1, 64, b7, 1.f, 1.f, 12735, false, false, false, 0},
+               2);
+    check_rope({GGML_ROPE_TYPE_IMROPE, 256, 16, 37, 64, b6, 1.f, 1.f, 4000, false, false, false, 0},
+               3);
     // Past the context: theta 262 143 at pair 0, positions apart per section.
-    check_rope({GGML_ROPE_TYPE_IMROPE, 256, 2, 5, 64, b7, 1.f, 1.f, 262139, true, false, false, 0}, 4);
-    check_rope({GGML_ROPE_TYPE_MROPE, 256, 4, 9, 64, b7, 0.5f, 1.25f, 9000, true, false, false, 0}, 5);
-    check_rope({GGML_ROPE_TYPE_NEOX, 128, 8, 6, 128, 1e4f, 1.f, 1.f, 70000, false, false, false, 0}, 6);
+    check_rope({GGML_ROPE_TYPE_IMROPE, 256, 2, 5, 64, b7, 1.f, 1.f, 262139, true, false, false, 0},
+               4);
+    check_rope({GGML_ROPE_TYPE_MROPE, 256, 4, 9, 64, b7, 0.5f, 1.25f, 9000, true, false, false, 0},
+               5);
+    check_rope({GGML_ROPE_TYPE_NEOX, 128, 8, 6, 128, 1e4f, 1.f, 1.f, 70000, false, false, false, 0},
+               6);
     check_rope({GGML_ROPE_TYPE_NEOX, 600, 3, 4, 64, 1e4f, 1.f, 1.f, 3, false, false, false, 0}, 7);
     // In place (the graph's own form when a layer ropes its q in place), a
     // strided source, a rotation offset.
-    check_rope({GGML_ROPE_TYPE_IMROPE, 256, 16, 3, 64, b7, 1.f, 1.f, 100, false, true, false, 0}, 8);
+    check_rope({GGML_ROPE_TYPE_IMROPE, 256, 16, 3, 64, b7, 1.f, 1.f, 100, false, true, false, 0},
+               8);
     check_rope({GGML_ROPE_TYPE_NEOX, 256, 2, 3, 64, b6, 1.f, 1.f, 100, false, true, false, 0}, 9);
-    check_rope({GGML_ROPE_TYPE_IMROPE, 256, 16, 3, 64, b7, 1.f, 1.f, 777, false, false, true, 0}, 10);
-    check_rope({GGML_ROPE_TYPE_NEOX, 256, 2, 3, 64, b6, 1.f, 1.f, 777, false, false, false, 32}, 11);
+    check_rope({GGML_ROPE_TYPE_IMROPE, 256, 16, 3, 64, b7, 1.f, 1.f, 777, false, false, true, 0},
+               10);
+    check_rope({GGML_ROPE_TYPE_NEOX, 256, 2, 3, 64, b6, 1.f, 1.f, 777, false, false, false, 32},
+               11);
     // Past the kernel's positions (d3d12_ssm_rope_pos_bound): the backend's
     // CPU path with cosf / sinf, as ggml-cpu.
-    check_rope({GGML_ROPE_TYPE_IMROPE, 256, 2, 3, 64, b7, 1.f, 1.f, 900000, true, false, false, 0}, 12,
-               true, 1e-6);
-    check_rope({GGML_ROPE_TYPE_NEOX, 128, 4, 2, 128, 1e4f, 1.f, 1.f, 5000000, false, false, false, 0},
-               13, true, 1e-6);
+    check_rope({GGML_ROPE_TYPE_IMROPE, 256, 2, 3, 64, b7, 1.f, 1.f, 900000, true, false, false, 0},
+               12, true, 1e-6);
+    check_rope(
+        {GGML_ROPE_TYPE_NEOX, 128, 4, 2, 128, 1e4f, 1.f, 1.f, 5000000, false, false, false, 0}, 13,
+        true, 1e-6);
 }
 
 TEST_CASE("ggml_d3d12 ssm: rope's position bound keeps every theta below 8e5") {
@@ -1198,10 +1208,10 @@ TEST_CASE("ggml_d3d12 ssm: f16_rne is ggml's float to half, NaN as F16C") {
             ++bad;
     });
     CHECK(bad == 0);
-    for (std::uint32_t u : {0x00000000u, 0x80000000u, 0x33000000u, 0x33000001u, 0x33c00000u,
-                            0x34200000u, 0x387fc000u, 0x387fe000u, 0x38800000u, 0x3f801000u,
-                            0x3f803000u, 0x477fe000u, 0x477fefffu, 0x477ff000u, 0x47800000u,
-                            0x7f7fffffu, 0x7f800000u, 0xff800000u})
+    for (std::uint32_t u :
+         {0x00000000u, 0x80000000u, 0x33000000u, 0x33000001u, 0x33c00000u, 0x34200000u, 0x387fc000u,
+          0x387fe000u, 0x38800000u, 0x3f801000u, 0x3f803000u, 0x477fe000u, 0x477fefffu, 0x477ff000u,
+          0x47800000u, 0x7f7fffffu, 0x7f800000u, 0xff800000u})
         CHECK(ssm_detail::f16_rne(u) == ggml_fp32_to_fp16(from_bits(u)));
     CHECK(ssm_detail::f16_rne(0x7fc00000u) == 0x7e00u);
     CHECK(ssm_detail::f16_rne(0x7f800001u) == 0x7e00u);
@@ -1212,13 +1222,30 @@ TEST_CASE("ggml_d3d12 ssm: f16_rne is ggml's float to half, NaN as F16C") {
 TEST_CASE("ggml_d3d12 ssm: set_rows emulation writes the cache as ggml's CPU op") {
     // Ties to even, overflow, subnormals and signed zeros through ggml-cpu's
     // from_float (NaN aside: its payload is the CPU's).
-    const std::vector<float> specials = {
-        0.f, -0.f, 65504.f, -65504.f, std::nextafter(65520.f, 0.f), 65520.f, -65520.f, 65536.f,
-        1e9f, from_bits(0x7f800000u), from_bits(0xff800000u), from_bits(0x33800000u),
-        from_bits(0x33000000u), from_bits(0x33000001u), from_bits(0x33c00000u),
-        from_bits(0x34200000u), from_bits(0x387fc000u), from_bits(0x38800000u),
-        from_bits(0x387fe000u), from_bits(0x3f801000u), from_bits(0x3f803000u), 1.f / 3.f, -1e-8f,
-        -from_bits(0x34200000u)};
+    const std::vector<float> specials = {0.f,
+                                         -0.f,
+                                         65504.f,
+                                         -65504.f,
+                                         std::nextafter(65520.f, 0.f),
+                                         65520.f,
+                                         -65520.f,
+                                         65536.f,
+                                         1e9f,
+                                         from_bits(0x7f800000u),
+                                         from_bits(0xff800000u),
+                                         from_bits(0x33800000u),
+                                         from_bits(0x33000000u),
+                                         from_bits(0x33000001u),
+                                         from_bits(0x33c00000u),
+                                         from_bits(0x34200000u),
+                                         from_bits(0x387fc000u),
+                                         from_bits(0x38800000u),
+                                         from_bits(0x387fe000u),
+                                         from_bits(0x3f801000u),
+                                         from_bits(0x3f803000u),
+                                         1.f / 3.f,
+                                         -1e-8f,
+                                         -from_bits(0x34200000u)};
     // K and V of qwen35moe's full-attention layer: 2 kv heads x 256 = 512 halves a row.
     check_set_rows(GGML_TYPE_F16, GGML_TYPE_I64, 512, 4096, 1, 21);
     check_set_rows(GGML_TYPE_F16, GGML_TYPE_I64, 512, 4096, 97, 22, specials);
@@ -1237,39 +1264,43 @@ TEST_CASE("ggml_d3d12 ssm: rope and set_rows nodes the kernels do not take") {
     ggml_tensor* ff = ggml_new_tensor_1d(ctx, f, 32);
     int sections[GGML_MROPE_SECTIONS] = {11, 11, 10, 0};
     D3d12SsmRopePlan rp;
-    CHECK(d3d12_ssm_rope_plan(
-        ggml_rope_ext(ctx, q, pos, nullptr, 64, GGML_ROPE_TYPE_NEOX, 4096, 1e4f, 1.f, 0.f, 1.f, 32.f, 1.f),
-        &rp));
-    CHECK_FALSE(d3d12_ssm_rope_plan(
-        ggml_rope_ext(ctx, q, pos, nullptr, 64, GGML_ROPE_TYPE_NORMAL, 4096, 1e4f, 1.f, 0.f, 1.f, 32.f, 1.f),
-        &rp));
-    CHECK_FALSE(d3d12_ssm_rope_plan(
-        ggml_rope_ext(ctx, q, pos, ff, 64, GGML_ROPE_TYPE_NEOX, 4096, 1e4f, 1.f, 0.f, 1.f, 32.f, 1.f), &rp));
-    CHECK_FALSE(d3d12_ssm_rope_plan(
-        ggml_rope_ext(ctx, q, pos, nullptr, 64, GGML_ROPE_TYPE_NEOX, 4096, 1e4f, 0.25f, 1.f, 1.f, 32.f, 1.f),
-        &rp));
-    CHECK_FALSE(d3d12_ssm_rope_plan(ggml_rope_multi(ctx, ggml_new_tensor_3d(ctx, f, 128, 4, 3), pos4, nullptr,
-                                                    128, sections, GGML_ROPE_TYPE_VISION, 4096, 1e4f, 1.f, 0.f,
-                                                    1.f, 32.f, 1.f),
+    CHECK(d3d12_ssm_rope_plan(ggml_rope_ext(ctx, q, pos, nullptr, 64, GGML_ROPE_TYPE_NEOX, 4096,
+                                            1e4f, 1.f, 0.f, 1.f, 32.f, 1.f),
+                              &rp));
+    CHECK_FALSE(d3d12_ssm_rope_plan(ggml_rope_ext(ctx, q, pos, nullptr, 64, GGML_ROPE_TYPE_NORMAL,
+                                                  4096, 1e4f, 1.f, 0.f, 1.f, 32.f, 1.f),
+                                    &rp));
+    CHECK_FALSE(d3d12_ssm_rope_plan(ggml_rope_ext(ctx, q, pos, ff, 64, GGML_ROPE_TYPE_NEOX, 4096,
+                                                  1e4f, 1.f, 0.f, 1.f, 32.f, 1.f),
+                                    &rp));
+    CHECK_FALSE(d3d12_ssm_rope_plan(ggml_rope_ext(ctx, q, pos, nullptr, 64, GGML_ROPE_TYPE_NEOX,
+                                                  4096, 1e4f, 0.25f, 1.f, 1.f, 32.f, 1.f),
                                     &rp));
     CHECK_FALSE(d3d12_ssm_rope_plan(
-        ggml_rope_ext(ctx, ggml_new_tensor_4d(ctx, f, 256, 4, 3, 2), pos, nullptr, 64, GGML_ROPE_TYPE_NEOX,
-                      4096, 1e4f, 1.f, 0.f, 1.f, 32.f, 1.f),
+        ggml_rope_multi(ctx, ggml_new_tensor_3d(ctx, f, 128, 4, 3), pos4, nullptr, 128, sections,
+                        GGML_ROPE_TYPE_VISION, 4096, 1e4f, 1.f, 0.f, 1.f, 32.f, 1.f),
         &rp));
+    CHECK_FALSE(d3d12_ssm_rope_plan(ggml_rope_ext(ctx, ggml_new_tensor_4d(ctx, f, 256, 4, 3, 2),
+                                                  pos, nullptr, 64, GGML_ROPE_TYPE_NEOX, 4096, 1e4f,
+                                                  1.f, 0.f, 1.f, 32.f, 1.f),
+                                    &rp));
     // An f16 cache of odd rows, a quantized cache, a batch of streams.
     D3d12SsmSetRowsPlan sp;
     ggml_tensor* ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 2);
-    CHECK_FALSE(d3d12_ssm_set_rows_plan(
-        ggml_set_rows(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 3, 8), ggml_new_tensor_2d(ctx, f, 3, 2), ids),
-        &sp));
-    CHECK_FALSE(d3d12_ssm_set_rows_plan(ggml_set_rows(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 64, 8),
-                                                      ggml_new_tensor_2d(ctx, f, 64, 2), ids),
-                                        &sp));
-    CHECK_FALSE(d3d12_ssm_set_rows_plan(ggml_set_rows(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 64, 8, 2),
-                                                      ggml_new_tensor_3d(ctx, f, 64, 2, 2),
-                                                      ggml_new_tensor_2d(ctx, GGML_TYPE_I64, 2, 2)),
-                                        &sp));
-    CHECK(d3d12_ssm_set_rows_plan(
-        ggml_set_rows(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 64, 8), ggml_new_tensor_2d(ctx, f, 64, 2), ids),
-        &sp));
+    CHECK_FALSE(
+        d3d12_ssm_set_rows_plan(ggml_set_rows(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 3, 8),
+                                              ggml_new_tensor_2d(ctx, f, 3, 2), ids),
+                                &sp));
+    CHECK_FALSE(
+        d3d12_ssm_set_rows_plan(ggml_set_rows(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 64, 8),
+                                              ggml_new_tensor_2d(ctx, f, 64, 2), ids),
+                                &sp));
+    CHECK_FALSE(
+        d3d12_ssm_set_rows_plan(ggml_set_rows(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 64, 8, 2),
+                                              ggml_new_tensor_3d(ctx, f, 64, 2, 2),
+                                              ggml_new_tensor_2d(ctx, GGML_TYPE_I64, 2, 2)),
+                                &sp));
+    CHECK(d3d12_ssm_set_rows_plan(ggml_set_rows(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 64, 8),
+                                                ggml_new_tensor_2d(ctx, f, 64, 2), ids),
+                                  &sp));
 }

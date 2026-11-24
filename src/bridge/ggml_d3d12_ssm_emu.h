@@ -678,8 +678,8 @@ inline bool d3d12_ssm_rope_plan(const ggml_tensor* node, D3d12SsmRopePlan* plan)
         !fits32((ne2 - 1) * s2 + (ne1 - 1) * s1 + static_cast<std::uint64_t>(ne0)) ||
         !fits32((ne2 - 1) * d2 + (ne1 - 1) * d1 + static_cast<std::uint64_t>(ne0)))
         return false;
-    const std::uint64_t gx = (static_cast<std::uint64_t>(ne0 - n_dims / 2) + kD3d12SsmThreads - 1) /
-                             kD3d12SsmThreads;
+    const std::uint64_t gx =
+        (static_cast<std::uint64_t>(ne0 - n_dims / 2) + kD3d12SsmThreads - 1) / kD3d12SsmThreads;
     if (gx > kD3d12MaxGroups || ne1 > kD3d12MaxGroups || ne2 > kD3d12MaxGroups)
         return false;
     p.groups_x = static_cast<std::uint32_t>(gx);
@@ -687,7 +687,8 @@ inline bool d3d12_ssm_rope_plan(const ggml_tensor* node, D3d12SsmRopePlan* plan)
     p.groups_z = static_cast<std::uint32_t>(ne2);
     p.n_pos = static_cast<std::uint32_t>(n_pos);
     p.params.ne0 = static_cast<std::uint32_t>(ne0);
-    p.params.dims_offs = static_cast<std::uint32_t>(n_dims) | static_cast<std::uint32_t>(n_offs) << 16;
+    p.params.dims_offs = static_cast<std::uint32_t>(n_dims) | static_cast<std::uint32_t>(n_offs)
+                                                                  << 16;
     p.params.pos_stride = static_cast<std::uint32_t>(ne2);
     p.params.src_nb1 = static_cast<std::uint32_t>(s1);
     p.params.src_nb2 = static_cast<std::uint32_t>(s2);
@@ -1144,9 +1145,8 @@ inline void d3d12_ssm_get_rows_emulate(const D3d12SsmGetRowsParams& p, std::uint
 // ggml-cpu takes them (cosf, sinf), the backend's path for positions past
 // d3d12_ssm_rope_pos_bound, where the shader's reduction is no longer exact.
 inline void d3d12_ssm_rope_emulate(const D3d12SsmRopeParams& p, std::uint32_t groups_x,
-                                   std::uint32_t groups_y, std::uint32_t groups_z,
-                                   const float* src, const std::int32_t* pos, float* dst,
-                                   bool libm = false) {
+                                   std::uint32_t groups_y, std::uint32_t groups_z, const float* src,
+                                   const std::int32_t* pos, float* dst, bool libm = false) {
     using namespace moe_detail;
     const std::uint32_t n_dims = p.dims_offs & 0xffffu, n_offs = p.dims_offs >> 16;
     const std::uint32_t half = n_dims / 2;
@@ -1176,7 +1176,10 @@ inline void d3d12_ssm_rope_emulate(const D3d12SsmRopeParams& p, std::uint32_t gr
                                 : (sector % 3 == 0 && sector < 3 * s0) ? 0
                                                                        : 3;
                     else
-                        which = sector < s0 ? 0 : sector < s0 + s1 ? 1 : sector < s0 + s1 + s2 ? 2 : 3;
+                        which = sector < s0             ? 0
+                                : sector < s0 + s1      ? 1
+                                : sector < s0 + s1 + s2 ? 2
+                                                        : 3;
                     at += which * p.pos_stride;
                 }
                 float theta = static_cast<float>(pos[at]);

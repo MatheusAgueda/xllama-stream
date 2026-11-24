@@ -1117,7 +1117,8 @@ std::vector<PsoSlot> pso_slots(Gpu& g) {
     static const char* const elt[] = {"binary", "rms_norm", "quant_q8_k", "norm_quant",
                                       "bin_quant"};
     static const char* const moe[] = {"combine", "tail"};
-    static const char* const ssm[] = {"unary", "copy", "get_rows", "conv", "gdn", "rope", "set_rows"};
+    static const char* const ssm[] = {"unary", "copy", "get_rows", "conv",
+                                      "gdn",   "rope", "set_rows"};
     static const char* const route[] = {"route", "emit"};
     static_assert(
         std::size(mmv) == std::size_t{kPsoCount} && std::size(mmid) == std::size_t{kMmidCount} &&
@@ -2085,9 +2086,9 @@ std::string pso_name(const Gpu& g, const ID3D12PipelineState* p) {
     static const char* const kElts[] = {"elt binary", "elt rms_norm", "elt quant q8_K",
                                         "elt rms_norm+q8_K", "elt binary+q8_K"};
     static const char* const kMoes[] = {"moe combine", "moe tail"};
-    static const char* const kSsms[] = {"ssm unary", "ssm copy",           "ssm get_rows",
-                                        "ssm conv",  "ssm gated delta net", "attn rope",
-                                        "attn set_rows"};
+    static const char* const kSsms[] = {
+        "ssm unary",           "ssm copy",  "ssm get_rows", "ssm conv",
+        "ssm gated delta net", "attn rope", "attn set_rows"};
     static_assert(static_cast<int>(std::size(kTypes)) == kPsoCount &&
                       static_cast<int>(std::size(kElts)) == kEltCount &&
                       static_cast<int>(std::size(kMoes)) == kMoeCount &&
@@ -3643,8 +3644,9 @@ struct PlanAct {
     Kind kind = kCopy;
     const std::uint8_t* src = nullptr;
     std::size_t off = 0, bytes = 0;         // kCopy: `bytes` from src to the scratch at off
-    std::int64_t n0 = 0, n1 = 0, bound = 0; // kIds: n1 rows of n0 ids at src, nb1 apart, in [0, bound)
-    std::size_t nb1 = 0, esz = 4;           // kIds: int32 (4) or int64 (8) ids
+    std::int64_t n0 = 0, n1 = 0,
+                 bound = 0;       // kIds: n1 rows of n0 ids at src, nb1 apart, in [0, bound)
+    std::size_t nb1 = 0, esz = 4; // kIds: int32 (4) or int64 (8) ids
     ggml_type wt = GGML_TYPE_F32; // kQuant: d3d12_quantize_activations of src into the scratch at off
     std::size_t stride = 0;
     int k = 0, ncols = 0;
@@ -3652,8 +3654,7 @@ struct PlanAct {
 bool same_act(const PlanAct& a, const PlanAct& b) {
     return a.kind == b.kind && a.src == b.src && a.off == b.off && a.bytes == b.bytes &&
            a.n0 == b.n0 && a.n1 == b.n1 && a.bound == b.bound && a.nb1 == b.nb1 && a.esz == b.esz &&
-           a.wt == b.wt &&
-           a.stride == b.stride && a.k == b.k && a.ncols == b.ncols;
+           a.wt == b.wt && a.stride == b.stride && a.k == b.k && a.ncols == b.ncols;
 }
 struct PlanGuard {
     const ggml_tensor* t = nullptr;
@@ -5723,8 +5724,8 @@ bool dev_supports_op(ggml_backend_dev_t, const ggml_tensor* op) {
     case GGML_OP_ROPE: {
         // A full-attention layer's q and k after their norms (attn_gpu_on).
         D3d12SsmRopePlan p;
-        return attn_gpu() && ssm_f32(op) && d3d12_ssm_rope_plan(op, &p) &&
-               ssm_f32(p.src) && ssm_chain(op);
+        return attn_gpu() && ssm_f32(op) && d3d12_ssm_rope_plan(op, &p) && ssm_f32(p.src) &&
+               ssm_chain(op);
     }
     case GGML_OP_SET_ROWS: {
         // The KV cache write (llama-kv-cache.cpp cpy_k / cpy_v) when the cache
@@ -7438,12 +7439,12 @@ D3d12SelftestRow run_attn_case(ggml_backend_t backend, int kind, std::int64_t t 
     }
 
     int sections[GGML_MROPE_SECTIONS] = {11, 11, 10, 0};
-    ggml_tensor* out = kind == 2 ? ggml_rope_ext(ctx_g, x, aux, nullptr, 128, GGML_ROPE_TYPE_NEOX,
-                                                 262144, 1e6f, 1.f, 0.f, 1.f, 32.f, 1.f)
-                       : rope    ? ggml_rope_multi(ctx_g, x, aux, nullptr, 64, sections,
-                                                   GGML_ROPE_TYPE_IMROPE, 262144, 1e7f, 1.f, 0.f,
-                                                   1.f, 32.f, 1.f)
-                                 : ggml_set_rows(ctx_g, cache, x, aux);
+    ggml_tensor* out =
+        kind == 2 ? ggml_rope_ext(ctx_g, x, aux, nullptr, 128, GGML_ROPE_TYPE_NEOX, 262144, 1e6f,
+                                  1.f, 0.f, 1.f, 32.f, 1.f)
+        : rope    ? ggml_rope_multi(ctx_g, x, aux, nullptr, 64, sections, GGML_ROPE_TYPE_IMROPE,
+                                    262144, 1e7f, 1.f, 0.f, 1.f, 32.f, 1.f)
+                  : ggml_set_rows(ctx_g, cache, x, aux);
     row.n = static_cast<int>(out->ne[0]);
     row.k = static_cast<int>(rope ? out->ne[1] : t);
     ggml_cgraph* gf = ggml_new_graph(ctx_g);
