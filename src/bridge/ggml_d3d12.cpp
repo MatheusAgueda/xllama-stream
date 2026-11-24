@@ -7334,7 +7334,49 @@ void run_fap_case(ggml_backend_t backend, std::vector<D3d12SelftestRow>* out, in
     else if (!row.ok)
         row.error = "mismatch vs the host emulation";
 
+    // softmax(q k^T / sqrt(d) + mask) v in double over the first `rows` tokens
+    auto exact = [&](std::size_t rows) {
+        std::vector<float> res(rows * heads * d, 0.0f);
+        std::vector<double> w(n_kv), acc(d);
+        const double scale = 1.0 / std::sqrt(static_cast<double>(d));
+        const int grp = heads / kv_heads;
+        for (std::size_t t = 0; t < rows; ++t)
+            for (int h = 0; h < heads; ++h) {
+                const float* qr = qh.data() + (t * heads + h) * d;
+                const std::size_t kvo = static_cast<std::size_t>(h / grp) * d;
+                double mx = -std::numeric_limits<double>::infinity();
+                for (int j = 0; j < n_kv; ++j) {
+                    const double mv = masked ? ggml_fp16_to_fp32(mh[t * n_kv + j]) : 0.0;
+                    if (std::isinf(mv)) {
+                        w[j] = mv;
+                        continue;
+                    }
+                    const ggml_fp16_t* kr = kh.data() + static_cast<std::size_t>(j) * gqa + kvo;
+                    double dot = 0.0;
+                    for (int e = 0; e < d; ++e)
+                        dot += static_cast<double>(qr[e]) * ggml_fp16_to_fp32(kr[e]);
+                    w[j] = dot * scale + mv;
+                    mx = std::max(mx, w[j]);
+                }
+                std::fill(acc.begin(), acc.end(), 0.0);
+                double sum = 0.0;
+                for (int j = 0; j < n_kv; ++j) {
+                    if (std::isinf(w[j]))
+                        continue;
+                    const double pj = std::exp(w[j] - mx);
+                    sum += pj;
+                    const ggml_fp16_t* vr = vh.data() + static_cast<std::size_t>(j) * gqa + kvo;
+                    for (int e = 0; e < d; ++e)
+                        acc[e] += pj * ggml_fp16_to_fp32(vr[e]);
+                }
+                float* o = res.data() + (t * heads + h) * d;
+                for (int e = 0; e < d; ++e)
+                    o[e] = sum > 0.0 ? static_cast<float>(acc[e] / sum) : 0.0f;
+            }
+        return res;
+    };
     double cpu_err = 0.0;
+    std::vector<float> cpu_out;
     if (cpu_threads > 0) {
         ggml_cpu_init();
         ggml_init_params cp = {};
@@ -7373,15 +7415,35 @@ void run_fap_case(ggml_backend_t backend, std::vector<D3d12SelftestRow>* out, in
                 if (cok && !cms.empty()) {
                     std::nth_element(cms.begin(), cms.begin() + cms.size() / 2, cms.end());
                     row.packed_gbs = cms[cms.size() / 2];
-                    cpu_err = d3d12_ssm_max_err(got.data(), static_cast<const float*>(co->data),
-                                                got.size());
+                    const float* cf = static_cast<const float*>(co->data);
+                    cpu_err = d3d12_ssm_max_err(got.data(), cf, got.size());
+                    if (!(cpu_err <= 1e-3))
+                        cpu_out.assign(cf, cf + got.size());
                 }
             }
             ggml_free(cc);
         }
+        // ggml-cpu accumulates V in f16 when V is f16 (ggml_vec_mad_f16): its own
+        // error grows with the positions and crosses 1e-3 near 16K (24/11: N 8,
+        // n_kv 16384, split and one pass both 1.032e-3 from it, 1e-7 from their
+        // emulation). Past the bound the softmax in double decides which side is off.
         if (row.ok && !(cpu_err <= 1e-3)) {
-            row.ok = false;
-            row.error = "mismatch vs the CPU backend: " + std::to_string(cpu_err);
+            double gpu_ex = std::numeric_limits<double>::infinity(), cpu_ex = 0.0;
+            if (!cpu_out.empty() && n_chk == got.size()) {
+                const std::vector<float> ex = exact(tokens);
+                gpu_ex = d3d12_ssm_max_err(got.data(), ex.data(), n_chk);
+                cpu_ex = d3d12_ssm_max_err(cpu_out.data(), ex.data(), n_chk);
+                char m[200];
+                std::snprintf(m, sizeof(m),
+                              "[xllama] d3d12 selftest: %s N %d n_kv %d: ggml-cpu %.3g from the "
+                              "exact softmax, the GPU %.3g\n",
+                              row.type.c_str(), n_tok, n_kv, cpu_ex, gpu_ex);
+                log_output(m);
+            }
+            if (!(gpu_ex <= 1e-4 && gpu_ex < cpu_ex)) {
+                row.ok = false;
+                row.error = "mismatch vs the CPU backend: " + std::to_string(cpu_err);
+            }
         }
     }
     cleanup();
