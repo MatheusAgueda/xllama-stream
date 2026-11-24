@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <utility>
 #include <vector>
@@ -963,4 +964,312 @@ TEST_CASE("ggml_d3d12 ssm: grids folded past 65535 groups") {
     CHECK(out == 65535);
     CHECK_FALSE(ssm_detail::fold(std::uint64_t(65535) * 65535 + 1, &in, &out));
     CHECK_FALSE(ssm_detail::fold(0, &in, &out));
+}
+
+// The full-attention layers' rope (KERNEL 6) and KV cache write (KERNEL 7).
+namespace {
+
+struct RopeCase {
+    int mode;
+    std::int64_t ne0, heads, T;
+    int n_dims;
+    float freq_base, freq_scale, attn_factor;
+    std::int32_t pos0;
+    bool spread;   // (i)mrope: h, w, e positions apart from t
+    bool in_place; // the _inplace op: dst is src
+    bool strided;  // src a view of a wider tensor (not in place)
+    int n_offs;
+};
+
+void check_rope(const RopeCase& rc, std::uint32_t seed, bool libm = false, double tol = 1e-5) {
+    const std::int64_t wide = rc.strided ? rc.ne0 + 44 : rc.ne0;
+    Ctx c(static_cast<std::size_t>(3 * wide * rc.heads * rc.T + 8 * rc.T) * sizeof(float) + (4u << 20),
+          false);
+    ggml_context* ctx = c.ctx;
+    std::mt19937 rng(seed);
+    const ggml_type f = GGML_TYPE_F32;
+    ggml_tensor* base = ggml_new_tensor_3d(ctx, f, wide, rc.heads, rc.T);
+    fill(base, &rng, -2.f, 2.f);
+    ggml_tensor* a = rc.strided ? ggml_view_3d(ctx, base, rc.ne0, rc.heads, rc.T, base->nb[1],
+                                               base->nb[2], ggml_row_size(f, 6))
+                                : base;
+    const bool multi = rc.mode != GGML_ROPE_TYPE_NEOX;
+    ggml_tensor* pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, multi ? 4 * rc.T : rc.T);
+    auto* p = static_cast<std::int32_t*>(pos->data);
+    for (std::int64_t i = 0; i < rc.T; ++i) {
+        const auto ii = static_cast<std::int32_t>(i);
+        p[i] = rc.pos0 + ii;
+        if (multi) {
+            p[i + rc.T] = rc.spread ? rc.pos0 / 3 + 2 * ii : rc.pos0 + ii;
+            p[i + 2 * rc.T] = rc.spread ? 7 * ii + 1 : rc.pos0 + ii;
+            p[i + 3 * rc.T] = rc.spread ? 5 + ii : 0;
+        }
+    }
+    const std::vector<float> in(fdata(base), fdata(base) + ggml_nelements(base));
+    int sections[GGML_MROPE_SECTIONS] = {11, 11, 10, 0};
+    ggml_tensor* r = nullptr;
+    if (multi)
+        r = (rc.in_place ? ggml_rope_multi_inplace : ggml_rope_multi)(
+            ctx, a, pos, nullptr, rc.n_dims, sections, rc.mode, 262144, rc.freq_base,
+            rc.freq_scale, 0.f, rc.attn_factor, 32.f, 1.f);
+    else
+        r = (rc.in_place ? ggml_rope_ext_inplace : ggml_rope_ext)(
+            ctx, a, pos, nullptr, rc.n_dims, rc.mode, 262144, rc.freq_base, rc.freq_scale, 0.f,
+            rc.attn_factor, 32.f, 1.f);
+    if (rc.n_offs)
+        ggml_rope_set_offset(r, rc.n_offs);
+    ggml_cgraph* gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, r);
+    compute(ctx, gf);
+
+    D3d12SsmRopePlan pl;
+    REQUIRE(d3d12_ssm_rope_plan(r, &pl));
+    CHECK(pl.groups_x == (rc.ne0 - rc.n_dims / 2 + 255) / 256);
+    CHECK(pl.groups_y == rc.heads);
+    CHECK(pl.groups_z == rc.T);
+    CHECK(pl.n_pos == (multi ? 4 : 1) * rc.T);
+    CHECK(pl.params.dims_offs == (static_cast<std::uint32_t>(rc.n_dims) | rc.n_offs << 16));
+    CHECK(pl.params.theta_scale_bits ==
+          bits(std::pow(rc.freq_base, -2.0f / static_cast<float>(rc.n_dims))));
+    CHECK(pl.params.mode == (rc.mode == GGML_ROPE_TYPE_NEOX    ? kD3d12RopeNeox
+                             : rc.mode == GGML_ROPE_TYPE_MROPE ? kD3d12RopeMrope
+                                                               : kD3d12RopeImrope));
+    CHECK(pl.params.sections == (multi ? (11u | 11u << 8 | 10u << 16) : 0u));
+    std::vector<float> out = poisoned(r);
+    const float* src = fdata(pl.src);
+    if (rc.in_place) {
+        REQUIRE(r->data == a->data);
+        std::copy(in.begin(), in.end(), out.begin());
+        src = out.data();
+    }
+    d3d12_ssm_rope_emulate(pl.params, pl.groups_x, pl.groups_y, pl.groups_z, src,
+                           static_cast<const std::int32_t*>(pos->data), out.data(), libm);
+    check_out(r, out, tol);
+}
+
+// Every n-th float bit pattern, both signs, NaNs aside.
+template <class F>
+void sweep_floats(std::uint32_t step, F&& f) {
+    for (std::uint64_t x = 0; x < (std::uint64_t(1) << 32); x += step) {
+        const auto u = static_cast<std::uint32_t>(x);
+        if ((u & 0x7fffffffu) <= 0x7f800000u)
+            f(u);
+    }
+}
+
+float from_bits(std::uint32_t u) {
+    float x = 0.f;
+    std::memcpy(&x, &u, sizeof(x));
+    return x;
+}
+
+// SET_ROWS of T rows into a cache of `rows`, at distinct random rows; the
+// emulation writes into a copy of the cache as it was, and the whole cache
+// (rows written and rows not) must match ggml-cpu's byte for byte.
+void check_set_rows(ggml_type cache_type, ggml_type ids_type, std::int64_t ne0, std::int64_t rows,
+                    std::int64_t T, std::uint32_t seed, const std::vector<float>& specials = {}) {
+    Ctx c(static_cast<std::size_t>(ne0 * rows * 4 + ne0 * T * 4 + T * 8) + (4u << 20), false);
+    ggml_context* ctx = c.ctx;
+    std::mt19937 rng(seed);
+    ggml_tensor* cache = ggml_new_tensor_2d(ctx, cache_type, ne0, rows);
+    auto* cb = static_cast<std::uint8_t*>(cache->data);
+    for (std::size_t i = 0; i < ggml_nbytes(cache); ++i)
+        cb[i] = static_cast<std::uint8_t>(rng());
+    ggml_tensor* src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, T);
+    fill(src, &rng, -3.f, 3.f);
+    std::copy(specials.begin(), specials.end(), static_cast<float*>(src->data));
+    std::vector<std::int64_t> order(static_cast<std::size_t>(rows));
+    for (std::int64_t i = 0; i < rows; ++i)
+        order[static_cast<std::size_t>(i)] = i;
+    std::shuffle(order.begin(), order.end(), rng);
+    ggml_tensor* ids = ggml_new_tensor_1d(ctx, ids_type, T);
+    for (std::int64_t i = 0; i < T; ++i) {
+        if (ids_type == GGML_TYPE_I64)
+            static_cast<std::int64_t*>(ids->data)[i] = order[static_cast<std::size_t>(i)];
+        else
+            static_cast<std::int32_t*>(ids->data)[i] =
+                static_cast<std::int32_t>(order[static_cast<std::size_t>(i)]);
+    }
+    const std::vector<std::uint8_t> before(cb, cb + ggml_nbytes(cache));
+    ggml_tensor* node = ggml_set_rows(ctx, cache, src, ids);
+    ggml_cgraph* gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, node);
+    compute(ctx, gf);
+
+    D3d12SsmSetRowsPlan pl;
+    REQUIRE(d3d12_ssm_set_rows_plan(node, &pl));
+    const bool f16 = cache_type == GGML_TYPE_F16;
+    CHECK(pl.groups_x == (ne0 + (f16 ? 511 : 255)) / (f16 ? 512 : 256));
+    CHECK(pl.groups_y == T);
+    CHECK(pl.dst_rows == rows);
+    CHECK(pl.params.dst_row_stride == cache->nb[1]);
+    CHECK(pl.params.ids_stride == (ids_type == GGML_TYPE_I64 ? 2u : 1u));
+    CHECK(pl.params.f16 == (f16 ? 1u : 0u));
+    std::vector<std::uint32_t> words(ggml_nbytes(ids) / 4);
+    std::memcpy(words.data(), ids->data, ggml_nbytes(ids));
+    std::vector<std::uint8_t> got = before;
+    d3d12_ssm_set_rows_emulate(pl.params, pl.groups_x, pl.groups_y, fdata(pl.src), words.data(),
+                               got.data());
+    CHECK(std::memcmp(got.data(), cb, got.size()) == 0);
+}
+
+} // namespace
+
+TEST_CASE("ggml_d3d12 ssm: rope emulation matches ggml's CPU op") {
+    const float b7 = 1e7f, b6 = 1e6f;
+    // qwen35moe's full-attention q and k at decode and in a prefill ubatch,
+    // 64 of 256 dims rotated, IMROPE {11, 11, 10, 0}, text positions (t = h = w).
+    check_rope({GGML_ROPE_TYPE_IMROPE, 256, 16, 1, 64, b7, 1.f, 1.f, 12735, false, false, false, 0}, 1);
+    check_rope({GGML_ROPE_TYPE_IMROPE, 256, 2, 1, 64, b7, 1.f, 1.f, 12735, false, false, false, 0}, 2);
+    check_rope({GGML_ROPE_TYPE_IMROPE, 256, 16, 37, 64, b6, 1.f, 1.f, 4000, false, false, false, 0}, 3);
+    // Past the context: theta 262 143 at pair 0, positions apart per section.
+    check_rope({GGML_ROPE_TYPE_IMROPE, 256, 2, 5, 64, b7, 1.f, 1.f, 262139, true, false, false, 0}, 4);
+    check_rope({GGML_ROPE_TYPE_MROPE, 256, 4, 9, 64, b7, 0.5f, 1.25f, 9000, true, false, false, 0}, 5);
+    check_rope({GGML_ROPE_TYPE_NEOX, 128, 8, 6, 128, 1e4f, 1.f, 1.f, 70000, false, false, false, 0}, 6);
+    check_rope({GGML_ROPE_TYPE_NEOX, 600, 3, 4, 64, 1e4f, 1.f, 1.f, 3, false, false, false, 0}, 7);
+    // In place (the graph's own form when a layer ropes its q in place), a
+    // strided source, a rotation offset.
+    check_rope({GGML_ROPE_TYPE_IMROPE, 256, 16, 3, 64, b7, 1.f, 1.f, 100, false, true, false, 0}, 8);
+    check_rope({GGML_ROPE_TYPE_NEOX, 256, 2, 3, 64, b6, 1.f, 1.f, 100, false, true, false, 0}, 9);
+    check_rope({GGML_ROPE_TYPE_IMROPE, 256, 16, 3, 64, b7, 1.f, 1.f, 777, false, false, true, 0}, 10);
+    check_rope({GGML_ROPE_TYPE_NEOX, 256, 2, 3, 64, b6, 1.f, 1.f, 777, false, false, false, 32}, 11);
+    // Past the kernel's positions (d3d12_ssm_rope_pos_bound): the backend's
+    // CPU path with cosf / sinf, as ggml-cpu.
+    check_rope({GGML_ROPE_TYPE_IMROPE, 256, 2, 3, 64, b7, 1.f, 1.f, 900000, true, false, false, 0}, 12,
+               true, 1e-6);
+    check_rope({GGML_ROPE_TYPE_NEOX, 128, 4, 2, 128, 1e4f, 1.f, 1.f, 5000000, false, false, false, 0},
+               13, true, 1e-6);
+}
+
+TEST_CASE("ggml_d3d12 ssm: rope's position bound keeps every theta below 8e5") {
+    auto params = [](float base, float fs, std::uint32_t n_dims) {
+        D3d12SsmRopeParams p;
+        p.dims_offs = n_dims;
+        p.theta_scale_bits = bits(std::pow(base, -2.0f / static_cast<float>(n_dims)));
+        p.freq_scale_bits = bits(fs);
+        return p;
+    };
+    CHECK(d3d12_ssm_rope_pos_bound(params(1e7f, 1.f, 64)) == 800000);
+    CHECK(d3d12_ssm_rope_pos_bound(params(1e7f, 0.5f, 64)) == 1600000);
+    CHECK(d3d12_ssm_rope_pos_bound(params(1e7f, 0.f, 64)) == 0x7fffffff);
+    CHECK(d3d12_ssm_rope_pos_bound(params(1e7f, std::numeric_limits<float>::infinity(), 64)) == 0);
+    // A base below 1 grows theta along the pairs: the last pair's sets the bound,
+    // and the theta the kernel computes there (the same products) stays below.
+    const D3d12SsmRopeParams p = params(0.5f, 1.f, 64);
+    const std::int64_t b = d3d12_ssm_rope_pos_bound(p);
+    REQUIRE(b > 0);
+    REQUIRE(b < 800000);
+    float ts = 0.f;
+    std::memcpy(&ts, &p.theta_scale_bits, sizeof(ts));
+    float theta = static_cast<float>(b - 1);
+    for (int i = 0; i < 31; ++i)
+        theta = theta * ts;
+    CHECK(theta < kD3d12RopeMaxTheta);
+}
+
+TEST_CASE("ggml_d3d12 ssm: rope's cos and sin within 5e-7 of the exact ones below theta 8e5") {
+    double worst = 0.0;
+    auto at = [&](float t) {
+        float c = 0.f, s = 0.f;
+        ssm_detail::rope_cos_sin(t, &c, &s);
+        worst = std::max({worst, std::fabs(c - std::cos(static_cast<double>(t))),
+                          std::fabs(s - std::sin(static_cast<double>(t)))});
+    };
+    sweep_floats(997, [&](std::uint32_t u) {
+        const float t = from_bits(u);
+        if (std::fabs(t) < kD3d12RopeMaxTheta)
+            at(t);
+    });
+    // The floats nearest to multiples of pi / 2, where the reduction cancels.
+    for (std::int64_t k = 1; k < 509000; k += 7) {
+        const float t = static_cast<float>(static_cast<double>(k) * 1.5707963267948966);
+        at(t);
+        at(std::nextafter(t, 0.f));
+        at(std::nextafter(t, 1e9f));
+    }
+    CAPTURE(worst);
+    CHECK(worst < 5e-7);
+}
+
+TEST_CASE("ggml_d3d12 ssm: f16_rne is ggml's float to half, NaN as F16C") {
+    std::size_t bad = 0;
+    sweep_floats(4099, [&](std::uint32_t u) {
+        if (ssm_detail::f16_rne(u) != ggml_fp32_to_fp16(from_bits(u)))
+            ++bad;
+    });
+    CHECK(bad == 0);
+    for (std::uint32_t u : {0x00000000u, 0x80000000u, 0x33000000u, 0x33000001u, 0x33c00000u,
+                            0x34200000u, 0x387fc000u, 0x387fe000u, 0x38800000u, 0x3f801000u,
+                            0x3f803000u, 0x477fe000u, 0x477fefffu, 0x477ff000u, 0x47800000u,
+                            0x7f7fffffu, 0x7f800000u, 0xff800000u})
+        CHECK(ssm_detail::f16_rne(u) == ggml_fp32_to_fp16(from_bits(u)));
+    CHECK(ssm_detail::f16_rne(0x7fc00000u) == 0x7e00u);
+    CHECK(ssm_detail::f16_rne(0x7f800001u) == 0x7e00u);
+    CHECK(ssm_detail::f16_rne(0xffffffffu) == 0xffffu);
+    CHECK(ssm_detail::f16_rne(0x7fa02000u) == 0x7f01u);
+}
+
+TEST_CASE("ggml_d3d12 ssm: set_rows emulation writes the cache as ggml's CPU op") {
+    // Ties to even, overflow, subnormals and signed zeros through ggml-cpu's
+    // from_float (NaN aside: its payload is the CPU's).
+    const std::vector<float> specials = {
+        0.f, -0.f, 65504.f, -65504.f, std::nextafter(65520.f, 0.f), 65520.f, -65520.f, 65536.f,
+        1e9f, from_bits(0x7f800000u), from_bits(0xff800000u), from_bits(0x33800000u),
+        from_bits(0x33000000u), from_bits(0x33000001u), from_bits(0x33c00000u),
+        from_bits(0x34200000u), from_bits(0x387fc000u), from_bits(0x38800000u),
+        from_bits(0x387fe000u), from_bits(0x3f801000u), from_bits(0x3f803000u), 1.f / 3.f, -1e-8f,
+        -from_bits(0x34200000u)};
+    // K and V of qwen35moe's full-attention layer: 2 kv heads x 256 = 512 halves a row.
+    check_set_rows(GGML_TYPE_F16, GGML_TYPE_I64, 512, 4096, 1, 21);
+    check_set_rows(GGML_TYPE_F16, GGML_TYPE_I64, 512, 4096, 97, 22, specials);
+    check_set_rows(GGML_TYPE_F16, GGML_TYPE_I32, 1026, 300, 40, 23, specials);
+    check_set_rows(GGML_TYPE_F32, GGML_TYPE_I64, 512, 1000, 33, 24, specials);
+    check_set_rows(GGML_TYPE_F32, GGML_TYPE_I32, 300, 64, 64, 25);
+}
+
+TEST_CASE("ggml_d3d12 ssm: rope and set_rows nodes the kernels do not take") {
+    Ctx c(8u << 20, false);
+    ggml_context* ctx = c.ctx;
+    const ggml_type f = GGML_TYPE_F32;
+    ggml_tensor* q = ggml_new_tensor_3d(ctx, f, 256, 4, 3);
+    ggml_tensor* pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 3);
+    ggml_tensor* pos4 = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 12);
+    ggml_tensor* ff = ggml_new_tensor_1d(ctx, f, 32);
+    int sections[GGML_MROPE_SECTIONS] = {11, 11, 10, 0};
+    D3d12SsmRopePlan rp;
+    CHECK(d3d12_ssm_rope_plan(
+        ggml_rope_ext(ctx, q, pos, nullptr, 64, GGML_ROPE_TYPE_NEOX, 4096, 1e4f, 1.f, 0.f, 1.f, 32.f, 1.f),
+        &rp));
+    CHECK_FALSE(d3d12_ssm_rope_plan(
+        ggml_rope_ext(ctx, q, pos, nullptr, 64, GGML_ROPE_TYPE_NORMAL, 4096, 1e4f, 1.f, 0.f, 1.f, 32.f, 1.f),
+        &rp));
+    CHECK_FALSE(d3d12_ssm_rope_plan(
+        ggml_rope_ext(ctx, q, pos, ff, 64, GGML_ROPE_TYPE_NEOX, 4096, 1e4f, 1.f, 0.f, 1.f, 32.f, 1.f), &rp));
+    CHECK_FALSE(d3d12_ssm_rope_plan(
+        ggml_rope_ext(ctx, q, pos, nullptr, 64, GGML_ROPE_TYPE_NEOX, 4096, 1e4f, 0.25f, 1.f, 1.f, 32.f, 1.f),
+        &rp));
+    CHECK_FALSE(d3d12_ssm_rope_plan(ggml_rope_multi(ctx, ggml_new_tensor_3d(ctx, f, 128, 4, 3), pos4, nullptr,
+                                                    128, sections, GGML_ROPE_TYPE_VISION, 4096, 1e4f, 1.f, 0.f,
+                                                    1.f, 32.f, 1.f),
+                                    &rp));
+    CHECK_FALSE(d3d12_ssm_rope_plan(
+        ggml_rope_ext(ctx, ggml_new_tensor_4d(ctx, f, 256, 4, 3, 2), pos, nullptr, 64, GGML_ROPE_TYPE_NEOX,
+                      4096, 1e4f, 1.f, 0.f, 1.f, 32.f, 1.f),
+        &rp));
+    // An f16 cache of odd rows, a quantized cache, a batch of streams.
+    D3d12SsmSetRowsPlan sp;
+    ggml_tensor* ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 2);
+    CHECK_FALSE(d3d12_ssm_set_rows_plan(
+        ggml_set_rows(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 3, 8), ggml_new_tensor_2d(ctx, f, 3, 2), ids),
+        &sp));
+    CHECK_FALSE(d3d12_ssm_set_rows_plan(ggml_set_rows(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 64, 8),
+                                                      ggml_new_tensor_2d(ctx, f, 64, 2), ids),
+                                        &sp));
+    CHECK_FALSE(d3d12_ssm_set_rows_plan(ggml_set_rows(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 64, 8, 2),
+                                                      ggml_new_tensor_3d(ctx, f, 64, 2, 2),
+                                                      ggml_new_tensor_2d(ctx, GGML_TYPE_I64, 2, 2)),
+                                        &sp));
+    CHECK(d3d12_ssm_set_rows_plan(
+        ggml_set_rows(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 64, 8), ggml_new_tensor_2d(ctx, f, 64, 2), ids),
+        &sp));
 }

@@ -170,6 +170,86 @@ struct D3d12GdnPlan {
     const ggml_tensor* state = nullptr;
 };
 
+// The full-attention layers' own nodes (qwen35moe.cpp build_layer_attn,
+// llama-kv-cache.cpp cpy_k / cpy_v), between their matmuls and flash attention:
+//   q, k = ROPE(MUL(RMS_NORM(view), q_norm / k_norm), pos)  elt, KERNEL 6
+//   SET_ROWS(cache_k_lN, view(k), k_idxs), same for v      KERNEL 7
+// Without them a layer's q and k go to the CPU and back each token.
+
+// KERNEL 6, rope. u1 = src (may be dst), u2 = the int32 positions, u0 = dst.
+// Grid (ceil((ne0 - n_dims / 2) / 256), ne1, ne2).
+inline constexpr std::uint32_t kD3d12RopeNeox = 0;
+inline constexpr std::uint32_t kD3d12RopeMrope = 1;
+inline constexpr std::uint32_t kD3d12RopeImrope = 2;
+// |theta| below which the shader's reduction by pi / 2 is exact to ~3e-7 rad
+// (k * C1 and k * C2 exact for k < 2^19 quadrants); positions are data, so the
+// backend checks them when it stages them.
+inline constexpr float kD3d12RopeMaxTheta = 8.0e5f;
+
+struct D3d12SsmRopeParams {
+    std::uint32_t ne0 = 0;
+    std::uint32_t dims_offs = 0;  // n_dims | n_offs << 16
+    std::uint32_t pos_stride = 0; // ne2: between an mrope token's 4 positions
+    std::uint32_t src_nb1 = 0;    // in floats
+    std::uint32_t src_nb2 = 0;
+    std::uint32_t dst_nb1 = 0;
+    std::uint32_t dst_nb2 = 0;
+    std::uint32_t theta_scale_bits = 0; // powf(freq_base, -2 / n_dims), the host's
+    std::uint32_t freq_scale_bits = 0;
+    std::uint32_t mscale_bits = 0; // attn_factor
+    std::uint32_t sections = 0;    // 8 bits each, sections[0] lowest
+    std::uint32_t mode = 0;        // kD3d12Rope*
+};
+static_assert(sizeof(D3d12SsmRopeParams) == 12 * sizeof(std::uint32_t), "12 root constants");
+
+// The positions the kernel takes, [0, bound): theta = freq_scale * pos *
+// theta_scale^i stays below kD3d12RopeMaxTheta for every pair i < n_dims / 2.
+inline std::int64_t d3d12_ssm_rope_pos_bound(const D3d12SsmRopeParams& p) {
+    float ts = 0.0f, fs = 0.0f;
+    std::memcpy(&ts, &p.theta_scale_bits, sizeof(ts));
+    std::memcpy(&fs, &p.freq_scale_bits, sizeof(fs));
+    const std::uint32_t half = (p.dims_offs & 0xffffu) / 2;
+    double peak = std::fabs(static_cast<double>(fs));
+    if (ts > 1.0f && half > 1)
+        peak *= std::pow(static_cast<double>(ts), static_cast<double>(half - 1));
+    constexpr std::int64_t kMax = 0x7fffffff;
+    if (!std::isfinite(peak) || !std::isfinite(ts))
+        return 0;
+    if (peak == 0.0)
+        return kMax;
+    const double b = std::floor(static_cast<double>(kD3d12RopeMaxTheta) / peak);
+    return b >= static_cast<double>(kMax) ? kMax : static_cast<std::int64_t>(b);
+}
+
+struct D3d12SsmRopePlan {
+    D3d12SsmRopeParams params;
+    std::uint32_t groups_x = 0;
+    std::uint32_t groups_y = 0; // ne1
+    std::uint32_t groups_z = 0; // ne2
+    std::uint32_t n_pos = 0;    // positions read: ne2, 4 * ne2 for (i)mrope
+    const ggml_tensor* src = nullptr;
+    const ggml_tensor* pos = nullptr;
+};
+
+// KERNEL 7, set_rows. u1 = src, u2 = the ids, u0 = dst. Grid (ceil(ne0 / 512),
+// rows) into f16, (ceil(ne0 / 256), rows) into f32.
+struct D3d12SsmSetRowsParams {
+    std::uint32_t ne0 = 0;
+    std::uint32_t src_row_stride = 0; // in floats
+    std::uint32_t dst_row_stride = 0; // in bytes
+    std::uint32_t ids_stride = 0;     // in 32-bit words: 2 for int64 ids, 1 for int32
+    std::uint32_t f16 = 0;
+};
+
+struct D3d12SsmSetRowsPlan {
+    D3d12SsmSetRowsParams params;
+    std::uint32_t groups_x = 0;
+    std::uint32_t groups_y = 0; // rows written
+    std::uint32_t dst_rows = 0; // rows of dst: every id must be below it
+    const ggml_tensor* src = nullptr;
+    const ggml_tensor* ids = nullptr;
+};
+
 namespace ssm_detail {
 
 using moe_detail::f32;
@@ -318,6 +398,63 @@ inline bool block(const ggml_tensor* src, const std::int64_t* dst_ne, const std:
     return true;
 }
 
+// float -> half by round to nearest even, as F16C's vcvtps2ph (ggml-cpu's
+// from_float on x86): overflow to inf, subnormals, a NaN quieted with the top
+// 10 bits of its payload kept. KERNEL 7's f16_rne.
+inline std::uint16_t f16_rne(std::uint32_t x) {
+    const std::uint32_t s = (x >> 16) & 0x8000u;
+    const std::uint32_t a = x & 0x7fffffffu;
+    if (a > 0x7f800000u)
+        return static_cast<std::uint16_t>(s | 0x7e00u | ((a & 0x7fffffu) >> 13));
+    if (a >= 0x477ff000u)
+        return static_cast<std::uint16_t>(s | 0x7c00u);
+    if (a >= 0x38800000u) {
+        std::uint32_t r = a - 0x38000000u;
+        r += 0xfffu + ((r >> 13) & 1u);
+        return static_cast<std::uint16_t>(s | (r >> 13));
+    }
+    if (a <= 0x33000000u)
+        return static_cast<std::uint16_t>(s);
+    const std::uint32_t sh = 126u - (a >> 23);
+    const std::uint32_t m = (a & 0x7fffffu) | 0x800000u;
+    const std::uint32_t rem = m & ((1u << sh) - 1u), half_ulp = 1u << (sh - 1u);
+    std::uint32_t q = m >> sh;
+    if (rem > half_ulp || (rem == half_ulp && (q & 1u) != 0u))
+        ++q;
+    return static_cast<std::uint16_t>(s | q);
+}
+
+// KERNEL 6's cos and sin of theta, operation for operation: Cody-Waite by
+// pi / 2 (C1 + C2 + C3, the first two exact times k < 2^19), Cephes' sinf and
+// cosf polynomials on [-pi / 4, pi / 4], then the quadrant.
+inline void rope_cos_sin(float theta, float* c, float* s) {
+    using moe_detail::add_rn;
+    using moe_detail::mul_rn;
+    const float kq = std::nearbyint(mul_rn(theta, 6.366197467e-01f)); // HLSL round: to even
+    float r = add_rn(theta, -mul_rn(kq, 1.5625f));
+    r = add_rn(r, -mul_rn(kq, 0.00830078125f));
+    r = add_rn(r, -mul_rn(kq, -4.454454938e-06f));
+    const float z = mul_rn(r, r);
+    float p = mul_rn(-1.9515295891e-4f, z);
+    p = add_rn(p, 8.3321608736e-3f);
+    p = mul_rn(p, z);
+    p = add_rn(p, -1.6666654611e-1f);
+    p = mul_rn(p, z);
+    p = mul_rn(p, r);
+    p = add_rn(p, r);
+    float q = mul_rn(2.443315711809948e-5f, z);
+    q = add_rn(q, -1.388731625493765e-3f);
+    q = mul_rn(q, z);
+    q = add_rn(q, 4.166664568298827e-2f);
+    q = mul_rn(q, z);
+    q = mul_rn(q, z);
+    q = add_rn(q, -mul_rn(0.5f, z));
+    q = add_rn(q, 1.0f);
+    const std::uint32_t quad = static_cast<std::uint32_t>(static_cast<std::int32_t>(kq)) & 3u;
+    *s = quad == 0 ? p : quad == 1 ? q : quad == 2 ? -p : -q;
+    *c = quad == 0 ? q : quad == 1 ? -p : quad == 2 ? -q : p;
+}
+
 } // namespace ssm_detail
 
 // SIGMOID, SOFTPLUS, SILU (UNARY) and SCALE without a bias, f32, rows of
@@ -464,6 +601,155 @@ inline bool d3d12_ssm_get_rows_plan(const ggml_tensor* node, D3d12SsmGetRowsPlan
     p.params.src_row_stride = static_cast<std::uint32_t>(ss);
     p.params.dst_row_stride = static_cast<std::uint32_t>(ds);
     p.params.ids_stride = 1;
+    *plan = p;
+    return true;
+}
+
+// ROPE, forward: NEOX, MROPE or IMROPE (not NORMAL, not VISION) of a 3-d f32
+// tensor into one of its shape, int32 positions, no freq factors, ext_factor 0
+// (no YaRN ramp). In place, or into a tensor apart from the source.
+inline bool d3d12_ssm_rope_plan(const ggml_tensor* node, D3d12SsmRopePlan* plan) {
+    using namespace ssm_detail;
+    if (!node || !plan || node->op != GGML_OP_ROPE || !f32_any(node))
+        return false;
+    D3d12SsmRopePlan p;
+    p.src = node->src[0];
+    p.pos = node->src[1];
+    if (!f32_any(p.src) || !p.pos || p.pos->type != GGML_TYPE_I32 || !ggml_is_contiguous(p.pos) ||
+        node->src[2] != nullptr)
+        return false;
+    std::int32_t op[16];
+    std::memcpy(op, node->op_params, sizeof(op));
+    const std::int32_t n_dims = op[1], mode = op[2], n_offs = op[15];
+    float freq_base = 0.0f, freq_scale = 0.0f, ext_factor = 0.0f, attn_factor = 0.0f;
+    std::memcpy(&freq_base, op + 5, sizeof(float));
+    std::memcpy(&freq_scale, op + 6, sizeof(float));
+    std::memcpy(&ext_factor, op + 7, sizeof(float));
+    std::memcpy(&attn_factor, op + 8, sizeof(float));
+    std::uint32_t kind = 0;
+    if (mode == GGML_ROPE_TYPE_NEOX)
+        kind = kD3d12RopeNeox;
+    else if (mode == GGML_ROPE_TYPE_MROPE)
+        kind = kD3d12RopeMrope;
+    else if (mode == GGML_ROPE_TYPE_IMROPE)
+        kind = kD3d12RopeImrope;
+    else
+        return false;
+    for (int k = 0; k < GGML_MAX_DIMS; ++k)
+        if (node->ne[k] != p.src->ne[k])
+            return false;
+    const std::int64_t ne0 = node->ne[0], ne1 = node->ne[1], ne2 = node->ne[2];
+    if (node->ne[3] != 1 || ext_factor != 0.0f || n_dims < 2 || n_dims % 2 != 0 || n_offs < 0 ||
+        n_offs % 2 != 0 || n_offs + n_dims > ne0 || ne0 >= 65536)
+        return false;
+    const std::int64_t n_pos = kind == kD3d12RopeNeox ? ne2 : 4 * ne2;
+    if (p.pos->ne[0] != n_pos)
+        return false;
+    std::uint32_t sections = 0;
+    if (kind != kD3d12RopeNeox) {
+        std::int64_t sum = 0;
+        for (int k = 0; k < 4; ++k) {
+            if (op[11 + k] < 0 || op[11 + k] > 255)
+                return false;
+            sum += op[11 + k];
+            sections |= static_cast<std::uint32_t>(op[11 + k]) << (8 * k);
+        }
+        if (op[11] + op[12] + op[13] <= 0 || sum > ne0)
+            return false;
+    }
+    // In place, or apart: one thread reads its pair before it writes it, so
+    // a partial overlap would read another thread's result.
+    if (node->data && p.src->data && node->data != p.src->data) {
+        const auto* a = static_cast<const char*>(node->data);
+        const auto* b = static_cast<const char*>(p.src->data);
+        if (a < b + ggml_nbytes(p.src) && b < a + ggml_nbytes(node))
+            return false;
+    }
+    if (node->data && node->data == p.src->data &&
+        (node->nb[1] != p.src->nb[1] || node->nb[2] != p.src->nb[2]))
+        return false;
+    if (ggml_is_empty(node)) {
+        *plan = p;
+        return true;
+    }
+    std::uint64_t s1 = 0, s2 = 0, d1 = 0, d2 = 0;
+    if (!floats(p.src->nb[1], &s1) || !floats(p.src->nb[2], &s2) || !floats(node->nb[1], &d1) ||
+        !floats(node->nb[2], &d2) ||
+        !fits32((ne2 - 1) * s2 + (ne1 - 1) * s1 + static_cast<std::uint64_t>(ne0)) ||
+        !fits32((ne2 - 1) * d2 + (ne1 - 1) * d1 + static_cast<std::uint64_t>(ne0)))
+        return false;
+    const std::uint64_t gx = (static_cast<std::uint64_t>(ne0 - n_dims / 2) + kD3d12SsmThreads - 1) /
+                             kD3d12SsmThreads;
+    if (gx > kD3d12MaxGroups || ne1 > kD3d12MaxGroups || ne2 > kD3d12MaxGroups)
+        return false;
+    p.groups_x = static_cast<std::uint32_t>(gx);
+    p.groups_y = static_cast<std::uint32_t>(ne1);
+    p.groups_z = static_cast<std::uint32_t>(ne2);
+    p.n_pos = static_cast<std::uint32_t>(n_pos);
+    p.params.ne0 = static_cast<std::uint32_t>(ne0);
+    p.params.dims_offs = static_cast<std::uint32_t>(n_dims) | static_cast<std::uint32_t>(n_offs) << 16;
+    p.params.pos_stride = static_cast<std::uint32_t>(ne2);
+    p.params.src_nb1 = static_cast<std::uint32_t>(s1);
+    p.params.src_nb2 = static_cast<std::uint32_t>(s2);
+    p.params.dst_nb1 = static_cast<std::uint32_t>(d1);
+    p.params.dst_nb2 = static_cast<std::uint32_t>(d2);
+    // ggml-cpu's theta_scale, the same expression (powf of the same floats).
+    p.params.theta_scale_bits = bits(std::pow(freq_base, -2.0f / static_cast<float>(n_dims)));
+    p.params.freq_scale_bits = bits(freq_scale);
+    p.params.mscale_bits = bits(attn_factor);
+    p.params.sections = sections;
+    p.params.mode = kind;
+    *plan = p;
+    return true;
+}
+
+// SET_ROWS of 2-d f32 rows into a 2-d f16 or f32 tensor (a 3-d one of a single
+// stream) by a 1-d int64 or int32 index: the KV cache write. f16 needs an even
+// ne0 and 4-byte aligned rows (two halves, one 32-bit store a thread). The ids
+// are data: the backend checks each against dst_rows when it stages them.
+inline bool d3d12_ssm_set_rows_plan(const ggml_tensor* node, D3d12SsmSetRowsPlan* plan) {
+    using namespace ssm_detail;
+    if (!node || !plan || node->op != GGML_OP_SET_ROWS)
+        return false;
+    D3d12SsmSetRowsPlan p;
+    p.src = node->src[0];
+    p.ids = node->src[1];
+    const bool f16 = node->type == GGML_TYPE_F16;
+    if (!f32_any(p.src) || !p.ids ||
+        (p.ids->type != GGML_TYPE_I64 && p.ids->type != GGML_TYPE_I32) ||
+        !ggml_is_contiguous(p.ids) || (!f16 && node->type != GGML_TYPE_F32) ||
+        node->nb[0] != ggml_type_size(node->type))
+        return false;
+    for (int k = 1; k < GGML_MAX_DIMS; ++k)
+        if (p.ids->ne[k] != 1 || (k >= 2 && (node->ne[k] != 1 || p.src->ne[k] != 1)))
+            return false;
+    if (node->ne[0] != p.src->ne[0] || p.ids->ne[0] != p.src->ne[1] || node->ne[1] < 1)
+        return false;
+    if (ggml_is_empty(p.src)) {
+        *plan = p;
+        return true;
+    }
+    std::uint64_t ss = 0;
+    const std::uint64_t w = static_cast<std::uint64_t>(node->ne[0]);
+    const std::uint64_t dst_rows = static_cast<std::uint64_t>(node->ne[1]);
+    const std::uint64_t esz = f16 ? 2 : 4;
+    if (!floats(p.src->nb[1], &ss) ||
+        !fits32((static_cast<std::uint64_t>(p.src->ne[1]) - 1) * ss + w) ||
+        (f16 && (w % 2 != 0 || node->nb[1] % 4 != 0)) ||
+        (dst_rows - 1) * node->nb[1] + w * esz > std::numeric_limits<std::uint32_t>::max())
+        return false;
+    const std::uint64_t per = f16 ? 2 * kD3d12SsmThreads : kD3d12SsmThreads;
+    const std::uint64_t gx = (w + per - 1) / per;
+    if (gx > kD3d12MaxGroups || static_cast<std::uint64_t>(p.src->ne[1]) > kD3d12MaxGroups)
+        return false;
+    p.groups_x = static_cast<std::uint32_t>(gx);
+    p.groups_y = static_cast<std::uint32_t>(p.src->ne[1]);
+    p.dst_rows = static_cast<std::uint32_t>(dst_rows);
+    p.params.ne0 = static_cast<std::uint32_t>(w);
+    p.params.src_row_stride = static_cast<std::uint32_t>(ss);
+    p.params.dst_row_stride = static_cast<std::uint32_t>(node->nb[1]);
+    p.params.ids_stride = p.ids->type == GGML_TYPE_I64 ? 2 : 1;
+    p.params.f16 = f16 ? 1 : 0;
     *plan = p;
     return true;
 }
@@ -850,6 +1136,91 @@ inline void d3d12_ssm_get_rows_emulate(const D3d12SsmGetRowsParams& p, std::uint
         for (std::uint32_t c = 0; c < groups_x * kD3d12SsmThreads && c < p.ne0; ++c)
             std::memcpy(dst + r * p.dst_row_stride + c, src + row * p.src_row_stride + c,
                         sizeof(float));
+    }
+}
+
+// In place when src == dst, as the shader: each pair is read before it is
+// written, and no thread reads another's elements. libm: cos and sin as
+// ggml-cpu takes them (cosf, sinf), the backend's path for positions past
+// d3d12_ssm_rope_pos_bound, where the shader's reduction is no longer exact.
+inline void d3d12_ssm_rope_emulate(const D3d12SsmRopeParams& p, std::uint32_t groups_x,
+                                   std::uint32_t groups_y, std::uint32_t groups_z,
+                                   const float* src, const std::int32_t* pos, float* dst,
+                                   bool libm = false) {
+    using namespace moe_detail;
+    const std::uint32_t n_dims = p.dims_offs & 0xffffu, n_offs = p.dims_offs >> 16;
+    const std::uint32_t half = n_dims / 2;
+    float ts = 0.0f, fs = 0.0f, ms = 0.0f;
+    std::memcpy(&ts, &p.theta_scale_bits, sizeof(ts));
+    std::memcpy(&fs, &p.freq_scale_bits, sizeof(fs));
+    std::memcpy(&ms, &p.mscale_bits, sizeof(ms));
+    const std::uint32_t s0 = p.sections & 0xffu, s1 = (p.sections >> 8) & 0xffu;
+    const std::uint32_t s2 = (p.sections >> 16) & 0xffu, s3 = p.sections >> 24;
+    for (std::uint32_t z = 0; z < groups_z; ++z)
+        for (std::uint32_t y = 0; y < groups_y; ++y) {
+            const std::uint32_t sb = z * p.src_nb2 + y * p.src_nb1;
+            const std::uint32_t db = z * p.dst_nb2 + y * p.dst_nb1;
+            for (std::uint32_t t = 0; t < groups_x * kD3d12SsmThreads && t < p.ne0 - half; ++t) {
+                if (t >= half) {
+                    const std::uint32_t j0 = t - half, j = j0 < n_offs ? j0 : j0 + n_dims;
+                    std::memcpy(dst + db + j, src + sb + j, sizeof(float));
+                    continue;
+                }
+                std::uint32_t at = z;
+                if (p.mode != kD3d12RopeNeox) {
+                    const std::uint32_t sector = t % (s0 + s1 + s2 + s3);
+                    std::uint32_t which;
+                    if (p.mode == kD3d12RopeImrope)
+                        which = (sector % 3 == 1 && sector < 3 * s1)   ? 1
+                                : (sector % 3 == 2 && sector < 3 * s2) ? 2
+                                : (sector % 3 == 0 && sector < 3 * s0) ? 0
+                                                                       : 3;
+                    else
+                        which = sector < s0 ? 0 : sector < s0 + s1 ? 1 : sector < s0 + s1 + s2 ? 2 : 3;
+                    at += which * p.pos_stride;
+                }
+                float theta = static_cast<float>(pos[at]);
+                for (std::uint32_t k = 0; k < t; ++k)
+                    theta = mul_rn(theta, ts);
+                theta = mul_rn(fs, theta);
+                float c = 0.0f, s = 0.0f;
+                if (libm) {
+                    c = std::cos(theta);
+                    s = std::sin(theta);
+                } else {
+                    ssm_detail::rope_cos_sin(theta, &c, &s);
+                }
+                c = mul_rn(c, ms);
+                s = mul_rn(s, ms);
+                const std::uint32_t i0 = n_offs + t, i1 = i0 + half;
+                const float x0 = src[sb + i0], x1 = src[sb + i1];
+                const float y0 = add_rn(mul_rn(x0, c), -mul_rn(x1, s));
+                const float y1 = add_rn(mul_rn(x0, s), mul_rn(x1, c));
+                dst[db + i0] = y0;
+                dst[db + i1] = y1;
+            }
+        }
+}
+
+// ids: the binding's 32-bit words (an int64 id's low word first). dst: bytes.
+inline void d3d12_ssm_set_rows_emulate(const D3d12SsmSetRowsParams& p, std::uint32_t groups_x,
+                                       std::uint32_t groups_y, const float* src,
+                                       const std::uint32_t* ids, std::uint8_t* dst) {
+    const std::uint32_t per = p.f16 ? 2 * kD3d12SsmThreads : kD3d12SsmThreads;
+    for (std::uint32_t r = 0; r < groups_y; ++r) {
+        const std::uint32_t row = ids[r * p.ids_stride];
+        const float* s = src + r * p.src_row_stride;
+        std::uint8_t* d = dst + static_cast<std::uint64_t>(row) * p.dst_row_stride;
+        for (std::uint32_t e = 0; e < groups_x * per && e < p.ne0; ++e) {
+            if (p.f16) {
+                std::uint32_t x = 0;
+                std::memcpy(&x, s + e, sizeof(x));
+                const std::uint16_t h = ssm_detail::f16_rne(x);
+                std::memcpy(d + 2 * e, &h, sizeof(h));
+            } else {
+                std::memcpy(d + 4 * e, s + e, sizeof(float));
+            }
+        }
     }
 }
 

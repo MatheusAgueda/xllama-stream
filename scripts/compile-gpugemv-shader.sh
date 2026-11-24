@@ -12,7 +12,7 @@
 #   shaders/ggml_d3d12_get_rows_q6_k.hlsl → ggml_d3d12_get_rows_q6_k_dxil.h (cs_6_4)
 #   shaders/ggml_d3d12_elt.hlsl → ggml_d3d12_elt_{binary,rms_norm,quant_q8_k,norm_quant,bin_quant}_dxil.h (cs_6_4, -D KERNEL)
 #   shaders/ggml_d3d12_moe.hlsl → ggml_d3d12_moe_{combine,tail}_dxil.h (cs_6_4, -D KERNEL)
-#   shaders/ggml_d3d12_ssm.hlsl → ggml_d3d12_ssm_{unary,copy,get_rows,conv,gdn}_dxil.h (cs_6_4, -D KERNEL)
+#   shaders/ggml_d3d12_ssm.hlsl → ggml_d3d12_ssm_{unary,copy,get_rows,conv,gdn,rope,set_rows}_dxil.h (cs_6_4, -D KERNEL)
 #   shaders/ggml_d3d12_route.hlsl → ggml_d3d12_route_{route,emit,hs}_dxil.h (cs_6_4, -D KERNEL, -Gis)
 #   shaders/ggml_d3d12_fap.hlsl → ggml_d3d12_fap_dxil.h (cs_6_4, FLASH_ATTN_EXT of a prefill ubatch)
 #   variants: shaders/variants.txt → $VARIANTS_OUT/<tag>/<slot>.dxil, raw blobs
@@ -143,7 +143,7 @@ compile_target() {
 		;;
 	ssm)
 		local k n name sym
-		for k in 1:unary:Unary 2:copy:Copy 3:get_rows:GetRows 4:conv:Conv 5:gdn:Gdn; do
+		for k in 1:unary:Unary 2:copy:Copy 3:get_rows:GetRows 4:conv:Conv 5:gdn:Gdn 6:rope:Rope 7:set_rows:SetRows; do
 			IFS=: read -r n name sym <<<"$k"
 			compile_one "$ROOT/shaders/ggml_d3d12_ssm.hlsl" \
 				"$ROOT/shaders/generated/ggml_d3d12_ssm_${name}_dxil.h" \
