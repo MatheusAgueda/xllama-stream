@@ -18,6 +18,7 @@ add_executable(xllama-tests
     test_prefix_cache.cpp
     test_chat_history.cpp
     test_diffusion.cpp
+    test_upscale.cpp
     test_stability_attribution.cpp
     test_routing_policy.cpp
     test_cancel_policy.cpp

@@ -8,6 +8,8 @@
 #include "xllama/inference_params.h"
 #include "xllama/training_params.h"
 
+#include <string>
+
 namespace xllama::bridge {
 
 // Thin wrappers kept for backward compatibility with existing UWP code.
@@ -80,6 +82,24 @@ void run_mic_probe();
 // LocalFolder\diffuse.flag (headless) or diffuse-inproc.flag (in-process
 // experiment) — see diffuse.cpp for the model contract.
 void run_diffuse();
+
+// 4x photo upscale (Real-ESRGAN x4plus, plain ORT DirectML, static tiles) for POST
+// /v1/images/upscale — see upscale.cpp for the model contract. `image` = the encoded file
+// (JPEG/PNG/…), `format` "png" or JPEG otherwise, `max_side` > 0 shrinks the 4x result so its
+// longer side fits, `pad` = tile context (clamped to T/4). Thread-safe; the session stays loaded
+// until release_upscale() or a failed run.
+constexpr long long kUpscaleMaxInPixels =
+    1'500'000; // the Ally's gv-media cap: a 24 MP result in RAM at most
+struct UpscaleResult {
+    int status = 500; // 200, 413 (input too large) or 500
+    std::string error;
+    std::string bytes; // the encoded result
+    int in_w = 0, in_h = 0, out_w = 0, out_h = 0, tile = 0, pad = 0, tiles = 0;
+    double seconds = 0, gpu_seconds = 0; // whole request / decode + tiles
+};
+UpscaleResult run_upscale(const std::string& image, const std::string& format, int max_side,
+                          int pad);
+void release_upscale();
 
 // Logit-parity dump: greedy 1-token forward pass on the ORT backend, writing the
 // last prefill-token logits to LocalState\logits.bin (+ .json sidecar, + a

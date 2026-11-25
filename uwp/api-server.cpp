@@ -44,6 +44,7 @@
     #include "xllama/tool_request.h"
     #include "xllama/tool_template.h"
     #include "xllama/tool_transcript.h"
+    #include "xllama/upscale/tile_plan.h"
     #include "xllama/utf8_utils.h"
 
     #include <algorithm>
@@ -51,6 +52,7 @@
     #include <charconv>
     #include <chrono>
     #include <climits>
+    #include <cmath>
     #include <cstdio>
     #include <cstdlib>
     #include <ctime>
@@ -247,17 +249,38 @@ void write_raw(StreamSocket const& socket, const std::string& out) {
     writer.DetachStream();
 }
 
-void write_response(StreamSocket const& socket, const char* status, const std::string& json) {
+std::string response_head(const char* status, size_t content_length) {
     std::string out = "HTTP/1.1 ";
     out += status;
     out += "\r\nContent-Type: application/json\r\nContent-Length: ";
-    out += std::to_string(json.size());
+    out += std::to_string(content_length);
     // Allow-Origin alone is not enough for browser clients: they send a custom
     // Authorization header + application/json, which triggers a CORS preflight
     // (handled separately in handle_connection).
     out += "\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n";
+    return out;
+}
+
+void write_response(StreamSocket const& socket, const char* status, const std::string& json) {
+    std::string out = response_head(status, json.size());
     out += json;
     write_raw(socket, out);
+}
+
+// Tens of MB of base64 (the upscale result): the UTF-8 bytes as they are, without write_raw's
+// UTF-16 round trip, which would hold the body three times over in the shared heap.
+void write_response_bytes(StreamSocket const& socket, const char* status, const std::string& json) {
+    const std::string head = response_head(status, json.size());
+    auto bytes = [](const std::string& s) {
+        const auto* p = reinterpret_cast<const uint8_t*>(s.data());
+        return winrt::array_view<const uint8_t>(p, p + s.size());
+    };
+    DataWriter writer(socket.OutputStream());
+    writer.WriteBytes(bytes(head));
+    writer.WriteBytes(bytes(json));
+    writer.StoreAsync().get();
+    writer.FlushAsync().get();
+    writer.DetachStream();
 }
 
 class PullJsonStream {
@@ -1793,6 +1816,70 @@ std::string handle_images_locked(const std::string& body, const char*& status) {
     return winrt::to_string(out.Stringify());
 }
 
+// POST /v1/images/upscale (alias POST /v1/upscale, the Ally's gv-media contract):
+//   {"image_b64": "<JPEG/PNG…>", "format": "png"|"jpg", "max_side": 0, "pad": 16}
+//   → {"image_b64", "model", "input": "WxH", "size": "WxH", "seconds", "gpu_seconds", "tile",
+//   "pad", "tiles"}
+// Runs on its own lock beside the chat (upscale.cpp); one upscale at a time, a second one gets 503.
+std::mutex g_upscale_mtx;
+
+std::string handle_upscale(const std::string& body, const char*& status) {
+    JsonObject root{nullptr};
+    if (!JsonObject::TryParse(winrt::to_hstring(body), root) || root == nullptr) {
+        status = "400 Bad Request";
+        return error_json("invalid JSON body");
+    }
+    if (root.GetNamedBoolean(L"release", false)) {
+        ::xllama::bridge::release_upscale();
+        JsonObject ok;
+        ok.Insert(L"released", JsonValue::CreateBooleanValue(true));
+        status = "200 OK";
+        return winrt::to_string(ok.Stringify());
+    }
+    const auto image =
+        ::xllama::upscale::base64_decode(winrt::to_string(root.GetNamedString(L"image_b64", L"")));
+    if (!image || image->empty()) {
+        status = "400 Bad Request";
+        return error_json("missing or invalid 'image_b64'");
+    }
+    const std::string format = winrt::to_string(root.GetNamedString(L"format", L"png"));
+    const int max_side = ::xllama::clamp_api_int(root.GetNamedNumber(L"max_side", 0), 0, 65535);
+    const int pad = ::xllama::clamp_api_int(root.GetNamedNumber(L"pad", 16), 0, 128);
+    auto r = ::xllama::bridge::run_upscale(*image, format, max_side, pad);
+    if (r.status != 200) {
+        status = r.status == 413 ? "413 Payload Too Large" : "500 Internal Server Error";
+        return error_json("upscale failed: " + r.error);
+    }
+    auto num = [](double v) { return JsonValue::CreateNumberValue(v); };
+    auto dims = [](int w, int h) {
+        return JsonValue::CreateStringValue(
+            winrt::to_hstring(std::to_string(w) + "x" + std::to_string(h)));
+    };
+    JsonObject out; // everything but the image; the image is spliced in as text below
+    out.Insert(L"model", JsonValue::CreateStringValue(L"realesrgan-x4plus-xbox"));
+    out.Insert(L"format", JsonValue::CreateStringValue(format == "png" ? L"png" : L"jpg"));
+    out.Insert(L"input", dims(r.in_w, r.in_h));
+    out.Insert(L"size", dims(r.out_w, r.out_h));
+    out.Insert(L"seconds", num(std::round(r.seconds * 100) / 100));
+    out.Insert(L"gpu_seconds", num(std::round(r.gpu_seconds * 100) / 100));
+    out.Insert(L"tile", num(r.tile));
+    out.Insert(L"pad", num(r.pad));
+    out.Insert(L"tiles", num(r.tiles));
+    const std::string meta = winrt::to_string(out.Stringify()); // "{...}", never empty
+    // A JsonValue would hold the base64 in UTF-16 (twice its size) and Stringify would copy it
+    // again.
+    std::string b64 = base64_encode(r.bytes);
+    std::string().swap(r.bytes);
+    std::string json;
+    json.reserve(b64.size() + meta.size() + 16);
+    json += "{\"image_b64\":\"";
+    json += b64;
+    json += "\",";
+    json.append(meta, 1, std::string::npos);
+    status = "200 OK";
+    return json;
+}
+
 bool same_pull_manifest_entry(const ::xllama::ManifestEntry& a, const ::xllama::ManifestEntry& b) {
     if (a.name != b.name || a.kind != b.kind || a.role != b.role ||
         a.hf_base_url != b.hf_base_url || a.n_ctx != b.n_ctx || a.files.size() != b.files.size())
@@ -2295,6 +2382,30 @@ void handle_connection(StreamSocket const& socket, uint64_t generation,
             // write_response throw, and the request was still served.
             record_outcome(ticket, status, json);
             write_response(socket, status, json);
+            return;
+        }
+
+        // 4x upscale on the GPU, beside the chat: not the compute permit nor the hub
+        // (handle_upscale).
+        if (req.method == "POST" &&
+            (req.path == "/v1/images/upscale" || req.path == "/v1/upscale")) {
+            std::unique_lock<std::mutex> up(g_upscale_mtx, std::try_to_lock);
+            if (!up.owns_lock() || ::xllama::session_hub().preloading.load()) {
+                activity().busy();
+                write_response(socket, ::xllama::kApiBusyStatus, error_json("busy"));
+                return;
+            }
+            auto ticket = activity().begin("upscale");
+            const char* status = "200 OK";
+            std::string json;
+            try {
+                json = handle_upscale(req.body, status);
+            } catch (...) {
+                status = "500 Internal Server Error";
+                json = error_json("upscale failed");
+            }
+            record_outcome(ticket, status, json);
+            write_response_bytes(socket, status, json);
             return;
         }
 
