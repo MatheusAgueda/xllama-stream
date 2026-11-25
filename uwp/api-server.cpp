@@ -240,12 +240,30 @@ HttpRequest read_request(StreamSocket const& socket) {
     return req;
 }
 
+// Store and flush what `writer` holds (`bytes` of it) within http_write_deadline.
+// Past it the operation is cancelled and this throws, which every caller already
+// handles as «the client is gone»; an error from the store itself throws as before.
+template <typename Op>
+void await_reply_io(Op const& op, winrt::Windows::Foundation::TimeSpan limit) {
+    if (op.wait_for(limit) == winrt::Windows::Foundation::AsyncStatus::Started) {
+        op.Cancel();
+        throw winrt::hresult_error(HRESULT_FROM_WIN32(ERROR_TIMEOUT), L"reply write deadline");
+    }
+    op.GetResults();
+}
+
+void store_with_deadline(DataWriter const& writer, size_t bytes) {
+    const auto limit = std::chrono::duration_cast<winrt::Windows::Foundation::TimeSpan>(
+        ::xllama::http_write_deadline(bytes));
+    await_reply_io(writer.StoreAsync(), limit);
+    await_reply_io(writer.FlushAsync(), limit);
+}
+
 void write_raw(StreamSocket const& socket, const std::string& out) {
     DataWriter writer(socket.OutputStream());
     writer.UnicodeEncoding(UnicodeEncoding::Utf8);
     writer.WriteString(winrt::to_hstring(out));
-    writer.StoreAsync().get();
-    writer.FlushAsync().get();
+    store_with_deadline(writer, out.size());
     writer.DetachStream();
 }
 
@@ -278,8 +296,7 @@ void write_response_bytes(StreamSocket const& socket, const char* status, const 
     DataWriter writer(socket.OutputStream());
     writer.WriteBytes(bytes(head));
     writer.WriteBytes(bytes(json));
-    writer.StoreAsync().get();
-    writer.FlushAsync().get();
+    store_with_deadline(writer, head.size() + json.size());
     writer.DetachStream();
 }
 
@@ -308,8 +325,7 @@ class PullJsonStream {
         frame += "\r\n";
         try {
             m_writer.WriteString(winrt::to_hstring(frame));
-            m_writer.StoreAsync().get();
-            m_writer.FlushAsync().get();
+            store_with_deadline(m_writer, frame.size());
             return true;
         } catch (...) {
             return false;
@@ -322,8 +338,7 @@ class PullJsonStream {
         m_finished = true;
         try {
             m_writer.WriteString(L"0\r\n\r\n");
-            m_writer.StoreAsync().get();
-            m_writer.FlushAsync().get();
+            store_with_deadline(m_writer, 5);
             m_writer.DetachStream();
         } catch (...) {
         }
@@ -378,10 +393,10 @@ SseHeadStatus write_sse_head(StreamSocket const& socket) {
     try {
         DataWriter writer(socket.OutputStream());
         writer.UnicodeEncoding(UnicodeEncoding::Utf8);
-        writer.WriteString(winrt::to_hstring(::xllama::sse_response_head()));
+        const std::string head = ::xllama::sse_response_head();
+        writer.WriteString(winrt::to_hstring(head));
         try {
-            writer.StoreAsync().get();
-            writer.FlushAsync().get();
+            store_with_deadline(writer, head.size());
             writer.DetachStream();
             return SseHeadStatus::Written;
         } catch (...) {
@@ -552,8 +567,7 @@ class SseStream {
         try {
             const std::string framed = ::xllama::chunk_frame(::xllama::sse_event(payload));
             m_writer.WriteString(winrt::to_hstring(framed));
-            m_writer.StoreAsync().get();
-            m_writer.FlushAsync().get();
+            store_with_deadline(m_writer, framed.size());
             return true;
         } catch (...) {
             // The client is gone: stop emitting and abort the generation.
@@ -567,10 +581,10 @@ class SseStream {
             return;
         m_finished = true;
         try {
-            m_writer.WriteString(winrt::to_hstring(::xllama::chunk_frame(::xllama::sse_done()) +
-                                                   ::xllama::chunk_final()));
-            m_writer.StoreAsync().get();
-            m_writer.FlushAsync().get();
+            const std::string tail =
+                ::xllama::chunk_frame(::xllama::sse_done()) + ::xllama::chunk_final();
+            m_writer.WriteString(winrt::to_hstring(tail));
+            store_with_deadline(m_writer, tail.size());
             m_writer.DetachStream();
         } catch (...) {
             if (m_abort)

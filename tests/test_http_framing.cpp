@@ -5,6 +5,7 @@
 
 #include "xllama/http_framing.h"
 
+#include <cstdint>
 #include <string>
 
 using xllama::parse_http_head;
@@ -76,4 +77,15 @@ TEST_CASE("http head: malformed request lines and fields are 400") {
 TEST_CASE("http_head_end finds the terminator or reports an incomplete head") {
     CHECK(xllama::http_head_end("GET / HTTP/1.1\r\n\r\nbody") == 18);
     CHECK(xllama::http_head_end("GET / HTTP/1.1\r\n") == std::string::npos);
+}
+
+TEST_CASE("http_write_deadline: a 30 s floor plus 256 KiB/s for the bytes") {
+    using std::chrono::milliseconds;
+    CHECK(xllama::http_write_deadline(0) == milliseconds(30000));
+    CHECK(xllama::http_write_deadline(200) == milliseconds(30000)); // an SSE event: the floor
+    CHECK(xllama::http_write_deadline(256 * 1024) == milliseconds(31000));
+    CHECK(xllama::http_write_deadline(128 * 1024) == milliseconds(30500));
+    // A 40 MB upscale reply to a slow client still fits; nothing overflows near SIZE_MAX.
+    CHECK(xllama::http_write_deadline(40'000'000) > std::chrono::seconds(180));
+    CHECK(xllama::http_write_deadline(SIZE_MAX) > std::chrono::hours(1));
 }

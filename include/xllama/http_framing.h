@@ -20,6 +20,20 @@ inline constexpr size_t kHttpMaxBody = 8 * 1024 * 1024; // larger is 413, not cl
 inline constexpr std::chrono::seconds kHttpHeadDeadline{10};
 inline constexpr std::chrono::seconds kHttpBodyDeadline{15};
 
+// Replies have a deadline too. A client that stops reading fills the TCP window,
+// and an unbounded store never returns: a streamed chat then holds the compute
+// permit and its connection slot for as long as the peer stays connected
+// (audit 2026-11-25, risk 3). Each write gets a 30 s floor plus 256 KiB/s for
+// its bytes, so a 40 MB upscale reply to a slow client still fits (~190 s).
+inline constexpr std::chrono::seconds kHttpWriteFloor{30};
+inline constexpr size_t kHttpWriteMinRate = 256 * 1024; // bytes per second
+
+inline std::chrono::milliseconds http_write_deadline(size_t bytes) {
+    return kHttpWriteFloor + std::chrono::milliseconds(static_cast<long long>(
+                                 bytes / kHttpWriteMinRate * 1000 +
+                                 bytes % kHttpWriteMinRate * 1000 / kHttpWriteMinRate));
+}
+
 struct HttpHead {
     // 0 when the head is valid; otherwise the HTTP status to answer with
     // (400, 411, 413 or 431) and `error` says why.
