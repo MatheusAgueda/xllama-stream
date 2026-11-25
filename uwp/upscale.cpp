@@ -16,7 +16,10 @@
 // 0.95 or PNG; the optional max_side shrink is the encoder's Fant transform).
 //
 // The session stays loaded between requests (a queue of catalogue photos pays the DirectML graph
-// build once) and is dropped by release_upscale() or a failed run.
+// build once) and is dropped by release_upscale(), a failed run or the next GGUF load on the GPU
+// (the reclaim hook, platform.h). The session shares the process's one D3D12 device with the
+// chat, so it is only built inside the memory gate (tile_plan.h budget_refusal): a DirectML init
+// that did not fit removed the device and stalled the chat (xllama-net 1.7.12.106, 25/11).
 
 #include "inference-bridge.h"
 
@@ -43,6 +46,7 @@
     #include <algorithm>
     #include <chrono>
     #include <cstdio>
+    #include <cstdlib>
     #include <cstring>
     #include <memory>
     #include <mutex>
@@ -66,6 +70,23 @@ struct Engine {
 
 std::mutex g_engine_mtx; // guards g_engine; the API route serialises requests before this
 std::unique_ptr<Engine> g_engine;
+
+// Registered once a session is up: a GGUF load on the GPU waits for a running upscale, then sizes
+// itself against a device the upscale no longer holds.
+void reclaim_for_gguf() noexcept {
+    try {
+        std::lock_guard<std::mutex> lk(g_engine_mtx);
+        if (g_engine) {
+            g_engine.reset();
+            log_output("[xllama] upscale: session released for a GGUF load\n");
+        }
+    } catch (...) {
+    }
+}
+
+std::size_t need_mb(const char* env, std::size_t fallback) {
+    return upscale::need_mb_from(std::getenv(env), fallback);
+}
 
 // A DML session as in diffuse.cpp: sequential, no memory pattern, EXTENDED optimisation.
 Engine& engine() {
@@ -151,7 +172,30 @@ UpscaleResult run_upscale(const std::string& image, const std::string& format, i
         if (src.size() != static_cast<size_t>(w) * h * 4)
             throw std::runtime_error("decoder returned " + std::to_string(src.size()) + " bytes");
 
+        // the gate: the DXGI figures only through an adapter a GGUF load already opened (no
+        // adapter = no GGUF on the GPU, nothing to protect); the GPU judged before a build, the
+        // app cap (up to ~350 MB of buffers for a 1.5 MP input) on every request
+        const bool build = !(g_engine && g_engine->session);
+        const GpuMemInfo g0 = gpu_mem_probe_open() ? gpu_mem_info() : GpuMemInfo{};
+        if (g0.available) {
+            r.dxgi_before_mb = g0.current_mb;
+            r.dxgi_budget_mb = g0.budget_mb;
+        }
+        const AppMemInfo a0 = app_mem_info();
+        const std::string refusal = upscale::budget_refusal(
+            {g0.current_mb, g0.budget_mb, g0.available},
+            build ? need_mb("XLLAMA_UPSCALE_GPU_NEED_MB", 512) : 0,
+            {a0.usage_mb, a0.limit_mb, a0.available}, need_mb("XLLAMA_UPSCALE_APP_NEED_MB", 384));
+        if (!refusal.empty()) {
+            r.status = 503;
+            r.error = refusal;
+            log_output("[xllama] upscale: 503 " + refusal + "\n");
+            return r;
+        }
         Engine& e = engine();
+        r.session_built = build;
+        if (build)
+            set_gpu_reclaim_hook(&reclaim_for_gguf);
         const int T = e.tile;
         pad = std::clamp(pad, 0, T / 4);
         const auto py = upscale::plan_axis(h, T, pad), pxs = upscale::plan_axis(w, T, pad);
@@ -208,6 +252,14 @@ UpscaleResult run_upscale(const std::string& image, const std::string& format, i
             }
         }
         const auto t1 = std::chrono::steady_clock::now();
+        if (g0.available) {
+            r.dxgi_after_mb = gpu_mem_info().current_mb;
+            if (build)
+                log_output("[xllama] upscale: session built, dxgi " +
+                           std::to_string(r.dxgi_before_mb) + " -> " +
+                           std::to_string(r.dxgi_after_mb) + " / " +
+                           std::to_string(r.dxgi_budget_mb) + " MB\n");
+        }
 
         // encode
         InMemoryRandomAccessStream os;

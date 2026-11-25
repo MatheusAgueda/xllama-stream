@@ -4,6 +4,7 @@
 #include "xllama/platform.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -174,6 +175,24 @@ std::size_t private_mb() noexcept {
 #endif
 }
 
+namespace {
+std::atomic<bool> g_gpu_probe_open{false};
+std::atomic<GpuReclaimHook> g_gpu_reclaim{nullptr};
+} // namespace
+
+bool gpu_mem_probe_open() noexcept {
+    return g_gpu_probe_open.load(std::memory_order_acquire);
+}
+
+void set_gpu_reclaim_hook(GpuReclaimHook hook) noexcept {
+    g_gpu_reclaim.store(hook, std::memory_order_release);
+}
+
+void run_gpu_reclaim_hook() noexcept {
+    if (GpuReclaimHook h = g_gpu_reclaim.load(std::memory_order_acquire))
+        h();
+}
+
 GpuMemInfo gpu_mem_info() noexcept {
 #ifdef XLLAMA_UWP
     // Adapter cached for process lifetime: gpu_mem_info() is called per phase
@@ -189,6 +208,7 @@ GpuMemInfo gpu_mem_info() noexcept {
             adapter1->Release();
         }
         factory->Release();
+        g_gpu_probe_open.store(true, std::memory_order_release);
         return adapter3;
     }();
 

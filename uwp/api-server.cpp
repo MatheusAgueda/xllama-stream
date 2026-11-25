@@ -1847,6 +1847,11 @@ std::string handle_upscale(const std::string& body, const char*& status) {
     const int pad = ::xllama::clamp_api_int(root.GetNamedNumber(L"pad", 16), 0, 128);
     auto r = ::xllama::bridge::run_upscale(*image, format, max_side, pad);
     if (r.status != 200) {
+        // 503 = the memory gate: nothing touched the device, try later or elsewhere
+        if (r.status == 503) {
+            status = "503 Service Unavailable";
+            return error_json("upscale refused: " + r.error);
+        }
         status = r.status == 413 ? "413 Payload Too Large" : "500 Internal Server Error";
         return error_json("upscale failed: " + r.error);
     }
@@ -1865,6 +1870,10 @@ std::string handle_upscale(const std::string& body, const char*& status) {
     out.Insert(L"tile", num(r.tile));
     out.Insert(L"pad", num(r.pad));
     out.Insert(L"tiles", num(r.tiles));
+    out.Insert(L"session_built", JsonValue::CreateBooleanValue(r.session_built));
+    out.Insert(L"dxgi_before_mb", num(static_cast<double>(r.dxgi_before_mb)));
+    out.Insert(L"dxgi_after_mb", num(static_cast<double>(r.dxgi_after_mb)));
+    out.Insert(L"dxgi_budget_mb", num(static_cast<double>(r.dxgi_budget_mb)));
     const std::string meta = winrt::to_string(out.Stringify()); // "{...}", never empty
     // A JsonValue would hold the base64 in UTF-16 (twice its size) and Stringify would copy it
     // again.

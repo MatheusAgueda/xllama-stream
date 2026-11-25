@@ -304,6 +304,7 @@ inline int apply_gguf_gpu_layers(int requested, llama_model_params& mparams,
     mparams.devices = no_devices;
     if (requested <= 0)
         return 0;
+    run_gpu_reclaim_hook(); // the upscale session gives the shared device back first (upscale.cpp)
     log_gguf_ws("before d3d12");
     if (!ggml_d3d12_register()) {
         log_output("[xllama] gguf gpu layers: d3d12 backend unavailable, using the CPU\n");

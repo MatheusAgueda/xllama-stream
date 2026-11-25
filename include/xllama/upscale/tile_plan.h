@@ -154,4 +154,48 @@ inline std::optional<std::string> base64_decode(std::string_view in) {
     return out;
 }
 
+// BUDGET GATE. The upscale session shares the process's one D3D12 device with the chat's GGUF
+// layers. On 25/11 (xllama-net 1.7.12.106, the 35B loaded, dxgi 4012/4147 MB, app 4608/5120 MB)
+// the DirectML init removed that device (887A0005 in DmlGraphFusionHelper, then 887A0007) and the
+// chat's next decode stalled until the watchdog. So a session is only built when both pools have
+// `need` free; otherwise the request is refused before anything touches the device.
+// "" = go ahead, else the refusal with the figures. A need of 0 or a pool the OS does not report
+// (known == false) is not judged.
+struct PoolFigures {
+    std::size_t used_mb = 0, cap_mb = 0;
+    bool known = false;
+};
+
+inline std::string budget_refusal(const char* pool, PoolFigures f, std::size_t need_mb) {
+    if (!f.known || need_mb == 0 || f.cap_mb == 0)
+        return {};
+    const std::size_t free_mb = f.used_mb < f.cap_mb ? f.cap_mb - f.used_mb : 0;
+    if (free_mb >= need_mb)
+        return {};
+    return std::string(pool) + ": " + std::to_string(free_mb) + " MB free of " +
+           std::to_string(f.cap_mb) + " MB, need " + std::to_string(need_mb) + " MB";
+}
+
+inline std::string budget_refusal(PoolFigures gpu, std::size_t gpu_need_mb, PoolFigures app,
+                                  std::size_t app_need_mb) {
+    std::string g = budget_refusal("gpu-budget", gpu, gpu_need_mb);
+    std::string a = budget_refusal("app-memory", app, app_need_mb);
+    if (g.empty() || a.empty())
+        return g.empty() ? a : g;
+    return g + "; " + a;
+}
+
+// An MB knob from the environment: unset, empty, junk or negative = the default.
+inline std::size_t need_mb_from(const char* text, std::size_t fallback) {
+    if (!text || !*text)
+        return fallback;
+    std::size_t v = 0;
+    for (const char* p = text; *p; ++p) {
+        if (*p < '0' || *p > '9' || v > 1'000'000)
+            return fallback;
+        v = v * 10 + static_cast<std::size_t>(*p - '0');
+    }
+    return v;
+}
+
 } // namespace xllama::upscale

@@ -127,3 +127,29 @@ TEST_CASE("upscale: base64 decodes RFC 4648 vectors and refuses junk") {
     CHECK_FALSE(base64_decode("Zg==Zg").has_value());
     CHECK_FALSE(base64_decode("Z").has_value());
 }
+
+TEST_CASE("upscale: the budget gate refuses the 25/11 console figures and passes a small model") {
+    // the window that removed the device: the 35B loaded, dxgi 4012/4147, app 4608/5120
+    const PoolFigures gpu35{4012, 4147, true}, app35{4608, 5120, true};
+    CHECK(budget_refusal(gpu35, 512, app35, 384) ==
+          "gpu-budget: 135 MB free of 4147 MB, need 512 MB");
+    CHECK(budget_refusal(gpu35, 512, app35, 600) ==
+          "gpu-budget: 135 MB free of 4147 MB, need 512 MB; app-memory: 512 MB free of 5120 MB, "
+          "need 600 MB");
+    CHECK(budget_refusal(PoolFigures{900, 4147, true}, 512, PoolFigures{1200, 5120, true}, 384) ==
+          "");
+    CHECK(budget_refusal(PoolFigures{4200, 4147, true}, 1, app35, 0) ==
+          "gpu-budget: 0 MB free of 4147 MB, need 1 MB"); // over budget counts as nothing free
+    CHECK(budget_refusal(gpu35, 0, app35, 0) == "");      // need 0 = that pool unjudged
+    CHECK(budget_refusal(PoolFigures{}, 512, PoolFigures{}, 384) == ""); // the OS reports nothing
+}
+
+TEST_CASE("upscale: need knobs read plain MB and fall back on anything else") {
+    CHECK(need_mb_from(nullptr, 512) == 512);
+    CHECK(need_mb_from("", 512) == 512);
+    CHECK(need_mb_from("768", 512) == 768);
+    CHECK(need_mb_from("0", 512) == 0);
+    CHECK(need_mb_from("-5", 512) == 512);
+    CHECK(need_mb_from("12x", 512) == 512);
+    CHECK(need_mb_from("99999999999", 512) == 512);
+}

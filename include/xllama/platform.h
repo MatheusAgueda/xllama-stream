@@ -61,6 +61,18 @@ struct GpuMemInfo {
 };
 GpuMemInfo gpu_mem_info() noexcept;
 
+// True once gpu_mem_info() has opened its adapter in this process (every GGUF load does, at
+// "before d3d12"). A caller about to create a DirectML device asks this first: opening the
+// adapter before DirectML's own device creation failed it with 887A0036 (inference.cpp, OGA).
+bool gpu_mem_probe_open() noexcept;
+
+// One process-wide hook run before a GGUF model takes D3D12 memory (apply_gguf_gpu_layers): the
+// app registers what else holds the shared device (the upscale session) so the model is sized
+// against a budget nobody else holds. nullptr clears it; the hook must not throw.
+using GpuReclaimHook = void (*)();
+void set_gpu_reclaim_hook(GpuReclaimHook hook) noexcept;
+void run_gpu_reclaim_hook() noexcept;
+
 // The app's memory cap as Windows.System.MemoryManager reports it. On Xbox an app starts
 // with a small limit that may grow as the system frees memory; ExpectedAppMemoryUsageLimit
 // is the upper limit it can expect (elsewhere it equals AppMemoryUsageLimit). Logged at
