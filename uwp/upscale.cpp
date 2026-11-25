@@ -61,8 +61,16 @@ namespace {
 using namespace winrt::Windows::Graphics::Imaging;
 using namespace winrt::Windows::Storage::Streams;
 
+// ORT's own warnings and errors into xllama.log: a failed DirectML init says where it failed
+// (.107 answered a bare "bad allocation", 25/11). The first OrtEnv of the process keeps its logger.
+void ORT_API_CALL ort_log(void*, OrtLoggingLevel, const char* category, const char*,
+                          const char* where, const char* message) {
+    log_output(std::string("[ort] ") + (category ? category : "") + " " + (where ? where : "") +
+               ": " + (message ? message : "") + "\n");
+}
+
 struct Engine {
-    Ort::Env env{ORT_LOGGING_LEVEL_WARNING, "upscale"};
+    Ort::Env env{ORT_LOGGING_LEVEL_WARNING, "upscale", &ort_log, nullptr};
     std::unique_ptr<Ort::Session> session;
     int tile = 0;
     bool f16 = true;
@@ -88,10 +96,12 @@ std::size_t need_mb(const char* env, std::size_t fallback) {
     return upscale::need_mb_from(std::getenv(env), fallback);
 }
 
-// A DML session as in diffuse.cpp: sequential, no memory pattern, EXTENDED optimisation.
-Engine& engine() {
+// A DML session as in diffuse.cpp: sequential, no memory pattern, EXTENDED optimisation. `phase`
+// names the step a failure came from (the error text and the log carry it).
+Engine& engine(const char*& phase) {
     if (g_engine && g_engine->session)
         return *g_engine;
+    phase = "session-env";
     auto e = std::make_unique<Engine>();
     const std::string path = resolve_local_path("models\\realesrgan-x4plus\\model.onnx");
     if (GetFileAttributesW(utf8_to_wstring(path).c_str()) == INVALID_FILE_ATTRIBUTES)
@@ -100,8 +110,11 @@ Engine& engine() {
     so.SetExecutionMode(ORT_SEQUENTIAL);
     so.DisableMemPattern();
     so.SetGraphOptimizationLevel(ORT_ENABLE_EXTENDED);
+    phase = "session-dml-ep"; // creates (or joins) the process's D3D12 device and a DML device
     Ort::ThrowOnError(OrtSessionOptionsAppendExecutionProvider_DML(so, /*device_id=*/0));
+    phase = "session-load"; // parse, partition, DML graph fusion and compile, weights upload
     e->session = std::make_unique<Ort::Session>(e->env, utf8_to_wstring(path).c_str(), so);
+    phase = "session-shape";
     auto info = e->session->GetInputTypeInfo(0).GetTensorTypeAndShapeInfo();
     const auto shape = info.GetShape();
     if (shape.size() != 4 || shape[0] != 1 || shape[1] != 3 || shape[2] != shape[3] ||
@@ -147,6 +160,7 @@ UpscaleResult run_upscale(const std::string& image, const std::string& format, i
     UpscaleResult r;
     const auto t0 = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> lk(g_engine_mtx);
+    const char* phase = "decode";
     try {
         // decode, upright, RGBA8
         InMemoryRandomAccessStream in;
@@ -175,6 +189,7 @@ UpscaleResult run_upscale(const std::string& image, const std::string& format, i
         // the gate: the DXGI figures only through an adapter a GGUF load already opened (no
         // adapter = no GGUF on the GPU, nothing to protect); the GPU judged before a build, the
         // app cap (up to ~350 MB of buffers for a 1.5 MP input) on every request
+        phase = "gate";
         const bool build = !(g_engine && g_engine->session);
         const GpuMemInfo g0 = gpu_mem_probe_open() ? gpu_mem_info() : GpuMemInfo{};
         if (g0.available) {
@@ -192,10 +207,18 @@ UpscaleResult run_upscale(const std::string& image, const std::string& format, i
             log_output("[xllama] upscale: 503 " + refusal + "\n");
             return r;
         }
-        Engine& e = engine();
+        if (build)
+            log_output(std::string("[xllama] upscale: building the session, dxgi ") +
+                       (g0.available ? std::to_string(g0.current_mb) + "/" +
+                                           std::to_string(g0.budget_mb) + " MB"
+                                     : "unread (no GGUF on the GPU)") +
+                       ", app " + std::to_string(a0.usage_mb) + "/" + std::to_string(a0.limit_mb) +
+                       " MB\n");
+        Engine& e = engine(phase);
         r.session_built = build;
         if (build)
             set_gpu_reclaim_hook(&reclaim_for_gguf);
+        phase = "run";
         const int T = e.tile;
         pad = std::clamp(pad, 0, T / 4);
         const auto py = upscale::plan_axis(h, T, pad), pxs = upscale::plan_axis(w, T, pad);
@@ -262,6 +285,7 @@ UpscaleResult run_upscale(const std::string& image, const std::string& format, i
         }
 
         // encode
+        phase = "encode";
         InMemoryRandomAccessStream os;
         const bool png = format == "png";
         BitmapEncoder enc{nullptr};
@@ -299,15 +323,33 @@ UpscaleResult run_upscale(const std::string& image, const std::string& format, i
         r.status = 500;
         char b[64];
         snprintf(b, sizeof(b), "hresult 0x%08X", static_cast<unsigned>(ex.code().value));
-        r.error = std::string(b) + " " + winrt::to_string(ex.message());
+        r.error = std::string(phase) + ": " + b + " " + winrt::to_string(ex.message());
+        g_engine.reset();
+    } catch (const Ort::Exception& ex) {
+        r.status = 500;
+        r.error = std::string(phase) + ": ort code " +
+                  std::to_string(static_cast<int>(ex.GetOrtErrorCode())) + " " + ex.what();
+        g_engine.reset();
+    } catch (const std::bad_alloc& ex) {
+        // thrown outside ORT's C API (that one arrives as an Ort::Exception above): ours or a
+        // C++/WinRT call answering E_OUTOFMEMORY
+        r.status = 500;
+        r.error = std::string(phase) + ": std::bad_alloc " + ex.what();
         g_engine.reset();
     } catch (const std::exception& ex) {
         r.status = 500;
-        r.error = ex.what();
+        r.error = std::string(phase) + ": " + ex.what();
         g_engine.reset(); // a DML device removal or OOM must not stick to the next request
     }
-    if (r.status != 200)
-        log_output("[xllama] upscale: " + std::to_string(r.status) + " " + r.error + "\n");
+    if (r.status != 200 && r.status != 503) { // the gate logged its own 503
+        const AppMemInfo a = app_mem_info();
+        const GpuMemInfo g = gpu_mem_probe_open() ? gpu_mem_info() : GpuMemInfo{};
+        log_output("[xllama] upscale: " + std::to_string(r.status) + " " + r.error + " (dxgi " +
+                   (g.available ? std::to_string(g.current_mb) + "/" + std::to_string(g.budget_mb)
+                                : std::string("unread")) +
+                   " MB, app " + std::to_string(a.usage_mb) + "/" + std::to_string(a.limit_mb) +
+                   " MB)\n");
+    }
     return r;
 }
 
