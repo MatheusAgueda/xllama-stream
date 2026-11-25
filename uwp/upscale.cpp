@@ -115,7 +115,11 @@ Engine& engine(const char*& phase) {
     phase = "session-load"; // parse, partition, DML graph fusion and compile, weights upload
     e->session = std::make_unique<Ort::Session>(e->env, utf8_to_wstring(path).c_str(), so);
     phase = "session-shape";
-    auto info = e->session->GetInputTypeInfo(0).GetTensorTypeAndShapeInfo();
+    // The tensor info is a view into the TypeInfo (OrtApi::CastTypeInfoToTensorInfo: valid until
+    // the type info is freed). Holding only the view read freed memory: a garbage rank sized the
+    // shape vector and threw bad_alloc on .107/.108 (25/11).
+    const Ort::TypeInfo type_info = e->session->GetInputTypeInfo(0);
+    const auto info = type_info.GetTensorTypeAndShapeInfo();
     const auto shape = info.GetShape();
     if (shape.size() != 4 || shape[0] != 1 || shape[1] != 3 || shape[2] != shape[3] ||
         shape[2] < 32 || shape[2] > 512)
