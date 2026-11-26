@@ -240,6 +240,12 @@ HttpRequest read_request(StreamSocket const& socket) {
     return req;
 }
 
+// Set on the thread that hit a write deadline; the work item that served the
+// connection closes the socket (dispatch_connection). Every reply, the streamed
+// tokens included (session->generate calls on_token inline), is written on that
+// one thread-pool thread.
+thread_local bool t_reply_deadline_hit = false;
+
 // Store and flush what `writer` holds (`bytes` of it) within http_write_deadline.
 // Past it the operation is cancelled and this throws, which every caller already
 // handles as «the client is gone»; an error from the store itself throws as before.
@@ -247,6 +253,7 @@ template <typename Op>
 void await_reply_io(Op const& op, winrt::Windows::Foundation::TimeSpan limit) {
     if (op.wait_for(limit) == winrt::Windows::Foundation::AsyncStatus::Started) {
         op.Cancel();
+        t_reply_deadline_hit = true;
         throw winrt::hresult_error(HRESULT_FROM_WIN32(ERROR_TIMEOUT), L"reply write deadline");
     }
     op.GetResults();
@@ -2463,7 +2470,20 @@ void dispatch_connection(StreamSocket const& socket, uint64_t generation,
         winrt::Windows::System::Threading::ThreadPool::RunAsync(
             [socket, generation, held, api_key](winrt::Windows::Foundation::IAsyncAction const&) {
                 auto client = activity().client();
+                t_reply_deadline_hit = false;
                 handle_connection(socket, generation, api_key);
+                // After a write deadline nothing else ends the connection: the
+                // cancelled store kept the socket open with no FIN for the
+                // 200 s the stalled client was watched (console 2026-11-26).
+                // Only then: on every other reply the release closes it
+                // gracefully, and an explicit Close with a read pending turns a
+                // 408 into a reset (1.6.0.1234).
+                if (t_reply_deadline_hit) {
+                    try {
+                        socket.Close();
+                    } catch (...) {
+                    }
+                }
                 (void)held;
                 (void)client;
             });
