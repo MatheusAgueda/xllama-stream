@@ -572,6 +572,60 @@ at 4K, 320 MiB at 16K), or the buffer is write-combined and CPU reads of it
 crawl. The memory moves from the CPU heap to D3D12_Host. Unset, the placement is
 upstream's.
 
+`0027-expert-cache-stats.patch` (applies after 0026; `include/llama.h`, `src/llama-model.cpp`,
+`src/llama-expert-cache.{h,cpp}`; instruments only, no op changes): `llama_model_expert_stats(model,
+&stats)` (`LLAMA_HAS_EXPERT_STATS`) copies the expert cache's cumulative counters - hits, misses, swaps,
+expert-major swaps, bytes read, read microseconds (the last load op's time included: the stats line
+adds it the same way), expert-major reads and bytes - into a caller struct whose first field is its own
+`size` (a smaller struct from an older header is filled up to its size; fields are only appended).
+`false` when the model has no cache. The counters are the existing atomics; nothing new is counted. The
+bridge (`llama_gpu.h` `expert_stats_snapshot`, `Session::generate` and `run_inference_llama`) takes one
+snapshot when a request starts and one when it ends, and the API reply's `timings` carries the
+difference as `"expert":{"hits":..,"misses":..,"swaps":..,"em_swaps":..,"bytes":..,"read_us":..,
+"em_reads":..,"em_bytes":..}`, only for a model with a cache (`include/xllama/api_timings.h`). The same
+`timings` gains `"stamps":{"permit_ms":..,"first_ms":..,"last_ms":..}`, ms since the socket was
+accepted: the compute permit and the session granted, the first generated token (measured in the
+stream callback when streaming, else derived from `t_first_token_ms`), and generate() returning. The
+snapshots are taken while no graph runs (one inference at a time, one context per model), so the
+difference is exact; a counter read costs one relaxed atomic load each, twice per request. Host test:
+`expert cache: decodes like the resident model` checks the snapshot against the final stats line.
+
+`0028-expert-cache-route-hash.patch` (applies after 0027; `include/llama.h`, `src/llama-model.cpp`,
+`src/llama-expert-cache.{h,cpp}`; instruments only): a 64-bit FNV-1a hash of the routing the cache
+actually served. Per layer, a chain over the FINAL expert ids (after cache-aware swaps; int16 LE, in
+token order) of every token the layer saw, taken where the plan pins them (so the GPU route's replay
+and the CPU path hash the same ids) and in the expert-major prep for prompt ubatches (hashed once, at
+`pos == 0`, so a prompt split into other ubatches hashes the same). The request's value folds the layers
+in layer-id order (4 bytes layer id LE, then the layer's 8 bytes LE). `llama_expert_stats` gains
+`route_hash` and `route_n` (the (token, layer) pairs covered; appended, so an older caller's struct is
+unaffected) and `llama_model_expert_route_reset(model)` restarts the chains (`LLAMA_HAS_EXPERT_ROUTE_HASH`).
+The bridge resets as a request starts, and the reply's `expert` object gains `"route":"<16 hex>"` and
+`"route_n":N` (a hex string: JSON numbers are doubles in a WinRT client). A turn that reuses the KV
+cache hashes only the tokens it computed. Equal prompt, sampling and cache state give equal `route`
+(the same calls, whatever their ubatch size or path; a prompt cut into other decode calls is another
+request: the last layer computes only each call's output token); a different route with the same
+tokens is a routing change. Cost: one multiply and xor per id byte, 2
+bytes per id, `n_used` ids per token per layer.
+
+`0029-expert-cache-prompt-trace.patch` (applies after 0028; `src/llama-expert-cache.{h,cpp}`,
+`src/llama-graph.cpp`, `src/llama-context.cpp`; default off): `LLAMA_EXPERT_TRACE_PROMPT=1`, together with
+`LLAMA_EXPERT_TRACE=<file>`, traces the prompt whatever the swap ratio. Before, the file was written by
+the select op only, so only with a swap ratio, and an expert-major prompt ubatch (no select op: its
+swap ratio is `LLAMA_EXPERT_EM_SWAP`, default 0) left no record. Now (1) a trace-only node per layer
+writes the same `ECT1` record for a prompt ubatch (2+ tokens) that no select op serves (it reads the
+router scores, the ids the layer routes with only order it; decode tokens keep their graph and the GPU
+route: nothing is added to them), and (2) the side file `<trace>.tok` gets one record per ubatch, written
+before its graph runs: `"ECK1"` (0x314B4345), `n_tokens`, `pos0`, `0` (4 x int32), then `trace_off` (int64:
+the trace file's byte length when the ubatch began, so the `ECT1` records from `trace_off` to the next
+record's belong to it) and `n_tokens` int32 token ids (-1 = an embedding input). **The trace file's own
+format is unchanged**, so a reader that knows `ECT1` (`sims/prog1127/trace_io.py`) reads the new files
+as before and just sees full-prompt records; a prompt that was traced is told from a decode token by
+`n_tokens > 1`, as it always was. With the knob off nothing changes: no side file, no node, no extra
+read of the scores. With it on, the trace file is open at any swap ratio, which makes the cache `plain =
+false` (as `LLAMA_EXPERT_TRACE` always did), so the GPU route's replay is off in a traced run: use it
+for studies, not for serving. Not run on the console: the node is a CPU custom op like the select op,
+which the D3D12 scheduler already places; its scores copy is the only extra traffic.
+
 ## Applying
 
 ```bash

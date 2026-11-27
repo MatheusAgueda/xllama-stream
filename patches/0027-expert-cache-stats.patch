@@ -1,0 +1,113 @@
+diff --git a/include/llama.h b/include/llama.h
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -41,6 +41,9 @@
+ // llama_model_params::n_expert_slots and expert_swap_ratio exist (xllama patch 0004-expert-cache)
+ #define LLAMA_HAS_EXPERT_SLOTS 1
+ 
++// llama_model_expert_stats exists (xllama patch 0027-expert-cache-stats)
++#define LLAMA_HAS_EXPERT_STATS 1
++
+ #define LLAMA_FILE_MAGIC_GGLA 0x67676c61u // 'ggla'
+ #define LLAMA_FILE_MAGIC_GGSN 0x6767736eu // 'ggsn'
+ #define LLAMA_FILE_MAGIC_GGSQ 0x67677371u // 'ggsq'
+@@ -616,6 +619,25 @@
+     LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
+     LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
+ 
++    // The expert cache's cumulative counters since the model was loaded (xllama patch 0027;
++    // LLAMA_HAS_EXPERT_STATS): a request's own figures are the difference of two snapshots taken
++    // while no graph runs. The caller sets size = sizeof(struct llama_expert_stats); an older, smaller
++    // struct is filled up to its size, fields are only ever appended.
++    struct llama_expert_stats {
++        size_t   size;
++        uint64_t hits;      // experts found in their slots
++        uint64_t misses;    // experts read from the file by the plan and load ops
++        uint64_t swaps;     // cache-aware routing: residents that took a missing expert's place
++        uint64_t em_swaps;  //   the same in expert-major ubatches (not in swaps)
++        uint64_t bytes;     // bytes the plan and load ops read
++        uint64_t read_us;   // wall time of the load ops (their slowest thread), the last one included
++        uint64_t em_reads;  // expert tensors read by expert-major ubatches
++        uint64_t em_bytes;  //   and their bytes
++    };
++
++    // false when the model has no expert cache (or size is 0); out is untouched then
++    LLAMA_API bool llama_model_expert_stats(const struct llama_model * model, struct llama_expert_stats * out);
++
+     // Get the model's RoPE frequency scaling factor
+     LLAMA_API float llama_model_rope_freq_scale_train(const struct llama_model * model);
+ 
+diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
+--- a/src/llama-expert-cache.cpp
++++ b/src/llama-expert-cache.cpp
+@@ -1,6 +1,7 @@
+ #include "llama-expert-cache.h"
+ 
+ #include "llama-impl.h"
++#include "llama.h"
+ 
+ #include "../ggml/src/ggml-backend-impl.h"
+ 
+@@ -3197,6 +3198,23 @@
+     cache.em_gpu_failed = false;
+ }
+ 
++void llama_expert_cache_stats(const llama_expert_cache & cache, llama_expert_stats * out) {
++    llama_expert_stats s = {};
++    s.size     = out->size;
++    s.hits     = cache.hits.load();
++    s.misses   = cache.misses.load();
++    s.swaps    = cache.swaps.load();
++    s.em_swaps = cache.em_swaps.load();
++    s.bytes    = cache.bytes.load();
++    s.read_us  = cache.read_us.load();
++    for (const auto & it : cache.layers) {
++        s.read_us += (uint64_t) it.second->load_us.load(); // the last load op, not yet folded in by its plan
++    }
++    s.em_reads = cache.em_reads.load();
++    s.em_bytes = cache.em_bytes.load();
++    memcpy(out, &s, std::min(out->size, sizeof(s)));
++}
++
+ uint32_t llama_expert_cache_n_slots(const llama_expert_cache & cache) {
+     return cache.n_slots;
+ }
+diff --git a/src/llama-expert-cache.h b/src/llama-expert-cache.h
+--- a/src/llama-expert-cache.h
++++ b/src/llama-expert-cache.h
+@@ -40,6 +40,7 @@
+ // place). One context per model at a time, n_ubatch <= max(n_slots / n_expert_used, expert-major).
+ 
+ struct llama_expert_cache;
++struct llama_expert_stats;
+ 
+ std::shared_ptr<llama_expert_cache> llama_expert_cache_init(uint32_t n_slots, uint32_t n_expert_used, float swap_ratio);
+ 
+@@ -56,6 +57,9 @@
+ // 0 when routing is exact
+ float llama_expert_cache_swap_ratio(const llama_expert_cache & cache);
+ 
++// the cumulative counters (llama_model_expert_stats): fills out up to out->size bytes
++void llama_expert_cache_stats(const llama_expert_cache & cache, llama_expert_stats * out);
++
+ // predicted experts per token read ahead, 0 when prefetch is off
+ uint32_t llama_expert_cache_prefetch(const llama_expert_cache & cache);
+ 
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -3398,6 +3398,14 @@
+     return model->hparams.n_expert;
+ }
+ 
++bool llama_model_expert_stats(const struct llama_model * model, struct llama_expert_stats * out) {
++    if (model == nullptr || !model->expert_cache || out == nullptr || out->size == 0) {
++        return false;
++    }
++    llama_expert_cache_stats(*model->expert_cache, out);
++    return true;
++}
++
+ int32_t llama_model_n_devices(const struct llama_model * model) {
+     return (int32_t)model->devices.size();
+ }

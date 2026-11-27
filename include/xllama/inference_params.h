@@ -199,6 +199,45 @@ struct TokenLogprob {
     std::string piece;
 };
 
+/// The expert cache's counters over one request (llama.cpp patch 0027): the difference of two
+/// snapshots of its cumulative counters, taken as the request starts and ends. `present` is false
+/// when the model has no expert cache; the reply then has no "expert" object.
+struct ExpertStats {
+    bool present = false;
+    uint64_t hits = 0;     ///< Experts found in their slots.
+    uint64_t misses = 0;   ///< Experts read from the file.
+    uint64_t swaps = 0;    ///< Cache-aware routing: residents that took a missing expert's place.
+    uint64_t em_swaps = 0; ///< The same in expert-major (prompt) ubatches.
+    uint64_t bytes = 0;    ///< Bytes read by the plan and load ops.
+    uint64_t read_us = 0;  ///< Wall time of the load ops.
+    uint64_t em_reads = 0; ///< Expert tensors read by expert-major ubatches.
+    uint64_t em_bytes = 0; ///< Their bytes.
+    /// FNV-1a 64 over the FINAL expert ids of every (token, layer) of the request (patch 0028);
+    /// not a difference: the bridge restarts it at the request's start. 0 when the patch is absent.
+    uint64_t route_hash = 0;
+    uint64_t route_n = 0; ///< The (token, layer) pairs it covers.
+    bool has_route = false;
+
+    /// This snapshot minus `before` (a counter that went down reads 0).
+    ExpertStats since(const ExpertStats& before) const {
+        const auto d = [](uint64_t now, uint64_t then) { return now >= then ? now - then : 0; };
+        ExpertStats r;
+        r.present = present && before.present;
+        r.hits = d(hits, before.hits);
+        r.misses = d(misses, before.misses);
+        r.swaps = d(swaps, before.swaps);
+        r.em_swaps = d(em_swaps, before.em_swaps);
+        r.bytes = d(bytes, before.bytes);
+        r.read_us = d(read_us, before.read_us);
+        r.em_reads = d(em_reads, before.em_reads);
+        r.em_bytes = d(em_bytes, before.em_bytes);
+        r.route_hash = route_hash; // a running chain, restarted per request: copied, not subtracted
+        r.route_n = route_n;
+        r.has_route = has_route;
+        return r;
+    }
+};
+
 /// Result of an inference call.
 struct InferenceResult {
     /// Whether generation succeeded.
@@ -271,6 +310,9 @@ struct InferenceResult {
 
     /// True when the stall watchdog ended the run (see inference_progress.h).
     bool stalled = false;
+
+    /// Expert-cache counters of this call (GGUF MoE with an expert cache only).
+    ExpertStats expert;
 
     /// Per reply token, when the call asked for them (GenerateParams::logprobs
     /// or forced_tokens). Empty otherwise.

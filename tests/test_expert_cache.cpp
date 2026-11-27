@@ -26,6 +26,7 @@
 
 #ifdef LLAMA_HAS_EXPERT_SLOTS
 
+    #include <algorithm>
     #include <chrono>
     #include <cmath>
     #include <cstdio>
@@ -239,6 +240,11 @@ struct EcRun {
     uint32_t n_ubatch = 0;
     std::vector<llama_token> tokens;
     std::vector<float> logits; // after the prompt
+    // llama_model_expert_stats (patch 0027): the cumulative counters after the prompt and after the
+    // last token, taken just before the context goes
+    bool has_stats = false;
+    llama_expert_stats after_prompt = {};
+    llama_expert_stats at_end = {};
 };
 
 // used_override > 0 replaces the model's experts-per-token, which is what bounds
@@ -297,6 +303,8 @@ EcRun run_greedy(const char* path, uint32_t slots, uint32_t n_ubatch, int64_t us
             const int32_t head = split > 0 && split < n ? split : 0;
             bool ok = head == 0 || llama_decode(ctx, llama_batch_get_one(toks.data(), head)) == 0;
             ok = ok && llama_decode(ctx, llama_batch_get_one(toks.data() + head, n - head)) == 0;
+            r.after_prompt.size = sizeof(r.after_prompt);
+            r.has_stats = llama_model_expert_stats(model, &r.after_prompt);
             for (int i = 0; ok && i < n_gen; ++i) {
                 const float* lg = llama_get_logits_ith(ctx, -1);
                 if (i == 0)
@@ -309,6 +317,8 @@ EcRun run_greedy(const char* path, uint32_t slots, uint32_t n_ubatch, int64_t us
                 ok = llama_decode(ctx, llama_batch_get_one(&r.tokens.back(), 1)) == 0;
             }
             r.ok = ok;
+            r.at_end.size = sizeof(r.at_end);
+            llama_model_expert_stats(model, &r.at_end);
         }
         llama_free(ctx);
     }
@@ -501,11 +511,28 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
         REQUIRE(plain.ok);
         CHECK(plain.n_ubatch == cached.n_ubatch);
         long long plain_misses = -1;
+        // The per-request counters are the stats line's: the snapshot before the context goes
+        // agrees with the line the cache logs when the model is freed (nothing ran in between)
+        REQUIRE(plain.has_stats);
+        CHECK(plain.at_end.hits >= plain.after_prompt.hits);
+        CHECK(plain.at_end.misses >= plain.after_prompt.misses);
+        CHECK(plain.at_end.bytes > 0);
+        CHECK(plain.at_end.swaps == 0);
+        // The route hash (patch 0028): same prompt, same routing -> same hash, however the run is
+        // otherwise configured (cached and plain agree: swap ratio 0 serves the router's own ids),
+        // and the decode moved it
+        CHECK(plain.at_end.route_n > plain.after_prompt.route_n);
+        CHECK(plain.at_end.route_n > 0);
+        CHECK(plain.at_end.route_hash != plain.after_prompt.route_hash);
+        CHECK(plain.at_end.route_hash == cached.at_end.route_hash);
+        CHECK(plain.at_end.route_n == cached.at_end.route_n);
+        CHECK(plain.after_prompt.route_hash == cached.after_prompt.route_hash);
         {
             std::lock_guard<std::mutex> lock(log.mtx);
             MESSAGE(log.final_line);
             plain_misses = misses_of(log.final_line);
             CHECK(plain_misses > 0);
+            CHECK(static_cast<long long>(plain.at_end.misses) == plain_misses);
             CHECK(prefetched_of(log.final_line) == -1);
             const IoStats io = io_of(log.final_line);
             CHECK(io.direct >= 0);
@@ -650,6 +677,10 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
             CHECK(swaps_of(log.final_line) > 0);
             CHECK(misses_of(log.final_line) >= 0);
             CHECK(misses_of(log.final_line) < plain_misses);
+            // the snapshot says the same (expert-major swaps are not in the line's count)
+            REQUIRE(swapped.has_stats);
+            CHECK(static_cast<long long>(swapped.at_end.swaps) == swaps_of(log.final_line));
+            CHECK(static_cast<long long>(swapped.at_end.misses) == misses_of(log.final_line));
         }
 
         // Swap tail (LLAMA_EXPERT_SWAP_TAIL): the weakest ranks of the top-k take
@@ -1091,6 +1122,115 @@ TEST_CASE(
             CHECK(s.kept > 0);
         CHECK(s.kept <= s.reads);
         CHECK(misses_of(final_line) > 0); // the decode
+        {
+            // The route hash does not depend on how the prompt was cut into ubatches nor on the
+            // expert-major path: one 64-token expert-major ubatch against the plain path's
+            // cap-sized ones, the same ids reach the same per-layer chain. (A prompt cut into
+            // several decode calls is not the same request: the last layer computes each call's
+            // output token.)
+            const EcRun noem = run_greedy(path, c.slots, 512, c.used, 24, 0.0f, c.split);
+            REQUIRE(noem.ok);
+            CHECK(em.at_end.route_n > 0);
+            CHECK(em.at_end.route_hash == noem.at_end.route_hash);
+            CHECK(em.at_end.route_n == noem.at_end.route_n);
+            CHECK(em.after_prompt.route_hash == noem.after_prompt.route_hash);
+        }
+
+        // Prompt trace (LLAMA_EXPERT_TRACE_PROMPT, patch 0029): the expert-major prompt has no
+        // select op, so the trace-only op writes its ECT1 records, and <trace>.tok holds every
+        // ubatch's token ids. The run itself is untouched: same tokens, logits and route hash. Knob
+        // off: no file.
+        {
+            const std::string tp = std::string(path) + ".ecprompt";
+            const std::string tk = tp + ".tok";
+            std::remove(tp.c_str());
+            std::remove(tk.c_str());
+            set_env_s("LLAMA_EXPERT_TRACE", tp.c_str());
+            set_expert_major(64);
+            const EcRun quiet = run_greedy(path, c.slots, 512, c.used, 24);
+            set_env_s("LLAMA_EXPERT_TRACE_PROMPT", "1");
+            const EcRun on = run_greedy(path, c.slots, 512, c.used, 24);
+            set_env_s("LLAMA_EXPERT_TRACE_PROMPT", nullptr);
+            set_expert_major(-1);
+            set_env_s("LLAMA_EXPERT_TRACE", nullptr);
+            REQUIRE(quiet.ok);
+            REQUIRE(on.ok);
+            CHECK(on.tokens == quiet.tokens);
+            CHECK(on.tokens == em.tokens);
+            CHECK(max_abs_diff(on.logits, quiet.logits) == 0.0f);
+            CHECK(on.at_end.route_hash == quiet.at_end.route_hash);
+
+            FILE* f = std::fopen(tp.c_str(), "rb");
+            FILE* k = std::fopen(tk.c_str(), "rb");
+            REQUIRE(f != nullptr);
+            REQUIRE(k != nullptr);
+            long long records = 0, bad = 0;
+            int32_t n_prompt = 0;
+            std::vector<int32_t> layers;
+            int32_t head[5];
+            while (std::fread(head, sizeof(head), 1, f) == 1) {
+                records++;
+                const int32_t n_tok = head[2], kk = head[3];
+                if (head[0] != 0x31544345 || head[1] < 0 || n_tok < 2 || kk < 1 || kk > 32) {
+                    bad++;
+                    break;
+                }
+                if (n_prompt == 0)
+                    n_prompt = n_tok;
+                bad += n_tok != n_prompt; // only the prompt: a decode token is not traced
+                layers.push_back(head[1]);
+                std::vector<char> body((size_t)n_tok * (size_t)kk *
+                                       (sizeof(int16_t) + sizeof(float)));
+                if (std::fread(body.data(), 1, body.size(), f) != body.size()) {
+                    bad++;
+                    break;
+                }
+            }
+            const long trace_size = std::ftell(f);
+            std::fclose(f);
+            std::sort(layers.begin(), layers.end());
+            CHECK(bad == 0);
+            CHECK(records > 0);
+            CHECK(n_prompt > 1);
+            CHECK(std::adjacent_find(layers.begin(), layers.end()) ==
+                  layers.end()); // one per layer
+            // the side file: the prompt, then one token per decode step (the generated ids fed
+            // back)
+            int32_t kh[4];
+            int64_t off = -1;
+            int rec = 0;
+            long long tok_bad = 0;
+            while (std::fread(kh, sizeof(kh), 1, k) == 1 &&
+                   std::fread(&off, sizeof(off), 1, k) == 1) {
+                std::vector<int32_t> ids((size_t)kh[1]);
+                if (kh[0] != 0x314B4345 || kh[1] < 1 ||
+                    std::fread(ids.data(), sizeof(int32_t), ids.size(), k) != ids.size()) {
+                    tok_bad++;
+                    break;
+                }
+                if (rec == 0) {
+                    CHECK(kh[1] == n_prompt);
+                    CHECK(kh[2] == 0);
+                    CHECK(off == 0);
+                    for (const int32_t id : ids)
+                        tok_bad += id < 0;
+                } else {
+                    CHECK(kh[1] == 1);
+                    CHECK(kh[2] == n_prompt + rec - 1);
+                    CHECK(off == trace_size); // nothing was traced after the prompt
+                    tok_bad +=
+                        (size_t)rec > on.tokens.size() || ids[0] != on.tokens[(size_t)rec - 1];
+                }
+                rec++;
+            }
+            std::fclose(k);
+            std::remove(tp.c_str());
+            std::remove(tk.c_str());
+            CHECK(tok_bad == 0);
+            CHECK(rec == 1 + (int)on.tokens.size());
+            MESSAGE("prompt trace: " << records << " records of " << n_prompt << " tokens, " << rec
+                                     << " token records");
+        }
         // auto (the default): any resident expert may come from the file
         CHECK(s.mode == "auto");
         CHECK(s.from_file >= 0);

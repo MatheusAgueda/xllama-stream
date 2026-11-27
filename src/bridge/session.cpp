@@ -1050,6 +1050,8 @@ class LlamaSession final : public Session {
         if (!ensure_ctx(&res.error_msg))
             return res;
         llama_context* ctx = m_ctx.get();
+        expert_route_reset(m_model.get());
+        const ExpertStats expert_before = expert_stats_snapshot(m_model.get());
 
         // KV-cache reuse: a continuation turn (reuse_kv && !reset_kv) keeps the
         // existing cache and appends the delta; otherwise re-prefill the full
@@ -1500,6 +1502,8 @@ class LlamaSession final : public Session {
             log_output(("[xllama] " + res.error_msg + "\n").c_str());
             return res;
         }
+        if (expert_before.present)
+            res.expert = expert_stats_snapshot(m_model.get()).since(expert_before);
         res.success = true;
 
         char log_buf[320];
