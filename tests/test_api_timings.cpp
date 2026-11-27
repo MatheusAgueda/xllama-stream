@@ -149,3 +149,33 @@ TEST_CASE("request stamps: a call without a token callback derives the first tok
     CHECK(none.first_ms < 0.0);
     CHECK(none.last_ms == doctest::Approx(10.0));
 }
+
+TEST_CASE("api timings: a batch object only for a batched result (B3)") {
+    xllama::InferenceResult result;
+    result.t_p_eval_ms = 30.0;
+    result.t_eval_ms = 5.0;
+    result.n_p_eval = 7;
+    result.n_eval = 2;
+    // Not batched: byte-identical to the pre-B3 reply.
+    CHECK(xllama::api_timings_json(result) ==
+          R"({"prefill_ms":30.0,"decode_ms":5.0,"prompt_n":7,"predicted_n":2})");
+
+    result.batch.k = 3;
+    result.batch.index = 1;
+    result.batch.n_tokens = 18;
+    result.batch.ms = 25.04;
+    CHECK(xllama::api_timings_json(result) ==
+          R"({"prefill_ms":30.0,"decode_ms":5.0,"prompt_n":7,"predicted_n":2,)"
+          R"("batch":{"k":3,"index":1,"prefill_ms":25.0,"prefill_n":18}})");
+
+    result.batch.expert.present = true;
+    result.batch.expert.hits = 4;
+    result.batch.expert.misses = 1;
+    result.batch.expert.bytes = 100;
+    result.batch.expert.read_us = 9;
+    result.batch.ms = std::numeric_limits<double>::quiet_NaN();
+    CHECK(xllama::api_timings_json(result) ==
+          R"({"prefill_ms":30.0,"decode_ms":5.0,"prompt_n":7,"predicted_n":2,)"
+          R"("batch":{"k":3,"index":1,"prefill_ms":0.0,"prefill_n":18,)"
+          R"("expert":{"hits":4,"misses":1,"bytes":100,"read_us":9}}})");
+}

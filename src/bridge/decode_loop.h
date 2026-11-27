@@ -153,6 +153,10 @@ struct DecodeLoopParams {
     int think_budget = 0;
     llama_token think_end = -1;
     const std::vector<llama_token>* think_close = nullptr;
+
+    // Sequence the loop decodes into (B3 batched prefill, Session::generate_batch).
+    // 0 = the single-sequence path, which keeps llama_batch_get_one exactly as before.
+    llama_seq_id seq_id = 0;
 };
 
 struct DecodeLoopResult {
@@ -279,27 +283,42 @@ inline bool stops_at_eog(const DecodeLoopParams& p, llama_token token) {
     return llama_vocab_is_eog(p.vocab, token) && !p.ignore_eog;
 }
 
-// Decode one already-sampled token (classic path).
-inline bool decode_one(llama_context* ctx, llama_token token) {
-    llama_batch next = llama_batch_get_one(&token, 1);
-    return llama_decode(ctx, next) == 0;
+// Decode one already-sampled token (classic path). Sequence 0 keeps the
+// auto-positioned single-sequence batch; another sequence (B3) gets an explicit
+// position after its own last cell and asks for its one logit row.
+inline bool decode_one(llama_context* ctx, llama_token token, llama_seq_id seq = 0) {
+    if (seq == 0) {
+        llama_batch next = llama_batch_get_one(&token, 1);
+        return llama_decode(ctx, next) == 0;
+    }
+    llama_batch batch = llama_batch_init(1, 0, 1);
+    batch.token[0] = token;
+    batch.pos[0] = llama_memory_seq_pos_max(llama_get_memory(ctx), seq) + 1;
+    batch.n_seq_id[0] = 1;
+    batch.seq_id[0][0] = seq;
+    batch.logits[0] = 1;
+    batch.n_tokens = 1;
+    const int rc = llama_decode(ctx, batch);
+    llama_batch_free(batch);
+    return rc == 0;
 }
 
 // Multi-token verify batch: lead sample + draft, all positions request logits
 // so the same sampler chain can sample at each batch index (#210 W2.2).
 // Positions are explicit from the current seq_pos_max so auto-tracking cannot
 // disagree with seq_rm on a partial accept.
-inline bool decode_verify_batch(llama_context* ctx, const std::vector<llama_token>& feed) {
+inline bool decode_verify_batch(llama_context* ctx, const std::vector<llama_token>& feed,
+                                llama_seq_id seq = 0) {
     if (feed.empty())
         return true;
     llama_batch batch = llama_batch_init(static_cast<int32_t>(feed.size()), 0, 1);
     llama_memory_t mem = llama_get_memory(ctx);
-    const llama_pos pos0 = llama_memory_seq_pos_max(mem, 0) + 1;
+    const llama_pos pos0 = llama_memory_seq_pos_max(mem, seq) + 1;
     for (size_t i = 0; i < feed.size(); ++i) {
         batch.token[i] = feed[i];
         batch.pos[i] = pos0 + static_cast<llama_pos>(i);
         batch.n_seq_id[i] = 1;
-        batch.seq_id[i][0] = 0;
+        batch.seq_id[i][0] = seq;
         batch.logits[i] = 1; // need a logit row per position for verification
     }
     batch.n_tokens = static_cast<int32_t>(feed.size());
@@ -311,11 +330,12 @@ inline bool decode_verify_batch(llama_context* ctx, const std::vector<llama_toke
 // Drop KV cells past the first |n_keep| tokens of a verify batch that began
 // after |pos_before|. Returns false if the memory refuses (no mutation on
 // hybrid caches — #183 / #210 W2.3).
-inline bool trim_verify_tail(llama_memory_t mem, llama_pos pos_before, int n_keep, int n_feed) {
+inline bool trim_verify_tail(llama_memory_t mem, llama_pos pos_before, int n_keep, int n_feed,
+                             llama_seq_id seq = 0) {
     if (n_keep >= n_feed)
         return true;
     const llama_pos keep = pos_before + static_cast<llama_pos>(n_keep) + 1;
-    return llama_memory_seq_rm(mem, 0, keep, -1);
+    return llama_memory_seq_rm(mem, seq, keep, -1);
 }
 
 // History for n-gram search = prefill/prior accepted tokens + the lead sample
@@ -345,7 +365,7 @@ inline bool classic_step(const DecodeLoopParams& p, llama_token token, std::stri
         return false;
     }
     const auto t0 = std::chrono::steady_clock::now();
-    const bool decoded = decode_one(p.ctx, token);
+    const bool decoded = decode_one(p.ctx, token, p.seq_id);
     out.decode_ms +=
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     if (!decoded) {
@@ -492,11 +512,11 @@ inline DecodeLoopResult decode_loop(const DecodeLoopParams& p, std::string& outp
         const int n_feed = static_cast<int>(feed.size());
 
         llama_memory_t mem = llama_get_memory(p.ctx);
-        const llama_pos pos_before = llama_memory_seq_pos_max(mem, 0);
+        const llama_pos pos_before = llama_memory_seq_pos_max(mem, p.seq_id);
 
-        if (!detail::decode_verify_batch(p.ctx, feed)) {
+        if (!detail::decode_verify_batch(p.ctx, feed, p.seq_id)) {
             log_output("[xllama] speculative draft batch failed — classic for first match\n");
-            if (!detail::trim_verify_tail(mem, pos_before, /*n_keep=*/0, n_feed)) {
+            if (!detail::trim_verify_tail(mem, pos_before, /*n_keep=*/0, n_feed, p.seq_id)) {
                 out.rewind_failed = true;
                 break;
             }
@@ -537,7 +557,7 @@ inline DecodeLoopResult decode_loop(const DecodeLoopParams& p, std::string& outp
         ++out.n_accepted;
         ++n_keep;
         if (!commit_draft(first)) {
-            if (!detail::trim_verify_tail(mem, pos_before, n_keep, n_feed))
+            if (!detail::trim_verify_tail(mem, pos_before, n_keep, n_feed, p.seq_id))
                 fail_rewind();
             break;
         }
@@ -545,7 +565,7 @@ inline DecodeLoopResult decode_loop(const DecodeLoopParams& p, std::string& outp
         bool stop_all = false;
         for (size_t i = 1; i < feed.size(); ++i) {
             if (out.n_generated >= p.n_predict || (p.abort_flag && p.abort_flag->load())) {
-                if (!detail::trim_verify_tail(mem, pos_before, n_keep, n_feed))
+                if (!detail::trim_verify_tail(mem, pos_before, n_keep, n_feed, p.seq_id))
                     fail_rewind();
                 stop_all = true;
                 break;
@@ -558,7 +578,7 @@ inline DecodeLoopResult decode_loop(const DecodeLoopParams& p, std::string& outp
                 ++out.n_accepted;
                 ++n_keep;
                 if (!commit_draft(cand)) {
-                    if (!detail::trim_verify_tail(mem, pos_before, n_keep, n_feed))
+                    if (!detail::trim_verify_tail(mem, pos_before, n_keep, n_feed, p.seq_id))
                         fail_rewind();
                     stop_all = true;
                     break;
@@ -566,7 +586,7 @@ inline DecodeLoopResult decode_loop(const DecodeLoopParams& p, std::string& outp
                 continue;
             }
             // Reject: keep accepted drafts, drop the rest, commit |cand|.
-            if (!detail::trim_verify_tail(mem, pos_before, n_keep, n_feed)) {
+            if (!detail::trim_verify_tail(mem, pos_before, n_keep, n_feed, p.seq_id)) {
                 fail_rewind();
                 stop_all = true;
                 break;
@@ -584,7 +604,7 @@ inline DecodeLoopResult decode_loop(const DecodeLoopParams& p, std::string& outp
                 break;
             }
             // cand is not yet in the KV (only accepted drafts are).
-            if (!detail::decode_one(p.ctx, cand)) {
+            if (!detail::decode_one(p.ctx, cand, p.seq_id)) {
                 log_output("[xllama] decode failed after speculative reject\n");
                 stop_all = true;
                 break;
@@ -599,7 +619,7 @@ inline DecodeLoopResult decode_loop(const DecodeLoopParams& p, std::string& outp
         if (stop_all)
             break;
         if (n_keep < n_feed) {
-            if (!detail::trim_verify_tail(mem, pos_before, n_keep, n_feed)) {
+            if (!detail::trim_verify_tail(mem, pos_before, n_keep, n_feed, p.seq_id)) {
                 fail_rewind();
                 break;
             }

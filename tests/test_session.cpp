@@ -9,6 +9,7 @@
 #include <chrono>
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <climits>
 #include <cstdint>
 #include <filesystem>
@@ -1017,4 +1018,152 @@ TEST_CASE("Session: the disk prefix cache drops bad files and keeps its budget (
     CHECK(total <= (mib << 20));
     small.reset();
     std::filesystem::remove_all(root, ec);
+}
+
+// B3: shared multi-sequence prefill, then each reply decoded alone. Greedy, so a
+// batched reply must be the one a lone generate() gives the same prompt: the
+// batch changes how the prompt cells are computed (several sequences per
+// ubatch over a unified KV), not what they hold.
+//   XLLAMA_TEST_MODEL=/path/to/model.gguf ./xllama-tests
+TEST_CASE("Session: batched prefill matches per-prompt generate (opt-in: XLLAMA_TEST_MODEL)") {
+    const char* model = std::getenv("XLLAMA_TEST_MODEL");
+    if (!model)
+        return;
+    const std::vector<std::string> users = {
+        "Say hello.",
+        "Count from one to five in words, separated by commas.",
+        "Name the planet closest to the Sun and give one fact about it in a short sentence.",
+    };
+    std::vector<xllama::GenerateParams> reqs;
+    for (const std::string& u : users) {
+        xllama::GenerateParams gp;
+        gp.prompt = "<|im_start|>user\n" + u + "<|im_end|>\n<|im_start|>assistant\n";
+        gp.n_predict = 24;
+        gp.temperature = 0;
+        gp.logprobs = true; // ids to compare token by token
+        reqs.push_back(gp);
+    }
+
+    xllama::SessionParams sp;
+    sp.model_path = model;
+    sp.n_ctx = 512;
+    sp.n_threads = 2;
+    std::string error;
+    std::vector<xllama::InferenceResult> lone;
+    {
+        auto ref = xllama::Session::create(sp, &error);
+        REQUIRE_MESSAGE(ref, error);
+        CHECK(ref->batch_seqs() == 1);
+        for (const auto& gp : reqs) {
+            lone.push_back(ref->generate(gp));
+            REQUIRE_MESSAGE(lone.back().success, lone.back().error_msg);
+            REQUIRE(lone.back().n_eval > 0);
+        }
+    }
+
+    xllama::SessionParams bp = sp;
+    bp.env = {{"XLLAMA_BATCH_SEQS", "3"}};
+    auto batched = xllama::Session::create(bp, &error);
+    REQUIRE_MESSAGE(batched, error);
+    REQUIRE(batched->batch_seqs() == 3);
+
+    const auto same = [](const xllama::InferenceResult& a, const xllama::InferenceResult& b) {
+        CHECK(a.n_prompt == b.n_prompt);
+        REQUIRE(a.logprobs.size() == static_cast<size_t>(a.n_eval));
+        const size_t n = std::min(a.logprobs.size(), b.logprobs.size());
+        for (size_t t = 0; t < n; ++t) {
+            CAPTURE(t);
+            CHECK(a.logprobs[t].id == b.logprobs[t].id);
+        }
+        CHECK(a.n_eval == b.n_eval);
+        CHECK(a.output_text == b.output_text);
+    };
+
+    for (const int k : {2, 3}) {
+        CAPTURE(k);
+        const std::vector<xllama::GenerateParams> sub(reqs.begin(), reqs.begin() + k);
+        const auto got = batched->generate_batch(sub);
+        REQUIRE(got.size() == static_cast<size_t>(k));
+        int shared_n = 0;
+        for (int i = 0; i < k; ++i) {
+            CAPTURE(i);
+            REQUIRE_MESSAGE(got[i].success, got[i].error_msg);
+            CHECK(got[i].batch.k == k);
+            CHECK(got[i].batch.index == i);
+            CHECK(got[i].batch.ms > 0.0);
+            CHECK(got[i].t_p_eval_ms >= got[i].batch.ms);
+            shared_n += got[i].n_prompt - 1;
+            same(got[i], lone[static_cast<size_t>(i)]);
+        }
+        CHECK(got[0].batch.n_tokens == shared_n);
+    }
+
+    // The single-sequence path on the multi-sequence context, after a batch:
+    // the batch left nothing resident and the unified KV changes no reply.
+    const auto after = batched->generate(reqs[1]);
+    REQUIRE_MESSAGE(after.success, after.error_msg);
+    CHECK(after.batch.k == 0);
+    same(after, lone[1]);
+
+    // More requests than sequences: every result fails, nothing is decoded.
+    std::vector<xllama::GenerateParams> four(reqs.begin(), reqs.end());
+    four.push_back(reqs[0]);
+    const auto over = batched->generate_batch(four);
+    REQUIRE(over.size() == 4);
+    for (const auto& r : over) {
+        CHECK_FALSE(r.success);
+        CHECK(r.error_msg.find("XLLAMA_BATCH_SEQS") != std::string::npos);
+    }
+
+    // One invalid request rejects the batch before any prefill.
+    std::vector<xllama::GenerateParams> bad(reqs.begin(), reqs.begin() + 2);
+    bad[1].forced_tokens = {-1};
+    const auto rejected = batched->generate_batch(bad);
+    REQUIRE(rejected.size() == 2);
+    CHECK_FALSE(rejected[0].success);
+    CHECK_FALSE(rejected[1].success);
+    CHECK(rejected[1].error_msg.find("outside the vocabulary") != std::string::npos);
+    CHECK(rejected[0].error_msg.find("batch rejected") != std::string::npos);
+}
+
+// B3 off (XLLAMA_BATCH_SEQS unset, the default): the session reports one
+// sequence, generate_batch runs the requests one after another as stateless
+// generate() calls (no batch info), and KV reuse across generate() calls —
+// the pre-B3 behaviour — is unchanged.
+TEST_CASE("Session: batching off keeps the single-sequence path (opt-in: XLLAMA_TEST_MODEL)") {
+    const char* model = std::getenv("XLLAMA_TEST_MODEL");
+    if (!model)
+        return;
+    xllama::SessionParams sp;
+    sp.model_path = model;
+    sp.n_ctx = 512;
+    sp.n_threads = 2;
+    // A previous test's catalogue env is reset by this load: unset again.
+    std::string error;
+    auto s = xllama::Session::create(sp, &error);
+    REQUIRE_MESSAGE(s, error);
+    CHECK(s->batch_seqs() == 1);
+
+    xllama::GenerateParams gp;
+    gp.prompt = "<|im_start|>user\nSay hello.<|im_end|>\n<|im_start|>assistant\n";
+    gp.n_predict = 12;
+    gp.temperature = 0;
+    const auto first = s->generate(gp);
+    REQUIRE_MESSAGE(first.success, first.error_msg);
+    CHECK(first.batch.k == 0);
+    // #170a still applies: the repeat prefills only its last token.
+    const auto again = s->generate(gp);
+    REQUIRE_MESSAGE(again.success, again.error_msg);
+    CHECK(again.n_p_eval < first.n_p_eval);
+    CHECK(again.output_text == first.output_text);
+
+    xllama::GenerateParams other = gp;
+    other.prompt = "<|im_start|>user\nSay goodbye.<|im_end|>\n<|im_start|>assistant\n";
+    const auto seq = s->generate_batch({gp, other});
+    REQUIRE(seq.size() == 2);
+    for (const auto& r : seq) {
+        REQUIRE_MESSAGE(r.success, r.error_msg);
+        CHECK(r.batch.k == 0);
+    }
+    CHECK(seq[0].output_text == first.output_text);
 }

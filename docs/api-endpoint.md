@@ -281,6 +281,46 @@ one and drops the match. Measured on
 Series S (2026-10-16, `lfm25-1.2b-instruct`, 52-token reply): first byte at 11 ms against
 1.90 s for the same completion without `stream`, both 1.90 s in total.
 
+### Batched chat (`POST /v1/xllama/batch`)
+
+For eval clients: up to k chat requests of one model in one call. The prompts are prefilled
+together (one sequence each, all but their last token, in shared batches), then each reply is
+decoded alone, in request order. Measured on the Series X 35B MoE, whose experts stream from
+the SSD: 2 prompts per batch cost 0.651x a lone prefill each, 4 prompts 0.420x.
+
+```json
+{"model": "<id>", "requests": [{"messages": [...], "max_tokens": 64, "temperature": 0,
+  "seed": 1, "logprobs": true, "chat_template_kwargs": {...}}, ...]}
+```
+
+The answer is `{"results": [...]}`, one entry per request in order. Each entry is the body
+`/v1/chat/completions` would return for that request. Its `timings` add a `batch` object:
+`k`, `index`, `prefill_ms` and `prefill_n` (the shared prefill, repeated in every entry), and
+the shared prefill's expert counters when the model has an expert cache. `timings.prefill_ms`
+is the shared prefill plus this request's own last-token decode. `decode_ms`, `expert` and
+`stamps` are this request's own.
+
+Each request is a stateless plain chat with the same validation as `/v1/chat/completions`.
+Rules that apply to the batch:
+
+- **Gates:** the same auth, 413 text cap (over the whole body, so it counts every prompt),
+  compute permit and busy answers as chat, and the same model spelling check (unknown is 404).
+- **Size:** `k` may not exceed the model's `XLLAMA_BATCH_SEQS` (catalogue `env`). Unset, the
+  limit is one request. An empty list is 400, as is more than 8 requests (checked before any
+  load).
+- **Context:** the prompts' tokens plus the largest `max_tokens` must fit `n_ctx` together,
+  otherwise 400. One unified KV holds every prefix while the first reply decodes.
+- **Request fields:** an inner `model` other than the batch's, `stream: true`, and `tools` or
+  `functions` are each 400.
+- **Not used:** KV reuse and the disk prefix cache (`xllama_prefix_cache` is ignored), and the
+  session keeps nothing resident afterwards.
+- **Failures:** a request that fails during generation is an `{"error":{...}}` entry in a 200.
+  When every request fails, the answer is 500.
+
+`XLLAMA_BATCH_SEQS` > 1 creates the model's context with that many sequences over a unified KV
+(`n_seq_max`, `kv_unified`). Each extra sequence costs one recurrent-state cell on a hybrid
+model. When the variable is unset or 1, nothing changes.
+
 ### Embeddings (`/api/embed`, `/api/embeddings`, `/v1/embeddings`)
 
 Embedding requests use the same resident `Session` and single-slot mutex as chat. Inputs in

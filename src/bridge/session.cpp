@@ -5,6 +5,7 @@
 // llama.cpp path (Linux): model kept alive; context rebuilt per generate().
 
 #include "xllama/session.h"
+#include "xllama/batch_policy.h"
 #include "xllama/chat_prompt.h"
 #include "xllama/inference_params.h"
 #include "xllama/path_utils.h"
@@ -634,6 +635,13 @@ class LlamaSession final : public Session {
                 cparams.n_ubatch = cparams.n_batch;
                 cparams.embeddings = true;
             }
+            // B3 (XLLAMA_BATCH_SEQS > 1): one sequence per batched request over
+            // a unified KV — n_ctx cells shared by all of them, which is also
+            // what the d3d12 SET_ROWS path requires. At 1 nothing is touched.
+            if (m_batch_seqs > 1 && !for_embedding) {
+                cparams.n_seq_max = static_cast<uint32_t>(m_batch_seqs);
+                cparams.kv_unified = true;
+            }
             const llama_flash_attn_type fa_requested = cparams.flash_attn_type;
             if (m_kv_q8) {
                 // #171: quantized V requires flash attention (the pin throws at
@@ -1044,6 +1052,410 @@ class LlamaSession final : public Session {
         return m_kv_tokens.size();
     }
 
+    // ---- per-request pieces shared by generate() and generate_batch() (B3) ----
+
+    // Scoring: GenerateParams::forced_tokens as ids, each inside the vocabulary.
+    static bool forced_ids(const llama_vocab* vocab, const GenerateParams& gp,
+                           std::vector<llama_token>& forced, std::string& err) {
+        forced.clear();
+        if (gp.forced_tokens.empty())
+            return true;
+        const int n_vocab = llama_vocab_n_tokens(vocab);
+        forced.reserve(gp.forced_tokens.size());
+        for (const int32_t id : gp.forced_tokens) {
+            if (id < 0 || id >= n_vocab) {
+                err = "forced token " + std::to_string(id) + " outside the vocabulary of " +
+                      std::to_string(n_vocab);
+                return false;
+            }
+            forced.push_back(static_cast<llama_token>(id));
+        }
+        return true;
+    }
+
+    // parse_special=true: every Session caller (chat UI, API endpoint, bench)
+    // passes a TEMPLATED prompt, whose <|im_start|>/<|im_end|> markers must
+    // become the special ids the model was trained on. As plain text the
+    // model sees an alien template and its next-token distribution goes flat
+    // (LFM2.5: top-2 gap 0.52 vs 3.91 with specials) — flat enough that the
+    // Zen2-vs-desktop kernel jitter (max |Δlogit| ~1.6 measured) flipped the
+    // greedy token on-device ("User\n\n<|end|>" instead of a greeting).
+    static bool tokenize_prompt(const llama_vocab* vocab, const std::string& prompt, bool add_bos,
+                                std::vector<llama_token>& tokens, std::string& err) {
+        int32_t n_tokens = llama_tokenize(
+            vocab, prompt.c_str(), static_cast<int32_t>(prompt.size()), nullptr, 0, add_bos, true);
+        if (n_tokens == INT32_MIN) {
+            err = "tokenize overflow";
+            return false;
+        }
+        // Size query returns the negated required count (see llama.h) — not an error.
+        n_tokens = -n_tokens;
+
+        tokens.assign(static_cast<size_t>(n_tokens), 0);
+        n_tokens = llama_tokenize(vocab, prompt.c_str(), static_cast<int32_t>(prompt.size()),
+                                  tokens.data(), n_tokens, add_bos, true);
+        if (n_tokens < 0) {
+            err = "tokenize failed";
+            return false;
+        }
+        tokens.resize(static_cast<size_t>(n_tokens));
+        return true;
+    }
+
+    // ADR 0005: a tool proposal carries its template's grammar. It lives for
+    // one generation; a grammar that does not parse fails the request.
+    static bool grammar_for(const llama_vocab* vocab, const GenerateParams& gp,
+                            LlamaSamplerPtr& grammar, std::string& err) {
+        grammar.reset(make_grammar_sampler(vocab, gp.grammar));
+        if (gp.grammar.empty())
+            return true;
+        if (!grammar) {
+            err = "tool grammar did not parse";
+            log_output("[xllama] session generate: " + err + "\n");
+            return false;
+        }
+        if (!gp.grammar.lazy &&
+            !prefill_grammar(grammar.get(), vocab, gp.grammar.generation_prompt)) {
+            err = "tool grammar rejected the generation prompt";
+            log_output("[xllama] session generate: " + err + "\n");
+            return false;
+        }
+        return true;
+    }
+
+    // A preserved string counts only when it is one token (llama-server rule).
+    static std::unordered_set<llama_token> preserved_ids(const llama_vocab* vocab,
+                                                         const GenerateParams& gp) {
+        std::unordered_set<llama_token> preserved;
+        for (const std::string& text : gp.preserved_tokens) {
+            llama_token id = 0;
+            if (llama_tokenize(vocab, text.c_str(), static_cast<int32_t>(text.size()), &id, 1,
+                               false, true) == 1)
+                preserved.insert(id);
+        }
+        return preserved;
+    }
+
+    // Thinking budget: the closer as ids (its "</think>" a special token, so
+    // parse_special) and the end tag, which must be one token to be watched.
+    // Arms dlp only with no grammar and no forced reply (set those first);
+    // think_close must outlive the loop.
+    static void arm_think_budget(const llama_vocab* vocab, const GenerateParams& gp,
+                                 DecodeLoopParams& dlp, std::vector<llama_token>& think_close) {
+        if (gp.think_budget <= 0 || dlp.grammar || dlp.forced)
+            return;
+        llama_token end_id = -1;
+        const std::string closer = kThinkBudgetClose;
+        const int32_t n_close = -llama_tokenize(
+            vocab, closer.c_str(), static_cast<int32_t>(closer.size()), nullptr, 0, false, true);
+        if (llama_tokenize(vocab, kThinkEndTag, static_cast<int32_t>(sizeof(kThinkEndTag) - 1),
+                           &end_id, 1, false, true) == 1 &&
+            n_close > 0) {
+            think_close.resize(static_cast<size_t>(n_close));
+            if (llama_tokenize(vocab, closer.c_str(), static_cast<int32_t>(closer.size()),
+                               think_close.data(), n_close, false, true) == n_close) {
+                dlp.think_budget = gp.think_budget;
+                dlp.think_end = end_id;
+                dlp.think_close = &think_close;
+            }
+        }
+        if (!dlp.think_close)
+            log_output("[xllama] thinking budget ignored: this vocabulary has no single "
+                       "</think> token\n");
+    }
+
+    // ---- B3: shared multi-sequence prefill, narrow decode ----------------------
+
+    // XLLAMA_BATCH_SEQS read at load (create_llama, after the catalogue env):
+    // > 1 creates the context with that many sequences over one unified KV
+    // (the d3d12 SET_ROWS path needs the unified layout). 1 = off, and the
+    // context is created exactly as before.
+    int m_batch_seqs = 1;
+
+    int batch_seqs() const override {
+        return m_batch_seqs;
+    }
+
+    // Every prompt but its last token, decoded in shared batches: sequence i
+    // holds request i at positions 0..len_i-2. Each chunk gives every sequence
+    // that still has tokens an equal share of n_batch, so split_equal (hybrid
+    // memory) cuts the chunk into few ubatches. No outputs are requested: the
+    // last tokens are decoded one per sequence afterwards.
+    bool prefill_shared(llama_context* ctx, const std::vector<std::vector<llama_token>>& toks,
+                        InferenceWatchdog& wd) {
+        const int k = static_cast<int>(toks.size());
+        const int n_batch = std::max(1, static_cast<int>(llama_n_batch(ctx)));
+        std::vector<int> done(static_cast<size_t>(k), 0);
+        const auto left = [&](int i) {
+            return static_cast<int>(toks[static_cast<size_t>(i)].size()) - 1 -
+                   done[static_cast<size_t>(i)];
+        };
+        llama_batch batch = llama_batch_init(n_batch, 0, 1);
+        int n_total = 0;
+        bool ok = true;
+        for (;;) {
+            int n_active = 0;
+            for (int i = 0; i < k; ++i)
+                n_active += left(i) > 0 ? 1 : 0;
+            if (n_active == 0)
+                break;
+            if (wd.aborted()) {
+                ok = false;
+                break;
+            }
+            const int share = std::max(1, n_batch / n_active);
+            int n = 0;
+            for (int i = 0; i < k && n < n_batch; ++i) {
+                const int take = std::min({left(i), share, n_batch - n});
+                for (int t = 0; t < take; ++t) {
+                    const int pos = done[static_cast<size_t>(i)] + t;
+                    batch.token[n] = toks[static_cast<size_t>(i)][static_cast<size_t>(pos)];
+                    batch.pos[n] = static_cast<llama_pos>(pos);
+                    batch.n_seq_id[n] = 1;
+                    batch.seq_id[n][0] = static_cast<llama_seq_id>(i);
+                    batch.logits[n] = 0;
+                    ++n;
+                }
+                done[static_cast<size_t>(i)] += std::max(0, take);
+            }
+            batch.n_tokens = n;
+            if (llama_decode(ctx, batch) != 0) {
+                ok = false;
+                break;
+            }
+            n_total += n;
+            wd.note_prefill_chunk(n_total);
+        }
+        llama_batch_free(batch);
+        return ok;
+    }
+
+    std::vector<InferenceResult> generate_batch(const std::vector<GenerateParams>& reqs) override {
+        const int k = static_cast<int>(reqs.size());
+        if (k <= 1 || m_batch_seqs <= 1)
+            return Session::generate_batch(reqs); // one by one, stateless: the default
+        std::vector<InferenceResult> out(static_cast<size_t>(k));
+        const auto fail_all = [&](const std::string& err) {
+            for (InferenceResult& r : out) {
+                r.success = false;
+                if (r.error_msg.empty())
+                    r.error_msg = err;
+            }
+            log_output("[xllama] session generate_batch: " + err + "\n");
+            return out;
+        };
+        if (k > m_batch_seqs)
+            return fail_all("batch of " + std::to_string(k) +
+                            " exceeds XLLAMA_BATCH_SEQS=" + std::to_string(m_batch_seqs));
+        std::string ctx_err;
+        if (!ensure_ctx(&ctx_err))
+            return fail_all(ctx_err);
+        llama_context* ctx = m_ctx.get();
+        if (static_cast<int>(llama_n_seq_max(ctx)) < k) // a context made for embed() first
+            return Session::generate_batch(reqs);
+        llama_memory_t mem = llama_get_memory(ctx);
+        const llama_vocab* vocab = llama_model_get_vocab(m_model.get());
+
+        // Per request, before any decode: forced ids, tokens, grammar. One bad
+        // request fails the whole batch (its own error, the others "batch
+        // rejected") — no prefill is paid for a batch that cannot run.
+        std::vector<std::vector<llama_token>> toks(static_cast<size_t>(k));
+        std::vector<std::vector<llama_token>> forced(static_cast<size_t>(k));
+        for (int i = 0; i < k; ++i) {
+            const GenerateParams& gp = reqs[static_cast<size_t>(i)];
+            InferenceResult& r = out[static_cast<size_t>(i)];
+            LlamaSamplerPtr probe;
+            if (!forced_ids(vocab, gp, forced[static_cast<size_t>(i)], r.error_msg) ||
+                !tokenize_prompt(vocab, gp.prompt, /*add_bos=*/true, toks[static_cast<size_t>(i)],
+                                 r.error_msg) ||
+                !grammar_for(vocab, gp, probe, r.error_msg))
+                return fail_all("batch rejected: request " + std::to_string(i) + " is invalid");
+            if (toks[static_cast<size_t>(i)].empty()) {
+                r.error_msg = "nothing to prefill";
+                return fail_all("batch rejected: request " + std::to_string(i) + " is empty");
+            }
+        }
+        // One unified KV holds every sequence: while request i decodes, the
+        // later ones' prefixes are still resident. Worst case is request 0:
+        // all prefixes + its last token + one generated token.
+        // tail[i] = cells the sequences after i hold.
+        std::vector<int> tail(static_cast<size_t>(k) + 1, 0);
+        for (int i = k - 1; i >= 0; --i)
+            tail[static_cast<size_t>(i)] = tail[static_cast<size_t>(i) + 1] +
+                                           static_cast<int>(toks[static_cast<size_t>(i)].size()) -
+                                           1;
+        const int need = tail[0] + 1 + 1;
+        if (need > m_n_ctx)
+            return fail_all("prompt too long: the batch needs " + std::to_string(need) +
+                            " cells, n_ctx=" + std::to_string(m_n_ctx));
+
+        // Stateless: the resident conversation and the drafter's mirror go.
+        // The #170c checkpoints name the history they absorbed, so they stay
+        // valid for a later generate(); the disk prefix cache is neither read
+        // nor written.
+        llama_memory_clear(mem, true);
+        m_kv_tokens.clear();
+        m_mtp.keep_prefix(0);
+
+        const GenerateParams& g0 = reqs.front();
+        expert_route_reset(m_model.get());
+        const ExpertStats shared_before = expert_stats_snapshot(m_model.get());
+        BatchPrefillInfo info;
+        info.k = k;
+        info.n_tokens = tail[0];
+        {
+            InferenceWatchdog wd(g0.progress(), g0.abort_flag);
+            wd.enter_prefill(info.n_tokens);
+            const auto t0 = std::chrono::steady_clock::now();
+            if (!prefill_shared(ctx, toks, wd)) {
+                std::string err = "prompt decode failed";
+                const bool stalled = wd.stalled();
+                if (stalled)
+                    err = wd.stall_error();
+                llama_memory_clear(mem, true);
+                for (InferenceResult& r : out)
+                    r.stalled = stalled;
+                return fail_all(err);
+            }
+            info.ms =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                    .count();
+            wd.prefill_done(info.n_tokens, info.ms);
+        }
+        if (shared_before.present)
+            info.expert = expert_stats_snapshot(m_model.get()).since(shared_before);
+        {
+            char lb[160];
+            snprintf(lb, sizeof(lb),
+                     "[xllama] session generate_batch: k=%d shared prefill %.1fms (%d tok)\n", k,
+                     info.ms, info.n_tokens);
+            log_output(lb);
+        }
+
+        for (int i = 0; i < k; ++i) {
+            const GenerateParams& gp = reqs[static_cast<size_t>(i)];
+            InferenceResult& res = out[static_cast<size_t>(i)];
+            const std::vector<llama_token>& tokens = toks[static_cast<size_t>(i)];
+            const llama_seq_id seq = static_cast<llama_seq_id>(i);
+            const int len = static_cast<int>(tokens.size());
+            res.batch = info;
+            res.batch.index = i;
+            res.n_prompt = len;
+            res.n_p_eval = len;
+
+            expert_route_reset(m_model.get());
+            const ExpertStats expert_before = expert_stats_snapshot(m_model.get());
+            InferenceWatchdog wd(gp.progress(), gp.abort_flag);
+            wd.enter_prefill(1);
+            const auto t_last0 = std::chrono::steady_clock::now();
+            // The last prompt token, with its logits row: the first sample reads it.
+            const bool last_ok = !wd.aborted() && detail::decode_one(ctx, tokens.back(), seq);
+            const double own_ms = std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - t_last0)
+                                      .count();
+            res.t_p_eval_ms = info.ms + own_ms;
+            if (!last_ok) {
+                res.stalled = wd.stalled();
+                res.error_msg = res.stalled ? wd.stall_error() : "prompt decode failed";
+                log_output("[xllama] session generate_batch: " + res.error_msg + "\n");
+                llama_memory_seq_rm(mem, seq, -1, -1);
+                continue;
+            }
+            wd.prefill_done(1, own_ms);
+
+            // A fresh chain per request, as a full-prompt generate() builds.
+            LlamaSamplerPtr sampler(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+            add_sampler_stages(sampler.get(), gp.sampling(), vocab);
+            LlamaSamplerPtr grammar;
+            if (!grammar_for(vocab, gp, grammar, res.error_msg)) {
+                llama_memory_seq_rm(mem, seq, -1, -1);
+                continue;
+            }
+            const std::unordered_set<llama_token> preserved = preserved_ids(vocab, gp);
+            std::vector<llama_token> history(tokens.begin(), tokens.end());
+
+            // #173 per sequence: its own cells and the later prefixes still resident.
+            const int room = m_n_ctx - len - tail[static_cast<size_t>(i) + 1];
+            const int n_predict_eff = std::max(0, std::min(gp.n_predict, room));
+            const auto t_decode0 = std::chrono::steady_clock::now();
+            DecodeLoopParams dlp;
+            dlp.ctx = ctx;
+            dlp.sampler = sampler.get();
+            dlp.vocab = vocab;
+            dlp.n_predict = n_predict_eff;
+            dlp.stop_sequences = &gp.stop_sequences;
+            dlp.preserved_tokens = preserved.empty() ? nullptr : &preserved;
+            dlp.grammar = grammar.get();
+            dlp.abort_flag = gp.abort_flag;
+            dlp.on_token = gp.on_token;
+            dlp.decode_start = t_decode0;
+            dlp.prompt_lookup = m_prompt_lookup;
+            dlp.token_history = &history; // no on_accepted: the loop appends itself
+            dlp.watchdog = &wd;
+            dlp.seq_id = seq;
+            const std::vector<llama_token>& forced_i = forced[static_cast<size_t>(i)];
+            if (!forced_i.empty()) {
+                dlp.forced = &forced_i;
+                dlp.n_predict = std::min(n_predict_eff, static_cast<int>(forced_i.size()));
+                dlp.stop_sequences = nullptr;
+            }
+            if (gp.logprobs || !forced_i.empty()) {
+                res.logprobs.reserve(static_cast<size_t>(dlp.n_predict));
+                dlp.logprobs = &res.logprobs;
+            }
+            std::vector<llama_token> think_close;
+            arm_think_budget(vocab, gp, dlp, think_close);
+            wd.enter_decode(dlp.n_predict);
+            // No MTP here: the drafter mirrors sequence 0 only.
+            const DecodeLoopResult dlr = decode_loop(dlp, res.output_text);
+            res.t_eval_ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t_decode0)
+                                .count();
+            res.t_first_token_ms =
+                dlr.first_token_ms > 0.0 ? res.t_p_eval_ms + dlr.first_token_ms : 0.0;
+            res.n_eval = dlr.n_generated;
+            res.ended_with_stop = dlr.ended_with_stop;
+            res.n_drafted = dlr.n_drafted;
+            res.n_spec_accepted = dlr.n_accepted;
+            res.n_think = dlr.n_think;
+            res.think_forced = dlr.think_forced;
+            if (expert_before.present)
+                res.expert = expert_stats_snapshot(m_model.get()).since(expert_before);
+            // This sequence is done: its cells go, whatever happened. A refused
+            // removal leaves cells nothing tracks — clear all, fail the rest.
+            const bool removed = llama_memory_seq_rm(mem, seq, -1, -1);
+            if (dlr.rewind_failed) {
+                res.error_msg =
+                    "speculative KV rewind unsupported (disable prompt_lookup for this model)";
+            } else if (wd.stalled()) {
+                res.stalled = true;
+                res.error_msg = wd.stall_error();
+            } else {
+                res.success = true;
+            }
+            if (!res.success)
+                log_output("[xllama] session generate_batch: " + res.error_msg + "\n");
+            char lb[200];
+            snprintf(lb, sizeof(lb),
+                     "[xllama] session generate_batch: seq %d n=%d last=%.1fms decode=%.1fms "
+                     "drafted=%d spec_accept=%d\n",
+                     i, dlr.n_generated, own_ms, res.t_eval_ms, dlr.n_drafted, dlr.n_accepted);
+            log_output(lb);
+            if (!removed || dlr.rewind_failed || res.stalled) {
+                llama_memory_clear(mem, true);
+                for (int j = i + 1; j < k; ++j) {
+                    out[static_cast<size_t>(j)].batch = info;
+                    out[static_cast<size_t>(j)].batch.index = j;
+                    out[static_cast<size_t>(j)].error_msg =
+                        "batch aborted: sequence " + std::to_string(i) + " left the cache unusable";
+                }
+                break;
+            }
+        }
+        llama_memory_clear(mem, true); // nothing resident: the next generate() starts clean
+        return out;
+    }
+
     InferenceResult generate(const GenerateParams& gp) override {
         InferenceResult res;
 
@@ -1064,44 +1476,12 @@ class LlamaSession final : public Session {
 
         // Scoring: a forced reply is checked before any prefill is paid for.
         std::vector<llama_token> forced;
-        if (!gp.forced_tokens.empty()) {
-            const int n_vocab = llama_vocab_n_tokens(vocab);
-            forced.reserve(gp.forced_tokens.size());
-            for (const int32_t id : gp.forced_tokens) {
-                if (id < 0 || id >= n_vocab) {
-                    res.error_msg = "forced token " + std::to_string(id) +
-                                    " outside the vocabulary of " + std::to_string(n_vocab);
-                    return res;
-                }
-                forced.push_back(static_cast<llama_token>(id));
-            }
-        }
-
-        // parse_special=true: every Session caller (chat UI, API endpoint, bench)
-        // passes a TEMPLATED prompt, whose <|im_start|>/<|im_end|> markers must
-        // become the special ids the model was trained on. As plain text the
-        // model sees an alien template and its next-token distribution goes flat
-        // (LFM2.5: top-2 gap 0.52 vs 3.91 with specials) — flat enough that the
-        // Zen2-vs-desktop kernel jitter (max |Δlogit| ~1.6 measured) flipped the
-        // greedy token on-device ("User\n\n<|end|>" instead of a greeting).
-        int32_t n_tokens =
-            llama_tokenize(vocab, gp.prompt.c_str(), static_cast<int32_t>(gp.prompt.size()),
-                           nullptr, 0, full_prompt, true);
-        if (n_tokens == INT32_MIN) {
-            res.error_msg = "tokenize overflow";
+        if (!forced_ids(vocab, gp, forced, res.error_msg))
             return res;
-        }
-        // Size query returns the negated required count (see llama.h) — not an error.
-        n_tokens = -n_tokens;
 
-        std::vector<llama_token> tokens(static_cast<size_t>(n_tokens));
-        n_tokens = llama_tokenize(vocab, gp.prompt.c_str(), static_cast<int32_t>(gp.prompt.size()),
-                                  tokens.data(), n_tokens, full_prompt, true);
-        if (n_tokens < 0) {
-            res.error_msg = "tokenize failed";
+        std::vector<llama_token> tokens;
+        if (!tokenize_prompt(vocab, gp.prompt, full_prompt, tokens, res.error_msg))
             return res;
-        }
-        tokens.resize(static_cast<size_t>(n_tokens));
 
         // #170a: on a full prompt, rewind the resident KV to the common token
         // prefix and prefill only the divergent tail. Capped at size-1 so at
@@ -1375,22 +1755,9 @@ class LlamaSession final : public Session {
         }
         llama_sampler* sampler_chain = m_sampler.get();
 
-        // ADR 0005: a tool proposal carries its template's grammar. It lives for
-        // this generate only; a grammar that does not parse fails the request.
-        LlamaSamplerPtr grammar(make_grammar_sampler(vocab, gp.grammar));
-        if (!gp.grammar.empty()) {
-            if (!grammar) {
-                res.error_msg = "tool grammar did not parse";
-                log_output("[xllama] session generate: " + res.error_msg + "\n");
-                return res;
-            }
-            if (!gp.grammar.lazy &&
-                !prefill_grammar(grammar.get(), vocab, gp.grammar.generation_prompt)) {
-                res.error_msg = "tool grammar rejected the generation prompt";
-                log_output("[xllama] session generate: " + res.error_msg + "\n");
-                return res;
-            }
-        }
+        LlamaSamplerPtr grammar;
+        if (!grammar_for(vocab, gp, grammar, res.error_msg))
+            return res;
 
         const auto t_decode0 = std::chrono::steady_clock::now();
 
@@ -1403,14 +1770,7 @@ class LlamaSession final : public Session {
         // see there for why. What stays here is what is genuinely this session's:
         // keeping m_kv_tokens in step with the KV cells, which the #170a prefix
         // diff and the #170b snapshot fingerprint both read.
-        // A preserved string counts only when it is one token (llama-server rule).
-        std::unordered_set<llama_token> preserved;
-        for (const std::string& text : gp.preserved_tokens) {
-            llama_token id = 0;
-            if (llama_tokenize(vocab, text.c_str(), static_cast<int32_t>(text.size()), &id, 1,
-                               false, true) == 1)
-                preserved.insert(id);
-        }
+        const std::unordered_set<llama_token> preserved = preserved_ids(vocab, gp);
 
         DecodeLoopParams dlp;
         dlp.ctx = ctx;
@@ -1437,30 +1797,8 @@ class LlamaSession final : public Session {
             res.logprobs.reserve(static_cast<size_t>(dlp.n_predict));
             dlp.logprobs = &res.logprobs;
         }
-        // Thinking budget: the closer as ids (its "</think>" a special token, so
-        // parse_special) and the end tag, which must be one token to be watched.
         std::vector<llama_token> think_close;
-        if (gp.think_budget > 0 && !dlp.grammar && !dlp.forced) {
-            llama_token end_id = -1;
-            const std::string closer = kThinkBudgetClose;
-            const int32_t n_close =
-                -llama_tokenize(vocab, closer.c_str(), static_cast<int32_t>(closer.size()), nullptr,
-                                0, false, true);
-            if (llama_tokenize(vocab, kThinkEndTag, static_cast<int32_t>(sizeof(kThinkEndTag) - 1),
-                               &end_id, 1, false, true) == 1 &&
-                n_close > 0) {
-                think_close.resize(static_cast<size_t>(n_close));
-                if (llama_tokenize(vocab, closer.c_str(), static_cast<int32_t>(closer.size()),
-                                   think_close.data(), n_close, false, true) == n_close) {
-                    dlp.think_budget = gp.think_budget;
-                    dlp.think_end = end_id;
-                    dlp.think_close = &think_close;
-                }
-            }
-            if (!dlp.think_close)
-                log_output("[xllama] thinking budget ignored: this vocabulary has no single "
-                           "</think> token\n");
-        }
+        arm_think_budget(vocab, gp, dlp, think_close);
         wd.enter_decode(dlp.n_predict);
         const bool use_mtp = m_mtp.usable() && !dlp.grammar && !dlp.forced && !dlp.logprobs &&
                              !think_budget_armed(dlp);
@@ -1730,6 +2068,11 @@ class LlamaSession final : public Session {
         snprintf(buf, sizeof(buf), "v%d n_ctx=%d kv_q8=%d lora=%.4f params=%llu %s", kStateVersion,
                  m_n_ctx, m_kv_q8 ? 1 : 0, m_adapter ? m_lora_scale : 0.0f,
                  static_cast<unsigned long long>(llama_model_n_params(m_model.get())), desc);
+        // B3: a multi-sequence unified context lays its cells out differently;
+        // the suffix only exists when batching is on, so every pre-B3 file still
+        // matches a default session.
+        if (m_batch_seqs > 1)
+            return std::string(buf) + " seqs=" + std::to_string(m_batch_seqs);
         return buf;
     }
 
@@ -1975,6 +2318,12 @@ std::unique_ptr<Session> create_llama(const SessionParams& sp, std::string* err)
     auto session = std::make_unique<LlamaSession>(
         LlamaModelPtr(raw_model), std::move(adapter), sp.lora_scale, n_ctx, n_threads, sp.n_batch,
         sp.n_ubatch, sp.kv_q8, sp.prompt_lookup, gpu_layers, mtp_n, mtp_p_min);
+    // B3: after apply_env_overrides, so a catalogue "env" entry sets it per model.
+    session->m_batch_seqs = batch_seqs_from_env(std::getenv("XLLAMA_BATCH_SEQS"));
+    if (session->m_batch_seqs > 1)
+        log_output("[xllama] Session: batched prefill on, " +
+                   std::to_string(session->m_batch_seqs) +
+                   " sequences over a unified KV (XLLAMA_BATCH_SEQS)\n");
     session->init_prefix_cache();
     return session;
 }
