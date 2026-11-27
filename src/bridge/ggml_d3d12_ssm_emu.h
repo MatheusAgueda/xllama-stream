@@ -1085,48 +1085,49 @@ inline void d3d12_ssm_unary_emulate(const D3d12SsmUnaryParams& p, std::uint32_t 
     float s = 0.0f;
     std::memcpy(&s, &p.scale_bits, sizeof(s));
     for (std::uint32_t z = 0; z < groups_z; ++z)
-    for (std::uint32_t y = 0; y < groups_y; ++y) {
-        const std::uint32_t r = z * p.rows_per_z + y;
-        if (p.rows_per_z != 0 && r >= p.rows)
-            continue;
-        for (std::uint32_t c = 0; c < groups_x * kD3d12SsmThreads && c < p.ne0; ++c) {
-            const float x = src[r * p.src_row_stride + c];
-            float y;
-            if (p.op == kD3d12SsmScale)
-                y = mul_rn(x, s);
-            else if (p.op == kD3d12SsmSigmoid)
-                y = 1.0f / add_rn(1.0f, std::exp(-x));
-            else if (p.op == kD3d12SsmSoftplus)
-                y = x > 20.0f ? x : std::log(add_rn(1.0f, std::exp(x)));
-            else
-                y = x / add_rn(1.0f, std::exp(-x));
-            dst[r * p.dst_row_stride + c] = y;
+        for (std::uint32_t y = 0; y < groups_y; ++y) {
+            const std::uint32_t r = z * p.rows_per_z + y;
+            if (p.rows_per_z != 0 && r >= p.rows)
+                continue;
+            for (std::uint32_t c = 0; c < groups_x * kD3d12SsmThreads && c < p.ne0; ++c) {
+                const float x = src[r * p.src_row_stride + c];
+                float y;
+                if (p.op == kD3d12SsmScale)
+                    y = mul_rn(x, s);
+                else if (p.op == kD3d12SsmSigmoid)
+                    y = 1.0f / add_rn(1.0f, std::exp(-x));
+                else if (p.op == kD3d12SsmSoftplus)
+                    y = x > 20.0f ? x : std::log(add_rn(1.0f, std::exp(x)));
+                else
+                    y = x / add_rn(1.0f, std::exp(-x));
+                dst[r * p.dst_row_stride + c] = y;
+            }
         }
-    }
 }
 
 inline void d3d12_ssm_copy_emulate(const D3d12SsmCopyParams& p, std::uint32_t groups_x,
                                    const float* src, float* dst, std::uint32_t groups_y = 1) {
     const std::uint64_t n = static_cast<std::uint64_t>(p.ne[0]) * p.ne[1] * p.ne[2] * p.ne[3];
     for (std::uint64_t y = 0; y < groups_y; ++y)
-    for (std::uint64_t t = 0; t < static_cast<std::uint64_t>(groups_x) * kD3d12SsmThreads; ++t) {
-        // The shader's 32-bit (gid.y * c12 + gid.x) * 256 + tid.
-        const std::uint64_t f = y * p.row_groups * kD3d12SsmThreads + t;
-        if (f >= n)
-            break;
-        std::uint32_t i = static_cast<std::uint32_t>(f);
-        const std::uint32_t i0 = i % p.ne[0];
-        i /= p.ne[0];
-        const std::uint32_t i1 = i % p.ne[1];
-        i /= p.ne[1];
-        const std::uint32_t i2 = i % p.ne[2];
-        const std::uint32_t i3 = i / p.ne[2];
-        const std::uint32_t s = i0 * p.src_stride[0] + i1 * p.src_stride[1] + i2 * p.src_stride[2] +
-                                i3 * p.src_stride[3];
-        const std::uint32_t d = i0 * p.dst_stride[0] + i1 * p.dst_stride[1] + i2 * p.dst_stride[2] +
-                                i3 * p.dst_stride[3];
-        std::memcpy(dst + d, src + s, sizeof(float));
-    }
+        for (std::uint64_t t = 0; t < static_cast<std::uint64_t>(groups_x) * kD3d12SsmThreads;
+             ++t) {
+            // The shader's 32-bit (gid.y * c12 + gid.x) * 256 + tid.
+            const std::uint64_t f = y * p.row_groups * kD3d12SsmThreads + t;
+            if (f >= n)
+                break;
+            std::uint32_t i = static_cast<std::uint32_t>(f);
+            const std::uint32_t i0 = i % p.ne[0];
+            i /= p.ne[0];
+            const std::uint32_t i1 = i % p.ne[1];
+            i /= p.ne[1];
+            const std::uint32_t i2 = i % p.ne[2];
+            const std::uint32_t i3 = i / p.ne[2];
+            const std::uint32_t s = i0 * p.src_stride[0] + i1 * p.src_stride[1] +
+                                    i2 * p.src_stride[2] + i3 * p.src_stride[3];
+            const std::uint32_t d = i0 * p.dst_stride[0] + i1 * p.dst_stride[1] +
+                                    i2 * p.dst_stride[2] + i3 * p.dst_stride[3];
+            std::memcpy(dst + d, src + s, sizeof(float));
+        }
 }
 
 inline void d3d12_ssm_get_rows_emulate(const D3d12SsmGetRowsParams& p, std::uint32_t groups_x,

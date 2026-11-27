@@ -166,8 +166,8 @@ std::size_t private_mb() noexcept {
 #ifdef XLLAMA_UWP
     PROCESS_MEMORY_COUNTERS_EX pmc{};
     pmc.cb = sizeof(pmc);
-    if (K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc),
-                                sizeof(pmc)))
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(),
+                                reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc)))
         return pmc.PrivateUsage / (1024 * 1024);
     return 0;
 #else
@@ -261,12 +261,13 @@ void watch_app_memory() noexcept {
                     try {
                         constexpr unsigned long long kMiB = 1024ull * 1024ull;
                         char b[192];
-                        std::snprintf(b, sizeof(b),
-                                      "[xllama] app-mem limit changing: %llu -> %llu MB (usage %llu MB)\n",
-                                      static_cast<unsigned long long>(a.OldLimit()) / kMiB,
-                                      static_cast<unsigned long long>(a.NewLimit()) / kMiB,
-                                      static_cast<unsigned long long>(MemoryManager::AppMemoryUsage()) /
-                                          kMiB);
+                        std::snprintf(
+                            b, sizeof(b),
+                            "[xllama] app-mem limit changing: %llu -> %llu MB (usage %llu MB)\n",
+                            static_cast<unsigned long long>(a.OldLimit()) / kMiB,
+                            static_cast<unsigned long long>(a.NewLimit()) / kMiB,
+                            static_cast<unsigned long long>(MemoryManager::AppMemoryUsage()) /
+                                kMiB);
                         log_output(b);
                     } catch (...) {
                     }
@@ -276,16 +277,17 @@ void watch_app_memory() noexcept {
                    winrt::Windows::Foundation::IInspectable const&) {
                     const AppMemInfo m = app_mem_info();
                     char b[192];
-                    std::snprintf(b, sizeof(b),
-                                  "[xllama] app-mem usage increased: %zu/%zu MB expected %zu MB level %d\n",
-                                  m.usage_mb, m.limit_mb, m.expected_mb, m.level);
+                    std::snprintf(
+                        b, sizeof(b),
+                        "[xllama] app-mem usage increased: %zu/%zu MB expected %zu MB level %d\n",
+                        m.usage_mb, m.limit_mb, m.expected_mb, m.level);
                     log_output(b);
                 });
             const AppMemInfo m = app_mem_info();
             char b[192];
             std::snprintf(b, sizeof(b),
-                          "[xllama] app-mem watch: %zu/%zu MB expected %zu MB level %d\n", m.usage_mb,
-                          m.limit_mb, m.expected_mb, m.level);
+                          "[xllama] app-mem watch: %zu/%zu MB expected %zu MB level %d\n",
+                          m.usage_mb, m.limit_mb, m.expected_mb, m.level);
             log_output(b);
         });
     } catch (...) {

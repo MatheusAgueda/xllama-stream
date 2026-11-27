@@ -41,8 +41,10 @@ inline constexpr std::uint32_t kD3d12FapRows = 16;     // q rows (token, head) p
 inline constexpr std::uint32_t kD3d12FapTile = 16;     // kv positions per tile
 inline constexpr std::uint32_t kD3d12FapMaxD = 256;    // head size the groupshared rows hold
 inline constexpr std::uint32_t kD3d12FapMask = 1;      // flags: a mask is bound
-inline constexpr std::uint32_t kD3d12FapSplit = 2;     // flags: chunk z of the positions, partials to u3
-inline constexpr std::uint32_t kD3d12FapReduce = 4;    // flags: u3's partials of (head x, token y) to dst
+inline constexpr std::uint32_t kD3d12FapSplit =
+    2; // flags: chunk z of the positions, partials to u3
+inline constexpr std::uint32_t kD3d12FapReduce =
+    4; // flags: u3's partials of (head x, token y) to dst
 // Split-K policy: plans below kD3d12FapSplitBelow groups are split into at
 // most kD3d12FapMaxChunks chunks of at least kD3d12FapMinChunk positions,
 // aiming at kD3d12FapTargetGroups groups (Series X: 52 CUs, 2 groups each).
@@ -56,7 +58,7 @@ inline constexpr std::uint32_t kD3d12FapTargetGroups = 128;
 // Grid (groups_x, groups_y): 16 / G tokens of one kv head per group; split:
 // (groups_x, groups_y, chunks); reduce: (n_head, N).
 struct D3d12FapParams {
-    std::uint32_t d_g = 0;             // D | G << 16
+    std::uint32_t d_g = 0; // D | G << 16
     std::uint32_t n_kv = 0;
     std::uint32_t n_head = 0;          // N | n_head << 16
     std::uint32_t q_token_stride = 0;  // floats
@@ -67,8 +69,8 @@ struct D3d12FapParams {
     std::uint32_t v_head_stride = 0;   // 32-bit words
     std::uint32_t mask_row_stride = 0; // halves
     std::uint32_t scale_bits = 0;
-    std::uint32_t flags = 0;           // kD3d12FapMask | kD3d12FapSplit | kD3d12FapReduce
-    std::uint32_t chunk = 0;           // split / reduce: positions per chunk (a multiple of the tile)
+    std::uint32_t flags = 0; // kD3d12FapMask | kD3d12FapSplit | kD3d12FapReduce
+    std::uint32_t chunk = 0; // split / reduce: positions per chunk (a multiple of the tile)
 };
 static_assert(sizeof(D3d12FapParams) == 13 * sizeof(std::uint32_t), "13 root constants");
 
@@ -107,9 +109,11 @@ inline float op_float(const ggml_tensor* t, int i) {
 }
 
 // One f16 tensor of [D, n_kv, heads, 1] with 32-bit aligned rows and heads.
-inline bool kv_operand(const ggml_tensor* t, std::int64_t d, std::int64_t n_kv, std::int64_t heads) {
-    return t && t->type == GGML_TYPE_F16 && t->ne[0] == d && t->ne[1] == n_kv && t->ne[2] == heads &&
-           t->ne[3] == 1 && t->nb[0] == sizeof(ggml_fp16_t) && t->nb[1] % 4 == 0 && t->nb[2] % 4 == 0;
+inline bool kv_operand(const ggml_tensor* t, std::int64_t d, std::int64_t n_kv,
+                       std::int64_t heads) {
+    return t && t->type == GGML_TYPE_F16 && t->ne[0] == d && t->ne[1] == n_kv &&
+           t->ne[2] == heads && t->ne[3] == 1 && t->nb[0] == sizeof(ggml_fp16_t) &&
+           t->nb[1] % 4 == 0 && t->nb[2] % 4 == 0;
 }
 
 } // namespace fap_detail

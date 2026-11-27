@@ -138,8 +138,7 @@ void check_unary(const ggml_tensor* node, double tol) {
     D3d12SsmUnaryPlan p;
     REQUIRE(d3d12_ssm_unary_plan(node, &p));
     std::vector<float> out = poisoned(node);
-    d3d12_ssm_unary_emulate(p.params, p.groups_x, p.groups_y, fdata(p.src), out.data(),
-                            p.groups_z);
+    d3d12_ssm_unary_emulate(p.params, p.groups_x, p.groups_y, fdata(p.src), out.data(), p.groups_z);
     check_out(node, out, tol);
 }
 

@@ -27,8 +27,7 @@ namespace xllama {
 bool d3d12_weight_type_supported(ggml_type t) {
     return t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q6_K ||
            t == GGML_TYPE_IQ3_S || t == GGML_TYPE_IQ2_S || t == GGML_TYPE_IQ2_XXS ||
-           t == GGML_TYPE_IQ4_XS ||
-           t == GGML_TYPE_Q5_K || t == GGML_TYPE_F32;
+           t == GGML_TYPE_IQ4_XS || t == GGML_TYPE_Q5_K || t == GGML_TYPE_F32;
 }
 
 D3d12Dispatch d3d12_mm_dispatch(std::int64_t n, std::int64_t ncols) {
@@ -821,9 +820,9 @@ constexpr UINT kOpConstants = 13;
 enum Mmid { kMmidIq4Xs = 0, kMmidIq3S = 1, kMmidIq2S = 2, kMmidIq2Xxs = 3, kMmidCount = 4 };
 
 int mmid_for(ggml_type t) {
-    return t == GGML_TYPE_IQ4_XS ? kMmidIq4Xs
-           : t == GGML_TYPE_IQ3_S ? kMmidIq3S
-           : t == GGML_TYPE_IQ2_S ? kMmidIq2S
+    return t == GGML_TYPE_IQ4_XS    ? kMmidIq4Xs
+           : t == GGML_TYPE_IQ3_S   ? kMmidIq3S
+           : t == GGML_TYPE_IQ2_S   ? kMmidIq2S
            : t == GGML_TYPE_IQ2_XXS ? kMmidIq2Xxs
                                     : -1;
 }
@@ -866,7 +865,7 @@ enum HostTag : int {
     kHostSlots
 };
 const char* host_slot_name(int s) {
-    static const char* const kNames[] = {"MUL moe combine", "MUL moe tail+1", "MUL moe tail+2",
+    static const char* const kNames[] = {"MUL moe combine", "MUL moe tail+1",   "MUL moe tail+2",
                                          "MUL moe gate",    "MUL moe gate CPU", "binary CPU",
                                          "RMS_NORM CPU"};
     static_assert(sizeof(kNames) / sizeof(kNames[0]) == kHostSlots - GGML_OP_COUNT, "names");
@@ -1008,8 +1007,8 @@ struct Gpu {
     // calls whose ops or host actions differ from the kept plan (nothing runs
     // from the cache); 0 = off.
     int plan_mode = 1;
-    std::uint64_t xq_gen = 0;               // bumped when ensure_xq replaces the scratch
-    std::atomic<std::uint64_t> buf_gen{0};  // bumped when a buffer is allocated or freed
+    std::uint64_t xq_gen = 0;              // bumped when ensure_xq replaces the scratch
+    std::atomic<std::uint64_t> buf_gen{0}; // bumped when a buffer is allocated or freed
     // Bumped when a tensor is placed in a host buffer (init_tensor): ggml-alloc
     // places every tensor of a graph it allocates, so a rebuilt graph bumps it
     // and a reused one (llama.cpp graph reuse) does not.
@@ -1018,7 +1017,7 @@ struct Gpu {
     std::uint64_t n_pc_same = 0, n_pc_diff = 0; // plan_mode 2
     std::uint64_t n_pc_fast = 0;     // hits on the node list and tensor_gen, no fingerprint
     std::uint64_t n_pc_fast_bad = 0; // plan_mode 2: those that the fingerprint would refuse
-    double pc_ms = 0.0;                         // host time of the hits before submitting
+    double pc_ms = 0.0;              // host time of the hits before submitting
     // IQ3_S group geometry asked for by XLLAMA_D3D12_IQ3S_RSL / _RT (read when a
     // backend is created; d3d12_geom_for shapes each matmul from it).
     D3d12GeomReq iq3s_geom;
@@ -1056,7 +1055,7 @@ struct Gpu {
     std::uint64_t n_submits = 0;
     std::uint64_t n_replays = 0; // submits that executed a kept command list again
     std::uint64_t n_barriers = 0;
-    std::uint64_t n_gdn_fused = 0; // delta-net layers run without their two state copies
+    std::uint64_t n_gdn_fused = 0;   // delta-net layers run without their two state copies
     std::uint64_t n_async = 0;       // submissions left running (shexp_async)
     std::uint64_t n_drain_waits = 0; // drains that found one still running
     double drain_ms = 0.0;           // time those waited
@@ -1112,8 +1111,8 @@ struct PsoSlot {
 // so `&g.pso[i][wd]` here released every pipeline at the end of init_gpu and
 // 1.7.12.54 ran every op as a bare barrier (0 dispatches, 1/48 selftest cases).
 std::vector<PsoSlot> pso_slots(Gpu& g) {
-    static const char* const mmv[] = {"q4_0", "q4_k", "q6_k", "iq3_s", "iq4_xs", "q5_k", "f32", "iq2_s",
-                                      "iq2_xxs"};
+    static const char* const mmv[] = {"q4_0", "q4_k", "q6_k",  "iq3_s",  "iq4_xs",
+                                      "q5_k", "f32",  "iq2_s", "iq2_xxs"};
     static const char* const mmid[] = {"iq4_xs", "iq3_s", "iq2_s", "iq2_xxs"};
     static const char* const elt[] = {"binary", "rms_norm", "quant_q8_k", "norm_quant",
                                       "bin_quant"};
@@ -1328,10 +1327,11 @@ bool init_gpu(Gpu& g) {
         }
     }
     {
-        const void* mb[kMmidCount][2] = {{kGgmlD3d12MmidIq4XsT64Dxil, kGgmlD3d12MmidIq4XsT128Dxil},
-                                         {kGgmlD3d12MmidIq3ST64Dxil, kGgmlD3d12MmidIq3ST128Dxil},
-                                         {kGgmlD3d12MmidIq2ST64Dxil, kGgmlD3d12MmidIq2ST128Dxil},
-                                         {kGgmlD3d12MmidIq2XxsT64Dxil, kGgmlD3d12MmidIq2XxsT128Dxil}};
+        const void* mb[kMmidCount][2] = {
+            {kGgmlD3d12MmidIq4XsT64Dxil, kGgmlD3d12MmidIq4XsT128Dxil},
+            {kGgmlD3d12MmidIq3ST64Dxil, kGgmlD3d12MmidIq3ST128Dxil},
+            {kGgmlD3d12MmidIq2ST64Dxil, kGgmlD3d12MmidIq2ST128Dxil},
+            {kGgmlD3d12MmidIq2XxsT64Dxil, kGgmlD3d12MmidIq2XxsT128Dxil}};
         const size_t ms[kMmidCount][2] = {
             {kGgmlD3d12MmidIq4XsT64DxilSize, kGgmlD3d12MmidIq4XsT128DxilSize},
             {kGgmlD3d12MmidIq3ST64DxilSize, kGgmlD3d12MmidIq3ST128DxilSize},
@@ -1355,8 +1355,7 @@ bool init_gpu(Gpu& g) {
                                      kGgmlD3d12EltQuantQ8KDxil, kGgmlD3d12EltNormQuantDxil,
                                      kGgmlD3d12EltBinQuantDxil};
         const size_t es[kEltCount] = {kGgmlD3d12EltBinaryDxilSize, kGgmlD3d12EltRmsNormDxilSize,
-                                      kGgmlD3d12EltQuantQ8KDxilSize,
-                                      kGgmlD3d12EltNormQuantDxilSize,
+                                      kGgmlD3d12EltQuantQ8KDxilSize, kGgmlD3d12EltNormQuantDxilSize,
                                       kGgmlD3d12EltBinQuantDxilSize};
         g.elt_ok = true;
         for (int i = 0; i < kEltCount && g.elt_ok; ++i) {
@@ -1405,11 +1404,12 @@ bool init_gpu(Gpu& g) {
         // the route kernel computes in double and splits 64-bit products
         D3D12_FEATURE_DATA_D3D12_OPTIONS o0 = {};
         D3D12_FEATURE_DATA_D3D12_OPTIONS1 o1 = {};
-        g.route_ok =
-            SUCCEEDED(g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &o0, sizeof(o0))) &&
-            o0.DoublePrecisionFloatShaderOps &&
-            SUCCEEDED(g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &o1, sizeof(o1))) &&
-            o1.Int64ShaderOps;
+        g.route_ok = SUCCEEDED(g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &o0,
+                                                             sizeof(o0))) &&
+                     o0.DoublePrecisionFloatShaderOps &&
+                     SUCCEEDED(g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &o1,
+                                                             sizeof(o1))) &&
+                     o1.Int64ShaderOps;
         const void* rb[kRouteCount] = {kGgmlD3d12RouteRouteDxil, kGgmlD3d12RouteEmitDxil};
         const size_t rs[kRouteCount] = {kGgmlD3d12RouteRouteDxilSize, kGgmlD3d12RouteEmitDxilSize};
         for (int i = 0; i < kRouteCount && g.route_ok; ++i) {
@@ -1466,8 +1466,9 @@ bool init_gpu(Gpu& g) {
         hr = g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.pso_fap));
         g.fap_ok = SUCCEEDED(hr);
         if (!g.fap_ok)
-            log_output("[xllama] d3d12: " + d3d12c::hr_message("CreateComputePipelineState (fap)", hr) +
-                       " — prefill attention stays on the CPU\n");
+            log_output(
+                "[xllama] d3d12: " + d3d12c::hr_message("CreateComputePipelineState (fap)", hr) +
+                " — prefill attention stays on the CPU\n");
     }
     if (SUCCEEDED(g.queue->GetTimestampFrequency(&g.ts_freq)) && g.ts_freq > 0) {
         D3D12_QUERY_HEAP_DESC qhd = {};
@@ -1529,7 +1530,8 @@ void drain_pending(Gpu& g) {
         const auto t0 = std::chrono::steady_clock::now();
         g.fence.wait(v, /*spin=*/true);
         g.drain_ms +=
-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                .count();
         ++g.n_drain_waits;
     }
     if (g.pending_ts) {
@@ -2082,8 +2084,8 @@ bool in_expert_cache(const ggml_tensor* t) {
 
 // A pipeline's kernel, for the profile.
 std::string pso_name(const Gpu& g, const ID3D12PipelineState* p) {
-    static const char* const kTypes[] = {"q4_0", "q4_K", "q6_K", "iq3_s", "iq4_xs", "q5_K", "f32", "iq2_s",
-                                         "iq2_xxs"};
+    static const char* const kTypes[] = {"q4_0", "q4_K", "q6_K",  "iq3_s",  "iq4_xs",
+                                         "q5_K", "f32",  "iq2_s", "iq2_xxs"};
     static const char* const kElts[] = {"elt binary", "elt rms_norm", "elt quant q8_K",
                                         "elt rms_norm+q8_K", "elt binary+q8_K"};
     static const char* const kMoes[] = {"moe combine", "moe tail"};
@@ -2169,12 +2171,12 @@ void backend_free(ggml_backend_t b) {
             g.n_normq = 0;
         }
         if (g.n_fap || g.n_fap_host) {
-            std::snprintf(msg, sizeof(msg),
-                          "[xllama] d3d12: %llu attention dispatches planned (%llu split-K), %llu on "
-                          "the host\n",
-                          static_cast<unsigned long long>(g.n_fap),
-                          static_cast<unsigned long long>(g.n_fad),
-                          static_cast<unsigned long long>(g.n_fap_host));
+            std::snprintf(
+                msg, sizeof(msg),
+                "[xllama] d3d12: %llu attention dispatches planned (%llu split-K), %llu on "
+                "the host\n",
+                static_cast<unsigned long long>(g.n_fap), static_cast<unsigned long long>(g.n_fad),
+                static_cast<unsigned long long>(g.n_fap_host));
             log_output(msg);
             g.n_fap = g.n_fap_host = g.n_fad = 0;
         }
@@ -2231,37 +2233,40 @@ void backend_free(ggml_backend_t b) {
         }
         if (g.n_route) {
             char rmsg[512];
-            std::snprintf(rmsg, sizeof(rmsg),
-                          "[xllama] d3d12 gpu route: %llu layers, %llu hit, %llu missed (%llu bad), "
-                          "%llu on the host, %llu resubmits, %llu swaps; %.1f ms host routing, "
-                          "%.1f ms replay; mismatches ids %llu slots %llu w %llu sig %llu probs "
-                          "%llu of %llu checked\n",
-                          static_cast<unsigned long long>(g.n_route),
-                          static_cast<unsigned long long>(g.n_route_hit),
-                          static_cast<unsigned long long>(g.n_route_miss),
-                          static_cast<unsigned long long>(g.n_route_bad),
-                          static_cast<unsigned long long>(g.n_route_host),
-                          static_cast<unsigned long long>(g.n_route_resub),
-                          static_cast<unsigned long long>(g.n_route_swaps), g.route_cpu_ms,
-                          g.route_replay_ms, static_cast<unsigned long long>(g.n_route_mis_ids),
-                          static_cast<unsigned long long>(g.n_route_mis_slots),
-                          static_cast<unsigned long long>(g.n_route_mis_w),
-                          static_cast<unsigned long long>(g.n_route_mis_sig),
-                          static_cast<unsigned long long>(g.n_route_mis_probs),
-                          static_cast<unsigned long long>(g.n_route_probs_checked));
+            std::snprintf(
+                rmsg, sizeof(rmsg),
+                "[xllama] d3d12 gpu route: %llu layers, %llu hit, %llu missed (%llu bad), "
+                "%llu on the host, %llu resubmits, %llu swaps; %.1f ms host routing, "
+                "%.1f ms replay; mismatches ids %llu slots %llu w %llu sig %llu probs "
+                "%llu of %llu checked\n",
+                static_cast<unsigned long long>(g.n_route),
+                static_cast<unsigned long long>(g.n_route_hit),
+                static_cast<unsigned long long>(g.n_route_miss),
+                static_cast<unsigned long long>(g.n_route_bad),
+                static_cast<unsigned long long>(g.n_route_host),
+                static_cast<unsigned long long>(g.n_route_resub),
+                static_cast<unsigned long long>(g.n_route_swaps), g.route_cpu_ms, g.route_replay_ms,
+                static_cast<unsigned long long>(g.n_route_mis_ids),
+                static_cast<unsigned long long>(g.n_route_mis_slots),
+                static_cast<unsigned long long>(g.n_route_mis_w),
+                static_cast<unsigned long long>(g.n_route_mis_sig),
+                static_cast<unsigned long long>(g.n_route_mis_probs),
+                static_cast<unsigned long long>(g.n_route_probs_checked));
             log_output(rmsg);
-            std::snprintf(rmsg, sizeof(rmsg),
-                          "[xllama] d3d12 gpu route: %.1f ms settling prefetch rounds; %llu layers "
-                          "recorded with the emit fused; the first %llu host graphs node by node:\n",
-                          g.route_prep_ms, static_cast<unsigned long long>(g.n_route_fused),
-                          static_cast<unsigned long long>(g.n_route_timed));
+            std::snprintf(
+                rmsg, sizeof(rmsg),
+                "[xllama] d3d12 gpu route: %.1f ms settling prefetch rounds; %llu layers "
+                "recorded with the emit fused; the first %llu host graphs node by node:\n",
+                g.route_prep_ms, static_cast<unsigned long long>(g.n_route_fused),
+                static_cast<unsigned long long>(g.n_route_timed));
             log_output(rmsg);
             std::vector<std::pair<std::string, Gpu::SegStat>> rn(g.route_nodes.begin(),
                                                                  g.route_nodes.end());
             std::sort(rn.begin(), rn.end(),
                       [](const auto& x, const auto& y) { return x.second.ms > y.second.ms; });
             for (const auto& [key, s] : rn) {
-                std::snprintf(rmsg, sizeof(rmsg), "[xllama] d3d12 route node: %6llu x %9.2f ms  %s\n",
+                std::snprintf(rmsg, sizeof(rmsg),
+                              "[xllama] d3d12 route node: %6llu x %9.2f ms  %s\n",
                               static_cast<unsigned long long>(s.n), s.ms, key.c_str());
                 log_output(rmsg);
             }
@@ -2430,8 +2435,7 @@ std::int64_t flat_rows(const ggml_tensor* t) {
 // and 2 fold the rows into a second grid dimension (elt_fold).
 bool flat_ok(const ggml_tensor* t) {
     const std::int64_t rows = flat_rows(t);
-    return t->ne[0] >= 1 && rows >= 1 &&
-           rows <= std::int64_t(kD3d12MaxGroups) * kD3d12MaxGroups &&
+    return t->ne[0] >= 1 && rows >= 1 && rows <= std::int64_t(kD3d12MaxGroups) * kD3d12MaxGroups &&
            (t->ne[0] + 255) / 256 <= kD3d12MaxGroups && t->ne[0] * rows <= (std::int64_t(1) << 28);
 }
 
@@ -2761,8 +2765,8 @@ void add_profile(Gpu& g, const std::vector<Op>& ops) {
             armed = true;
         if (k >= kProfStamps)
             break;
-        Gpu::SegStat& s = skipping ? g.prof_tail
-                                   : g.kernels[std::make_tuple(op.pso, op.gx, op.gy, op.gz)];
+        Gpu::SegStat& s =
+            skipping ? g.prof_tail : g.kernels[std::make_tuple(op.pso, op.gx, op.gy, op.gz)];
         ++s.n;
         if (t[k] > t[k - 1])
             s.ms += 1000.0 * static_cast<double>(t[k] - t[k - 1]) / static_cast<double>(g.ts_freq);
@@ -2834,8 +2838,7 @@ ListCache& list_cache() { // guarded by gpu().mu
 
 // Record and run one submission; async leaves it running (g.pending, its
 // timestamps read when drained). Caller holds g.mu.
-bool submit_ops(Gpu& g, const std::vector<Op>& ops, bool async = false,
-                ListHint* hint = nullptr) {
+bool submit_ops(Gpu& g, const std::vector<Op>& ops, bool async = false, ListHint* hint = nullptr) {
     const bool ts = g.ts_on && g.ts && g.ts_rb;
     const bool prof = g.prof_on && g.prof && g.prof_rb && g.ts_freq > 0;
     async = async && !prof; // the profile readback is mapped right after the run
@@ -2975,10 +2978,10 @@ bool route_node(const ggml_tensor* t) {
         const ggml_tensor* a = t->src[0];
         float p[2] = {};
         std::memcpy(p, t->op_params, sizeof(p)); // scale, max_bias
-        return name_is(t, "ffn_moe_probs-") && t->type == GGML_TYPE_F32 &&
-               ggml_is_contiguous(t) && one_row(t) && t->ne[0] % 8 == 0 && t->ne[0] >= 8 &&
-               t->ne[0] <= kRouteMaxExpert && a && a->type == GGML_TYPE_F32 && !t->src[1] &&
-               !t->src[2] && p[0] == 1.0f && p[1] == 0.0f;
+        return name_is(t, "ffn_moe_probs-") && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) &&
+               one_row(t) && t->ne[0] % 8 == 0 && t->ne[0] >= 8 && t->ne[0] <= kRouteMaxExpert &&
+               a && a->type == GGML_TYPE_F32 && !t->src[1] && !t->src[2] && p[0] == 1.0f &&
+               p[1] == 0.0f;
     }
     case GGML_OP_CUSTOM: {
         llama_ec_route_info ri{};
@@ -3045,7 +3048,8 @@ bool ensure_fad(Gpu& g) {
     BufCtx c;
     std::string err;
     if (!create_host_res(g, kBytes, false, &c, &err)) {
-        log_output("[xllama] d3d12: split-K scratch failed, attention stays one pass: " + err + "\n");
+        log_output("[xllama] d3d12: split-K scratch failed, attention stays one pass: " + err +
+                   "\n");
         return false;
     }
     std::memset(c.host, 0, kBytes);
@@ -3141,8 +3145,8 @@ bool host_compute(Gpu& g, ggml_tensor* const* nodes, std::size_t n) {
             ggml_graph_clear(h->gf);
             ggml_graph_add_node(h->gf, nodes[i]);
             ok = ggml_backend_graph_compute(h->be, h->gf) == GGML_STATUS_SUCCESS;
-            Gpu::SegStat& s = g.route_nodes[std::string(ggml_op_desc(nodes[i])) + " " +
-                                            seg_name(nodes[i])];
+            Gpu::SegStat& s =
+                g.route_nodes[std::string(ggml_op_desc(nodes[i])) + " " + seg_name(nodes[i])];
             ++s.n;
             s.ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1)
                         .count();
@@ -3237,13 +3241,12 @@ bool route_sig_same(const std::uint8_t* rec) {
 // them, used nowhere else but W, the slot ids and the sigmoid (sig_cand, the
 // node before the softmax, when it is the shared expert's gate). Returns why
 // not, else nullptr; idxs = the graph nodes the use counts were checked for.
-const char* route_match(ggml_cgraph* cgraph, int gi, ggml_tensor* sig_cand, int sig_gi,
-                        RouteGrp* r, std::vector<int>* idxs) {
+const char* route_match(ggml_cgraph* cgraph, int gi, ggml_tensor* sig_cand, int sig_gi, RouteGrp* r,
+                        std::vector<int>* idxs) {
     idxs->clear();
     ggml_tensor* S = ggml_graph_node(cgraph, gi);
     const ggml_tensor* logits = S->src[0];
-    if (!elt_operand(logits) || !ggml_is_contiguous(logits) ||
-        ggml_nelements(logits) != S->ne[0])
+    if (!elt_operand(logits) || !ggml_is_contiguous(logits) || ggml_nelements(logits) != S->ne[0])
         return "router logits not in D3D12_Host";
     ggml_tensor *C1 = nullptr, *C2 = nullptr, *C3 = nullptr, *gr = nullptr, *sum = nullptr,
                 *clamp = nullptr, *div = nullptr, *scale = nullptr;
@@ -3354,9 +3357,7 @@ const char* route_match(ggml_cgraph* cgraph, int gi, ggml_tensor* sig_cand, int 
         return "expert cache shape";
     if (!std::isfinite(ri1.swap_ratio) || ri1.swap_ratio < 0.0f)
         return "swap ratio";
-    auto host_buf = [](const ggml_tensor* t) {
-        return t->buffer && t->buffer->buft == &kHostBuft;
-    };
+    auto host_buf = [](const ggml_tensor* t) { return t->buffer && t->buffer->buft == &kHostBuft; };
     if (!host_buf(S))
         return "not in D3D12_Host";
     for (const int j : members)
@@ -3505,13 +3506,14 @@ void route_probs_log(const RouteGrp& r, const std::uint8_t* rec, const std::uint
         nden += (gp[i] < 0x00800000u || cp[i] < 0x00800000u) ? 1 : 0;
     }
     char msg[400];
-    std::snprintf(msg, sizeof(msg),
-                  "[xllama] d3d12 GPU routing: probabilities differ in %s (state %u): %d of %d, "
-                  "max %u ulp, %d with a denormal or zero side, first [%d] gpu %08X cpu %08X "
-                  "logit %08X; logits the kernel read differ in %d (first [%d] gpu %08X cpu %08X)%s\n",
-                  r.S->name, state, np, n, ulp, nden, fp, fp >= 0 ? gp[fp] : 0u,
-                  fp >= 0 ? cp[fp] : 0u, fp >= 0 ? lg[fp] : 0u, nl, fl, fl >= 0 ? gl[fl] : 0u,
-                  fl >= 0 ? lg[fl] : 0u, r.S->data == r.logits->data ? ", softmax in place" : "");
+    std::snprintf(
+        msg, sizeof(msg),
+        "[xllama] d3d12 GPU routing: probabilities differ in %s (state %u): %d of %d, "
+        "max %u ulp, %d with a denormal or zero side, first [%d] gpu %08X cpu %08X "
+        "logit %08X; logits the kernel read differ in %d (first [%d] gpu %08X cpu %08X)%s\n",
+        r.S->name, state, np, n, ulp, nden, fp, fp >= 0 ? gp[fp] : 0u, fp >= 0 ? cp[fp] : 0u,
+        fp >= 0 ? lg[fp] : 0u, nl, fl, fl >= 0 ? gl[fl] : 0u, fl >= 0 ? lg[fl] : 0u,
+        r.S->data == r.logits->data ? ", softmax in place" : "");
     log_output(std::string(msg));
 }
 
@@ -3579,7 +3581,8 @@ bool submit_routed(Gpu& g, const std::vector<Op>& ops, std::vector<RouteGrp>& ro
         const auto tp = std::chrono::steady_clock::now();
         llama_ec_route_prepare(r.C1);
         g.route_prep_ms +=
-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp).count();
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp)
+                .count();
         llama_ec_route_info ri{};
         ri.size = sizeof(ri);
         const int kind = llama_ec_route_query(r.C1, &ri);
@@ -3643,11 +3646,12 @@ struct PlanAct {
     enum Kind : std::uint8_t { kCopy, kIds, kQuant };
     Kind kind = kCopy;
     const std::uint8_t* src = nullptr;
-    std::size_t off = 0, bytes = 0;         // kCopy: `bytes` from src to the scratch at off
+    std::size_t off = 0, bytes = 0; // kCopy: `bytes` from src to the scratch at off
     std::int64_t n0 = 0, n1 = 0,
                  bound = 0;       // kIds: n1 rows of n0 ids at src, nb1 apart, in [0, bound)
     std::size_t nb1 = 0, esz = 4; // kIds: int32 (4) or int64 (8) ids
-    ggml_type wt = GGML_TYPE_F32; // kQuant: d3d12_quantize_activations of src into the scratch at off
+    ggml_type wt =
+        GGML_TYPE_F32; // kQuant: d3d12_quantize_activations of src into the scratch at off
     std::size_t stride = 0;
     int k = 0, ncols = 0;
 };
@@ -3809,8 +3813,8 @@ ggml_status run_plan(Gpu& g, SplitPlan& p, std::chrono::steady_clock::time_point
                            : submit_routed(g, p.ops, p.routes, &p.hint, &p.rhints, &p.rtails)))
         return GGML_STATUS_FAILED;
     const auto t_end = std::chrono::steady_clock::now();
-    g.sub_ms += std::chrono::duration<double, std::milli>(t_end - tf).count() -
-                (g.rec_ms + g.wait_ms - rw);
+    g.sub_ms +=
+        std::chrono::duration<double, std::milli>(t_end - tf).count() - (g.rec_ms + g.wait_ms - rw);
     ++g.n_pc_hit;
     g.n_gdn_fused += p.n_gdn;
     ++g.n_calls;
@@ -3885,7 +3889,7 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
     // Containers kept across calls (their capacity is reused); one llama
     // thread computes graphs.
     thread_local std::vector<ggml_tensor*> nodes;
-    thread_local std::vector<int> node_idx; // each node's index in cgraph, for moe_fusable
+    thread_local std::vector<int> node_idx;     // each node's index in cgraph, for moe_fusable
     thread_local std::vector<std::uint64_t> fp; // the plan cache's fingerprint of the call
     nodes.clear();
     node_idx.clear();
@@ -4079,8 +4083,8 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
                     ++logged;
                     char msg[256];
                     std::snprintf(msg, sizeof(msg),
-                                  "[xllama] d3d12 GPU routing: %s not routed: %s\n",
-                                  nodes[i]->name, why);
+                                  "[xllama] d3d12 GPU routing: %s not routed: %s\n", nodes[i]->name,
+                                  why);
                     log_output(std::string(msg));
                 }
                 continue;
@@ -4151,17 +4155,17 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
         const bool keep = last && pc_keep;
         bool ok = true;
         if (!ops.empty() && !pend.empty()) {
-            ok = submit_routed(g, ops, pend, keep ? &pc_hint : nullptr,
-                               keep ? &pc_rhints : nullptr, keep ? &pc_rtails : nullptr);
+            ok = submit_routed(g, ops, pend, keep ? &pc_hint : nullptr, keep ? &pc_rhints : nullptr,
+                               keep ? &pc_rtails : nullptr);
             if (keep)
                 pc_routes = pend;
         } else if (!ops.empty()) {
             ok = submit_ops(g, ops, async, keep ? &pc_hint : nullptr);
         }
         pend.clear();
-        g.sub_ms +=
-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count() -
-            (g.rec_ms + g.wait_ms - rw);
+        g.sub_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf)
+                        .count() -
+                    (g.rec_ms + g.wait_ms - rw);
         ops.clear();
         bar_r.clear();
         bar_w.clear();
@@ -4675,9 +4679,8 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
                  (!gpu_q && any_overlap(batch_w, rng_of(x)))) &&
                 !flush())
                 return GGML_STATUS_FAILED;
-            const std::size_t need =
-                (routed ? 0 : ((plan.ids_bytes + 255) & ~std::size_t(255))) +
-                ((plan.x_bytes + 255) & ~std::size_t(255));
+            const std::size_t need = (routed ? 0 : ((plan.ids_bytes + 255) & ~std::size_t(255))) +
+                                     ((plan.x_bytes + 255) & ~std::size_t(255));
             if (used + need > g.xq_bytes && (!flush() || !ensure_xq(g, need)))
                 return GGML_STATUS_FAILED;
             std::size_t ioff = 0, xoff = 0;
@@ -4717,10 +4720,10 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
             m.u[1] = xq_va(xoff);
             m.gx = plan.groups_x;
             m.gy = plan.groups_y;
-            record(m,
-                   {xq_rng(xoff, plan.x_bytes),
-                    routed ? rng_of(ids) : xq_rng(ioff, plan.ids_bytes)},
-                   {rng_of(node)});
+            record(
+                m,
+                {xq_rng(xoff, plan.x_bytes), routed ? rng_of(ids) : xq_rng(ioff, plan.ids_bytes)},
+                {rng_of(node)});
             break;
         }
         // The delta net's kernels (ggml_d3d12_ssm_emu.h). supports_op admits
@@ -5030,15 +5033,17 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
                 // finds in `done`. By rows as kernel 1, or, when the matmul reads
                 // it wider (the gated norm's [128, 32] as [4096]), over the
                 // contiguous bytes in rows of that width.
-                const ggml_tensor* qx = g.binq && g.pso_elt[kEltBinQuant] ? q8k_reader(node, i + 1)
-                                                                          : nullptr;
+                const ggml_tensor* qx =
+                    g.binq && g.pso_elt[kEltBinQuant] ? q8k_reader(node, i + 1) : nullptr;
                 const std::int64_t qk = qx ? qx->ne[0] : 0;
                 const bool by_rows = qx && qk == node->ne[0] && qx->nb[1] == node->nb[1];
-                const bool by_bytes =
-                    qx && !by_rows && ggml_is_contiguous(qx) && ggml_nbytes(qx) == ggml_nbytes(node) &&
-                    ggml_is_contiguous(node) && ggml_is_contiguous(a) && ggml_is_contiguous(b) &&
-                    ggml_are_same_shape(node, b);
-                const std::int64_t qrows = by_rows ? rows : by_bytes ? ggml_nelements(node) / qk : 0;
+                const bool by_bytes = qx && !by_rows && ggml_is_contiguous(qx) &&
+                                      ggml_nbytes(qx) == ggml_nbytes(node) &&
+                                      ggml_is_contiguous(node) && ggml_is_contiguous(a) &&
+                                      ggml_is_contiguous(b) && ggml_are_same_shape(node, b);
+                const std::int64_t qrows = by_rows    ? rows
+                                           : by_bytes ? ggml_nelements(node) / qk
+                                                      : 0;
                 const bool bq = (by_rows || by_bytes) && qk % kD3d12Chunk == 0 &&
                                 qk / kD3d12Chunk <= kD3d12MaxGroups && qrows >= 1 &&
                                 qrows <= kD3d12MaxGroups;
@@ -5175,7 +5180,8 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
             // groups: split-K, the chunks' partials to fad, then the reduce.
             D3d12FapPlan p;
             GGML_ASSERT(d3d12_fap_plan(node, &p));
-            const std::uint32_t chunk = g.fa_split && g.fad_ptr ? d3d12_fap_chunk(p, g.fad_bytes) : 0;
+            const std::uint32_t chunk =
+                g.fa_split && g.fad_ptr ? d3d12_fap_chunk(p, g.fad_bytes) : 0;
             auto fap_operand = [&](const ggml_tensor* t) {
                 return t && t->buffer && t->buffer->buft == &kHostBuft &&
                        reinterpret_cast<std::uintptr_t>(t->data) % 4 == 0 &&
@@ -5191,14 +5197,15 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
                 if (!flush())
                     return GGML_STATUS_FAILED;
                 if (g.n_fap_host++ == 0)
-                    log_output("[xllama] d3d12: FLASH_ATTN_EXT on the host (operands outside D3D12_Host)\n");
+                    log_output("[xllama] d3d12: FLASH_ATTN_EXT on the host (operands outside "
+                               "D3D12_Host)\n");
                 const float* hq = static_cast<const float*>(p.q->data);
                 const auto* hk = static_cast<const ggml_fp16_t*>(p.k->data);
                 const auto* hv = static_cast<const ggml_fp16_t*>(p.v->data);
                 const auto* hm = p.mask ? static_cast<const ggml_fp16_t*>(p.mask->data) : nullptr;
                 if (chunk)
-                    d3d12_fap_emulate_chunked(p.params, chunk, p.groups_x, p.groups_y, hq, hk, hv, hm,
-                                              static_cast<float*>(node->data));
+                    d3d12_fap_emulate_chunked(p.params, chunk, p.groups_x, p.groups_y, hq, hk, hv,
+                                              hm, static_cast<float*>(node->data));
                 else
                     d3d12_fap_emulate(p.params, p.groups_x, p.groups_y, hq, hk, hv, hm,
                                       static_cast<float*>(node->data));
@@ -5278,8 +5285,8 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
         const SplitPlan& p = *vplan;
         bool& same = pc_same;
         same = pc_keep && p.n_gdn == gdn_fused.size() && p.ops.size() == pc_ops.size() &&
-                    p.acts.size() == pc_acts.size() && p.guards.size() == pc_guards.size() &&
-                    p.routes.size() == pc_routes.size();
+               p.acts.size() == pc_acts.size() && p.guards.size() == pc_guards.size() &&
+               p.routes.size() == pc_routes.size();
         const char* what = !pc_keep ? "not cacheable" : "sizes";
         for (std::size_t j = 0; same && j < pc_ops.size(); ++j)
             if (!same_op(p.ops[j], pc_ops[j])) {
@@ -5301,13 +5308,12 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
             ++g.n_pc_same;
         } else if (g.n_pc_diff++ < 3) {
             log_output("[xllama] d3d12 plan cache: replay would differ (" + std::string(what) +
-                       ") in " + seg_name(nodes.front()) + " .. " + seg_name(nodes.back()) +
-                       " /" + std::to_string(nodes.size()) + ": ops " +
-                       std::to_string(p.ops.size()) + "/" + std::to_string(pc_ops.size()) +
-                       ", actions " + std::to_string(p.acts.size()) + "/" +
-                       std::to_string(pc_acts.size()) + ", guards " +
-                       std::to_string(p.guards.size()) + "/" + std::to_string(pc_guards.size()) +
-                       "\n");
+                       ") in " + seg_name(nodes.front()) + " .. " + seg_name(nodes.back()) + " /" +
+                       std::to_string(nodes.size()) + ": ops " + std::to_string(p.ops.size()) +
+                       "/" + std::to_string(pc_ops.size()) + ", actions " +
+                       std::to_string(p.acts.size()) + "/" + std::to_string(pc_acts.size()) +
+                       ", guards " + std::to_string(p.guards.size()) + "/" +
+                       std::to_string(pc_guards.size()) + "\n");
         }
     }
     if (pc && pc_keep && !pc_same) { // a plan that differed is replaced
@@ -5374,7 +5380,8 @@ const char* dev_name(ggml_backend_dev_t) {
     return "D3D12";
 }
 const char* dev_description(ggml_backend_dev_t) {
-    return "xllama D3D12 compute (Q4_0/Q4_K/Q5_K/Q6_K/IQ2_XXS/IQ2_S/IQ3_S/IQ4_XS matmul, Q6_K get_rows, f32 "
+    return "xllama D3D12 compute (Q4_0/Q4_K/Q5_K/Q6_K/IQ2_XXS/IQ2_S/IQ3_S/IQ4_XS matmul, Q6_K "
+           "get_rows, f32 "
            "add/mul/rms_norm/swiglu, q8_K quant)";
 }
 void dev_memory(ggml_backend_dev_t, size_t* free, size_t* total) {
@@ -5452,10 +5459,11 @@ ggml_backend_t dev_init_backend(ggml_backend_dev_t dev, const char*) {
         }
         if (g.fa_prefill) {
             char m[160];
-            std::snprintf(m, sizeof(m),
-                          "[xllama] d3d12: prefill attention on the GPU from %lld tokens per ubatch "
-                          "(XLLAMA_FA_PREFILL)\n",
-                          static_cast<long long>(g.fa_prefill_min));
+            std::snprintf(
+                m, sizeof(m),
+                "[xllama] d3d12: prefill attention on the GPU from %lld tokens per ubatch "
+                "(XLLAMA_FA_PREFILL)\n",
+                static_cast<long long>(g.fa_prefill_min));
             log_output(m);
         }
         const char* fdk = std::getenv("XLLAMA_FA_DECODE_KV");
@@ -5494,19 +5502,22 @@ ggml_backend_t dev_init_backend(ggml_backend_dev_t dev, const char*) {
         if (g.plan_mode < 0 || g.plan_mode > 2)
             g.plan_mode = 1;
         if (g.plan_mode)
-            log_output(g.plan_mode == 1
-                           ? "[xllama] d3d12: split plans kept and replayed (XLLAMA_D3D12_PLANCACHE=1)\n"
-                           : "[xllama] d3d12: split plans kept and checked against planning, never "
-                             "replayed (XLLAMA_D3D12_PLANCACHE=2)\n");
+            log_output(
+                g.plan_mode == 1
+                    ? "[xllama] d3d12: split plans kept and replayed (XLLAMA_D3D12_PLANCACHE=1)\n"
+                    : "[xllama] d3d12: split plans kept and checked against planning, never "
+                      "replayed (XLLAMA_D3D12_PLANCACHE=2)\n");
         plan_cache().clear();
         const char* nq = std::getenv("XLLAMA_D3D12_NORMQ");
         g.normq = !(nq && *nq == '0');
         if (!g.normq)
-            log_output("[xllama] d3d12: rms_norm and its q8_K copy kept apart (XLLAMA_D3D12_NORMQ=0)\n");
+            log_output(
+                "[xllama] d3d12: rms_norm and its q8_K copy kept apart (XLLAMA_D3D12_NORMQ=0)\n");
         const char* bq = std::getenv("XLLAMA_D3D12_BINQ");
         g.binq = !(bq && *bq == '0');
         if (!g.binq)
-            log_output("[xllama] d3d12: binary ops and their q8_K copy kept apart (XLLAMA_D3D12_BINQ=0)\n");
+            log_output("[xllama] d3d12: binary ops and their q8_K copy kept apart "
+                       "(XLLAMA_D3D12_BINQ=0)\n");
         const char* hp = std::getenv("XLLAMA_D3D12_HOSTPROF");
         g.host_prof = hp && *hp && *hp != '0';
         if (g.host_prof)
@@ -5539,23 +5550,22 @@ ggml_backend_t dev_init_backend(ggml_backend_dev_t dev, const char*) {
                        static_cast<int>(kRouteMax)));
         g.route_on = false;
         if (route_want) {
-            const char* off = !g.route_ok      ? "no route kernels"
-                              : g.waves        ? "XLLAMA_D3D12_WAVES"
-                              : g.shexp_async  ? "XLLAMA_D3D12_SHEXP_ASYNC"
+            const char* off = !g.route_ok             ? "no route kernels"
+                              : g.waves               ? "XLLAMA_D3D12_WAVES"
+                              : g.shexp_async         ? "XLLAMA_D3D12_SHEXP_ASYNC"
                               : !ensure_route_bufs(g) ? "no buffers"
-                              : !host_cpu(g)   ? "no CPU backend"
-                                               : nullptr;
+                              : !host_cpu(g)          ? "no CPU backend"
+                                                      : nullptr;
             g.route_on = off == nullptr;
-            log_output(g.route_on
-                           ? "[xllama] d3d12: MoE routing on the GPU, predicated on a miss "
-                             "(XLLAMA_D3D12_GPUROUTE, sigmoid " +
-                                 std::string(g.route_sig ? "on" : "off") + ", " +
-                                 (g.route_shared
-                                      ? std::string("llama's CPU threadpool")
-                                      : std::to_string(g.route_io) + " CPU threads, poll " +
-                                            std::to_string(g.route_poll)) +
-                                 (g.route_fuse ? ", emit fused" : "") + ")\n"
-                           : "[xllama] d3d12: GPU routing off: " + std::string(off) + "\n");
+            log_output(g.route_on ? "[xllama] d3d12: MoE routing on the GPU, predicated on a miss "
+                                    "(XLLAMA_D3D12_GPUROUTE, sigmoid " +
+                                        std::string(g.route_sig ? "on" : "off") + ", " +
+                                        (g.route_shared
+                                             ? std::string("llama's CPU threadpool")
+                                             : std::to_string(g.route_io) + " CPU threads, poll " +
+                                                   std::to_string(g.route_poll)) +
+                                        (g.route_fuse ? ", emit fused" : "") + ")\n"
+                                  : "[xllama] d3d12: GPU routing off: " + std::string(off) + "\n");
         }
     }
     return new ggml_backend{backend_guid(), kBackendIface, dev, nullptr};
@@ -5777,8 +5787,8 @@ bool dev_supports_op(ggml_backend_dev_t, const ggml_tensor* op) {
         // a also in planes: q and k of a prefill ubatch); b a's shape or one row
         // (ssm_dt, ssm_a, the gated norm's weight).
         if (op->op != GGML_OP_GLU && a && gpu().ssm_ok && flat_ok(op) &&
-            (flat_ok(a) || (op->op == GGML_OP_RMS_NORM && flat_rows(a) == 0 &&
-                            plane_rows(a) == flat_rows(op))) &&
+            (flat_ok(a) ||
+             (op->op == GGML_OP_RMS_NORM && flat_rows(a) == 0 && plane_rows(a) == flat_rows(op))) &&
             ggml_are_same_shape(op, a) && elt_f32(op) && ssm_f32(op) && elt_f32(a) && ssm_f32(a) &&
             (op->op == GGML_OP_RMS_NORM ||
              (b && elt_f32(b) && ssm_f32(b) && b->ne[0] == op->ne[0] &&
@@ -6934,8 +6944,8 @@ D3d12SelftestRow run_normq_case(ggml_backend_t backend, int k, int n, int ncols,
     std::memcpy(yf.data(), fused.y.data(), yf.size() * sizeof(float));
     row.rel_err = reference_rel_err(wtype, q, w->nb[1], mf, yf, n, k, ncols);
     const bool same = apart.nrm == fused.nrm && apart.m == fused.m && apart.y == fused.y;
-    const bool one_less = fused.fused == 1 && apart.fused == 0 &&
-                          fused.dispatches + 1 == apart.dispatches;
+    const bool one_less =
+        fused.fused == 1 && apart.fused == 0 && fused.dispatches + 1 == apart.dispatches;
     row.ok = same && one_less && row.rel_err <= kD3d12SelftestRelTol;
     if (!one_less)
         row.error = "not fused: " + std::to_string(apart.dispatches) + " -> " +
@@ -7085,8 +7095,8 @@ D3d12SelftestRow run_binq_case(ggml_backend_t backend, int kind, int ne0, int ne
     std::memcpy(yf.data(), fused.y.data(), yf.size() * sizeof(float));
     row.rel_err = reference_rel_err(wtype, q, w->nb[1], rf, yf, n, k, ncols);
     const bool same = apart.r == fused.r && apart.y == fused.y;
-    const bool one_less = fused.fused == 1 && apart.fused == 0 &&
-                          fused.dispatches + 1 == apart.dispatches;
+    const bool one_less =
+        fused.fused == 1 && apart.fused == 0 && fused.dispatches + 1 == apart.dispatches;
     row.ok = same && one_less && row.rel_err <= kD3d12SelftestRelTol;
     if (!one_less)
         row.error = "not fused: " + std::to_string(apart.dispatches) + " -> " +
@@ -7113,10 +7123,9 @@ D3d12SelftestRow run_binq_case(ggml_backend_t backend, int kind, int ne0, int ne
 // CONCAT at 2048 pass the 65535 groups of a grid dimension (folded grids), as
 // kind 9's 32 x 2048 rows do.
 D3d12SelftestRow run_ssm_case(ggml_backend_t backend, int kind, std::int64_t t = 1) {
-    static const char* const kNames[] = {"ssm_sigmoid", "ssm_softplus", "ssm_silu",
-                                         "ssm_scale",   "ssm_concat",   "ssm_get_rows",
-                                         "ssm_conv",    "ssm_gdn",      "ssm_qk_norm",
-                                         "ssm_gated_norm"};
+    static const char* const kNames[] = {"ssm_sigmoid", "ssm_softplus",  "ssm_silu", "ssm_scale",
+                                         "ssm_concat",  "ssm_get_rows",  "ssm_conv", "ssm_gdn",
+                                         "ssm_qk_norm", "ssm_gated_norm"};
     constexpr std::int64_t kCh = 8192, kConv = 4, kSv = kD3d12GdnSv, kHk = 16, kHv = 32;
     constexpr float kEps = 1e-6f;
     D3d12SelftestRow row;
@@ -7229,10 +7238,9 @@ D3d12SelftestRow run_ssm_case(ggml_backend_t backend, int kind, std::int64_t t =
         out = ggml_silu(ctx_g, ggml_ssm_conv(ctx_g, in[0], in[1]));
         break;
     case 8:
-        out = ggml_rms_norm(ctx_g,
-                            ggml_view_3d(ctx_g, in[0], kSv, kHk, t, kSv * sizeof(float),
-                                         in[0]->nb[1], 0),
-                            kEps);
+        out = ggml_rms_norm(
+            ctx_g, ggml_view_3d(ctx_g, in[0], kSv, kHk, t, kSv * sizeof(float), in[0]->nb[1], 0),
+            kEps);
         break;
     case 9:
         out = ggml_mul(ctx_g, ggml_mul(ctx_g, ggml_rms_norm(ctx_g, in[0], kEps), in[1]), in[2]);
@@ -7533,7 +7541,9 @@ void run_fap_case(ggml_backend_t backend, std::vector<D3d12SelftestRow>* out, in
     struct Restore {
         Gpu& g;
         bool v;
-        ~Restore() { g.fa_split = v; }
+        ~Restore() {
+            g.fa_split = v;
+        }
     } restore{g, split_was};
     const auto row_name = [&](bool sk) {
         char name[48];
@@ -7557,8 +7567,8 @@ void run_fap_case(ggml_backend_t backend, std::vector<D3d12SelftestRow>* out, in
                     ggml_tensor* mk) {
         auto view = [&](ggml_tensor* c) {
             return ggml_permute(ctx,
-                                ggml_view_4d(ctx, c, d, kv_heads, n_kv, 1, ggml_row_size(c->type, d),
-                                             ggml_row_size(c->type, gqa),
+                                ggml_view_4d(ctx, c, d, kv_heads, n_kv, 1,
+                                             ggml_row_size(c->type, d), ggml_row_size(c->type, gqa),
                                              ggml_row_size(c->type, gqa * kv_size), 0),
                                 0, 2, 1, 3);
         };
@@ -7647,7 +7657,9 @@ void run_fap_case(ggml_backend_t backend, std::vector<D3d12SelftestRow>* out, in
     for (int i = 0; i < kSelftestTimedRuns && st == GGML_STATUS_SUCCESS; ++i) {
         const auto tw = std::chrono::steady_clock::now();
         st = ggml_backend_graph_compute(backend, gf);
-        wall.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw).count());
+        wall.push_back(
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw)
+                .count());
         ms.push_back(gpu().last_gpu_ms);
     }
     row.d3d12_ran = st == GGML_STATUS_SUCCESS;
@@ -7665,8 +7677,8 @@ void run_fap_case(ggml_backend_t backend, std::vector<D3d12SelftestRow>* out, in
     const std::uint32_t gx = check_groups > 0
                                  ? std::min(p.groups_x, static_cast<std::uint32_t>(check_groups))
                                  : p.groups_x;
-    const std::size_t tokens =
-        std::min<std::size_t>(n_tok, static_cast<std::size_t>(gx) * (kD3d12FapRows / (heads / kv_heads)));
+    const std::size_t tokens = std::min<std::size_t>(
+        n_tok, static_cast<std::size_t>(gx) * (kD3d12FapRows / (heads / kv_heads)));
     const std::size_t n_chk = tokens * heads * d;
     std::vector<float> ref(got.size(), 0.0f);
     if (chunk)
@@ -7803,7 +7815,8 @@ void run_fap_case(ggml_backend_t backend, std::vector<D3d12SelftestRow>* out, in
         up.k = n_kv;
         up.ncols = d;
         up.gpu_ms = upload_ms;
-        up.packed_gbs = upload_ms > 0.0 ? 2.0 * view_halves * sizeof(ggml_fp16_t) / 1e6 / upload_ms : 0.0;
+        up.packed_gbs =
+            upload_ms > 0.0 ? 2.0 * view_halves * sizeof(ggml_fp16_t) / 1e6 / upload_ms : 0.0;
         up.d3d12_ran = up.ok = true;
         out->push_back(std::move(up));
         D3d12SelftestRow wr;
@@ -7853,18 +7866,17 @@ D3d12SelftestRow run_route_sig_case() {
     Gpu& g = gpu();
     const int n = row.n;
     std::vector<float> x(static_cast<std::size_t>(n));
-    const std::uint32_t specials[] = {0x00000000u, 0x80000000u, 0x00000001u, 0x807FFFFFu,
-                                      0x00800000u, 0x80800000u, 0x7F800000u, 0xFF800000u,
-                                      0x7FC00000u, 0xFFC00000u, 0x7F800001u, 0xFFBFFFFFu,
-                                      0x7F7FFFFFu, 0xFF7FFFFFu, 0x42B17218u, 0xC2B17218u,
-                                      0x42CFF1B5u, 0xC2CFF1B5u, 0x42DC0000u, 0xC2DC0000u};
+    const std::uint32_t specials[] = {
+        0x00000000u, 0x80000000u, 0x00000001u, 0x807FFFFFu, 0x00800000u, 0x80800000u, 0x7F800000u,
+        0xFF800000u, 0x7FC00000u, 0xFFC00000u, 0x7F800001u, 0xFFBFFFFFu, 0x7F7FFFFFu, 0xFF7FFFFFu,
+        0x42B17218u, 0xC2B17218u, 0x42CFF1B5u, 0xC2CFF1B5u, 0x42DC0000u, 0xC2DC0000u};
     int i = 0;
     for (const std::uint32_t u : specials)
         std::memcpy(&x[static_cast<std::size_t>(i++)], &u, sizeof(u));
     const int n_sweep = n / 4;
     for (int k = 0; k < n_sweep; ++k)
-        x[static_cast<std::size_t>(i++)] = -110.0f + 220.0f * static_cast<float>(k) /
-                                                         static_cast<float>(n_sweep - 1);
+        x[static_cast<std::size_t>(i++)] =
+            -110.0f + 220.0f * static_cast<float>(k) / static_cast<float>(n_sweep - 1);
     std::mt19937 rng(20261111u);
     std::uniform_real_distribution<float> gate(-20.0f, 20.0f);
     for (int k = 0; k < n / 4; ++k)
@@ -7904,12 +7916,14 @@ D3d12SelftestRow run_route_sig_case() {
         op.gy = 1;
         const std::vector<Op> one = {op};
         const auto t0 = std::chrono::steady_clock::now();
-        if (!run_now(g, [&](ID3D12GraphicsCommandList* cl) { record_ops(g, cl, one, false, false); })) {
+        if (!run_now(
+                g, [&](ID3D12GraphicsCommandList* cl) { record_ops(g, cl, one, false, false); })) {
             row.error = "submit failed";
             return row;
         }
         row.gpu_ms =
-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                .count();
     }
     row.d3d12_ran = true;
     int bad = 0, bad_exp = 0, first = -1;
@@ -7936,8 +7950,8 @@ D3d12SelftestRow run_route_sig_case() {
         std::memcpy(&gb, &got, 4);
         std::memcpy(&rb, &ref[static_cast<std::size_t>(first)], 4);
         std::snprintf(msg, sizeof(msg),
-                      "%d differ from ggml (first x %08X: gpu %08X, cpu %08X); std::exp %d", bad, xb,
-                      gb, rb, bad_exp);
+                      "%d differ from ggml (first x %08X: gpu %08X, cpu %08X); std::exp %d", bad,
+                      xb, gb, rb, bad_exp);
         row.error = msg;
     } else if (bad_exp) {
         std::snprintf(msg, sizeof(msg), "bit-exact; std::exp would differ in %d", bad_exp);
@@ -8113,12 +8127,14 @@ D3d12SelftestRow run_route_case() {
     {
         std::lock_guard<std::mutex> lock(g.mu);
         const auto t0 = std::chrono::steady_clock::now();
-        if (!run_now(g, [&](ID3D12GraphicsCommandList* cl) { record_ops(g, cl, ops, false, false); })) {
+        if (!run_now(
+                g, [&](ID3D12GraphicsCommandList* cl) { record_ops(g, cl, ops, false, false); })) {
             row.error = "submit failed";
             return row;
         }
         row.gpu_ms =
-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                .count();
     }
     row.d3d12_ran = true;
     int bad = 0;
@@ -8332,7 +8348,8 @@ D3d12SelftestRow run_route_pred_case() {
         }
         std::memset(g.pred_ptr, 0, 8);
         std::memcpy(g.pred_ptr, &p0, 4);
-        return run_now(g, [&](ID3D12GraphicsCommandList* cl) { record_ops(g, cl, list, false, false); });
+        return run_now(
+            g, [&](ID3D12GraphicsCommandList* cl) { record_ops(g, cl, list, false, false); });
     };
     std::string bad;
     // 1: A hits, B misses
@@ -8361,8 +8378,7 @@ D3d12SelftestRow run_route_pred_case() {
         set_res(1, true);
         if (!run(ops, 0))
             bad = "submit failed";
-        else if (!emitted(0) || !emitted(1) || state_of(0) != 1 || state_of(1) != 1 ||
-                 pred() != 0)
+        else if (!emitted(0) || !emitted(1) || state_of(0) != 1 || state_of(1) != 1 || pred() != 0)
             bad = "both hit: emit A " + std::to_string(emitted(0)) + ", emit B " +
                   std::to_string(emitted(1)) + ", predicate " + std::to_string(pred());
     }
@@ -8470,9 +8486,9 @@ void run_latency_probe(std::vector<D3d12SelftestRow>* out) {
                                           D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST,
                                           "lat_wb", &err);
     // Mode 3's dispatch: src at 0, dst at kData, write-back UAVs like D3D12_Host.
-    auto ua = d3d12c::create_buffer_props(
-        g.device.Get(), 2 * kData, custom_l0_props(), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "lat_ua", &err);
+    auto ua = d3d12c::create_buffer_props(g.device.Get(), 2 * kData, custom_l0_props(),
+                                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "lat_ua", &err);
     if (!rb || !up || !wb || !ua) {
         fail("buffers: " + err);
         return;
@@ -8493,16 +8509,17 @@ void run_latency_probe(std::vector<D3d12SelftestRow>* out) {
     auto* ua_w = static_cast<volatile std::uint32_t*>(p_ua);
     constexpr std::size_t kWords = kData / 4;
     constexpr std::size_t kFlag[kModes] = {0, kWords, 0, kWords + 4}; // flag word per mode
-    up_w[kWords] = kMagic; // the 4-byte copy's source
+    up_w[kWords] = kMagic;                                            // the 4-byte copy's source
     const bool uav_ok = g.ssm_ok && g.pso_ssm[kSsmUnary];
 
     D3D12_FEATURE_DATA_D3D12_OPTIONS3 o3 = {};
-    bool wbi = SUCCEEDED(g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &o3,
-                                                       sizeof(o3))) &&
-               (o3.WriteBufferImmediateSupportFlags & D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT);
+    bool wbi =
+        SUCCEEDED(g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &o3, sizeof(o3))) &&
+        (o3.WriteBufferImmediateSupportFlags & D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT);
     ComPtr<ID3D12CommandAllocator> al;
     ComPtr<ID3D12GraphicsCommandList> cls[kModes];
-    if (FAILED(g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&al)))) {
+    if (FAILED(
+            g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&al)))) {
         fail("CreateCommandAllocator failed");
         return;
     }
@@ -8581,7 +8598,8 @@ void run_latency_probe(std::vector<D3d12SelftestRow>* out) {
     std::uint32_t seed = 0;
     // Mode 3's source word w: a normal float in [1, 2), exact under the scale by 1.
     auto uav_word = [](std::uint32_t s, std::size_t w) {
-        return 0x3F800000u | ((s ^ (0x85EBCA6Bu * static_cast<std::uint32_t>(w + 1))) & 0x007FFFFFu);
+        return 0x3F800000u |
+               ((s ^ (0x85EBCA6Bu * static_cast<std::uint32_t>(w + 1))) & 0x007FFFFFu);
     };
     {
         std::lock_guard<std::mutex> lock(g.mu);
@@ -8721,13 +8739,15 @@ void run_latency_probe(std::vector<D3d12SelftestRow>* out) {
         out->push_back(std::move(r));
     };
     char fx[160];
-    std::snprintf(fx, sizeof(fx), "; %s; flag timeouts %d; 64 KiB copy not visible at the flag %d/%zu",
+    std::snprintf(fx, sizeof(fx),
+                  "; %s; flag timeouts %d; 64 KiB copy not visible at the flag %d/%zu",
                   wbi ? "WriteBufferImmediate MARKER_OUT" : "4-byte copy", flag_timeouts, data_bad,
                   tail_flag.size());
     char ux[160];
-    std::snprintf(ux, sizeof(ux), "; %s; flag timeouts %d; dispatch output not visible at the flag %d/%zu",
-                  uav_ok ? (wbi ? "WriteBufferImmediate MARKER_OUT" : "4-byte copy") : "no SSM kernels",
-                  uav_timeouts, uav_bad, tail_uav.size());
+    std::snprintf(
+        ux, sizeof(ux), "; %s; flag timeouts %d; dispatch output not visible at the flag %d/%zu",
+        uav_ok ? (wbi ? "WriteBufferImmediate MARKER_OUT" : "4-byte copy") : "no SSM kernels",
+        uav_timeouts, uav_bad, tail_uav.size());
     char gx[64];
     std::snprintf(gx, sizeof(gx), "; started before the CPU signal %d", early);
     row("lat_exec", exec, "");
@@ -8825,13 +8845,11 @@ void run_hs_probe(std::vector<D3d12SelftestRow>* out) {
     auto* hw = static_cast<volatile std::uint32_t*>(p_hb);
     // Word offsets of the kernel's bytes 0 / 64 / 128 / 132 / 136.
     constexpr std::size_t kTok = 0, kAns = 16, kSpins = 32, kSeen = 33, kEnd = 34;
-    auto clflush = [&](std::size_t w) {
-        _mm_clflush(const_cast<const std::uint32_t*>(hw + w));
-    };
+    auto clflush = [&](std::size_t w) { _mm_clflush(const_cast<const std::uint32_t*>(hw + w)); };
     ComPtr<ID3D12CommandAllocator> al;
     ComPtr<ID3D12GraphicsCommandList> cl;
-    if (FAILED(g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                                IID_PPV_ARGS(&al))) ||
+    if (FAILED(
+            g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&al))) ||
         FAILED(g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, al.Get(), nullptr,
                                            IID_PPV_ARGS(&cl))) ||
         FAILED(cl->Close())) {
@@ -9025,8 +9043,9 @@ void run_hs_probe(std::vector<D3d12SelftestRow>* out) {
                 }
                 const std::string tag = std::string(gvars[v].name) + (f ? "_flush" : "_coh");
                 char x[160];
-                std::snprintf(x, sizeof(x), "; seen %d/%d, mid-flight %d, answer reached the shader %d",
-                              seen, kIters, mid, answered);
+                std::snprintf(x, sizeof(x),
+                              "; seen %d/%d, mid-flight %d, answer reached the shader %d", seen,
+                              kIters, mid, answered);
                 row("hs_g2c_" + tag, g2c, x);
                 row("hs_c2g_" + tag, c2g, x);
             }
@@ -9233,8 +9252,8 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
                         run_fap_case(backend, out, 256, 16, 2, n, kv, 16384, true, 2, 6);
         if (xbits & 2)
             for (const int n : axis("XLLAMA_FA_XPROBE_DN", {1, 2, 4, 8}, 64))
-                for (const int kv :
-                     axis("XLLAMA_FA_XPROBE_DKV", {512, 1024, 2048, 4096, 8192, 13312, 16384}, 16384))
+                for (const int kv : axis("XLLAMA_FA_XPROBE_DKV",
+                                         {512, 1024, 2048, 4096, 8192, 13312, 16384}, 16384))
                     for (const bool sk : {true, false})
                         if (kv >= n)
                             run_fap_case(backend, out, 256, 16, 2, n, kv, 16384, true, 0, 6, sk);

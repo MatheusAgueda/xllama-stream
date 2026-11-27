@@ -90,7 +90,8 @@ inline SessionParams resolve_session_params(const std::string& model, const Cata
     // once per ubatch (~8.5 GB a ubatch for the 35B-A3B IQ3_S, 2026-11-22), so
     // one ubatch for the whole prompt reads each expert once. Past 2048 the
     // logical batch follows, else llama.cpp would cut the ubatch back to 2048.
-    sp.n_ubatch = c.n_ubatch > 0 ? std::clamp(c.n_ubatch, 1, std::max(2048, std::min(sp.n_ctx, 65536))) : 0;
+    sp.n_ubatch =
+        c.n_ubatch > 0 ? std::clamp(c.n_ubatch, 1, std::max(2048, std::min(sp.n_ctx, 65536))) : 0;
     sp.n_batch = sp.n_ubatch > 2048 ? sp.n_ubatch : 0;
     // The session forces flash attention for it and falls back to f16 KV when the
     // context cannot be built that way, so the opt-in never stops a load.

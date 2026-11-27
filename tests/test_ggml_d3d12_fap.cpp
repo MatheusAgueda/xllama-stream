@@ -65,8 +65,9 @@ Layer build(ggml_context* ctx, const Shape& s, float scale = 0.f, float max_bias
     l.kc = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, gqa, s.kv_size);
     l.vc = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, gqa, s.kv_size);
     auto view = [&](ggml_tensor* c) {
-        ggml_tensor* t = ggml_view_4d(ctx, c, s.d, s.kv_heads, s.n_kv, 1, ggml_row_size(c->type, s.d),
-                                      ggml_row_size(c->type, gqa), ggml_row_size(c->type, gqa * s.kv_size), 0);
+        ggml_tensor* t =
+            ggml_view_4d(ctx, c, s.d, s.kv_heads, s.n_kv, 1, ggml_row_size(c->type, s.d),
+                         ggml_row_size(c->type, gqa), ggml_row_size(c->type, gqa * s.kv_size), 0);
         return ggml_permute(ctx, t, 0, 2, 1, 3);
     };
     l.q_cur = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, s.d, s.heads, s.n);
@@ -192,7 +193,8 @@ Errors run(const Shape& s, unsigned seed, std::uint32_t chunk = 0) {
     const auto* vd = static_cast<const ggml_fp16_t*>(p.v->data);
     const auto* md = p.mask ? static_cast<const ggml_fp16_t*>(p.mask->data) : nullptr;
     if (chunk)
-        d3d12_fap_emulate_chunked(p.params, chunk, p.groups_x, p.groups_y, qd, kd, vd, md, emu.data());
+        d3d12_fap_emulate_chunked(p.params, chunk, p.groups_x, p.groups_y, qd, kd, vd, md,
+                                  emu.data());
     else
         d3d12_fap_emulate(p.params, p.groups_x, p.groups_y, qd, kd, vd, md, emu.data());
 
@@ -211,7 +213,9 @@ Errors run(const Shape& s, unsigned seed, std::uint32_t chunk = 0) {
         e.ref_max = std::max(e.ref_max, std::fabs(ref[i]));
     }
     // dst is [D, H, N]: token i, head h at (i * H + h) * D
-    auto row = [&](int i, int h) { return emu.data() + (static_cast<std::size_t>(i) * s.heads + h) * s.d; };
+    auto row = [&](int i, int h) {
+        return emu.data() + (static_cast<std::size_t>(i) * s.heads + h) * s.d;
+    };
     if (s.blind_token >= 0)
         for (int h = 0; h < s.heads; ++h)
             for (int x = 0; x < s.d; ++x)
@@ -223,9 +227,9 @@ Errors run(const Shape& s, unsigned seed, std::uint32_t chunk = 0) {
             for (int x = 0; x < s.d; ++x)
                 CHECK(row(s.lone_token, h)[x] == ggml_fp16_to_fp32(vc[(h / g) * s.d + x]));
     }
-    MESSAGE("d=" << s.d << " heads=" << s.heads << "/" << s.kv_heads << " n=" << s.n << " n_kv=" << s.n_kv
-                 << " chunk=" << chunk << ": vs double " << e.vs_ref << ", vs ggml cpu " << e.vs_cpu
-                 << ", |ref| max " << e.ref_max);
+    MESSAGE("d=" << s.d << " heads=" << s.heads << "/" << s.kv_heads << " n=" << s.n
+                 << " n_kv=" << s.n_kv << " chunk=" << chunk << ": vs double " << e.vs_ref
+                 << ", vs ggml cpu " << e.vs_cpu << ", |ref| max " << e.ref_max);
     return e;
 }
 

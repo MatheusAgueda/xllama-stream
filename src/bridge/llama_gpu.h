@@ -54,10 +54,11 @@ inline void llama_bridge_log(ggml_log_level level, const char* text, void*) noex
 // when the heap is what ran out.
 inline void mem_brief(char* buf, std::size_t n) noexcept {
     const GpuMemInfo g = gpu_mem_info();
-    std::snprintf(buf, n,
-                  "ws %zu MB, private %zu MB, dxgi %zu/%zu MB, avail_phys %zu MB, commit_avail %zu MB",
-                  working_set_mb(), private_mb(), g.current_mb, g.budget_mb, avail_phys_mb(),
-                  avail_commit_mb());
+    std::snprintf(
+        buf, n,
+        "ws %zu MB, private %zu MB, dxgi %zu/%zu MB, avail_phys %zu MB, commit_avail %zu MB",
+        working_set_mb(), private_mb(), g.current_mb, g.budget_mb, avail_phys_mb(),
+        avail_commit_mb());
 }
 
 // GGML_ABORT's message goes to stderr, which UWP never shows: 14-slot loads on the console
@@ -205,16 +206,19 @@ inline void set_env_str(const char* name, const char* v) {
 inline void apply_gguf_residency(bool stream, llama_model_params& mparams, int expert_slots = 0,
                                  float expert_swap = 0.0f, int expert_prefetch = 0,
                                  int expert_major = 0, bool expert_prefetch_ahead = false) {
-    // patch 0016: the tensors named here are read through a mapping of their span only; every load sets it again
+    // patch 0016: the tensors named here are read through a mapping of their span only; every load
+    // sets it again
     set_env_str("LLAMA_LAZY_TENSORS", "");
     if (expert_slots > 0) {
 #ifdef LLAMA_HAS_EXPERT_SLOTS
-        // XLLAMA_EXPERT_MMAP=1 (a manifest env.* entry): token_embd and output.weight become lazy tensors (on the
-        // CPU), file-backed through one view of the span that holds them, instead of private heap copies. The
-        // Qwen3.5-122B-A10B IQ3_S load reached 4810 MB with those 909 MiB copied and died allocating its 245 MiB of
-        // KV + recurrent state. A whole-file view (LLAMA_LOAD_MODE_MMAP) of its 52.9 GB is refused by the title's
-        // mapped-view ceiling (MapViewOfFileFromApp: not enough memory resources, measured 2026-11-12), so the load
-        // stays NONE and only the lazy span is mapped: 920 MiB at the start of that file, under the 1.0 GiB that maps.
+        // XLLAMA_EXPERT_MMAP=1 (a manifest env.* entry): token_embd and output.weight become lazy
+        // tensors (on the CPU), file-backed through one view of the span that holds them, instead
+        // of private heap copies. The Qwen3.5-122B-A10B IQ3_S load reached 4810 MB with those 909
+        // MiB copied and died allocating its 245 MiB of KV + recurrent state. A whole-file view
+        // (LLAMA_LOAD_MODE_MMAP) of its 52.9 GB is refused by the title's mapped-view ceiling
+        // (MapViewOfFileFromApp: not enough memory resources, measured 2026-11-12), so the load
+        // stays NONE and only the lazy span is mapped: 920 MiB at the start of that file, under
+        // the 1.0 GiB that maps.
         const char* em = std::getenv("XLLAMA_EXPERT_MMAP");
         const bool mapped = em && em[0] == '1';
         mparams.load_mode = LLAMA_LOAD_MODE_NONE;
@@ -225,7 +229,8 @@ inline void apply_gguf_residency(bool stream, llama_model_params& mparams, int e
         set_env_int("LLAMA_EXPERT_PREFETCH", expert_prefetch);
         set_env_int("LLAMA_EXPERT_MAJOR", expert_major);
         set_env_int("LLAMA_EXPERT_PREFETCH_AHEAD", expert_prefetch_ahead ? 1 : 0);
-        log_output(std::string("[xllama] gguf weights: ") + (mapped ? "heap, token_embd + output lazy (span mapped)" : "heap") +
+        log_output(std::string("[xllama] gguf weights: ") +
+                   (mapped ? "heap, token_embd + output lazy (span mapped)" : "heap") +
                    ", expert cache of " + std::to_string(expert_slots) +
                    " experts per layer, swap ratio " + std::to_string(expert_swap) + ", prefetch " +
                    std::to_string(expert_prefetch) + (expert_prefetch_ahead ? " ahead" : "") +
@@ -281,8 +286,8 @@ inline void apply_expert_used_override(llama_model_params& mparams, const std::s
     }
     gguf_free(g);
     if (have <= 0 || k >= have || key.size() >= sizeof(ovr[0].key)) {
-        log_output("[xllama] expert used " + std::to_string(k) + " ignored (" + (key.empty() ? "no arch" : key) +
-                   " = " + std::to_string(have) + ")\n");
+        log_output("[xllama] expert used " + std::to_string(k) + " ignored (" +
+                   (key.empty() ? "no arch" : key) + " = " + std::to_string(have) + ")\n");
         return;
     }
     ovr[0] = {};
@@ -291,7 +296,8 @@ inline void apply_expert_used_override(llama_model_params& mparams, const std::s
     ovr[0].val_i64 = k;
     ovr[1] = {}; // key[0] == 0 ends the list
     mparams.kv_overrides = ovr;
-    log_output("[xllama] expert used " + std::to_string(k) + " of " + std::to_string(have) + " (" + key + ")\n");
+    log_output("[xllama] expert used " + std::to_string(k) + " of " + std::to_string(have) + " (" +
+               key + ")\n");
 }
 
 // Sets mparams.devices / n_gpu_layers and returns the layers actually
@@ -342,7 +348,8 @@ inline int apply_gguf_gpu_layers(int requested, llama_model_params& mparams,
     // runs) wins over LocalState\gguf_output_cpu.txt: 1 = CPU, 0 = D3D12. The
     // 122B needs the CPU and the 35B the device, and the file is one per app.
     const char* oc = std::getenv("XLLAMA_OUTPUT_CPU");
-    const bool output_cpu = (oc != nullptr && *oc != '\0') ? std::atoi(oc) != 0 : gguf_output_on_cpu();
+    const bool output_cpu =
+        (oc != nullptr && *oc != '\0') ? std::atoi(oc) != 0 : gguf_output_on_cpu();
     if (have_info && has_output && output_cpu) {
         overrides[n_overrides++] = {"^output\\.weight$", ggml_backend_cpu_buffer_type()};
         log_output("[xllama] gguf gpu layers: output.weight kept on the CPU\n");
@@ -429,7 +436,8 @@ class GgufCpuThreadpools {
                 tune(pb);
                 tp_batch_ = ggml_threadpool_new(&pb);
             }
-            log_output("[xllama] cpu threadpool: " + std::to_string(n_threads) + " threads (batch " +
+            log_output("[xllama] cpu threadpool: " + std::to_string(n_threads) +
+                       " threads (batch " +
                        std::to_string(tp_batch_ ? n_threads_batch : n_threads) + "), poll " +
                        std::to_string(p.poll) + ", prio " + std::to_string(int(p.prio)) + "\n");
             if (tp_)

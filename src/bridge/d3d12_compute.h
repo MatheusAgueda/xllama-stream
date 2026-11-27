@@ -70,7 +70,9 @@ class QueueFence {
     // (*value gets it), then, later, wait until the fence reaches a value.
     bool signal(ID3D12CommandQueue* queue, UINT64* value);
     bool wait(UINT64 value, bool spin);
-    bool reached(UINT64 value) const { return fence_->GetCompletedValue() >= value; }
+    bool reached(UINT64 value) const {
+        return fence_->GetCompletedValue() >= value;
+    }
 
   private:
     ComPtr<ID3D12Fence> fence_;
