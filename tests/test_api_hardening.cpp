@@ -433,6 +433,18 @@ TEST_CASE("batch policy: XLLAMA_BATCH_SEQS parses to 1 unless it is a number of 
     CHECK(batch_seqs_from_env("999") == kMaxBatchSeqs);
 }
 
+// output_reserve asserts max(n_outputs, n_seq_max) <= n_outputs_max: the GPU path's cap of 1 (+
+// draft) must rise to the sequence count, and llama.cpp's default (0 = n_batch) must stay.
+TEST_CASE("batch policy: the logits-row cap covers every sequence of a batching context") {
+    constexpr uint32_t kMax = static_cast<uint32_t>(kMaxBatchSeqs);
+    CHECK(outputs_max_for_seqs(1u, 1u) == 1u);
+    CHECK(outputs_max_for_seqs(1u, 4u) == 4u);
+    CHECK(outputs_max_for_seqs(5u, 4u) == 5u);
+    CHECK(outputs_max_for_seqs(4u, 4u) == 4u);
+    CHECK(outputs_max_for_seqs(0u, 4u) == 0u);
+    CHECK(outputs_max_for_seqs(1u, kMax) == kMax);
+}
+
 TEST_CASE("batch policy: empty and over-sequence batches are refused, batching off serves one") {
     CHECK(batch_admit_count(0, 4) == BatchAdmit::Empty);
     CHECK(batch_admit_count(1, 4) == BatchAdmit::Ok);

@@ -641,6 +641,8 @@ class LlamaSession final : public Session {
             if (m_batch_seqs > 1 && !for_embedding) {
                 cparams.n_seq_max = static_cast<uint32_t>(m_batch_seqs);
                 cparams.kv_unified = true;
+                cparams.n_outputs_max =
+                    outputs_max_for_seqs(cparams.n_outputs_max, cparams.n_seq_max);
             }
             const llama_flash_attn_type fa_requested = cparams.flash_attn_type;
             if (m_kv_q8) {
@@ -718,7 +720,7 @@ class LlamaSession final : public Session {
         cparams.n_rs_seq = 0;
         cparams.ctx_other = m_ctx.get();
         cparams.n_ctx = llama_n_ctx(m_ctx.get());
-        cparams.n_outputs_max = 1;
+        cparams.n_outputs_max = outputs_max_for_seqs(1, cparams.n_seq_max);
         cparams.embeddings = false;
         m_mtp_ctx.reset(llama_init_from_model(m_model.get(), cparams));
         if (!m_mtp_ctx) {

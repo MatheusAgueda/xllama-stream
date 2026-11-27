@@ -30,6 +30,15 @@ inline int batch_seqs_from_env(const char* v) {
     return n > kMaxBatchSeqs ? kMaxBatchSeqs : static_cast<int>(n);
 }
 
+/// The logits-row cap (n_outputs_max) for a context of n_seq_max sequences. llama.cpp's
+/// output_reserve keeps max(n_outputs, n_seq_max) rows and asserts the cap covers them; the GPU
+/// path caps it at 1 (+ draft) to keep the compute reserve small, which aborted the first B3
+/// context on the console (GGML_ASSERT n_outputs_max <= cparams.n_outputs_max, 2026-11-27). 0
+/// (llama.cpp's default, n_batch) is left alone.
+inline uint32_t outputs_max_for_seqs(uint32_t outputs_max, uint32_t n_seq_max) {
+    return outputs_max > 0 && outputs_max < n_seq_max ? n_seq_max : outputs_max;
+}
+
 /// How a batch's prompts are decoded. llama.cpp's split_equal (hybrid memory) grows a ubatch only
 /// while every sequence in it still has a token, so sequences of unequal length cost one ubatch
 /// per distinct length, each re-paying the expert reads. The shared part therefore takes the same
