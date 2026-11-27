@@ -8,6 +8,8 @@
 #include "xllama/inference_params.h"
 #include "xllama/training_params.h"
 
+#include <string>
+
 namespace xllama::bridge {
 
 // Thin wrappers kept for backward compatibility with existing UWP code.
@@ -51,6 +53,11 @@ void run_gpustep(bool inproc);
 // Q4_K / Q6_K shape against ggml's dequantizers. llama builds only.
 void run_d3d12_selftest();
 
+// D3D12 allocation ceilings per heap kind, shared-pool test against the heap,
+// reserved buffers on 64 MiB heaps. Triggered by LocalFolder\gpumem.flag;
+// writes gpumem-result.txt (+ .done). llama builds only.
+void run_gpumem();
+
 // Operator override for GGUF GPU layers in interactive sessions (GUI and LAN
 // API): the value in LocalState\gguf_gpu_layers.txt, or
 // kGgufGpuLayersKnobAbsent when there is no file. Callers combine it with the
@@ -75,6 +82,31 @@ void run_mic_probe();
 // LocalFolder\diffuse.flag (headless) or diffuse-inproc.flag (in-process
 // experiment) — see diffuse.cpp for the model contract.
 void run_diffuse();
+
+// 4x photo upscale (Real-ESRGAN x4plus, plain ORT DirectML, static tiles) for POST
+// /v1/images/upscale — see upscale.cpp for the model contract. `image` = the encoded file
+// (JPEG/PNG/…), `format` "png" or JPEG otherwise, `max_side` > 0 shrinks the 4x result so its
+// longer side fits, `pad` = tile context (clamped to T/4). Thread-safe; the session stays loaded
+// until release_upscale(), a failed run or the next GGUF load on the GPU (the reclaim hook).
+// A session is only built when the DXGI budget and the app cap both have the need free
+// (XLLAMA_UPSCALE_GPU_NEED_MB, default 512; XLLAMA_UPSCALE_APP_NEED_MB, default 384; 0 = unjudged):
+// otherwise 503 with the figures, and the shared device is never touched.
+constexpr long long kUpscaleMaxInPixels =
+    1'500'000; // the Ally's gv-media cap: a 24 MP result in RAM at most
+struct UpscaleResult {
+    int status = 500; // 200, 413 (input too large), 503 (memory gate) or 500
+    std::string error;
+    std::string bytes; // the encoded result
+    int in_w = 0, in_h = 0, out_w = 0, out_h = 0, tile = 0, pad = 0, tiles = 0;
+    double seconds = 0, gpu_seconds = 0; // whole request / decode + tiles
+    // DXGI LOCAL usage at entry and after the tiles, and the budget (0 = not read: no adapter
+    // opened yet); session_built = this request created the session, so after - before is its cost
+    std::size_t dxgi_before_mb = 0, dxgi_after_mb = 0, dxgi_budget_mb = 0;
+    bool session_built = false;
+};
+UpscaleResult run_upscale(const std::string& image, const std::string& format, int max_side,
+                          int pad);
+void release_upscale();
 
 // Logit-parity dump: greedy 1-token forward pass on the ORT backend, writing the
 // last prefill-token logits to LocalState\logits.bin (+ .json sidecar, + a

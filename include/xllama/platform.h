@@ -39,6 +39,16 @@ std::size_t working_set_mb() noexcept;
 // CreateFileMappingFromApp measured zero benefit; uwp-constraints.md §1).
 std::size_t avail_phys_mb() noexcept;
 
+// Commit the process can still make, in MB (0 if unavailable). UWP: GlobalMemoryStatusEx
+// ullAvailPageFile, "the maximum amount of memory the current process can commit" — the
+// limit a heap allocation actually meets (console, chain96: a 149 MiB KV checkpoint failed
+// with avail_phys at 879 MB). Linux: MemAvailable.
+std::size_t avail_commit_mb() noexcept;
+
+// The process's private commit in MB (UWP: PrivateUsage; Linux: 0). The working set also
+// counts mapped file pages, so it is not what the commit limit is spent against.
+std::size_t private_mb() noexcept;
+
 // Per-process video memory (DXGI LOCAL segment). Measured Budget on Series S
 // with the package designated Game is 3801 MB (in-app QueryVideoMemoryInfo,
 // 2026-07-07 — uwp-constraints.md §7; the older "~768 MB" figure was inferred
@@ -50,6 +60,35 @@ struct GpuMemInfo {
     bool available = false;     // false on non-UWP builds or DXGI failure
 };
 GpuMemInfo gpu_mem_info() noexcept;
+
+// True once gpu_mem_info() has opened its adapter in this process (every GGUF load does, at
+// "before d3d12"). A caller about to create a DirectML device asks this first: opening the
+// adapter before DirectML's own device creation failed it with 887A0036 (inference.cpp, OGA).
+bool gpu_mem_probe_open() noexcept;
+
+// One process-wide hook run before a GGUF model takes D3D12 memory (apply_gguf_gpu_layers): the
+// app registers what else holds the shared device (the upscale session) so the model is sized
+// against a budget nobody else holds. nullptr clears it; the hook must not throw.
+using GpuReclaimHook = void (*)();
+void set_gpu_reclaim_hook(GpuReclaimHook hook) noexcept;
+void run_gpu_reclaim_hook() noexcept;
+
+// The app's memory cap as Windows.System.MemoryManager reports it. On Xbox an app starts
+// with a small limit that may grow as the system frees memory; ExpectedAppMemoryUsageLimit
+// is the upper limit it can expect (elsewhere it equals AppMemoryUsageLimit). Logged at
+// every GGUF load stage so the expert cache can be sized against the limit the OS grants.
+struct AppMemInfo {
+    std::size_t usage_mb = 0;    // AppMemoryUsage
+    std::size_t limit_mb = 0;    // AppMemoryUsageLimit
+    std::size_t expected_mb = 0; // ExpectedAppMemoryUsageLimit; 0 where the property is absent
+    int level = -1;              // AppMemoryUsageLevel: 0 low, 1 medium, 2 high, 3 over limit
+    bool available = false;      // false on non-UWP builds or when the API throws
+};
+AppMemInfo app_mem_info() noexcept;
+
+// Log AppMemoryUsageLimitChanging (old -> new limit) and AppMemoryUsageIncreased (usage
+// reaching a higher level). Registers once per process; no-op off UWP.
+void watch_app_memory() noexcept;
 
 // Pin the process CWD to ApplicationData LocalFolder (UWP only, no-op elsewhere).
 // Relative paths — e.g. the ORT enable_profiling prefix — then land in LocalState

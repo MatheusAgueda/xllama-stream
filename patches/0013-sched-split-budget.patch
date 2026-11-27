@@ -1,0 +1,81 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 184089f..0687c49 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -946,6 +946,7 @@ struct ggml_backend_sched {
+ 
+     int * prev_node_backend_ids; // [graph_size]
+     int * prev_leaf_backend_ids; // [graph_size]
++    size_t backend_ids_size;     // xllama patch 0013: entries in each of the four arrays above
+ 
+     // copy of the graph with modified inputs
+     struct ggml_cgraph graph;
+@@ -1636,6 +1637,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+     // remember the actual graph_size for performing reallocation checks later [GGML_SCHED_DEBUG_REALLOC]
+     sched->debug_prev_graph_size = sched->debug_graph_size;
+     sched->debug_graph_size = graph_size;
++    // xllama patch 0013: the backend-id arrays are fixed at sched_new; a capped split budget must still cover them
++    if ((size_t) graph_size > sched->backend_ids_size) {
++        GGML_ABORT("%s: graph needs %d scheduler nodes, budget is %zu: raise GGML_SCHED_MAX_SPLITS",
++                   __func__, graph_size, sched->backend_ids_size);
++    }
+ 
+     if (sched->graph.size < graph_size) {
+         sched->graph.size = graph_size;
+@@ -2115,18 +2121,36 @@ ggml_backend_sched_t ggml_backend_sched_new(
+     sched->hv_tensor_backend_ids = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
+     sched->hv_tensor_copies      = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+ 
+-    const size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
++    size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
++    // xllama patch 0013: GGML_SCHED_MAX_SPLITS=<n> bounds the splits (and so the split inputs) the
++    // context buffer below is sized for. At one split per node it takes graph_size*60 tensors:
++    // ~0.5 GiB of commit for a 26k-node Qwen3.6-35B graph that splits 104 ways, on a console
++    // whose app commit limit is ~5 GiB. Too low a bound aborts in ggml_new_tensor ("not enough space").
++    {
++        const char * ms = getenv("GGML_SCHED_MAX_SPLITS");
++        const long   v  = ms != nullptr ? atol(ms) : 0;
++        if (v > 0 && (size_t) v < ggml_sched_max_splits) {
++            ggml_sched_max_splits = (size_t) v;
++        }
++    }
+     const size_t nodes_size = graph_size + ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2;
+     sched->node_backend_ids = (int *) calloc(nodes_size, sizeof(sched->node_backend_ids[0]));
+     sched->leaf_backend_ids = (int *) calloc(nodes_size, sizeof(sched->leaf_backend_ids[0]));
+     sched->prev_node_backend_ids = (int *) calloc(nodes_size, sizeof(sched->prev_node_backend_ids[0]));
+     sched->prev_leaf_backend_ids = (int *) calloc(nodes_size, sizeof(sched->prev_leaf_backend_ids[0]));
++    sched->backend_ids_size = nodes_size;
+ 
+     sched->debug_graph_size = 0;
+     sched->debug_prev_graph_size = 0;
+ 
+     sched->context_buffer_size = ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sizeof(struct ggml_tensor) + ggml_graph_overhead_custom(graph_size, false);
+     sched->context_buffer = (char *) malloc(sched->context_buffer_size);
++    if (sched->context_buffer == NULL || sched->node_backend_ids == NULL || sched->leaf_backend_ids == NULL ||
++            sched->prev_node_backend_ids == NULL || sched->prev_leaf_backend_ids == NULL) {
++        // xllama patch 0013: fail here, with the size, instead of an anonymous mem_buffer assert in ggml_init later
++        GGML_ABORT("%s: out of memory: %zu-node scheduler wants %zu MiB of context buffer (GGML_SCHED_MAX_SPLITS=%zu)",
++                   __func__, graph_size, sched->context_buffer_size >> 20, ggml_sched_max_splits);
++    }
+ 
+     const int initial_splits_capacity = 16;
+     sched->splits = (ggml_backend_sched_split *) calloc(initial_splits_capacity, sizeof(sched->splits[0]));
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 6557247..e3c85a5 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2440,6 +2440,14 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+         }
+     }
+ 
++    // xllama patch 0013: an MTP context of Qwen3.5/3.6 builds the nextn block alone (~150 nodes),
++    // not the whole model the budget above counts from n_tensors. Each budgeted node costs graph
++    // metadata here and scheduler arrays (ggml_backend_sched_new), allocated per context.
++    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
++            (model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE)) {
++        res = std::max<uint32_t>(4096u, n_tokens * 8);
++    }
++
+     uint32_t n_sampling_nodes = 0;
+     uint32_t n_sampling_nodes_max = 0;
+     for (const auto & [seq_id, sampler] : sampling.samplers) {

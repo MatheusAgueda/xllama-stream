@@ -1,0 +1,62 @@
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -1,6 +1,9 @@
+ #include "models.h"
+ #include "llama-memory-recurrent.h"
+ 
++#include <cstdlib>
++#include <vector>
++
+ void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
+     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
+@@ -521,6 +524,15 @@
+     // The shared expert goes into the graph before the routed ones: its matmuls then follow the
+     // layer's output projection and post-attention norm in node order, so a GPU backend runs them
+     // in that submission instead of one of its own after the routed experts' CPU tail.
++    // xllama patch 0014: XLLAMA_D3D12_SHEXP_ASYNC (read per graph build: a catalogue entry's env
++    // is applied before its load) puts it after the router logits instead, still in that
++    // submission but last, so the D3D12 backend waits only for the logits and leaves the shared
++    // expert running while the CPU routes and reads experts. For one token its intermediates are
++    // marked outputs: the graph allocator then never gives their memory to the CPU split that
++    // runs meanwhile in the same buffer (3 x n_ff_shexp floats per layer). Only the order
++    // changes; every op computes the same values.
++    const char * shexp_async_env = std::getenv("XLLAMA_D3D12_SHEXP_ASYNC");
++    const bool   shexp_late      = shexp_async_env && *shexp_async_env && *shexp_async_env != '0';
+     ggml_tensor * ffn_shexp = nullptr;
+     if (model.layers[il].ffn_up_shexp != nullptr) {
+         ffn_shexp =
+@@ -531,7 +543,20 @@
+                 NULL,
+                 LLM_FFN_SILU, LLM_FFN_PAR, il);
+         cb(ffn_shexp, "ffn_shexp", il);
+-        ggml_build_forward_expand(gf, ffn_shexp);
++        if (!shexp_late) {
++            ggml_build_forward_expand(gf, ffn_shexp);
++        } else if (n_tokens == 1) {
++            std::vector<ggml_tensor *> todo(ffn_shexp->src, ffn_shexp->src + GGML_MAX_SRC);
++            while (!todo.empty()) {
++                ggml_tensor * t = todo.back();
++                todo.pop_back();
++                if (t == nullptr || t == cur || t->op == GGML_OP_NONE || (t->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++                    continue;
++                }
++                ggml_set_output(t);
++                todo.insert(todo.end(), t->src, t->src + GGML_MAX_SRC);
++            }
++        }
+     }
+ 
+     // xllama patch 0008: build the shared expert gate before the routed experts. It is an
+@@ -558,6 +583,10 @@
+     cb(moe_logits, "ffn_moe_logits", il);
+     ggml_build_forward_expand(gf, moe_logits);
+ 
++    if (shexp_late && ffn_shexp != nullptr) {
++        ggml_build_forward_expand(gf, ffn_shexp); // xllama patch 0014
++    }
++
+     if (shared_gate != nullptr) {
+         // Apply sigmoid to the gate
+         shared_gate = ggml_sigmoid(ctx0, shared_gate);

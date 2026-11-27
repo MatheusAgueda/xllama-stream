@@ -75,9 +75,12 @@ inline constexpr int kMaxPromptTokens = 1800;
 inline constexpr int kReservedGenerationTokens = 250;
 
 // Catalogue n_ctx bounds. 0 / omit → kDefaultNCtx. Above the max is clamped so
-// a bad override cannot OOM the console KV pool.
+// a bad override cannot OOM the console KV pool. 32K: a Qwen3.5/3.6 hybrid keeps
+// KV only on its full-attention layers (10 of 40 on 35B-A3B, ~20 KB per token in
+// f16, 640 MB at 32K) and a reasoning reply needs the room; the catalogue entry
+// still decides, so a dense model's entry must stay small.
 inline constexpr int kMinSessionNCtx = 512;
-inline constexpr int kMaxSessionNCtx = 8192;
+inline constexpr int kMaxSessionNCtx = 32768;
 
 // Resolve a catalogue (or CLI) n_ctx request: 0 means shipping default.
 inline constexpr int resolve_n_ctx(int requested) {

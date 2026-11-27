@@ -1,0 +1,262 @@
+diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
+--- a/src/llama-expert-cache.cpp
++++ b/src/llama-expert-cache.cpp
+@@ -139,6 +139,10 @@
+     std::vector<int32_t> gq;
+     int32_t n_kept  = 0;
+     int32_t n_chunk = 0;
++    // LLAMA_EXPERT_EM_RUN: the queue as n_run spans, (i0, len) pairs of gq (the round's experts one
++    // each); gnext then counts spans. 0: gnext counts experts
++    std::vector<int32_t> grun;
++    int32_t n_run = 0;
+     std::atomic<int32_t> gnext {0};
+     std::unique_ptr<std::atomic<int32_t>[]> gread; // reads done: [0] the round's, [1 + c] chunk c's
+     int32_t n_gread = 0;
+@@ -416,6 +420,13 @@
+     std::atomic<uint64_t> em_gpu_us      {0}; // thread 0 in them, gather and scatter included
+     std::atomic<uint64_t> em_gpu_wait_us {0}; // thread 0 waiting for the reads
+     std::atomic<uint64_t> em_gpu_cpu     {0}; // dispatches that failed, computed on the CPU instead
++    // LLAMA_EXPERT_EM_RUN=<n> (0 = off, the default; needs LLAMA_EXPERT_EM_GPU): a staging chunk's
++    // experts in ascending ids, the staged ones of a tensor whose expert size is a multiple of
++    // EC_DIRECT_ALIGN packed at their file stride, and the consecutive ones of a chunk read as one
++    // span of up to <n> experts (ec_read_run) instead of one read each
++    uint32_t em_run = 0;
++    std::atomic<uint64_t> em_run_n {0}; // the spans read
++    std::atomic<uint64_t> em_run_e {0}; //   and the experts they held
+ 
+     // LLAMA_EXPERT_HOST=<MiB>[:<keep MiB>] (0 = off, the default): up to <MiB> of host memory, split
+     // evenly over the layers, as a victim tier behind the slots. Each layer allocates its share at its
+@@ -475,15 +486,19 @@
+                     n ? pf_lag_us.load()/1000.0/n : 0.0, n ? pf_run_us.load()/1000.0/n : 0.0,
+                     pf_ahead ? ", ahead" : "", pf_help ? ", help" : "", prio, mode);
+         }
+-        char em[480] = "";
++        char em[560] = "";
+         if (em_rounds.load() > 0) {
+             static const char * const res_name[] = { "slot", "file", "auto" };
+             const uint64_t sus = em_slot_us.load();
+             const uint64_t fus = em_file_us.load();
+-            char gp[160] = "";
++            char gp[240] = "";
+             if (em_gpu_n.load() > 0) {
+-                snprintf(gp, sizeof(gp), "; gpu %" PRIu64 " dispatches, %" PRIu64 " pairs, %.0f ms, %.0f ms waiting for reads, %" PRIu64 " on the CPU",
+-                        em_gpu_n.load(), em_gpu_p.load(), em_gpu_us.load()/1000.0, em_gpu_wait_us.load()/1000.0, em_gpu_cpu.load());
++                char rn[80] = "";
++                if (em_run_n.load() > 0) {
++                    snprintf(rn, sizeof(rn), ", %" PRIu64 " spans of %.1f experts", em_run_n.load(), (double) em_run_e.load()/em_run_n.load());
++                }
++                snprintf(gp, sizeof(gp), "; gpu %" PRIu64 " dispatches, %" PRIu64 " pairs, %.0f ms, %.0f ms waiting for reads, %" PRIu64 " on the CPU%s",
++                        em_gpu_n.load(), em_gpu_p.load(), em_gpu_us.load()/1000.0, em_gpu_wait_us.load()/1000.0, em_gpu_cpu.load(), rn);
+             }
+             snprintf(em, sizeof(em), "; expert-major %" PRIu64 " ubatches, %" PRIu64 " read (%.1f MiB), %" PRIu64 " resident, %" PRIu64 " kept, %.0f ms, %" PRIu64 " resident read from the file (%s; stage from slots %.0f MB/s, from the file %.0f MB/s per thread)%s",
+                     em_rounds.load(), em_reads.load(), em_bytes.load()/1024.0/1024.0, em_hits.load(), em_kept.load(), em_wall/1000.0,
+@@ -887,6 +902,29 @@
+ #endif
+ }
+ 
++// LLAMA_EXPERT_EM_RUN: [offs, offs + n) into dst without writing a byte outside [dst, dst + n), the
++// span's aligned middle in place (unbuffered, when dst sits at the offset's remainder) and the
++// partial blocks at its ends through the thread's staging buffer; buffered, one read
++static void ec_read_run(ec_file & f, int ith, char * dst, size_t n, size_t offs) {
++    if (!f.direct || f.dio[ith].state < 0) {
++        ec_read(f, ith, dst, n, offs);
++        return;
++    }
++    const size_t A   = EC_DIRECT_ALIGN;
++    const size_t end = offs + n;
++    const size_t m0  = std::min(end, (offs + A - 1)/A*A);
++    const size_t m1  = std::max(m0, end/A*A);
++    if (m0 > offs) {
++        ec_read(f, ith, dst, m0 - offs, offs);
++    }
++    if (m1 > m0) {
++        ec_read(f, ith, dst + (m0 - offs), m1 - m0, m0);
++    }
++    if (end > m1) {
++        ec_read(f, ith, dst + (m1 - offs), end - m1, m1);
++    }
++}
++
+ // a read split in n_parts: each part aligned and of at least EC_LOAD_MIN_PART, so that more reads
+ // are in flight at once (LLAMA_EXPERT_SPLIT=0: whole reads). Part p covers [p*size, min((p+1)*size, nb2))
+ static constexpr size_t EC_LOAD_MIN_PART = 128*1024;
+@@ -2080,18 +2118,50 @@
+     LLAMA_LOG_INFO("expert cache: expert-major matmuls on %s, staging 2 x %u experts (%.1f MiB), %zu pairs per dispatch (%.1f MiB)\n",
+             ggml_backend_name(C.gpu), C.em_gpu_chunk, n_stage/1024.0/1024.0, P, n_io/1024.0/1024.0);
+     return true;
++}
++
++// LLAMA_EXPERT_EM_RUN: T's staged experts packed at their file stride, read as spans
++static bool ec_em_run_ok(const llama_expert_cache & C, const ec_tensor & T) {
++    return C.em_run >= 2 && T.eb % EC_DIRECT_ALIGN == 0;
+ }
+ 
++// the spans of a read queue: each of gq[0, n_kept) alone, then the staged ones (sorted) cut where
++// the ids stop being consecutive, at a chunk's end and after max_run experts. (i0, len) pairs into
++// out; returns their number
++static int32_t ec_em_runs(const std::vector<int32_t> & gq, int32_t n_kept, int32_t chunk, int32_t max_run, std::vector<int32_t> & out) {
++    out.clear();
++    const int32_t nq = (int32_t) gq.size();
++    for (int32_t i = 0; i < n_kept && i < nq; ++i) {
++        out.push_back(i);
++        out.push_back(1);
++    }
++    for (int32_t i = std::max(n_kept, 0); i < nq; ) {
++        const int32_t c   = (i - n_kept)/chunk;
++        int32_t       len = 1;
++        while (i + len < nq && len < max_run && gq[i + len] == gq[i + len - 1] + 1 && (i + len - n_kept)/chunk == c) {
++            len++;
++        }
++        out.push_back(i);
++        out.push_back(len);
++        i += len;
++    }
++    return (int32_t) (out.size()/2);
++}
++
+ // position p of staging half h for tensor T, and the stride (nb[2] of the staged experts): a padded
+ // tensor's experts at the file offset's remainder, EC_DIRECT_ALIGN apart beyond their bytes, so that
+-// they read in place as into the slots
++// they read in place as into the slots; packed (ec_em_run_ok) at the remainder, eb apart, so that a
++// span of consecutive experts is the file's bytes
+ static char * ec_em_gpu_pos(const llama_expert_cache & C, const ec_tensor & T, int h, int32_t p, size_t * nb2) {
+     const size_t A    = EC_DIRECT_ALIGN;
+     char *       half = (char *) ggml_backend_buffer_get_base(C.em_gpu_stage) + (size_t) h*C.em_gpu_half;
+     char *       d0   = nullptr;
+     size_t       s    = 0;
+-    if (T.pad) {
++    if (ec_em_run_ok(C, T)) {
+         d0 = (char *) GGML_PAD((uintptr_t) half + A, A) + T.offs % A;
++        s  = T.eb;
++    } else if (T.pad) {
++        d0 = (char *) GGML_PAD((uintptr_t) half + A, A) + T.offs % A;
+         s  = T.eb + A;
+     } else {
+         d0 = (char *) GGML_PAD((uintptr_t) half, 256);
+@@ -2266,8 +2336,12 @@
+     const int32_t chunk = (int32_t) C.em_gpu_chunk;
+ 
+     if (ith != 0) {
+-        for (int32_t i = E.gnext.fetch_add(1); i < nq; i = E.gnext.fetch_add(1)) {
+-            const int32_t e = E.gq[i];
++        const bool    run = E.n_run > 0;
++        const int32_t nr  = run ? E.n_run : nq;
++        for (int32_t r = E.gnext.fetch_add(1); r < nr; r = E.gnext.fetch_add(1)) {
++            const int32_t i   = run ? E.grun[2*(size_t) r]     : r;
++            const int32_t len = run ? E.grun[2*(size_t) r + 1] : 1;
++            const int32_t e   = E.gq[i];
+             char *  buf = nullptr;
+             int32_t at  = 0;
+             if (i < E.n_kept) {
+@@ -2282,11 +2356,18 @@
+                 at  = 1 + c;
+             }
+             const int64_t c0 = ggml_time_us();
+-            ec_read(*C.files[T.file], ith, buf, T.eb, T.offs + (size_t) e*T.eb, T.pad);
++            if (run && at > 0) {
++                // packed: no spill into the neighbours, which hold other experts
++                ec_read_run(*C.files[T.file], ith, buf, (size_t) len*T.eb, T.offs + (size_t) e*T.eb);
++                C.em_run_n.fetch_add(1, std::memory_order_relaxed);
++                C.em_run_e.fetch_add((uint64_t) len, std::memory_order_relaxed);
++            } else {
++                ec_read(*C.files[T.file], ith, buf, T.eb, T.offs + (size_t) e*T.eb, T.pad);
++            }
+             file_us += (uint64_t) (ggml_time_us() - c0);
+-            file_b  += T.eb;
+-            reads++;
+-            E.gread[at].fetch_add(1, std::memory_order_release);
++            file_b  += (size_t) len*T.eb;
++            reads   += (uint64_t) len;
++            E.gread[at].fetch_add(len, std::memory_order_release);
+         }
+         return;
+     }
+@@ -2335,6 +2416,40 @@
+     C.em_gpu_wait_us += (uint64_t) wait_us;
+ }
+ 
++// the GPU path's read queue of E's experts (E.list, the slots given): the round's ones (into their
++// slots) first, then the missing ones to stage, the counters reset
++static void ec_em_gpu_queue(const llama_expert_cache & C, ec_em & E, const ec_layer & L) {
++    E.gq.clear();
++    for (int32_t e : E.list) {
++        if (L.em_slot[e] >= 0) {
++            E.gq.push_back(e);
++        }
++    }
++    E.n_kept = (int32_t) E.gq.size();
++    for (int32_t e : E.list) {
++        if (L.slot_of[e] < 0) {
++            E.gq.push_back(e);
++        }
++    }
++    const int32_t chunk = (int32_t) C.em_gpu_chunk;
++    E.n_chunk = ((int32_t) E.gq.size() - E.n_kept + chunk - 1)/chunk;
++    E.n_run   = 0;
++    if (ec_em_run_ok(C, C.tensors[E.tensor])) {
++        // the staged ones by id, so that a chunk's consecutive experts are one span of the file
++        std::sort(E.gq.begin() + E.n_kept, E.gq.end());
++        E.n_run = ec_em_runs(E.gq, E.n_kept, chunk, (int32_t) C.em_run, E.grun);
++    }
++    if (E.n_gread < E.n_chunk + 1) {
++        E.gread.reset(new std::atomic<int32_t>[(size_t) E.n_chunk + 1]);
++        E.n_gread = E.n_chunk + 1;
++    }
++    for (int32_t i = 0; i < E.n_gread; ++i) {
++        E.gread[i].store(0, std::memory_order_relaxed);
++    }
++    E.gnext.store(0, std::memory_order_relaxed);
++    E.gdisp.store(0, std::memory_order_relaxed);
++}
++
+ // all threads: the activations b [k, ne11, n_tokens] (F32) quantized for the dot product of the
+ // expert type, one row per (ne11 row, token); thread 0 also groups the ubatch's pairs by expert and,
+ // for the first expert tensor of the layer, gives slots to missing experts. src = {b, ids}, dst =
+@@ -2456,29 +2571,7 @@
+     // LLAMA_EXPERT_EM_GPU: the matmul's read queue, the round's experts (into their slots) first
+     E.gpu = false;
+     if (C.em_gpu_chunk > 0 && nth >= 2 && C.gpu != nullptr && !C.em_gpu_failed && ec_em_gpu_ok(C, C.tensors[E.tensor])) {
+-        E.gq.clear();
+-        for (int32_t e : E.list) {
+-            if (L.em_slot[e] >= 0) {
+-                E.gq.push_back(e);
+-            }
+-        }
+-        E.n_kept = (int32_t) E.gq.size();
+-        for (int32_t e : E.list) {
+-            if (L.slot_of[e] < 0) {
+-                E.gq.push_back(e);
+-            }
+-        }
+-        const int32_t chunk = (int32_t) C.em_gpu_chunk;
+-        E.n_chunk = ((int32_t) E.gq.size() - E.n_kept + chunk - 1)/chunk;
+-        if (E.n_gread < E.n_chunk + 1) {
+-            E.gread.reset(new std::atomic<int32_t>[(size_t) E.n_chunk + 1]);
+-            E.n_gread = E.n_chunk + 1;
+-        }
+-        for (int32_t i = 0; i < E.n_gread; ++i) {
+-            E.gread[i].store(0, std::memory_order_relaxed);
+-        }
+-        E.gnext.store(0, std::memory_order_relaxed);
+-        E.gdisp.store(0, std::memory_order_relaxed);
++        ec_em_gpu_queue(C, E, L);
+         E.gpu = true;
+     }
+     L.em_state[E.pos] = 1;
+@@ -2854,6 +2947,16 @@
+             cache->em_gpu_chunk   = std::min(ch, 256u);
+             cache->em_gpu_pairs   = std::min(std::max(pr, 64u), 16384u);
+             cache->em_gpu_keep_mb = std::min(kp, 2048u);
++        }
++    }
++    // LLAMA_EXPERT_EM_RUN=<n>: the GPU path's staged experts read as spans of up to <n> consecutive
++    // ones (0 = off; 2 at least)
++    const char * er = getenv("LLAMA_EXPERT_EM_RUN");
++    if (er != nullptr && *er != '\0' && cache->em_gpu_chunk > 0) {
++        const int n = atoi(er);
++        cache->em_run = n >= 2 ? (uint32_t) std::min(n, 256) : 0;
++        if (cache->em_run > 0) {
++            LLAMA_LOG_INFO("%s: expert cache: expert-major reads in spans of up to %u experts\n", __func__, cache->em_run);
+         }
+     }
+     // LLAMA_EXPERT_EM_RESIDENT: where an expert-major ubatch's resident experts come from (slot,

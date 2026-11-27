@@ -14,7 +14,7 @@ Tested and measured on Series S. Not yet tested on Series X.
 - **Retail games and apps don't run in Developer Mode.** You need to switch back to Retail Mode to play. Microsoft notes that required updates may cause "diminished or lost functionality" on a Developer Mode console, and a console reset deletes local saves that aren't synced to the cloud.
 - **Unofficial.** Independent project, not affiliated with or endorsed by Microsoft. xllama is not reviewed, certified or supported by Microsoft and is not distributed through the Microsoft Store. Sideload it only on a console you own, at your own risk. This project makes no statement about warranty coverage or about how Microsoft may treat Developer Mode use; read Microsoft's terms and warranty for your country.
 - **Sideload only from this repository's Releases page** and check the SHA-256. The package is signed with a test certificate (`xllama-test.cer`); trust it only if you downloaded it from here.
-- **The LAN API is off by default and has no authentication.** When it is on, any device on your network, and any web page open in a browser on it, can send it requests. Enable it only on a network you trust.
+- **The LAN API is off by default; [a bearer key is optional](docs/api-endpoint.md#bearer-key).** When enabled without a key, any device on your network, and any web page open in a browser on it, can send it requests. Enable it only on a network you trust.
 - **Models are third-party.** Models are downloaded separately (from Hugging Face or this repository's `models-v1` release) and each one is under its own licence, not under xllama's MIT licence. Some licences are non-commercial or carry attribution requirements. Check each model's licence on its upstream model card (LFM models also download their LICENSE file alongside the weights) before using it.
 - xllama is provided "AS IS", without warranty, under the MIT licence.
 
@@ -69,7 +69,7 @@ No model bundled in MSIX.
 
 - **LAN API** — OpenAI-compat completions, GGUF embeddings, trusted catalogue
   pull, preferences and training status. Current integration probe for games
-  and assistants; **off by default and has no authentication**.
+  and assistants; **off by default, with an [optional bearer key](docs/api-endpoint.md#bearer-key)**.
 - **Bench** — headless tok/s, membw, diskbw, gpubw, gpugemv, gpustep, ramceil probes, d3d12 backend selftest
 - **Diffuse** — SD-Turbo on DirectML, in-process with XAML compositor.
   Image generation uses SD-Turbo. **Powered by Stability AI.**
@@ -107,7 +107,7 @@ Hugging Face collection: [xllama: GGUF models run on Xbox Series S](https://hugg
 
 xllama exposes an HTTP endpoint on the local network that exposes its full
 inference core (`SessionHub`) with OpenAI and Ollama-compatible APIs.
-Status: v1, **off by default and has no authentication**. Developer Mode / trusted
+Status: v1, **off by default, with an [optional bearer key](docs/api-endpoint.md#bearer-key)**. Developer Mode / trusted
 LAN only — the current integration probe, not a public inbound service.
 
 ```bash

@@ -1,0 +1,193 @@
+diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
+index 3cb3d8d..9cad515 100644
+--- a/src/llama-mmap.cpp
++++ b/src/llama-mmap.cpp
+@@ -601,11 +601,12 @@ struct llama_mmap::impl {
+     // read from storage on first touch and dropped by the memory manager under
+     // pressure, which a whole-file PrefetchVirtualMemory would defeat.
+     HANDLE hMapping = nullptr;
++    void * view = nullptr; // what MapViewOfFileFromApp returned: addr is view minus the offset of the mapped span
+ 
+-    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
++    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges,
++            bool lazy_only = false) {
+         GGML_UNUSED(prefetch);
+         GGML_UNUSED(numa);
+-        GGML_UNUSED(lazy_ranges);
+ 
+         size = file->size();
+ 
+@@ -617,12 +618,46 @@ struct llama_mmap::impl {
+             throw std::runtime_error(format("CreateFileMappingFromApp failed: %s", llama_format_win_err(error).c_str()));
+         }
+ 
+-        addr = MapViewOfFileFromApp(hMapping, FILE_MAP_READ, 0, 0);
+-        if (addr == NULL) {
++        // The mapped views of a title have their own ceiling (Series X, Developer Mode: 1.0 GiB maps, 1.5 GiB fails
++        // with ERROR_NOT_ENOUGH_MEMORY, however many files), so a whole-file view of a 50 GB model fails. When only
++        // the lazy tensors are read through the mapping, map the span that holds them, from its first range rounded
++        // down to the allocation granularity (a view offset must be a multiple of it) to its last range.
++        size_t span_first = 0;
++        size_t span_len   = 0; // 0 maps the whole file
++        if (lazy_only && lazy_ranges.empty()) {
++            // another file of the model holds the lazy tensors: nothing is read through this one
++            addr = nullptr;
++            return;
++        }
++        if (lazy_only) {
++            SYSTEM_INFO si;
++            GetNativeSystemInfo(&si);
++            const size_t gran = si.dwAllocationGranularity ? si.dwAllocationGranularity : 65536;
++            size_t lo = size;
++            size_t hi = 0;
++            for (const auto & range : lazy_ranges) {
++                lo = std::min(lo, range.first);
++                hi = std::max(hi, range.second);
++            }
++            hi = std::min(hi, size);
++            if (lo < hi) {
++                span_first = lo / gran * gran;
++                span_len   = hi - span_first;
++            }
++        }
++
++        view = MapViewOfFileFromApp(hMapping, FILE_MAP_READ, (ULONG64) span_first, span_len);
++        if (view == NULL) {
+             DWORD error = GetLastError();
+             CloseHandle(hMapping);
+             hMapping = nullptr;
+-            throw std::runtime_error(format("MapViewOfFileFromApp failed: %s", llama_format_win_err(error).c_str()));
++            throw std::runtime_error(format("MapViewOfFileFromApp failed (%.2f MiB at offset %zu): %s",
++                    (span_len ? span_len : size) / 1024.0 / 1024.0, span_first, llama_format_win_err(error).c_str()));
++        }
++        addr = (uint8_t *) view - span_first;
++        if (span_len) {
++            LLAMA_LOG_INFO("%s: mapped %.2f MiB at offset %zu of a %.2f MiB file, the span of the lazy tensors\n",
++                    __func__, span_len / 1024.0 / 1024.0, span_first, size / 1024.0 / 1024.0);
+         }
+     }
+ 
+@@ -632,7 +667,7 @@ struct llama_mmap::impl {
+     }
+ 
+     ~impl() {
+-        if (addr && !UnmapViewOfFile(addr)) {
++        if (view && !UnmapViewOfFile(view)) {
+             LLAMA_LOG_WARN("warning: UnmapViewOfFile failed: %s\n",
+                     llama_format_win_err(GetLastError()).c_str());
+         }
+@@ -734,8 +769,15 @@ struct llama_mmap::impl {
+     size_t size;
+ };
+ 
++#if !defined(_POSIX_MAPPED_FILES) && defined(_WIN32) && defined(LLAMA_WIN32_APP_PARTITION)
+ llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa,
+-        const ranges & lazy_ranges) : pimpl(std::make_unique<impl>(file, prefetch, numa, lazy_ranges)) {}
++        const ranges & lazy_ranges, bool lazy_only) : pimpl(std::make_unique<impl>(file, prefetch, numa, lazy_ranges, lazy_only)) {}
++#else
++llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa,
++        const ranges & lazy_ranges, bool lazy_only) : pimpl(std::make_unique<impl>(file, prefetch, numa, lazy_ranges)) {
++    GGML_UNUSED(lazy_only);
++}
++#endif
+ llama_mmap::~llama_mmap() = default;
+ 
+ size_t llama_mmap::size() const { return pimpl->size; }
+diff --git a/src/llama-mmap.h b/src/llama-mmap.h
+index 6c6393d..1feaf73 100644
+--- a/src/llama-mmap.h
++++ b/src/llama-mmap.h
+@@ -49,8 +49,11 @@ struct llama_mmap {
+     using ranges = std::vector<std::pair<size_t, size_t>>;
+ 
+     llama_mmap(const llama_mmap &) = delete;
++    // lazy_only: nothing but the lazy ranges is read through this mapping (the loader reads the rest with file I/O),
++    // so a platform that cannot map the whole file may map only the span that holds them; addr() stays the address
++    // of file offset 0 and is valid inside that span
+     llama_mmap(struct llama_file * file, size_t prefetch = (size_t) -1, bool numa = false,
+-               const ranges & lazy_ranges = {});
++               const ranges & lazy_ranges = {}, bool lazy_only = false);
+     ~llama_mmap();
+ 
+     size_t size() const;
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 8c74362..8353d94 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1148,14 +1148,40 @@ ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() {
+     return ggml_backend_dev_buffer_type(cpu_dev);
+ }
+ 
++// LLAMA_LAZY_TENSORS=<name>[,<name>...]: tensors read on demand whatever the lazy mode and their size, e.g. the
++// host-resident token_embd / output of an expert-cache model, which then stay file-backed instead of private copies.
++// Read at every call, so a later load in the same process sees the value its caller set.
++bool llama_model_loader::lazy_read::forced(const std::string & name) {
++    const char * env = getenv("LLAMA_LAZY_TENSORS");
++    if (env == nullptr || *env == '\0') {
++        return false;
++    }
++    std::string cur;
++    for (const char * p = env; ; ++p) {
++        if (*p == ',' || *p == '\0') {
++            if (cur == name) {
++                return true;
++            }
++            cur.clear();
++            if (*p == '\0') {
++                return false;
++            }
++        } else if (*p != ' ') {
++            cur += *p;
++        }
++    }
++}
++
+ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w) {
+-    if (mode == LLAMA_LAZY_MODE_OFF) {
++    const bool is_forced = forced(name);
++
++    if (mode == LLAMA_LAZY_MODE_OFF && !is_forced) {
+         return false;
+     }
+ 
+     // do not lazy-read small tensors, it has significant overhead and is not worth it
+     constexpr size_t auto_min_size = 4ull * 1024 * 1024 * 1024;
+-    if (mode != LLAMA_LAZY_MODE_ON && ggml_nbytes(t) <= auto_min_size) {
++    if (mode != LLAMA_LAZY_MODE_ON && !is_forced && ggml_nbytes(t) <= auto_min_size) {
+         return false;
+     }
+ 
+@@ -1408,7 +1434,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         return NULL;
+     }
+ 
+-    if (flags & TENSOR_READ_LAZY) {
++    if ((flags & TENSOR_READ_LAZY) || lazy_read::forced(tn.str())) {
+         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
+         is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
+     }
+@@ -1498,8 +1524,9 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
+ 
+             const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
+ 
++            // without mmap only the lazy tensors are read through the mapping
+             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
+-                    lazy.for_file(idx));
++                    lazy.for_file(idx), /*lazy_only =*/ !use_mmap);
+             mmaps_used.emplace_back(mapping->size(), 0);
+             if (mlock_mmaps) {
+                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index f36bdc1..b57e84f 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -94,6 +94,9 @@ struct llama_model_loader {
+         // pass w to also record it, or nullptr to only ask
+         bool add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w);
+ 
++        // named in LLAMA_LAZY_TENSORS: lazy whatever the mode and size
++        static bool forced(const std::string & name);
++
+         bool any() const {
+             return !ranges.empty();
+         }

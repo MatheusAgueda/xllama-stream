@@ -1,0 +1,117 @@
+name: expert-cache-bench
+
+# A measurement of llama.cpp patch 0004 on a real MoE, not a gate: build the
+# patched tree in Release for Linux, decode Qwen3.6 35B-A3B (uncensored heretic,
+# i1-IQ4_XS, 18.7 GB, the console's catalogue model) with 41 resident experts
+# per layer (the console's) at several swap ratio[:prefetch width[:largest
+# expert-major ubatch]] configs ("expert-cache bench" in
+# tests/test_expert_cache.cpp; "0" = exact routing, no prefetch, slot-path
+# prompts; "0::512" = the same with expert-major prompts), and keep the
+# reference run's routing trace for offline cache-policy simulation. long = a
+# fourth prompt of ~350 tokens. The runner's disk and CPU are not the
+# console's: hits, misses, swaps, top-1 agreement and KL carry over; tok/s and
+# read ms do not.
+
+on:
+  push:
+    branches: [ec-bench]
+  workflow_dispatch:
+    inputs:
+      swaps:
+        description: Swap ratio[:prefetch width, "a" for ahead[:expert-major]] configs, the first is the reference
+        default: "0,0::512,0.7::512"
+      long:
+        description: 1 = add the ~350-token prompt
+        default: "1"
+      tokens:
+        description: Tokens generated per prompt
+        default: "64"
+      slots:
+        description: Resident experts per layer
+        default: "41"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BENCH_MODEL_URL: https://huggingface.co/mradermacher/Qwen3.6-35B-A3B-uncensored-heretic-i1-GGUF/resolve/main/Qwen3.6-35B-A3B-uncensored-heretic.i1-IQ4_XS.gguf
+  BENCH_MODEL_BYTES: "18728778912"
+
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Free disk space for the model
+        run: |
+          df -h / /mnt || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h / /mnt || true
+          nproc; free -m; lscpu | grep -E 'Model name|^CPU\(s\)|Flags' | cut -c1-200
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential libcurl4-openssl-dev
+
+      - name: Apply the UWP llama.cpp patches
+        run: bash scripts/apply-uwp-patches.sh
+
+      - name: Configure (Release, tests)
+        run: cmake --preset linux-release -DXLLAMA_BUILD_TESTS=ON -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+
+      - name: Build the unit tests
+        run: cmake --build build/linux-release --target xllama-tests -j"$(nproc)"
+
+      - name: Fetch the model
+        run: |
+          need=$((BENCH_MODEL_BYTES + 2 * 1024 * 1024 * 1024))
+          dir="$RUNNER_TEMP"
+          if [ "$(df --output=avail -B1 "$dir" | tail -1)" -lt "$need" ]; then
+            sudo mkdir -p /mnt/ec && sudo chown "$USER" /mnt/ec && dir=/mnt/ec
+          fi
+          [ "$(df --output=avail -B1 "$dir" | tail -1)" -ge "$need" ] || {
+            echo "no disk for the model"; df -h; exit 1; }
+          curl -fL --retry 3 --no-progress-meter -o "$dir/model.gguf" "$BENCH_MODEL_URL"
+          [ "$(stat -c %s "$dir/model.gguf")" = "$BENCH_MODEL_BYTES" ]
+          echo "EC_BENCH_MODEL=$dir/model.gguf" >> "$GITHUB_ENV"
+
+      - name: Bench
+        env:
+          XLLAMA_EC_BENCH_SWAPS: ${{ inputs.swaps || '0,0::512,0.7::512' }}
+          XLLAMA_EC_BENCH_LONG: ${{ inputs.long || '1' }}
+          XLLAMA_EC_BENCH_TOKENS: ${{ inputs.tokens || '64' }}
+          XLLAMA_EC_BENCH_SLOTS: ${{ inputs.slots || '41' }}
+          XLLAMA_EC_BENCH_TRACE: ${{ runner.temp }}/ec-trace.txt
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/out"
+          XLLAMA_EC_BENCH_MODEL="$EC_BENCH_MODEL" XLLAMA_EC_BENCH_THREADS="$(nproc)" \
+            ./build/linux-release/tests/xllama-tests --test-case='expert-cache bench*' 2>&1 |
+            tee "$RUNNER_TEMP/out/bench.log"
+          # doctest exits 0 when the filter matches nothing: require the case ran.
+          grep -Eq 'test cases: +1 \| +1 passed' "$RUNNER_TEMP/out/bench.log"
+          grep '^\[ec-bench\]' "$RUNNER_TEMP/out/bench.log" | grep -v '\] text ' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the log and the routing trace
+        if: always()
+        run: |
+          [ -f "$RUNNER_TEMP/ec-trace.txt" ] && gzip -c "$RUNNER_TEMP/ec-trace.txt" > "$RUNNER_TEMP/out/ec-trace.txt.gz"
+          ls -la "$RUNNER_TEMP/out" || true
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: expert-cache-bench
+          path: ${{ runner.temp }}/out
+          if-no-files-found: warn

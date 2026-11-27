@@ -188,6 +188,17 @@ inline int resolve_max_length(int n_ctx, int n_prompt, int n_predict, int overri
     return static_cast<int>(std::min<int64_t>(n_ctx, int64_t{n_prompt} + n_predict));
 }
 
+/// One reply token as scored by the decode loop (GenerateParams::logprobs).
+struct TokenLogprob {
+    int32_t id = 0;
+    /// log p(id) under the raw logits (temperature 1, no sampler stage).
+    float logprob = 0.0f;
+    /// The id was the logits' argmax (greedy would have picked it).
+    bool argmax = false;
+    /// The token's text, special tokens rendered.
+    std::string piece;
+};
+
 /// Result of an inference call.
 struct InferenceResult {
     /// Whether generation succeeded.
@@ -213,6 +224,10 @@ struct InferenceResult {
     /// Length of the prompt passed to this call, in tokens, whatever was reused.
     /// This is what an API reports as usage.prompt_tokens (#335).
     int n_prompt = 0;
+
+    /// Prompt tokens restored from the session's on-disk prefix cache
+    /// (XLLAMA_PREFIX_CACHE_MIB) instead of prefilled; 0 when unused.
+    int n_prefix_cache_tokens = 0;
 
     /// Number of decode tokens generated.
     int n_eval = 0;
@@ -242,6 +257,12 @@ struct InferenceResult {
     /// Speculative drafts accepted.
     int n_spec_accepted = 0;
 
+    /// Thinking budget armed (GenerateParams::think_budget): generated tokens up
+    /// to and including "</think>" (all of them when it never closed), and
+    /// whether the budget wrote the close. 0 / false when no budget was armed.
+    int n_think = 0;
+    bool think_forced = false;
+
     /// Generated text output.
     std::string output_text;
 
@@ -250,6 +271,10 @@ struct InferenceResult {
 
     /// True when the stall watchdog ended the run (see inference_progress.h).
     bool stalled = false;
+
+    /// Per reply token, when the call asked for them (GenerateParams::logprobs
+    /// or forced_tokens). Empty otherwise.
+    std::vector<TokenLogprob> logprobs;
 };
 
 } // namespace xllama

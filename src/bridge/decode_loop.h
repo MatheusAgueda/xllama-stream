@@ -6,6 +6,7 @@
 
 #include "llama.h"
 #include "xllama/chat_prompt.h"        // apply_stop_sequences
+#include "xllama/inference_params.h"   // TokenLogprob
 #include "xllama/inference_progress.h" // prefill/decode progress + stall watchdog
 #include "xllama/platform.h"           // log_output
 #include "xllama/speculative.h"        // prompt_lookup_draft (#210)
@@ -52,18 +53,34 @@ namespace xllama {
 // coding session's trimmer ceiling is 3846, so a long paste used to kill the
 // process. This is the LOGICAL batch only; the physical ubatch stays at the #172
 // optimum of 512, which is what every published prefill rate was measured on.
+//
+// |progress_base| is what earlier calls of the same prefill already fed, so a
+// prefill split at recurrent checkpoints (#170c) reports one running count.
+//
+// |after_chunk| (optional) sees every decoded chunk — its tokens, count and
+// first position — while the context still holds that chunk's outputs. The MTP
+// drafter (decode_loop_mtp.h) mirrors each chunk into its own context there,
+// pairing token i with the trunk's hidden state of token i-1; false fails the
+// prefill like a decode error.
+using PrefillChunkHook = std::function<bool(const llama_token*, int, llama_pos)>;
+
 inline bool prefill_chunked(llama_context* ctx, const llama_token* tokens, int n_tokens,
-                            InferenceWatchdog* wd = nullptr) {
+                            InferenceWatchdog* wd = nullptr, int progress_base = 0,
+                            const PrefillChunkHook* after_chunk = nullptr) {
     const int n_batch = std::max(1, static_cast<int>(llama_n_batch(ctx)));
     for (int off = 0; off < n_tokens; off += n_batch) {
         if (wd && wd->aborted())
             return false;
         const int chunk = std::min(n_batch, n_tokens - off);
+        const llama_pos pos0 =
+            after_chunk ? llama_memory_seq_pos_max(llama_get_memory(ctx), 0) + 1 : 0;
         llama_batch batch = llama_batch_get_one(const_cast<llama_token*>(tokens) + off, chunk);
         if (llama_decode(ctx, batch) != 0)
             return false;
+        if (after_chunk && !(*after_chunk)(tokens + off, chunk, pos0))
+            return false;
         if (wd)
-            wd->note_prefill_chunk(off + chunk);
+            wd->note_prefill_chunk(progress_base + off + chunk);
     }
     return true;
 }
@@ -120,6 +137,22 @@ struct DecodeLoopParams {
 
     // Optional stall watchdog / decode-progress logger. Shared with prefill.
     InferenceWatchdog* watchdog = nullptr;
+
+    // Scoring: forced = the reply's ids, decoded in order instead of sampled (the
+    // loop ends when they run out; EOG and stop sequences do not end it early);
+    // logprobs = one entry per reply token. Either turns drafting off.
+    const std::vector<llama_token>* forced = nullptr;
+    std::vector<TokenLogprob>* logprobs = nullptr;
+
+    // Thinking budget (GenerateParams::think_budget): once think_budget tokens are
+    // generated and think_end has not been, think_close is fed in order as if
+    // sampled (accepted into the chain, so penalties see it), then sampling
+    // resumes for the answer. Off unless all three are set; never with forced
+    // ids or a grammar; turns prompt-lookup drafting off (a draft could carry
+    // think_end past the count).
+    int think_budget = 0;
+    llama_token think_end = -1;
+    const std::vector<llama_token>* think_close = nullptr;
 };
 
 struct DecodeLoopResult {
@@ -133,7 +166,27 @@ struct DecodeLoopResult {
     // batch. Callers must treat the generation as failed and drop the KV —
     // continuing would desync history from cells (hybrid/LFM caches).
     bool rewind_failed = false;
+    // Wall time of the classic path's llama_decode calls and of sampling.
+    double decode_ms = 0.0;
+    double sample_ms = 0.0;
+    // MTP drafter (decode_loop_mtp.h): its draft decodes, and its mirror of each
+    // verify batch (the catch-up decode that keeps its KV and hidden rows in step).
+    double draft_ms = 0.0;
+    double mirror_ms = 0.0;
+    int n_rounds = 0;        // verify batches (one target decode each)
+    bool mtp_failed = false; // the drafter's context refused a decode; drafting stopped
+    // Thinking budget armed: tokens through think_end (all generated ones when it
+    // never came), and whether the loop fed think_close itself.
+    int n_think = 0;
+    bool think_forced = false;
 };
+
+// The budget is armed only when it can do what it says: a free reply (no forced
+// ids, no grammar) with the closer tokenized and its end tag one token.
+inline bool think_budget_armed(const DecodeLoopParams& p) {
+    return p.think_budget > 0 && p.think_end >= 0 && p.think_close && !p.think_close->empty() &&
+           p.forced == nullptr && p.grammar == nullptr;
+}
 
 namespace detail {
 
@@ -153,7 +206,7 @@ inline bool emit_token(const DecodeLoopParams& p, llama_token token, std::string
             std::fflush(stdout);
         }
     }
-    return p.stop_sequences && apply_stop_sequences(output_text, *p.stop_sequences);
+    return p.stop_sequences && !p.forced && apply_stop_sequences(output_text, *p.stop_sequences);
 }
 
 // One token through the chain, checked against the grammar the way llama-server
@@ -186,6 +239,30 @@ inline llama_token sample_with_grammar(const DecodeLoopParams& p) {
     llama_sampler_accept(p.grammar, id);
     llama_sampler_accept(p.sampler, id);
     return id;
+}
+
+// log p(token) from the logits the next sample reads (row -1), as log-softmax at
+// temperature 1: the model's own distribution, before any sampler stage.
+inline TokenLogprob token_logprob(const DecodeLoopParams& p, llama_token token) {
+    const float* logits = llama_get_logits_ith(p.ctx, -1);
+    const int n_vocab = llama_vocab_n_tokens(p.vocab);
+    int best = 0;
+    for (int i = 1; i < n_vocab; ++i)
+        if (logits[i] > logits[best])
+            best = i;
+    double sum = 0.0;
+    for (int i = 0; i < n_vocab; ++i)
+        sum += std::exp(static_cast<double>(logits[i]) - static_cast<double>(logits[best]));
+    TokenLogprob t;
+    t.id = token;
+    t.logprob = static_cast<float>(static_cast<double>(logits[token]) -
+                                   static_cast<double>(logits[best]) - std::log(sum));
+    t.argmax = token == best;
+    char buf[256] = {};
+    const int len = llama_token_to_piece(p.vocab, token, buf, sizeof(buf) - 1, 0, true);
+    if (len > 0)
+        t.piece.assign(buf, static_cast<size_t>(len));
+    return t;
 }
 
 // Record an accepted token in history / session bookkeeping.
@@ -267,7 +344,11 @@ inline bool classic_step(const DecodeLoopParams& p, llama_token token, std::stri
         log_output("[xllama] stop sequence after " + std::to_string(out.n_generated) + " tokens\n");
         return false;
     }
-    if (!decode_one(p.ctx, token)) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool decoded = decode_one(p.ctx, token);
+    out.decode_ms +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (!decoded) {
         log_output("[xllama] decode failed at token, stopping generation\n");
         decode_ok = false;
         return false;
@@ -299,21 +380,51 @@ inline bool classic_step(const DecodeLoopParams& p, llama_token token, std::stri
 // single-token decode of lead on this stack. Commit lead first, then speculate.
 inline DecodeLoopResult decode_loop(const DecodeLoopParams& p, std::string& output_text) {
     DecodeLoopResult out;
-    bool spec_enabled =
-        p.prompt_lookup && p.token_history != nullptr && p.spec_k > 0 && p.grammar == nullptr;
+    const bool budget = think_budget_armed(p);
+    bool spec_enabled = p.prompt_lookup && p.token_history != nullptr && p.spec_k > 0 &&
+                        p.grammar == nullptr && p.forced == nullptr && p.logprobs == nullptr &&
+                        !budget;
+    bool thinking = budget; // inside the reasoning the prompt opened
+    size_t n_fed = 0;       // think_close tokens already fed
+    const size_t n_close = budget ? p.think_close->size() : 0;
 
     while (out.n_generated < p.n_predict) {
         if (p.abort_flag && p.abort_flag->load())
             break;
         if (p.watchdog && p.watchdog->aborted())
             break;
+        if (p.forced && out.n_generated >= static_cast<int>(p.forced->size()))
+            break;
 
-        llama_token token =
-            p.grammar ? detail::sample_with_grammar(p) : llama_sampler_sample(p.sampler, p.ctx, -1);
-        if (detail::stops_at_eog(p, token)) {
+        // Feeding starts when the budget is spent inside the reasoning and, once
+        // started, runs to the end of the closer (its "</think>" ends `thinking`
+        // before the trailing blank line is fed).
+        const bool closing =
+            n_fed < n_close && (n_fed > 0 || (thinking && out.n_generated >= p.think_budget));
+        const auto ts0 = std::chrono::steady_clock::now();
+        llama_token token;
+        if (closing) {
+            token = (*p.think_close)[n_fed++];
+            llama_sampler_accept(p.sampler, token);
+            if (!out.think_forced)
+                log_output("[xllama] thinking budget spent after " +
+                           std::to_string(out.n_generated) + " tokens: closing the reasoning\n");
+            out.think_forced = true;
+        } else {
+            token = p.forced    ? (*p.forced)[static_cast<size_t>(out.n_generated)]
+                    : p.grammar ? detail::sample_with_grammar(p)
+                                : llama_sampler_sample(p.sampler, p.ctx, -1);
+        }
+        out.sample_ms +=
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts0)
+                .count();
+        if (!p.forced && !closing && detail::stops_at_eog(p, token)) {
             log_output("[xllama] EOG after " + std::to_string(out.n_generated) + " tokens\n");
             break;
         }
+        // Before classic_step: its decode replaces the logits this token came from.
+        if (p.logprobs)
+            p.logprobs->push_back(detail::token_logprob(p, token));
 
         // Always commit the sampled token via the classic path first. Spec never
         // changes this step — that is what keeps greedy text identical.
@@ -325,7 +436,12 @@ inline DecodeLoopResult decode_loop(const DecodeLoopParams& p, std::string& outp
                                          .count();
             }
             bool stop = false, decode_ok = true;
-            if (!detail::classic_step(p, token, output_text, out, stop, decode_ok))
+            const bool stepped = detail::classic_step(p, token, output_text, out, stop, decode_ok);
+            if (thinking && token == p.think_end) {
+                thinking = false;
+                out.n_think = out.n_generated;
+            }
+            if (!stepped)
                 break;
         }
         if (p.watchdog)
@@ -492,6 +608,8 @@ inline DecodeLoopResult decode_loop(const DecodeLoopParams& p, std::string& outp
             p.watchdog->on_decode_token(out.n_generated);
         // All drafts accepted: logits after the last draft are ready for -1.
     }
+    if (thinking)
+        out.n_think = out.n_generated; // the reasoning never closed: all of it
     return out;
 }
 

@@ -6,12 +6,20 @@
 #   shaders/gpugemv_q4k_wave32.hlsl → gpugemv_q4k_wave32_dxil.h (H6.2 LDS-red)
 #   shaders/gpugemv_q4k_rows.hlsl   → gpugemv_q4k_rows_dxil.h   (H6.3 multi-row)
 #   shaders/gpugemv_q4k_dot4.hlsl   → gpugemv_q4k_dot4_dxil.h   (H6.3 int8 dot, cs_6_4)
-#   shaders/ggml_d3d12_mmv_{q4_0,q4_k,q6_k}.hlsl → ggml_d3d12_mmv_*_t{64,128}_dxil.h (cs_6_4)
+#   shaders/ggml_d3d12_mmv_{q4_0,q4_k,q5_k,q6_k,iq3_s,iq2_s,iq2_xxs,iq4_xs,f32}.hlsl → ggml_d3d12_mmv_*_t{64,128}_dxil.h (cs_6_4)
 #     (D2 backend; one blob per thread-group width, -D NUM_THREADS)
+#   shaders/ggml_d3d12_mmid_{iq4_xs,iq3_s,iq2_s,iq2_xxs}.hlsl → ggml_d3d12_mmid_*_t{64,128}_dxil.h (cs_6_4, MUL_MAT_ID)
 #   shaders/ggml_d3d12_get_rows_q6_k.hlsl → ggml_d3d12_get_rows_q6_k_dxil.h (cs_6_4)
+#   shaders/ggml_d3d12_elt.hlsl → ggml_d3d12_elt_{binary,rms_norm,quant_q8_k,norm_quant,bin_quant}_dxil.h (cs_6_4, -D KERNEL)
+#   shaders/ggml_d3d12_moe.hlsl → ggml_d3d12_moe_{combine,tail}_dxil.h (cs_6_4, -D KERNEL)
+#   shaders/ggml_d3d12_ssm.hlsl → ggml_d3d12_ssm_{unary,copy,get_rows,conv,gdn,rope,set_rows}_dxil.h (cs_6_4, -D KERNEL)
+#   shaders/ggml_d3d12_route.hlsl → ggml_d3d12_route_{route,emit,hs}_dxil.h (cs_6_4, -D KERNEL, -Gis)
+#   shaders/ggml_d3d12_fap.hlsl → ggml_d3d12_fap_dxil.h (cs_6_4, FLASH_ATTN_EXT of a prefill ubatch)
+#   variants: shaders/variants.txt → $VARIANTS_OUT/<tag>/<slot>.dxil, raw blobs
+#     for XLLAMA_D3D12_SHADER_DIR (default out: build/shader-variants)
 #
-# Usage: compile-gpugemv-shader.sh [naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q6_k|get_rows_q6_k ...]
-#        (default: all)
+# Usage: compile-gpugemv-shader.sh [naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q5_k|mmv_q6_k|mmv_iq3_s|mmv_iq2_s|mmv_iq2_xxs|mmv_iq4_xs|mmv_f32|mmid_iq4_xs|mmid_iq3_s|mmid_iq2_s|mmid_iq2_xxs|get_rows_q6_k|elt|moe|ssm|route|fap|variants ...]
+#        (default: all headers, no variants)
 # A different dxc release emits different bytes: regenerate only the targets
 # you changed so measured blobs stay the ones the CSVs were recorded with.
 set -euo pipefail
@@ -90,7 +98,7 @@ compile_target() {
 	dot4) compile_one "$ROOT/shaders/gpugemv_q4k_dot4.hlsl" \
 		"$ROOT/shaders/generated/gpugemv_q4k_dot4_dxil.h" \
 		"shaders/gpugemv_q4k_dot4.hlsl" "kGpugemvQ4kDot4Dxil" cs_6_4 ;;
-	mmv_q4_0 | mmv_q4_k | mmv_q6_k)
+	mmv_q4_0 | mmv_q4_k | mmv_q5_k | mmv_q6_k | mmv_iq3_s | mmv_iq2_s | mmv_iq2_xxs | mmv_iq4_xs | mmv_f32)
 		local t="${1#mmv_}" w sym
 		for w in 64 128; do
 			sym="kGgmlD3d12Mmv$(echo "$t" | sed -e 's/_\(.\)/\U\1/g' -e 's/^./\U&/')T${w}Dxil"
@@ -100,18 +108,83 @@ compile_target() {
 				-D "NUM_THREADS=${w}"
 		done
 		;;
+	mmid_iq4_xs | mmid_iq3_s | mmid_iq2_s | mmid_iq2_xxs)
+		local t="${1#mmid_}" w sym
+		for w in 64 128; do
+			sym="kGgmlD3d12Mmid$(echo "$t" | sed -e 's/_\(.\)/\U\1/g' -e 's/^./\U&/')T${w}Dxil"
+			compile_one "$ROOT/shaders/ggml_d3d12_mmid_${t}.hlsl" \
+				"$ROOT/shaders/generated/ggml_d3d12_mmid_${t}_t${w}_dxil.h" \
+				"shaders/ggml_d3d12_mmid_${t}.hlsl -D NUM_THREADS=${w}" "$sym" cs_6_4 \
+				-D "NUM_THREADS=${w}"
+		done
+		;;
 	get_rows_q6_k) compile_one "$ROOT/shaders/ggml_d3d12_get_rows_q6_k.hlsl" \
 		"$ROOT/shaders/generated/ggml_d3d12_get_rows_q6_k_dxil.h" \
 		"shaders/ggml_d3d12_get_rows_q6_k.hlsl" "kGgmlD3d12GetRowsQ6KDxil" cs_6_4 ;;
+	elt)
+		local k n name sym
+		for k in 1:binary:Binary 2:rms_norm:RmsNorm 3:quant_q8_k:QuantQ8K 4:norm_quant:NormQuant 5:bin_quant:BinQuant; do
+			IFS=: read -r n name sym <<<"$k"
+			compile_one "$ROOT/shaders/ggml_d3d12_elt.hlsl" \
+				"$ROOT/shaders/generated/ggml_d3d12_elt_${name}_dxil.h" \
+				"shaders/ggml_d3d12_elt.hlsl -D KERNEL=${n}" "kGgmlD3d12Elt${sym}Dxil" cs_6_4 \
+				-D "KERNEL=${n}"
+		done
+		;;
+	moe)
+		local k n name sym
+		for k in 1:combine:Combine 2:tail:Tail; do
+			IFS=: read -r n name sym <<<"$k"
+			compile_one "$ROOT/shaders/ggml_d3d12_moe.hlsl" \
+				"$ROOT/shaders/generated/ggml_d3d12_moe_${name}_dxil.h" \
+				"shaders/ggml_d3d12_moe.hlsl -D KERNEL=${n}" "kGgmlD3d12Moe${sym}Dxil" cs_6_4 \
+				-D "KERNEL=${n}"
+		done
+		;;
+	ssm)
+		local k n name sym
+		for k in 1:unary:Unary 2:copy:Copy 3:get_rows:GetRows 4:conv:Conv 5:gdn:Gdn 6:rope:Rope 7:set_rows:SetRows; do
+			IFS=: read -r n name sym <<<"$k"
+			compile_one "$ROOT/shaders/ggml_d3d12_ssm.hlsl" \
+				"$ROOT/shaders/generated/ggml_d3d12_ssm_${name}_dxil.h" \
+				"shaders/ggml_d3d12_ssm.hlsl -D KERNEL=${n}" "kGgmlD3d12Ssm${sym}Dxil" cs_6_4 \
+				-D "KERNEL=${n}"
+		done
+		;;
+	route)
+		local k n name sym
+		for k in 1:route:Route 2:emit:Emit 3:hs:Hs; do
+			IFS=: read -r n name sym <<<"$k"
+			compile_one "$ROOT/shaders/ggml_d3d12_route.hlsl" \
+				"$ROOT/shaders/generated/ggml_d3d12_route_${name}_dxil.h" \
+				"shaders/ggml_d3d12_route.hlsl -D KERNEL=${n} -Gis" "kGgmlD3d12Route${sym}Dxil" cs_6_4 \
+				-D "KERNEL=${n}" -Gis
+		done
+		;;
+	fap) compile_one "$ROOT/shaders/ggml_d3d12_fap.hlsl" \
+		"$ROOT/shaders/generated/ggml_d3d12_fap_dxil.h" \
+		"shaders/ggml_d3d12_fap.hlsl" "kGgmlD3d12FapDxil" cs_6_4 ;;
+	variants)
+		# shaders/variants.txt → $VARIANTS_OUT/<tag>/<slot>.dxil (raw, not headers)
+		local out="${VARIANTS_OUT:-$ROOT/build/shader-variants}" tag slot src rest
+		local -a args
+		while read -r tag slot src rest; do
+			[[ -z "$tag" || "$tag" == \#* ]] && continue
+			read -r -a args <<<"$rest"
+			mkdir -p "$out/$tag"
+			"$DXC" -T cs_6_4 -E CSMain "${args[@]}" -Fo "$out/$tag/$slot.dxil" "$ROOT/$src"
+			echo "wrote $out/$tag/$slot.dxil ($(wc -c <"$out/$tag/$slot.dxil") bytes) from $src ${args[*]}"
+		done <"$ROOT/shaders/variants.txt"
+		;;
 	*)
-		echo "unknown target: $1 (naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q6_k|get_rows_q6_k)" >&2
+		echo "unknown target: $1 (naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q5_k|mmv_q6_k|mmv_iq3_s|mmv_iq2_s|mmv_iq2_xxs|mmv_iq4_xs|mmv_f32|mmid_iq4_xs|mmid_iq3_s|mmid_iq2_s|mmid_iq2_xxs|get_rows_q6_k|elt|moe|ssm|route|fap|variants)" >&2
 		exit 2
 		;;
 	esac
 }
 
 if [[ $# -eq 0 ]]; then
-	set -- naive wave32 rows dot4 mmv_q4_0 mmv_q4_k mmv_q6_k get_rows_q6_k
+	set -- naive wave32 rows dot4 mmv_q4_0 mmv_q4_k mmv_q5_k mmv_q6_k mmv_iq3_s mmv_iq2_s mmv_iq2_xxs mmv_iq4_xs mmv_f32 mmid_iq4_xs mmid_iq3_s mmid_iq2_s mmid_iq2_xxs get_rows_q6_k elt moe ssm route fap
 fi
 for target in "$@"; do
 	compile_target "$target"

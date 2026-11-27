@@ -4,6 +4,7 @@
 #include "xllama/platform.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -22,7 +23,10 @@
     #define PSAPI_VERSION 2
     #include <psapi.h>
     #include <unknwn.h>
+    #include <winrt/Windows.Foundation.h>
+    #include <winrt/Windows.Foundation.Metadata.h>
     #include <winrt/Windows.Storage.h>
+    #include <winrt/Windows.System.h>
     #include <dxgi1_4.h>
 // clang-format on
 #endif
@@ -146,6 +150,49 @@ std::size_t avail_phys_mb() noexcept {
 #endif
 }
 
+std::size_t avail_commit_mb() noexcept {
+#ifdef XLLAMA_UWP
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof(ms);
+    if (GlobalMemoryStatusEx(&ms))
+        return static_cast<std::size_t>(ms.ullAvailPageFile / (1024 * 1024));
+    return 0;
+#else
+    return avail_phys_mb();
+#endif
+}
+
+std::size_t private_mb() noexcept {
+#ifdef XLLAMA_UWP
+    PROCESS_MEMORY_COUNTERS_EX pmc{};
+    pmc.cb = sizeof(pmc);
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(),
+                                reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc)))
+        return pmc.PrivateUsage / (1024 * 1024);
+    return 0;
+#else
+    return 0;
+#endif
+}
+
+namespace {
+std::atomic<bool> g_gpu_probe_open{false};
+std::atomic<GpuReclaimHook> g_gpu_reclaim{nullptr};
+} // namespace
+
+bool gpu_mem_probe_open() noexcept {
+    return g_gpu_probe_open.load(std::memory_order_acquire);
+}
+
+void set_gpu_reclaim_hook(GpuReclaimHook hook) noexcept {
+    g_gpu_reclaim.store(hook, std::memory_order_release);
+}
+
+void run_gpu_reclaim_hook() noexcept {
+    if (GpuReclaimHook h = g_gpu_reclaim.load(std::memory_order_acquire))
+        h();
+}
+
 GpuMemInfo gpu_mem_info() noexcept {
 #ifdef XLLAMA_UWP
     // Adapter cached for process lifetime: gpu_mem_info() is called per phase
@@ -161,6 +208,7 @@ GpuMemInfo gpu_mem_info() noexcept {
             adapter1->Release();
         }
         factory->Release();
+        g_gpu_probe_open.store(true, std::memory_order_release);
         return adapter3;
     }();
 
@@ -176,6 +224,74 @@ GpuMemInfo gpu_mem_info() noexcept {
     return info;
 #else
     return {};
+#endif
+}
+
+AppMemInfo app_mem_info() noexcept {
+    AppMemInfo info;
+#ifdef XLLAMA_UWP
+    try {
+        using winrt::Windows::System::MemoryManager;
+        constexpr unsigned long long kMiB = 1024ull * 1024ull;
+        info.usage_mb = static_cast<std::size_t>(MemoryManager::AppMemoryUsage() / kMiB);
+        info.limit_mb = static_cast<std::size_t>(MemoryManager::AppMemoryUsageLimit() / kMiB);
+        info.level = static_cast<int>(MemoryManager::AppMemoryUsageLevel());
+        static const bool s_expected =
+            winrt::Windows::Foundation::Metadata::ApiInformation::IsPropertyPresent(
+                L"Windows.System.MemoryManager", L"ExpectedAppMemoryUsageLimit");
+        if (s_expected)
+            info.expected_mb =
+                static_cast<std::size_t>(MemoryManager::ExpectedAppMemoryUsageLimit() / kMiB);
+        info.available = true;
+    } catch (...) {
+    }
+#endif
+    return info;
+}
+
+void watch_app_memory() noexcept {
+#ifdef XLLAMA_UWP
+    static std::once_flag s_once;
+    try {
+        std::call_once(s_once, [] {
+            using winrt::Windows::System::MemoryManager;
+            (void)MemoryManager::AppMemoryUsageLimitChanging(
+                [](winrt::Windows::Foundation::IInspectable const&,
+                   winrt::Windows::System::AppMemoryUsageLimitChangingEventArgs const& a) {
+                    try {
+                        constexpr unsigned long long kMiB = 1024ull * 1024ull;
+                        char b[192];
+                        std::snprintf(
+                            b, sizeof(b),
+                            "[xllama] app-mem limit changing: %llu -> %llu MB (usage %llu MB)\n",
+                            static_cast<unsigned long long>(a.OldLimit()) / kMiB,
+                            static_cast<unsigned long long>(a.NewLimit()) / kMiB,
+                            static_cast<unsigned long long>(MemoryManager::AppMemoryUsage()) /
+                                kMiB);
+                        log_output(b);
+                    } catch (...) {
+                    }
+                });
+            (void)MemoryManager::AppMemoryUsageIncreased(
+                [](winrt::Windows::Foundation::IInspectable const&,
+                   winrt::Windows::Foundation::IInspectable const&) {
+                    const AppMemInfo m = app_mem_info();
+                    char b[192];
+                    std::snprintf(
+                        b, sizeof(b),
+                        "[xllama] app-mem usage increased: %zu/%zu MB expected %zu MB level %d\n",
+                        m.usage_mb, m.limit_mb, m.expected_mb, m.level);
+                    log_output(b);
+                });
+            const AppMemInfo m = app_mem_info();
+            char b[192];
+            std::snprintf(b, sizeof(b),
+                          "[xllama] app-mem watch: %zu/%zu MB expected %zu MB level %d\n",
+                          m.usage_mb, m.limit_mb, m.expected_mb, m.level);
+            log_output(b);
+        });
+    } catch (...) {
+    }
 #endif
 }
 

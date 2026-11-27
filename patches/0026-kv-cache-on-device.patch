@@ -1,0 +1,26 @@
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -8,6 +8,7 @@
+ #include <algorithm>
+ #include <cassert>
+ #include <cmath>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <map>
+@@ -213,7 +214,13 @@
+ 
+         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+ 
+-        if (offload) {
++        // xllama patch 0026: LLAMA_KV_ON_DEVICE (set, not "0") puts the KV cache
++        // on the layer's device even when offload_kqv is off, so a backend that
++        // runs flash attention reads the cache in place instead of the scheduler
++        // copying the K / V views into it for every ubatch; one that does not
++        // must be able to use the buffer from the CPU (a host buffer type).
++        const char * kv_dev = getenv("LLAMA_KV_ON_DEVICE");
++        if (offload || (kv_dev && strcmp(kv_dev, "0") != 0)) {
+             auto * dev = model.dev_layer(il);
+             buft = ggml_backend_dev_buffer_type(dev);
+ 

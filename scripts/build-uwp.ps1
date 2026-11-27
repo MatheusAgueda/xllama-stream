@@ -73,7 +73,9 @@ if (-not (Test-Path $SlnPath)) {
 $cert = $null
 if ((-not $ForceNewCert) -and (Test-Path $PfxPath) -and (Test-Path $CerPath)) {
     Write-Host "Reusing existing test certificate ..."
-    $cert = Get-PfxCertificate -FilePath $PfxPath -Password (ConvertTo-SecureString -String $CertPwd -Force -AsPlainText) -ErrorAction SilentlyContinue
+    # X509Certificate2, not Get-PfxCertificate -Password: that parameter is PowerShell 7 only,
+    # and the local builds (build_nb) run under Windows PowerShell 5.1
+    $cert = try { New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($PfxPath, $CertPwd) } catch { $null }
     if (-not $cert) {
         Write-Warning "Failed to load existing PFX; generating a new certificate."
     }

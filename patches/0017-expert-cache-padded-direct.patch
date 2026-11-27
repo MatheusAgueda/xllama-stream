@@ -1,0 +1,284 @@
+diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
+--- a/src/llama-expert-cache.cpp
++++ b/src/llama-expert-cache.cpp
+@@ -50,6 +50,15 @@
+ // through the OS file cache and no read-ahead. Offsets, sizes and addresses are multiples of
+ // EC_DIRECT_ALIGN (512-byte and 4 KiB sectors alike); a read that is not aligned goes through the
+ // thread's staging buffer. A thread whose handle cannot read this way reads buffered.
++//
++// LLAMA_EXPERT_PAD=1: a GGUF aligns tensor data to 32 bytes, so an expert tensor whose file offset is
++// not a multiple of EC_DIRECT_ALIGN (Qwen3.5-122B-A10B: every one) had every read staged and copied
++// (the console: ~0.9 GB/s staged against ~2 GB/s in place). Its slots are then EC_DIRECT_ALIGN apart
++// beyond the expert's bytes (nb[2] = nb[1]*ne[1] + EC_DIRECT_ALIGN, which the MUL_MAT_ID kernels
++// take as the expert stride) and the tensor's data is moved, when bound, to the file offset's
++// remainder: the aligned span around an expert, or around any aligned part of it, then lands in
++// place, spilling only into the gap before and after its slot (a part's spill is the same file
++// bytes its neighbouring parts write there)
+ static constexpr size_t EC_DIRECT_ALIGN = 4096;
+ 
+ // LLAMA_EXPERT_IO_QD > 1 (Windows): an unbuffered read goes to the disk as up to that many requests
+@@ -131,6 +140,8 @@
+     size_t  file;
+     size_t  offs;  // file offset of expert 0
+     int32_t layer;
++    size_t  eb;    // an expert's bytes, its stride in the file (t->nb[2], the slot stride, adds the pad)
++    bool    pad;   // slots padded and aligned to offs (LLAMA_EXPERT_PAD): spans read in place
+     std::unique_ptr<ec_em> em {};
+ };
+ 
+@@ -278,6 +289,7 @@
+     bool io_direct = true; // unbuffered reads (LLAMA_EXPERT_DIRECT)
+     bool io_split  = true; // a load op's reads split over all its threads (LLAMA_EXPERT_SPLIT)
+     int  io_qd     = 1;    // requests in flight per unbuffered read (LLAMA_EXPERT_IO_QD, Windows)
++    bool io_pad    = false; // slots padded so that unaligned experts read in place (LLAMA_EXPERT_PAD)
+ 
+     // pre-gating prefetch: pf_k predicted experts per token, read by I/O threads ahead of the plan.
+     // pf_ahead: layer il+1 is predicted from layer il's post-attention residual and queued right
+@@ -393,8 +405,8 @@
+         }
+ #endif
+         char io[160] = "";
+-        snprintf(io, sizeof(io), "; reads %" PRIu64 " direct, %" PRIu64 " staged, %" PRIu64 " buffered%s%s",
+-                n_direct, n_staged, n_buffered, io_split ? ", split" : "", qd);
++        snprintf(io, sizeof(io), "; reads %" PRIu64 " direct, %" PRIu64 " staged, %" PRIu64 " buffered%s%s%s",
++                n_direct, n_staged, n_buffered, io_split ? ", split" : "", io_pad ? ", pad" : "", qd);
+         LLAMA_LOG_INFO("expert cache (%s): %u slots x %zu layers, %" PRIu64 " ubatches, %" PRIu64 " hits, %" PRIu64 " misses (%.1f%% hit), %" PRIu64 " swaps, %.1f MiB read in %.0f ms%s%s%s\n",
+                 when, n_slots, layers.size(), n_rounds, h, m, h + m ? 100.0*h/(h + m) : 0.0, swaps.load(), bytes.load()/1024.0/1024.0, us/1000.0, pf, em, io);
+     }
+@@ -453,6 +465,14 @@
+ 
+ static size_t ec_buft_get_max_size(ggml_backend_buffer_type_t buft) {
+     return ggml_backend_buft_get_max_size(ec_inner_buft(buft));
++}
++
++// a padded tensor (LLAMA_EXPERT_PAD) also holds the room its data moves by when bound (< 2 aligns)
++// and the last slot's spill
++static size_t ec_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * t) {
++    GGML_UNUSED(buft);
++    const bool pad = t->ne[2] > 0 && t->nb[2] > t->nb[1]*(size_t) t->ne[1];
++    return ggml_nbytes(t) + (pad ? 3*EC_DIRECT_ALIGN : 0);
+ }
+ 
+ static bool ec_buft_is_host(ggml_backend_buffer_type_t buft) {
+@@ -673,10 +693,12 @@
+ }
+ 
+ // unbuffered read of [offs, offs + n) into dst: the aligned span around it, in place when it is the
+-// span itself, else into the staging buffer and copied out. A failed read in place (memory the
+-// device cannot write to) moves the thread to the staging buffer; a failed staged read (a file
+-// system without O_DIRECT, a larger sector) to buffered reads: false, read it buffered
+-static bool ec_read_direct(ec_file & f, int ith, void * dst, size_t n, size_t offs) {
++// span itself or when the caller lets the span spill around dst (pad: its EC_DIRECT_ALIGN bytes
++// before and after dst are free) and dst sits at the offset's remainder, else into the staging
++// buffer and copied out. A failed read in place (memory the device cannot write to) moves the
++// thread to the staging buffer; a failed staged read (a file system without O_DIRECT, a larger
++// sector) to buffered reads: false, read it buffered
++static bool ec_read_direct(ec_file & f, int ith, void * dst, size_t n, size_t offs, bool pad) {
+     ec_direct & d = f.dio[ith];
+     if (d.state == 0) {
+         d.state = ec_direct_open(f.path, d, f.qd) ? 1 : -1;
+@@ -688,8 +710,9 @@
+     const size_t A  = EC_DIRECT_ALIGN;
+     const size_t lo = offs/A*A;
+     const size_t hi = (offs + n + A - 1)/A*A;
+-    if (d.in_place && lo == offs && hi == offs + n && (uintptr_t) dst % A == 0) {
+-        if (ec_direct_span(d, (char *) dst, lo, hi - lo, offs + n)) {
++    char * const at = (char *) dst - (offs - lo);
++    if (d.in_place && (pad || (lo == offs && hi == offs + n)) && (uintptr_t) at % A == 0) {
++        if (ec_direct_span(d, at, lo, hi - lo, offs + n)) {
+             f.n_direct++;
+             return true;
+         }
+@@ -709,8 +732,8 @@
+     return true;
+ }
+ 
+-static void ec_read(ec_file & f, int ith, void * dst, size_t n, size_t offs) {
+-    if (f.direct && ec_read_direct(f, ith, dst, n, offs)) {
++static void ec_read(ec_file & f, int ith, void * dst, size_t n, size_t offs, bool pad = false) {
++    if (f.direct && ec_read_direct(f, ith, dst, n, offs, pad)) {
+         return;
+     }
+     f.n_buffered++;
+@@ -783,18 +806,17 @@
+     if (j.parts == 1) {
+         for (size_t ti : L.tensors) {
+             const ec_tensor & T = C.tensors[ti];
+-            const size_t nb2 = T.t->nb[2];
+-            ec_read(*C.files[T.file], ith, (char *) T.t->data + (size_t) j.slot*nb2, nb2, T.offs + (size_t) j.expert*nb2);
+-            bytes += nb2;
++            ec_read(*C.files[T.file], ith, (char *) T.t->data + (size_t) j.slot*T.t->nb[2], T.eb, T.offs + (size_t) j.expert*T.eb, T.pad);
++            bytes += T.eb;
+         }
+     } else {
+         const ec_tensor & T = C.tensors[L.tensors[(size_t) p / EC_PF_SUBPARTS]];
+-        const size_t nb2  = T.t->nb[2];
+-        const size_t part = ec_part_size(nb2, EC_PF_SUBPARTS);
++        const size_t eb   = T.eb;
++        const size_t part = ec_part_size(eb, EC_PF_SUBPARTS);
+         const size_t b    = ((size_t) p % EC_PF_SUBPARTS)*part;
+-        if (b < nb2) {
+-            const size_t n = std::min(part, nb2 - b);
+-            ec_read(*C.files[T.file], ith, (char *) T.t->data + (size_t) j.slot*nb2 + b, n, T.offs + (size_t) j.expert*nb2 + b);
++        if (b < eb) {
++            const size_t n = std::min(part, eb - b);
++            ec_read(*C.files[T.file], ith, (char *) T.t->data + (size_t) j.slot*T.t->nb[2] + b, n, T.offs + (size_t) j.expert*eb + b, T.pad);
+             bytes = n;
+         }
+     }
+@@ -1568,14 +1590,14 @@
+         const size_t r = j / n_parts;
+         const auto & job = L.pending[r / n_t];
+         const ec_tensor & T = C.tensors[L.tensors[r % n_t]];
+-        const size_t nb2  = T.t->nb[2];
+-        const size_t part = ec_part_size(nb2, n_parts);
++        const size_t eb   = T.eb;
++        const size_t part = ec_part_size(eb, n_parts);
+         const size_t b    = (j % n_parts)*part;
+-        if (b >= nb2) {
++        if (b >= eb) {
+             continue;
+         }
+-        const size_t n = std::min(part, nb2 - b);
+-        ec_read(*C.files[T.file], ith, (char *) T.t->data + (size_t) job.first*nb2 + b, n, T.offs + (size_t) job.second*nb2 + b);
++        const size_t n = std::min(part, eb - b);
++        ec_read(*C.files[T.file], ith, (char *) T.t->data + (size_t) job.first*T.t->nb[2] + b, n, T.offs + (size_t) job.second*eb + b, T.pad);
+         bytes += n;
+     }
+     if (bytes > 0) {
+@@ -1828,7 +1850,8 @@
+     const int64_t n_rows = w->ne[1];
+     const int64_t n_used = dst->ne[1];
+     const size_t  qrs    = ggml_row_size(tr->vec_dot_type, k);
+-    const size_t  nb2    = w->nb[2];
++    const size_t  nb2    = w->nb[2]; // the slot stride
++    const size_t  eb     = T.eb;     // an expert's bytes and its stride in the file
+     const int32_t n_list = (int32_t) E.list.size();
+     const bool    res_file = ec_em_resident_from_file(C);
+ 
+@@ -1848,6 +1871,21 @@
+         }
+         return (char *) GGML_PAD((uintptr_t) stage.data(), 64);
+     };
++    // an expert read from the file: with padded slots the stage sits at the file offset's remainder
++    // with EC_DIRECT_ALIGN bytes free around it, so that the read lands in place too
++    auto file_buf = [&stage, &T](size_t n, size_t offs) {
++        if (!T.pad) {
++            if (stage.size() < n + 64) {
++                stage.resize(n + 64);
++            }
++            return (char *) GGML_PAD((uintptr_t) stage.data(), 64);
++        }
++        const size_t A = EC_DIRECT_ALIGN;
++        if (stage.size() < n + 3*A) {
++            stage.resize(n + 3*A);
++        }
++        return (char *) GGML_PAD((uintptr_t) stage.data() + A, A) + offs % A;
++    };
+     const size_t  nb1 = w->nb[1];
+     const int64_t blk = std::max<int64_t>(1, (int64_t) (EC_EM_BLOCK/nb1)); // rows per copy of a resident expert
+     for (int32_t i = E.next.fetch_add(1); i < n_list; i = E.next.fetch_add(1)) {
+@@ -1881,7 +1919,7 @@
+         // or is read from the file like a missing one (res_file), its slot left as it is
+         if (v < 0 && s >= 0 && !res_file) {
+             const char * slot = (const char *) w->data + (size_t) s*nb2;
+-            char       * buf  = stage_buf(std::min<size_t>(nb2, (size_t) blk*nb1));
++            char       * buf  = stage_buf(std::min<size_t>(eb, (size_t) blk*nb1));
+             for (int64_t r0 = 0; r0 < n_rows; r0 += blk) {
+                 const int64_t r1 = std::min(n_rows, r0 + blk);
+                 const int64_t c0 = ggml_time_us();
+@@ -1892,13 +1930,14 @@
+             slot_b += (size_t) n_rows*nb1;
+             hits++;
+         } else {
+-            char * buf = stage_buf(nb2);
++            const size_t fo  = T.offs + (size_t) e*eb;
++            char *       buf = file_buf(eb, fo);
+             const int64_t c0 = ggml_time_us();
+-            ec_read(*C.files[T.file], ith, buf, nb2, T.offs + (size_t) e*nb2);
++            ec_read(*C.files[T.file], ith, buf, eb, fo, T.pad);
+             file_us += (uint64_t) (ggml_time_us() - c0);
+-            file_b  += nb2;
++            file_b  += eb;
+             if (v >= 0) {
+-                ec_copy_stream((char *) w->data + (size_t) v*nb2, buf, nb2, true);
++                ec_copy_stream((char *) w->data + (size_t) v*nb2, buf, eb, true);
+             }
+             mm_rows(buf, 0, n_rows);
+             if (v < 0 && s >= 0) {
+@@ -1912,7 +1951,7 @@
+ 
+     if (reads > 0) {
+         C.em_reads += reads;
+-        C.em_bytes += reads*nb2;
++        C.em_bytes += reads*eb;
+     }
+     if (hits > 0) {
+         C.em_hits += hits;
+@@ -2132,6 +2171,9 @@
+     // LLAMA_EXPERT_IO_QD: requests in flight per unbuffered read on Windows (1, the default: one)
+     const char * qd = getenv("LLAMA_EXPERT_IO_QD");
+     cache->io_qd = qd != nullptr && *qd != '\0' ? std::min(std::max(atoi(qd), 1), EC_IO_QD_MAX) : 1;
++    // LLAMA_EXPERT_PAD=1: slots padded so that experts at unaligned file offsets read in place (off by default)
++    const char * pad = getenv("LLAMA_EXPERT_PAD");
++    cache->io_pad = cache->io_direct && pad != nullptr && *pad != '\0' && atoi(pad) != 0;
+     // LLAMA_EXPERT_EM_RESIDENT: where an expert-major ubatch's resident experts come from (slot,
+     // file, auto - the default; also 0, 1, 2)
+     const char * res = getenv("LLAMA_EXPERT_EM_RESIDENT");
+@@ -2147,7 +2189,7 @@
+             /* .alloc_buffer_n   = */ nullptr,
+             /* .get_alignment    = */ ec_buft_get_alignment,
+             /* .get_max_size     = */ ec_buft_get_max_size,
+-            /* .get_alloc_size   = */ nullptr, // the tensors are shrunk, ggml_nbytes is their size
++            /* .get_alloc_size   = */ ec_buft_get_alloc_size, // shrunk: ggml_nbytes, and a padded one's room
+             /* .get_alloc_size_n = */ nullptr,
+             /* .is_host          = */ ec_buft_is_host,
+         },
+@@ -2278,7 +2320,12 @@
+     if (!llama_expert_cache_wants(buft, t)) {
+         return;
+     }
+-    t->ne[2] = ec_slots_of(*ec_of_buft(buft), t);
++    const llama_expert_cache * cache = ec_of_buft(buft);
++    t->ne[2] = ec_slots_of(*cache, t);
++    const size_t eb = t->nb[1]*(size_t) t->ne[1];
++    if (cache->io_pad && eb % EC_DIRECT_ALIGN == 0) {
++        t->nb[2] = eb + EC_DIRECT_ALIGN; // the gap the aligned span around an expert spills into
++    }
+     t->nb[3] = t->nb[2]*(size_t) t->ne[2];
+ }
+ 
+@@ -2299,10 +2346,22 @@
+         throw std::runtime_error(std::string("expert cache: no layer in tensor name ") + ggml_get_name(t));
+     }
+     const uint32_t n_slots = ec_slots_of(*cache, t);
+-    if (t->ne[3] != 1 || t->ne[2] != (int64_t) n_slots || n_expert <= t->ne[2] ||
+-            t->nb[2] != t->nb[1]*(size_t) t->ne[1]) {
++    const size_t   eb      = t->nb[1]*(size_t) t->ne[1];
++    const bool     pad     = cache->io_pad && t->nb[2] == eb + EC_DIRECT_ALIGN;
++    if (t->ne[3] != 1 || t->ne[2] != (int64_t) n_slots || n_expert <= t->ne[2] ||
++            (t->nb[2] != eb && !pad)) {
+         throw std::runtime_error(std::string("expert cache: unsupported layout for ") + ggml_get_name(t));
+     }
++    if (cache->tensor_idx.count(t) != 0) {
++        return; // bound already (and a padded one's data moved)
++    }
++    if (pad) {
++        // slot s at data + s*nb[2] = the file offset of an expert modulo EC_DIRECT_ALIGN (eb is a
++        // multiple of it), at least one align past the allocation's start for slot 0's spill
++        const size_t    A  = EC_DIRECT_ALIGN;
++        const uintptr_t d0 = (uintptr_t) t->data;
++        t->data = (void *) (d0 + A + (offs % A + A - d0 % A) % A);
++    }
+ 
+     size_t file = 0;
+     while (file < cache->files.size() && cache->files[file]->path != path) {
+@@ -2348,7 +2407,7 @@
+ 
+     cache->tensor_idx[t] = cache->tensors.size();
+     slot->tensors.push_back(cache->tensors.size());
+-    cache->tensors.push_back({ t, file, offs, il });
++    cache->tensors.push_back({ t, file, offs, il, eb, pad });
+ }
+ 
+ // the cache layer of a bound expert tensor, nullptr otherwise

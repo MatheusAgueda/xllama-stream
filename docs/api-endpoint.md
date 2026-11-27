@@ -14,6 +14,25 @@ process-wide). Code lives in
 `uwp/api-server.{h,cpp}` (WinRT `StreamSocketListener`), entirely under `#ifdef
 XLLAMA_UWP`; the Linux/CLI build is unaffected.
 
+Tool proposals honor a boolean `chat_template_kwargs.enable_thinking` in the
+request. Otherwise they use the text path's model rule: Qwen3 ids without a
+thinking designation render the template's no-think form. Rendering and parsing
+use the same flag.
+
+## Bearer key
+
+Place a text key of at least 32 characters in `LocalState/api.key` to require
+`Authorization: Bearer <key>`. Surrounding whitespace is trimmed. The key is read
+once each time the listener starts; restart the listener after changing it.
+Short keys are ignored with a log warning. Without a valid key the endpoint is
+unauthenticated. The key and request body are never logged on an auth failure.
+
+`OPTIONS`, `GET /` and `GET /health` remain open. Every other route, including
+model discovery, returns `401 Unauthorized` with
+`{"error":{"message":"unauthorized","type":"auth"}}` for a missing or invalid
+bearer. The scheme is case-insensitive; the key is case-sensitive. This is plain
+HTTP, so use a trusted LAN even with a key.
+
 ## Enabling and controlling it
 
 The normal path is **Settings → LAN API**: choose a port and toggle the endpoint
@@ -131,8 +150,18 @@ alias), `temperature`, `top_p`, `seed`, and `stop` (string or array). Numbers ar
 checked before the model loads, and a bad one is `400` naming the field: the token
 count is a whole number from 1 to the catalogue `n_ctx` minus 1, `temperature` is
 0–2, `top_p` is 0–1, and `seed` is a whole number (a negative seed keeps the
-default, llama.cpp's `-1`). `stream: true` answers with SSE; see the streaming
+default, llama.cpp's `-1`). `top_k` (whole, 0 = off) and `repetition_penalty` (0–2,
+1 = off; default 1.1 over the last 64 tokens) are llama-server's, so a model card's
+sampler can be asked for as written (Qwen3.6 thinking: 0.6 / 0.95 / 20 / 1.0).
+`stream: true` answers with SSE; see the streaming
 paragraph under [Protocol (v1)](#protocol-v1). Most other fields are ignored.
+
+With `chat_template_kwargs.enable_thinking: true` on a Qwen3.x hybrid, the reply's
+reasoning is stripped and a reply cut mid-thought comes back empty. `thinking_budget`
+(whole, below the token count) bounds the reasoning instead: after that many reply
+tokens still inside it, the session writes the Qwen3 technical report's stop-thinking
+sentence and `</think>` and the model answers from what it has. `usage` then carries
+`completion_tokens_details.reasoning_tokens` and `xllama_thinking_forced`.
 
 Plain chat (no tool schema, `tools: []`, or `tool_choice` `"none"`) keeps
 `ChatFormat::render_prompt` (`include/xllama/chat_prompt.h`). Roles are system, user,
@@ -213,14 +242,19 @@ a dropped connection.
 
 The reply follows the OpenAI shape: `id` (unique `chatcmpl-…`), `object: chat.completion`,
 `created`, `model`, `choices[0]` (`message`, `finish_reason` — `length` only when the token
-cap is hit, else `stop`; and `logprobs: null`, omitting which breaks openai-python/LangChain
-Pydantic validation), and a `usage` block from `InferenceResult`: `prompt_tokens` is the prompt's length
+cap is hit, else `stop`; and `logprobs`, always present because omitting it breaks openai-python/LangChain
+Pydantic validation: `null` unless the request sets `"logprobs": true` or `xllama_force_ids`, then
+`{content: [{token, logprob, id, argmax, top_logprobs: []}], sum_logprob, argmax_count}` — plain
+non-streamed replies only; SSE chunks and tool-call replies keep `null`), and a `usage` block from `InferenceResult`: `prompt_tokens` is the prompt's length
 (`n_prompt`), not the tokens prefilled after a KV prefix reuse (`n_p_eval`), and
-`completion_tokens` is `n_eval`.
+`completion_tokens` is `n_eval`. A top-level `timings` object reports numeric
+`prefill_ms` and `decode_ms` rounded to one decimal, plus `prompt_n` (`n_p_eval`,
+tokens actually prefilled) and `predicted_n` (`n_eval`). Missing measurements are
+zero, so a reused prefix can reduce `timings.prompt_n` without changing usage.
 
 `stream: true` answers with Server-Sent Events instead of one JSON body: one
 `chat.completion.chunk` per token piece (`choices[0].delta.content`), a final chunk carrying
-`finish_reason` and `usage`, then `data: [DONE]`. The response is `Content-Type:
+`finish_reason`, `usage` and the same `timings` object, then `data: [DONE]`. The response is `Content-Type:
 text/event-stream` over chunked transfer (no `Content-Length`) and the socket closes at the
 end; token pieces ride `GenerateParams::on_token`. A failure after the head travels as a
 `{"error":{...}}` event, since the 200 is already on the wire. The text is sent **raw**:
@@ -377,7 +411,7 @@ curl -sS -o /tmp/xllama-gui-busy.json -w '%{http_code}\n' \
 - No `internetClientServer` / public inbound — `privateNetworkClientServer` (already in the
   manifest) covers LAN only.
 - No `llama.cpp/tools/server` or cpp-httplib imported into the MSIX.
-- The endpoint is **unauthenticated** — only expose it on a trusted LAN.
+- Without `LocalState/api.key` the endpoint is **unauthenticated**; see [Bearer key](#bearer-key).
 - ~~Memory note: the server's `Session` is independent of the UI's…~~ **Done
   (PR #161/#164)**: server and UI share the one `session_hub()` Session behind
   the same mutex — two loaded copies can no longer happen.

@@ -18,9 +18,10 @@ default LFM) with a progress bar, writes it to `LocalState\models\`, and opens
 the chat.
 
 The console needs internet access for this step. After that, the app only
-goes online to download a model you don't have yet. The optional LAN API, off
-by default, accepts connections only from your local network and has no authentication. If the download
-fails, provisioning via Device Portal or USB
+goes online to download a model you don't have yet. The optional LAN API is off
+by default and accepts connections only from your local network. An
+[optional bearer key](api-endpoint.md#bearer-key) can require authentication.
+If the download fails, provisioning via Device Portal or USB
 (`E:\xllama\models\<name>`) is described in
 [model-selection.md](./model-selection.md).
 
@@ -182,7 +183,7 @@ chat`. On a coding session that ceiling is 4096 tokens, roughly 13 KB of dense
   with the chat UI**: a LAN request while you are generating on the pad gets
   a "busy" reply, and a LAN request naming a different model swaps the loaded
   model under your conversation (the next pad turn transparently re-reads the
-  full context). It is unauthenticated: enable it only on a
+  full context). An [optional bearer key](api-endpoint.md#bearer-key) can require authentication; enable it only on a
   trusted LAN; see [api-endpoint.md](api-endpoint.md). Embedding models are API-only
   and do not appear in the chat picker. If another GUI/API download is writing,
   provisioning reports a busy error; retry after that download completes.

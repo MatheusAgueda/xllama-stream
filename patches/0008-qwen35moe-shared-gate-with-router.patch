@@ -1,0 +1,48 @@
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index c1e59d8..650f5cf 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -525,6 +525,25 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
+         ggml_build_forward_expand(gf, ffn_shexp);
+     }
+ 
++    // xllama patch 0008: build the shared expert gate before the routed experts. It is an
++    // F32 matmul to one value per token and a sigmoid, which a GPU backend without F32
++    // weights leaves on the CPU; next to the router (also F32) it joins the router's CPU
++    // split instead of opening one between the routed experts and the residual adds.
++    // Only the order changes; the graph and its results stay the same.
++    ggml_tensor * shared_gate = nullptr;
++    if (ffn_shexp != nullptr) {
++        // Apply shared expert gating as in the reference implementation
++        // The shared expert has its own gate that is sigmoided
++        // Note: ffn_gate_inp_shexp is the shared expert gate (outputs 1 value per token)
++        shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
++        cb(shared_gate, "shared_expert_gate", il);
++
++        // Apply sigmoid to the gate
++        shared_gate = ggml_sigmoid(ctx0, shared_gate);
++        cb(shared_gate, "shared_expert_gate_sigmoid", il);
++        ggml_build_forward_expand(gf, shared_gate);
++    }
++
+     ggml_tensor * moe_out =
+         build_moe_ffn(cur,
+             model.layers[il].ffn_gate_inp,
+@@ -544,17 +563,6 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
+ 
+     // Add shared experts if present - following Qwen3Next reference implementation
+     if (ffn_shexp != nullptr) {
+-        // Apply shared expert gating as in the reference implementation
+-        // The shared expert has its own gate that is sigmoided
+-        // Note: ffn_gate_inp_shexp is the shared expert gate (outputs 1 value per token)
+-        ggml_tensor * shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
+-        cb(shared_gate, "shared_expert_gate", il);
+-
+-        // Apply sigmoid to the gate
+-        shared_gate = ggml_sigmoid(ctx0, shared_gate);
+-        cb(shared_gate, "shared_expert_gate_sigmoid", il);
+-
+-
+         // Apply the gate to the shared expert output
+         ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
+         cb(ffn_shexp, "ffn_shexp_gated", il);

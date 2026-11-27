@@ -1320,16 +1320,19 @@ void MainPageController::LoadSettings() {
     auto folder = winrt::Windows::Storage::ApplicationData::Current().LocalFolder();
     std::wstring wpath(folder.Path().c_str());
     wpath += L"\\settings.json";
-    FILE* f = _wfopen(wpath.c_str(), L"r");
-    if (!f)
-        return;
+    // No settings.json is not "no settings": the model.txt fallback and the
+    // dashboard flag below still apply. Returning here started every console
+    // with LocalState model.txt naming a 35B on DefaultChatModelId() instead
+    // (observed 2026-11-26: "EnsureModel: begin 'lfm25-350m'" at launch).
     std::string json;
-    char buf[16384];
-    while (size_t n = fread(buf, 1, sizeof(buf) - 1, f)) {
-        buf[n] = 0;
-        json += buf;
+    if (FILE* f = _wfopen(wpath.c_str(), L"r")) {
+        char buf[16384];
+        while (size_t n = fread(buf, 1, sizeof(buf) - 1, f)) {
+            buf[n] = 0;
+            json += buf;
+        }
+        fclose(f);
     }
-    fclose(f);
 
     // Parse flat keys: "system_prompt", "model", and "sampling" object
     auto read_key = [&](size_t& pos) -> std::string {

@@ -240,6 +240,27 @@ the full prompt safely. Snapshot restoration alone is not a delta-reuse guarante
 A conversation that is stripped to empty (thinking model truncated to no answer)
 takes no KV snapshot (#170b).
 
+### Prefix cache on disk (hybrid models, LAN API)
+
+The #170c checkpoints keep only the recurrent half of a hybrid cache, so they
+help a request whose prefix is still resident. API clients share one session,
+and interleaved conversations (A, B, A′) overwrite each other's attention KV.
+With `XLLAMA_PREFIX_CACHE_MIB` set (catalogue `env`; off by default), a
+full-prompt prefill of a request that sends `"xllama_prefix_cache": true`
+(`GenerateParams::save_prefix`) also writes the full sequence state at the
+#170c split points — the file holds the prompt's token history, so nothing is
+written for a request that does not opt in — and a later full prompt restores the longest saved prefix that beats
+the in-memory paths. Knobs, file lifecycle and failure handling are documented
+at `LlamaSession::init_prefix_cache` and the `m_pc_*` members in
+`src/bridge/session.cpp`; the index is
+`include/xllama/prefix_cache.h`. A restore that fails for any reason drops the
+file and prefills in full. The first session of a process to use a cache root
+wipes every file under it and logs only the number removed; later sessions in
+the same process keep the live sessions' files. `XLLAMA_PREFIX_CACHE_TTL_S`
+(default 1800 seconds) limits file age by last write: every save prunes old
+files, and lookups delete expired entries before choosing a prefix. Cache hits
+do not extend that age.
+
 ### Cancel policy (`cancel_policy.h`)
 
 The UI has one Cancel affordance and three jobs that can be running behind it —
@@ -747,6 +768,8 @@ not keep a second copy. Headers without a dedicated file are header-only RAII wr
 | Test file                        | Under test                                                                                  |
 | -------------------------------- | ------------------------------------------------------------------------------------------- |
 | `test_api_activity.cpp`          | `api_activity.h`                                                                            |
+| `test_api_auth.cpp`              | `api_auth.h` key normalization and bearer comparison                                        |
+| `test_api_timings.cpp`           | `api_timings.h` response timing numbers                                                     |
 | `test_compute_admission.cpp`     | `compute_admission.h`                                                                       |
 | `test_api_connection.cpp`        | `api_connection.h` — overlapping compute requests are 200+503; connection-gate bound        |
 | `test_debug_dashboard.cpp`       | `debug_dashboard.h`                                                                         |
@@ -782,6 +805,7 @@ not keep a second copy. Headers without a dedicated file are header-only RAII wr
 | `test_path.cpp`                  | `path_utils.h`                                                                              |
 | `test_personalize.cpp`           | `personalize.h`                                                                             |
 | `test_preference_capture.cpp`    | `preference_capture.h`                                                                      |
+| `test_prefix_cache.cpp`          | `prefix_cache.h` (session behaviour: `test_session.cpp`, opt-in model)                      |
 | `test_prompt_budget.cpp`         | `prompt_budget.h`                                                                           |
 | `test_ramceil.cpp`               | `ramceil.h`                                                                                 |
 | `test_routing_policy.cpp`        | `routing_policy.h`                                                                          |

@@ -15,8 +15,10 @@ add_executable(xllama-tests
     test_bench.cpp
     test_session.cpp
     test_kv_store.cpp
+    test_prefix_cache.cpp
     test_chat_history.cpp
     test_diffusion.cpp
+    test_upscale.cpp
     test_stability_attribution.cpp
     test_routing_policy.cpp
     test_cancel_policy.cpp
@@ -28,6 +30,8 @@ add_executable(xllama-tests
     test_session_spec.cpp
     test_api_policy.cpp
     test_http_framing.cpp
+    test_api_auth.cpp
+    test_api_timings.cpp
     test_sse.cpp
     test_stop_filter.cpp
     test_tool_proposal.cpp
@@ -38,11 +42,16 @@ add_executable(xllama-tests
     test_gpugemv.cpp
     test_gpustep.cpp
     test_ggml_d3d12.cpp
+    test_ggml_d3d12_mmid.cpp
+    test_ggml_d3d12_moe.cpp
+    test_ggml_d3d12_ssm.cpp
+    test_ggml_d3d12_fap.cpp
     test_ramceil.cpp
     test_model_provision.cpp
     test_model_file_plan.cpp
     test_model_write.cpp
     test_logit_parity.cpp
+    test_expert_cache.cpp
     test_training.cpp
     test_device_train.cpp
     test_json_utils.cpp
@@ -58,6 +67,7 @@ add_executable(xllama-tests
     test_autopilot.cpp
     test_speculative.cpp
     test_capture_probe.cpp
+    test_d3d12_env.cpp
 )
 
 target_link_libraries(xllama-tests PRIVATE xllama doctest::doctest)
@@ -69,6 +79,7 @@ target_include_directories(xllama-tests PRIVATE
 target_compile_definitions(xllama-tests PRIVATE
     GOLDEN_JSON_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../diffusion/golden_vectors.json"
     CLIP_TOKENIZER_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../diffusion/clip_tokenizer"
+    PATCH_0026_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../patches/0026-kv-cache-on-device.patch"
     PARITY_GOLDEN_BIN="${CMAKE_CURRENT_SOURCE_DIR}/golden/logits-smol-short.bin"
     LLAMA_TEMPLATES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/models/templates")
 
