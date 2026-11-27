@@ -607,6 +607,25 @@ request: the last layer computes only each call's output token); a different rou
 tokens is a routing change. Cost: one multiply and xor per id byte, 2
 bytes per id, `n_used` ids per token per layer.
 
+`0029-expert-cache-prompt-trace.patch` (applies after 0028; `src/llama-expert-cache.{h,cpp}`,
+`src/llama-graph.cpp`, `src/llama-context.cpp`; default off): `LLAMA_EXPERT_TRACE_PROMPT=1`, together with
+`LLAMA_EXPERT_TRACE=<file>`, traces the prompt whatever the swap ratio. Before, the file was written by
+the select op only, so only with a swap ratio, and an expert-major prompt ubatch (no select op: its
+swap ratio is `LLAMA_EXPERT_EM_SWAP`, default 0) left no record. Now (1) a trace-only node per layer
+writes the same `ECT1` record for a prompt ubatch (2+ tokens) that no select op serves (it reads the
+router scores, the ids the layer routes with only order it; decode tokens keep their graph and the GPU
+route: nothing is added to them), and (2) the side file `<trace>.tok` gets one record per ubatch, written
+before its graph runs: `"ECK1"` (0x314B4345), `n_tokens`, `pos0`, `0` (4 x int32), then `trace_off` (int64:
+the trace file's byte length when the ubatch began, so the `ECT1` records from `trace_off` to the next
+record's belong to it) and `n_tokens` int32 token ids (-1 = an embedding input). **The trace file's own
+format is unchanged**, so a reader that knows `ECT1` (`sims/prog1127/trace_io.py`) reads the new files
+as before and just sees full-prompt records; a prompt that was traced is told from a decode token by
+`n_tokens > 1`, as it always was. With the knob off nothing changes: no side file, no node, no extra
+read of the scores. With it on, the trace file is open at any swap ratio, which makes the cache `plain =
+false` (as `LLAMA_EXPERT_TRACE` always did), so the GPU route's replay is off in a traced run: use it
+for studies, not for serving. Not run on the console: the node is a CPU custom op like the select op,
+which the D3D12 scheduler already places; its scores copy is the only extra traffic.
+
 ## Applying
 
 ```bash

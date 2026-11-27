@@ -26,6 +26,7 @@
 
 #ifdef LLAMA_HAS_EXPERT_SLOTS
 
+    #include <algorithm>
     #include <chrono>
     #include <cmath>
     #include <cstdio>
@@ -1133,6 +1134,102 @@ TEST_CASE(
             CHECK(em.at_end.route_hash == noem.at_end.route_hash);
             CHECK(em.at_end.route_n == noem.at_end.route_n);
             CHECK(em.after_prompt.route_hash == noem.after_prompt.route_hash);
+        }
+
+        // Prompt trace (LLAMA_EXPERT_TRACE_PROMPT, patch 0029): the expert-major prompt has no
+        // select op, so the trace-only op writes its ECT1 records, and <trace>.tok holds every
+        // ubatch's token ids. The run itself is untouched: same tokens, logits and route hash. Knob
+        // off: no file.
+        {
+            const std::string tp = std::string(path) + ".ecprompt";
+            const std::string tk = tp + ".tok";
+            std::remove(tp.c_str());
+            std::remove(tk.c_str());
+            set_env_s("LLAMA_EXPERT_TRACE", tp.c_str());
+            set_expert_major(64);
+            const EcRun quiet = run_greedy(path, c.slots, 512, c.used, 24);
+            set_env_s("LLAMA_EXPERT_TRACE_PROMPT", "1");
+            const EcRun on = run_greedy(path, c.slots, 512, c.used, 24);
+            set_env_s("LLAMA_EXPERT_TRACE_PROMPT", nullptr);
+            set_expert_major(-1);
+            set_env_s("LLAMA_EXPERT_TRACE", nullptr);
+            REQUIRE(quiet.ok);
+            REQUIRE(on.ok);
+            CHECK(on.tokens == quiet.tokens);
+            CHECK(on.tokens == em.tokens);
+            CHECK(max_abs_diff(on.logits, quiet.logits) == 0.0f);
+            CHECK(on.at_end.route_hash == quiet.at_end.route_hash);
+
+            FILE* f = std::fopen(tp.c_str(), "rb");
+            FILE* k = std::fopen(tk.c_str(), "rb");
+            REQUIRE(f != nullptr);
+            REQUIRE(k != nullptr);
+            long long records = 0, bad = 0;
+            int32_t n_prompt = 0;
+            std::vector<int32_t> layers;
+            int32_t head[5];
+            while (std::fread(head, sizeof(head), 1, f) == 1) {
+                records++;
+                const int32_t n_tok = head[2], kk = head[3];
+                if (head[0] != 0x31544345 || head[1] < 0 || n_tok < 2 || kk < 1 || kk > 32) {
+                    bad++;
+                    break;
+                }
+                if (n_prompt == 0)
+                    n_prompt = n_tok;
+                bad += n_tok != n_prompt; // only the prompt: a decode token is not traced
+                layers.push_back(head[1]);
+                std::vector<char> body((size_t)n_tok * (size_t)kk *
+                                       (sizeof(int16_t) + sizeof(float)));
+                if (std::fread(body.data(), 1, body.size(), f) != body.size()) {
+                    bad++;
+                    break;
+                }
+            }
+            const long trace_size = std::ftell(f);
+            std::fclose(f);
+            std::sort(layers.begin(), layers.end());
+            CHECK(bad == 0);
+            CHECK(records > 0);
+            CHECK(n_prompt > 1);
+            CHECK(std::adjacent_find(layers.begin(), layers.end()) ==
+                  layers.end()); // one per layer
+            // the side file: the prompt, then one token per decode step (the generated ids fed
+            // back)
+            int32_t kh[4];
+            int64_t off = -1;
+            int rec = 0;
+            long long tok_bad = 0;
+            while (std::fread(kh, sizeof(kh), 1, k) == 1 &&
+                   std::fread(&off, sizeof(off), 1, k) == 1) {
+                std::vector<int32_t> ids((size_t)kh[1]);
+                if (kh[0] != 0x314B4345 || kh[1] < 1 ||
+                    std::fread(ids.data(), sizeof(int32_t), ids.size(), k) != ids.size()) {
+                    tok_bad++;
+                    break;
+                }
+                if (rec == 0) {
+                    CHECK(kh[1] == n_prompt);
+                    CHECK(kh[2] == 0);
+                    CHECK(off == 0);
+                    for (const int32_t id : ids)
+                        tok_bad += id < 0;
+                } else {
+                    CHECK(kh[1] == 1);
+                    CHECK(kh[2] == n_prompt + rec - 1);
+                    CHECK(off == trace_size); // nothing was traced after the prompt
+                    tok_bad +=
+                        (size_t)rec > on.tokens.size() || ids[0] != on.tokens[(size_t)rec - 1];
+                }
+                rec++;
+            }
+            std::fclose(k);
+            std::remove(tp.c_str());
+            std::remove(tk.c_str());
+            CHECK(tok_bad == 0);
+            CHECK(rec == 1 + (int)on.tokens.size());
+            MESSAGE("prompt trace: " << records << " records of " << n_prompt << " tokens, " << rec
+                                     << " token records");
         }
         // auto (the default): any resident expert may come from the file
         CHECK(s.mode == "auto");

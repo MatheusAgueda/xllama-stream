@@ -1,0 +1,195 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1920,6 +1920,11 @@
+ 
+         ggml_status status;
+ 
++        if (model.expert_cache) {
++            llama_expert_cache_trace_tokens(*model.expert_cache, ubatch.token, (int32_t) ubatch.n_tokens,
++                    ubatch.pos != nullptr ? (int32_t) ubatch.pos[0] : 0);
++        }
++
+         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+ 
+         if (!res) {
+diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
+--- a/src/llama-expert-cache.cpp
++++ b/src/llama-expert-cache.cpp
+@@ -329,6 +329,13 @@
+     FILE *     trace   = nullptr;
+     std::mutex trace_mu;
+     std::vector<char> trace_buf;
++    // LLAMA_EXPERT_TRACE_PROMPT=1 (with LLAMA_EXPERT_TRACE, any swap ratio, patch 0029): the prompt
++    // ubatches no select op serves (expert-major, or no swap ratio) get a trace-only op, and every ubatch's
++    // token ids go to the side file <trace>.tok: records "ECK1", n_tokens, pos0, 0 (int32 each), the
++    // trace file's byte offset when the ubatch started (int64), then n_tokens int32 token ids (-1 = an
++    // embedding input). The trace file's own format is unchanged.
++    bool       trace_prompt = false;
++    FILE *     trace_tok    = nullptr;
+ 
+     ggml_backend_buffer_type buft {};
+     ggml_backend_buffer_type_t inner = nullptr; // a GPU device's host buft holding the slots, nullptr = CPU
+@@ -585,6 +592,9 @@
+         if (trace != nullptr) {
+             fclose(trace);
+         }
++        if (trace_tok != nullptr) {
++            fclose(trace_tok);
++        }
+     }
+ };
+ 
+@@ -1675,6 +1685,46 @@
+     }
+ }
+ 
++// 1 thread, LLAMA_EXPERT_TRACE_PROMPT: the ECT1 record ec_select would write for a ubatch it does not
++// serve (the router's ranking, untouched); the ids it feeds on are only a source for the node order
++static void ec_trace_only(ggml_tensor * dst, int ith, int nth, void * userdata) {
++    GGML_UNUSED(nth);
++    if (ith != 0) {
++        return;
++    }
++    ec_layer & L = *(ec_layer *) userdata;
++    llama_expert_cache & C = *L.cache;
++    const ggml_tensor * scores = dst->src[0];
++    const int64_t n_expert = scores->ne[0];
++    const int64_t n_tokens = scores->ne[1];
++    const int64_t n_used   = dst->src[1]->ne[0];
++    const int64_t n_tr     = std::min<int64_t>(32, n_expert);
++
++    std::vector<int32_t> order((size_t) n_expert);
++    std::lock_guard<std::mutex> lock(C.trace_mu);
++    auto put = [&C](const void * p, size_t n) {
++        C.trace_buf.insert(C.trace_buf.end(), (const char *) p, (const char *) p + n);
++    };
++    const int32_t head[5] = { 0x31544345 /* "ECT1" */, L.id, (int32_t) n_tokens, (int32_t) n_tr, (int32_t) n_used };
++    C.trace_buf.clear();
++    put(head, sizeof(head));
++    for (int64_t t = 0; t < n_tokens; ++t) {
++        const float * s = (const float *) ((const char *) scores->data + t*scores->nb[1]);
++        ec_rank(order, s);
++        for (int64_t k = 0; k < n_tr; ++k) {
++            const int16_t e = (int16_t) order[k];
++            put(&e, sizeof(e));
++        }
++        for (int64_t k = 0; k < n_tr; ++k) {
++            put(&s[order[k]], sizeof(float));
++        }
++    }
++    fwrite(C.trace_buf.data(), 1, C.trace_buf.size(), C.trace);
++    if (L.id == C.first_layer) {
++        fflush(C.trace);
++    }
++}
++
+ // 1 thread: LRU slot assignment for the experts of this ubatch; dst = slot ids
+ static void ec_plan(ggml_tensor * dst, int ith, int nth, void * userdata) {
+     GGML_UNUSED(nth);
+@@ -3033,10 +3083,24 @@
+     // LLAMA_EXPERT_TRACE: needs the select op, i.e. a swap ratio (a ratio above 1 never swaps: an exact
+     // routing trace)
+     const char * tr = getenv("LLAMA_EXPERT_TRACE");
+-    if (tr != nullptr && *tr != '\0' && cache->swap_ratio > 0.0f) {
++    const char * trp = getenv("LLAMA_EXPERT_TRACE_PROMPT");
++    const bool   tr_prompt = trp != nullptr && *trp != '\0' && strcmp(trp, "0") != 0;
++    if (tr != nullptr && *tr != '\0' && (cache->swap_ratio > 0.0f || tr_prompt)) {
+         cache->trace = ggml_fopen(tr, "ab");
+         if (cache->trace != nullptr) {
+             LLAMA_LOG_INFO("%s: expert cache: routing trace to %s\n", __func__, tr);
++            if (tr_prompt) {
++                // an appended file: its logical end is the first offset the side file refers to
++                fseek(cache->trace, 0, SEEK_END);
++                const std::string tok_path = std::string(tr) + ".tok";
++                cache->trace_tok    = ggml_fopen(tok_path.c_str(), "ab");
++                cache->trace_prompt = cache->trace_tok != nullptr;
++                LLAMA_LOG_INFO("%s: expert cache: prompt routing and token ids (%s)\n", __func__, tok_path.c_str());
++                if (!cache->trace_prompt && !(cache->swap_ratio > 0.0f)) {
++                    fclose(cache->trace); // nothing to trace without the side file or a swap ratio
++                    cache->trace = nullptr;
++                }
++            }
+         } else {
+             LLAMA_LOG_WARN("%s: expert cache: routing trace %s: %s\n", __func__, tr, strerror(errno));
+         }
+@@ -3606,6 +3670,42 @@
+     return sel;
+ }
+ 
++ggml_tensor * llama_expert_cache_build_trace(ggml_context * ctx, ggml_tensor * w, ggml_tensor * scores, ggml_tensor * selected) {
++    ec_layer * layer = ec_layer_of(w);
++    // prompts only: a decode token keeps the graph (and the GPU route) it has without the trace
++    if (layer == nullptr || !layer->cache->trace_prompt || layer->cache->trace == nullptr || scores->ne[1] < 2) {
++        return nullptr;
++    }
++    if (scores->type != GGML_TYPE_F32 || scores->nb[0] != sizeof(float) || scores->ne[2] != 1 || scores->ne[3] != 1 ||
++            scores->ne[0] != (int64_t) layer->slot_of.size() || selected->ne[0] < 1) {
++        return nullptr;
++    }
++    ggml_tensor * srcs[2] = { scores, selected };
++    ggml_tensor * tr = ggml_custom_4d(ctx, GGML_TYPE_I32, 1, 1, 1, 1, srcs, 2, ec_trace_only, 1, layer);
++    ggml_format_name(tr, "ffn_moe_trace-%d", layer->id);
++    return tr;
++}
++
++void llama_expert_cache_trace_tokens(llama_expert_cache & cache, const int32_t * tokens, int32_t n_tokens, int32_t pos0) {
++    if (!cache.trace_prompt || cache.trace_tok == nullptr || cache.trace == nullptr || n_tokens < 1) {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(cache.trace_mu);
++    const int32_t head[4] = { 0x314B4345 /* "ECK1" */, n_tokens, pos0, 0 };
++    const int64_t off     = (int64_t) ftell(cache.trace);
++    fwrite(head, sizeof(head), 1, cache.trace_tok);
++    fwrite(&off, sizeof(off), 1, cache.trace_tok);
++    if (tokens != nullptr) {
++        fwrite(tokens, sizeof(int32_t), (size_t) n_tokens, cache.trace_tok);
++    } else {
++        for (int32_t i = 0; i < n_tokens; ++i) {
++            const int32_t none = -1;
++            fwrite(&none, sizeof(none), 1, cache.trace_tok);
++        }
++    }
++    fflush(cache.trace_tok);
++}
++
+ int llama_expert_cache_prefetch_mode(const ggml_tensor * w) {
+     const ec_layer * layer = ec_layer_of(w);
+     if (layer == nullptr || layer->cache->pf_k == 0) {
+diff --git a/src/llama-expert-cache.h b/src/llama-expert-cache.h
+--- a/src/llama-expert-cache.h
++++ b/src/llama-expert-cache.h
+@@ -136,6 +136,14 @@
+ // the caller keeps its own top-k
+ ggml_tensor * llama_expert_cache_build_select(ggml_context * ctx, ggml_tensor * w, ggml_tensor * scores, int64_t n_used);
+ 
++// graph, LLAMA_EXPERT_TRACE_PROMPT only: a node that writes the router's ranking of a prompt ubatch (2+
++// tokens) the select op does not serve; `selected` (the ids the caller routes with) only orders it. nullptr
++// when off, so the caller changes nothing; the caller adds the node with ggml_build_forward_expand
++ggml_tensor * llama_expert_cache_build_trace(ggml_context * ctx, ggml_tensor * w, ggml_tensor * scores, ggml_tensor * selected);
++
++// LLAMA_EXPERT_TRACE_PROMPT: one record in the side file <trace>.tok per ubatch, before its graph runs
++void llama_expert_cache_trace_tokens(llama_expert_cache & cache, const int32_t * tokens, int32_t n_tokens, int32_t pos0);
++
+ // graph: how the layer of w is prefetched: 0 = not (not cached or prefetch off), 1 = from its own
+ // input residual during its attention, 2 = ahead, from the previous layer's post-attention residual
+ int llama_expert_cache_prefetch_mode(const ggml_tensor * w);
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2211,6 +2211,15 @@
+         selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+         cb(selected_experts->src[0], "ffn_moe_argsort", il);
+     }
++    // expert cache, LLAMA_EXPERT_TRACE_PROMPT: a prompt ubatch the select op does not serve is traced by a
++    // side node (nullptr, and nothing added, when the knob is off)
++    if (selected_experts_in == nullptr && gating_op != LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT &&
++            selected_experts->op != GGML_OP_CUSTOM) {
++        ggml_tensor * tr = llama_expert_cache_build_trace(ctx0, down_exps, selection_probs, selected_experts);
++        if (tr != nullptr) {
++            ggml_build_forward_expand(gf, tr);
++        }
++    }
+     cb(selected_experts, "ffn_moe_topk", il);
+ 
+     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
