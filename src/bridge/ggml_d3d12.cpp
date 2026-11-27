@@ -83,12 +83,19 @@ std::uint32_t d3d12_geom_parse(const char* s, std::uint32_t fallback) {
     return static_cast<std::uint32_t>(v);
 }
 
+// A 2-D weight broadcasts over src1's dims 2 and 3, and a contiguous src1 is
+// then ne11 * ne12 * ne13 columns nb1 apart (the delta net's ssm_out with one
+// sequence per dim-2 slice, B3): one matmul over the flattened columns.
+std::int64_t d3d12_mm_cols(const D3d12MatmulDesc& d) {
+    return d.ne12 >= 1 && d.ne13 >= 1 ? d.ne11 * d.ne12 * d.ne13 : -1;
+}
+
 bool d3d12_mm_supported(const D3d12MatmulDesc& d) {
     return d3d12_weight_type_supported(d.src0_type) && d.src0_in_weight_buffer &&
            d.src0_contiguous && d.src1_contiguous && d.src1_type == GGML_TYPE_F32 &&
            d.dst_type == GGML_TYPE_F32 && d.ne00 > 0 && d.ne00 % kD3d12Chunk == 0 &&
-           d.ne00 == d.ne10 && d.ne02 == 1 && d.ne03 == 1 && d.ne12 == 1 && d.ne13 == 1 &&
-           d3d12_mm_dispatch(d.ne01, d.ne11).ok;
+           d.ne00 == d.ne10 && d.ne02 == 1 && d.ne03 == 1 &&
+           d3d12_mm_dispatch(d.ne01, d3d12_mm_cols(d)).ok;
 }
 
 bool d3d12_get_rows_type_supported(ggml_type t) {
@@ -4607,7 +4614,10 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
             const ggml_tensor* x = b;
             GGML_ASSERT(w->buffer && w->buffer->buft == &kWeightsBuft);
             GGML_ASSERT(x->buffer && ggml_backend_buffer_is_host(x->buffer));
-            const int ncols = static_cast<int>(x->ne[1]);
+            // Dims 2 and 3 fold into columns (d3d12_mm_cols): both sides flat.
+            const std::int64_t folded = x->ne[2] * x->ne[3];
+            GGML_ASSERT(folded == 1 || (ggml_is_contiguous(x) && ggml_is_contiguous(node)));
+            const int ncols = static_cast<int>(x->ne[1] * folded);
             D3D12_GPU_VIRTUAL_ADDRESS x_va = 0;
             std::uint64_t x_stride = 0;
             Rng xr;
@@ -4627,7 +4637,7 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
                 x_stride = row;
                 xr = xq_rng(off, static_cast<std::size_t>(row) * ncols);
             }
-            const D3d12Dispatch d = d3d12_mm_dispatch(node->ne[0], node->ne[1]);
+            const D3d12Dispatch d = d3d12_mm_dispatch(node->ne[0], ncols);
             const int wide = d3d12_mm_threads(w->ne[0]) == kD3d12MmvThreadsLong ? 1 : 0;
             Op m;
             m.pso = g.pso[pso_for(w->type)][wide].Get();
