@@ -67,6 +67,7 @@ add_executable(xllama-tests
     test_autopilot.cpp
     test_speculative.cpp
     test_capture_probe.cpp
+    test_d3d12_env.cpp
 )
 
 target_link_libraries(xllama-tests PRIVATE xllama doctest::doctest)
@@ -78,6 +79,7 @@ target_include_directories(xllama-tests PRIVATE
 target_compile_definitions(xllama-tests PRIVATE
     GOLDEN_JSON_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../diffusion/golden_vectors.json"
     CLIP_TOKENIZER_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../diffusion/clip_tokenizer"
+    PATCH_0026_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../patches/0026-kv-cache-on-device.patch"
     PARITY_GOLDEN_BIN="${CMAKE_CURRENT_SOURCE_DIR}/golden/logits-smol-short.bin"
     LLAMA_TEMPLATES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/models/templates")
 

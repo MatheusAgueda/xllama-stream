@@ -1167,6 +1167,39 @@ TEST_CASE(
     llama_log_set(nullptr, nullptr);
 }
 
+// llama.cpp patch 0026 (LLAMA_KV_ON_DEVICE, set and not "0"): the KV cache goes on the layer's
+// device even with offload_kqv off. On this CPU-only host the device IS the CPU, so the switch
+// must change nothing: same greedy tokens, same logits after the prompt, as with the variable
+// unset or "0" (the d3d12 backend, where the buffer really moves, is the console's to check).
+// Its own name, not "expert cache*": expert-cache-host.yml counts exactly two of those.
+TEST_CASE("kv on device: LLAMA_KV_ON_DEVICE decodes like the default (opt-in: "
+          "XLLAMA_EC_TEST_MODEL)") {
+    const char* path = std::getenv("XLLAMA_EC_TEST_MODEL");
+    if (!path)
+        return;
+    llama_backend_init();
+    llama_log_set(nullptr, nullptr);
+
+    set_env_s("LLAMA_KV_ON_DEVICE", nullptr);
+    const EcRun off = run_greedy(path, 0, 64, 0, 24);
+    set_env_s("LLAMA_KV_ON_DEVICE", "0");
+    const EcRun zero = run_greedy(path, 0, 64, 0, 24);
+    set_env_s("LLAMA_KV_ON_DEVICE", "1");
+    const EcRun on = run_greedy(path, 0, 64, 0, 24);
+    set_env_s("LLAMA_KV_ON_DEVICE", nullptr);
+    REQUIRE(off.ok);
+    REQUIRE(zero.ok);
+    REQUIRE(on.ok);
+
+    CHECK(zero.tokens == off.tokens);
+    CHECK(on.tokens == off.tokens);
+    REQUIRE(on.logits.size() == off.logits.size());
+    REQUIRE(zero.logits.size() == off.logits.size());
+    // Same CPU kernels over the same buffer type, at the neighbours' tolerance.
+    CHECK(max_abs_diff(zero.logits, off.logits) <= 1e-4f);
+    CHECK(max_abs_diff(on.logits, off.logits) <= 1e-4f);
+}
+
 // A measurement, not a check (the hyphen keeps it out of "expert cache*"): per
 // config (swap ratio[:prefetch width, "a" for ahead[:largest expert-major
 // ubatch]]), prefill and decode speed and the cache's final stats; for every

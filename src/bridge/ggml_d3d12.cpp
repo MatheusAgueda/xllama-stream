@@ -6,6 +6,7 @@
 #ifdef XLLAMA_USE_LLAMA
 
     #include "xllama/ggml_d3d12.h"
+    #include "xllama/d3d12_env.h"
 
     #include "ggml-cpu.h"
 
@@ -2501,8 +2502,7 @@ bool ssm_weight_name(const char* name) {
 // which puts attn_q_norm / attn_k_norm in D3D12_Host, runs before a backend
 // exists, and a catalogue entry's env is applied before its load.
 bool attn_gpu_on() {
-    const char* s = std::getenv("XLLAMA_ATTN_GPU");
-    return s && *s && *s != '0';
+    return ::xllama::env_flag_on(std::getenv("XLLAMA_ATTN_GPU"));
 }
 // ... and its kernels built: else none of those ops moves, not half of them.
 bool attn_gpu() {
@@ -5459,13 +5459,7 @@ ggml_backend_t dev_init_backend(ggml_backend_dev_t dev, const char*) {
             log_output(m);
         }
         const char* fdk = std::getenv("XLLAMA_FA_DECODE_KV");
-        g.fa_decode_kv = 0;
-        if (g.fap_ok && fdk && *fdk) {
-            char* end = nullptr;
-            const long long v = std::strtoll(fdk, &end, 10);
-            if (end != fdk && v >= 1 && v <= 0x7fffffffLL)
-                g.fa_decode_kv = v;
-        }
+        g.fa_decode_kv = ::xllama::fa_decode_kv_from_env(fdk, g.fap_ok);
         const char* sk = std::getenv("XLLAMA_FA_SPLITK");
         g.fa_split = !(sk && *sk == '0');
         if (g.fa_split && (g.fa_prefill || g.fa_decode_kv) && !ensure_fad(g))

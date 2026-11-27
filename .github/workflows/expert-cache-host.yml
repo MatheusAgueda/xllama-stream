@@ -81,6 +81,16 @@ jobs:
           # ran (slot-mapped decode, expert-major prompts).
           grep -Eq 'test cases: +2 \| +2 passed' <<<"$out"
 
+      - name: KV cache on the device (patch 0026) against the default
+        env:
+          XLLAMA_EC_TEST_MODEL: ${{ runner.temp }}/moe.gguf
+          ASAN_OPTIONS: detect_leaks=0
+        run: |
+          out=$(./build/${{ matrix.preset }}/tests/xllama-tests --test-case='kv on device*' 2>&1) || {
+            echo "$out"; exit 1; }
+          echo "$out"
+          grep -Eq 'test cases: +1 \| +1 passed' <<<"$out"
+
       - name: Session parameters (expert_slots plumbing)
         run: |
           ./build/${{ matrix.preset }}/tests/xllama-tests \
