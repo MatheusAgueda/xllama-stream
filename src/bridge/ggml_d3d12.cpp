@@ -901,6 +901,10 @@ struct Gpu {
     // apart; its pipeline failing leaves the other elementwise kernels on.
     bool normq = true;
     std::uint64_t n_normq = 0; // such dispatches recorded (a replayed plan records none)
+    // MUL_MAT over a 2-D weight with src1 dims 2-3 folded into columns
+    // (d3d12_mm_cols). XLLAMA_D3D12_MMFOLD=0 (read when a backend is created)
+    // refuses those shapes again, as before B3c: the A arm and the return.
+    bool mm_fold = true;
     // KERNEL 5 the same way for an add / mul / SwiGLU a q8_K matmul reads (the
     // SwiGLUs before ffn_down, the gated norm, the attention gate): kernels 1
     // and 3 as one dispatch (selftest binq). XLLAMA_D3D12_BINQ=0 keeps them apart.
@@ -5523,6 +5527,11 @@ ggml_backend_t dev_init_backend(ggml_backend_dev_t dev, const char*) {
         if (!g.normq)
             log_output(
                 "[xllama] d3d12: rms_norm and its q8_K copy kept apart (XLLAMA_D3D12_NORMQ=0)\n");
+        const char* mf = std::getenv("XLLAMA_D3D12_MMFOLD");
+        g.mm_fold = !(mf && *mf == '0');
+        if (!g.mm_fold)
+            log_output("[xllama] d3d12: MUL_MAT over a batched src1 left to the CPU "
+                       "(XLLAMA_D3D12_MMFOLD=0)\n");
         const char* bq = std::getenv("XLLAMA_D3D12_BINQ");
         g.binq = !(bq && *bq == '0');
         if (!g.binq)
@@ -5660,7 +5669,7 @@ bool dev_supports_op(ggml_backend_dev_t, const ggml_tensor* op) {
         d.src0_contiguous = ggml_is_contiguous(w);
         d.src1_contiguous = ggml_is_contiguous(x);
         d.src0_in_weight_buffer = w->buffer && w->buffer->buft == &kWeightsBuft;
-        const bool ok = d3d12_mm_supported(d);
+        const bool ok = d3d12_mm_supported(d) && (gpu().mm_fold || (d.ne12 == 1 && d.ne13 == 1));
         // A refused matmul whose weight already sits in D3D12_Weights means a
         // placement the backend then cannot run — log the first few (D2b #309).
         static int logged = 0;
