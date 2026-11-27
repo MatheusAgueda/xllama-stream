@@ -29,6 +29,7 @@
     #include "xllama/api_timings.h"
     #include "xllama/chat_prompt.h"
     #include "xllama/compute_admission.h"
+    #include "xllama/force_ids.h"
     #include "xllama/http_framing.h"
     #include "xllama/model_provision.h"
     #include "xllama/path_utils.h"
@@ -244,7 +245,7 @@ HttpRequest read_request(StreamSocket const& socket) {
 // connection closes the socket (dispatch_connection). Every reply, the streamed
 // tokens included (session->generate calls on_token inline), is written on that
 // one thread-pool thread.
-thread_local bool t_reply_deadline_hit = false;
+thread_local ::xllama::ReplyDeadlineMark t_reply_deadline;
 
 // Store and flush what `writer` holds (`bytes` of it) within http_write_deadline.
 // Past it the operation is cancelled and this throws, which every caller already
@@ -253,7 +254,7 @@ template <typename Op>
 void await_reply_io(Op const& op, winrt::Windows::Foundation::TimeSpan limit) {
     if (op.wait_for(limit) == winrt::Windows::Foundation::AsyncStatus::Started) {
         op.Cancel();
-        t_reply_deadline_hit = true;
+        t_reply_deadline.expired();
         throw winrt::hresult_error(HRESULT_FROM_WIN32(ERROR_TIMEOUT), L"reply write deadline");
     }
     op.GetResults();
@@ -1142,24 +1143,21 @@ std::string handle_chat_locked(const std::string& body, const char*& status,
         root.GetNamedValue(L"logprobs").ValueType() == JsonValueType::Boolean)
         gp.logprobs = root.GetNamedBoolean(L"logprobs");
     if (root.HasKey(L"xllama_force_ids")) {
-        if (root.GetNamedValue(L"xllama_force_ids").ValueType() != JsonValueType::Array) {
-            status = "400 Bad Request";
-            return error_json("'xllama_force_ids' must be an array of token ids");
-        }
-        for (auto&& e : root.GetNamedArray(L"xllama_force_ids")) {
-            const double v = e.ValueType() == JsonValueType::Number ? e.GetNumber() : -1.0;
-            if (!(v >= 0.0 && v <= 2147483647.0) ||
-                v != static_cast<double>(static_cast<int64_t>(v))) {
-                status = "400 Bad Request";
-                return error_json("'xllama_force_ids' must hold whole non-negative numbers");
+        const bool is_array =
+            root.GetNamedValue(L"xllama_force_ids").ValueType() == JsonValueType::Array;
+        std::vector<::xllama::ForceIdElement> elems;
+        if (is_array) {
+            for (auto&& e : root.GetNamedArray(L"xllama_force_ids")) {
+                const bool is_number = e.ValueType() == JsonValueType::Number;
+                elems.push_back({is_number, is_number ? e.GetNumber() : 0.0});
             }
-            gp.forced_tokens.push_back(static_cast<int32_t>(v));
         }
-        if (static_cast<int>(gp.forced_tokens.size()) > gp.n_predict) {
+        auto forced = ::xllama::parse_force_ids(is_array, elems, gp.n_predict);
+        if (forced.error != ::xllama::ForceIdsError::None) {
             status = "400 Bad Request";
-            return error_json("max_tokens must cover the " +
-                              std::to_string(gp.forced_tokens.size()) + " forced ids");
+            return error_json(::xllama::force_ids_message(forced.error, forced.ids.size()));
         }
+        gp.forced_tokens = std::move(forced.ids);
     }
 
     // Same budget as the chat UI, same primitive, same tokenizer: the oldest
@@ -2420,7 +2418,8 @@ void handle_connection(StreamSocket const& socket, uint64_t generation,
         if (req.method == "POST" &&
             (req.path == "/v1/images/upscale" || req.path == "/v1/upscale")) {
             std::unique_lock<std::mutex> up(g_upscale_mtx, std::try_to_lock);
-            if (!up.owns_lock() || ::xllama::session_hub().preloading.load()) {
+            if (!::xllama::upscale::upscale_admit(up.owns_lock(),
+                                                  ::xllama::session_hub().preloading.load())) {
                 activity().busy();
                 write_response(socket, ::xllama::kApiBusyStatus, error_json("busy"));
                 return;
@@ -2470,7 +2469,7 @@ void dispatch_connection(StreamSocket const& socket, uint64_t generation,
         winrt::Windows::System::Threading::ThreadPool::RunAsync(
             [socket, generation, held, api_key](winrt::Windows::Foundation::IAsyncAction const&) {
                 auto client = activity().client();
-                t_reply_deadline_hit = false;
+                t_reply_deadline.begin();
                 handle_connection(socket, generation, api_key);
                 // After a write deadline nothing else ends the connection: the
                 // cancelled store kept the socket open with no FIN for the
@@ -2478,7 +2477,7 @@ void dispatch_connection(StreamSocket const& socket, uint64_t generation,
                 // Only then: on every other reply the release closes it
                 // gracefully, and an explicit Close with a read pending turns a
                 // 408 into a reset (1.6.0.1234).
-                if (t_reply_deadline_hit) {
+                if (t_reply_deadline.close_socket()) {
                     try {
                         socket.Close();
                     } catch (...) {

@@ -34,6 +34,33 @@ inline std::chrono::milliseconds http_write_deadline(size_t bytes) {
                                  bytes % kHttpWriteMinRate * 1000 / kHttpWriteMinRate));
 }
 
+// What the connection's work item does with the socket once it has served the request
+// (uwp/api-server.cpp, dispatch_connection). Every reply write, streamed tokens included, runs on
+// that one thread-pool thread, so the thread keeps the mark.
+//   begin()        a new connection starts on this thread (pool threads are reused: a mark left by
+//                  an earlier stalled client must not close the next, healthy one)
+//   expired()      a reply write passed http_write_deadline and was cancelled
+//   close_socket() whether to Close() explicitly. A cancelled store leaves the connection open
+//                  with no FIN for as long as the stalled peer is watched (console 2026-11-26,
+//                  commit 013d403), so after a deadline nothing else ends it. Only then: on every
+//                  other reply the release closes gracefully, and an explicit Close with a read
+//                  still pending turns a 408 into a reset (1.6.0.1234).
+class ReplyDeadlineMark {
+  public:
+    void begin() noexcept {
+        hit_ = false;
+    }
+    void expired() noexcept {
+        hit_ = true;
+    }
+    bool close_socket() const noexcept {
+        return hit_;
+    }
+
+  private:
+    bool hit_ = false;
+};
+
 struct HttpHead {
     // 0 when the head is valid; otherwise the HTTP status to answer with
     // (400, 411, 413 or 431) and `error` says why.

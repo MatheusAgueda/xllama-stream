@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "xllama/api_connection.h"
 #include "xllama/diffusion/half.h"
 #include "xllama/upscale/tile_plan.h"
 
@@ -152,4 +153,13 @@ TEST_CASE("upscale: need knobs read plain MB and fall back on anything else") {
     CHECK(need_mb_from("-5", 512) == 512);
     CHECK(need_mb_from("12x", 512) == 512);
     CHECK(need_mb_from("99999999999", 512) == 512);
+}
+
+TEST_CASE("upscale: admission needs the mutex and no model preload, else the busy 503") {
+    CHECK(upscale_admit(true, false));
+    CHECK_FALSE(upscale_admit(false, false)); // another upscale holds the lock
+    CHECK_FALSE(upscale_admit(true, true));   // a preload is staging a model
+    CHECK_FALSE(upscale_admit(false, true));
+    // The refusal is the same bounded 503 every busy gate answers with.
+    CHECK(std::string(xllama::kApiBusyStatus) == "503 Service Unavailable");
 }

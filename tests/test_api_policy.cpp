@@ -4,9 +4,13 @@
 #include <doctest/doctest.h>
 
 #include "xllama/api_policy.h"
+#include "xllama/force_ids.h"
 
 #include <cmath>
+#include <cstdint>
+#include <initializer_list>
 #include <limits>
+#include <vector>
 
 // F01: the audit sent max_tokens -1, 1.5 and 2147483647 and got 200 for all three.
 
@@ -53,4 +57,80 @@ TEST_CASE("clamp_api_int: clamped on the double, never an out-of-range cast") {
     CHECK(clamp_api_int(-1e300, 1, 4) == 1);
     CHECK(clamp_api_int(std::nan(""), 1, 4) == 1);
     CHECK(clamp_api_int(2.9, 1, 4) == 2);
+}
+
+// "xllama_force_ids" (research API): the elements the WinRT layer saw, checked here.
+
+namespace {
+std::vector<xllama::ForceIdElement> nums(std::initializer_list<double> values) {
+    std::vector<xllama::ForceIdElement> out;
+    for (double v : values)
+        out.push_back({true, v});
+    return out;
+}
+} // namespace
+
+TEST_CASE("force_ids: a valid list passes through in order") {
+    using xllama::ForceIdsError;
+    const auto r = xllama::parse_force_ids(true, nums({0, 15, 151645, 2147483647.0}), 8);
+    CHECK(r.error == ForceIdsError::None);
+    CHECK(r.ids == std::vector<int32_t>{0, 15, 151645, 2147483647});
+    // Exactly n_predict ids is allowed; the budget is a ceiling.
+    CHECK(xllama::parse_force_ids(true, nums({1, 2, 3}), 3).error == ForceIdsError::None);
+}
+
+TEST_CASE("force_ids: an empty list is valid and forces nothing") {
+    const auto r = xllama::parse_force_ids(true, {}, 1);
+    CHECK(r.error == xllama::ForceIdsError::None);
+    CHECK(r.ids.empty());
+}
+
+TEST_CASE("force_ids: only whole non-negative numbers up to INT32_MAX are ids") {
+    using xllama::ForceIdsError;
+    using xllama::parse_force_ids;
+    CHECK(parse_force_ids(true, nums({1.5}), 8).error == ForceIdsError::BadId);
+    CHECK(parse_force_ids(true, nums({-1}), 8).error == ForceIdsError::BadId);
+    CHECK(parse_force_ids(true, nums({-0.5}), 8).error == ForceIdsError::BadId);
+    CHECK(parse_force_ids(true, nums({2147483648.0}), 8).error == ForceIdsError::BadId);
+    CHECK(parse_force_ids(true, nums({1e300}), 8).error == ForceIdsError::BadId);
+    CHECK(parse_force_ids(true, nums({std::nan("")}), 8).error == ForceIdsError::BadId);
+    CHECK(parse_force_ids(true, nums({std::numeric_limits<double>::infinity()}), 8).error ==
+          ForceIdsError::BadId);
+    // 2.0 is whole, whatever its text said.
+    CHECK(parse_force_ids(true, nums({2.0}), 8).ids == std::vector<int32_t>{2});
+}
+
+TEST_CASE("force_ids: a non-number element is refused, and the first bad one stops the list") {
+    using xllama::ForceIdElement;
+    using xllama::ForceIdsError;
+    // "abc", true, null and nested arrays all reach the checker as is_number = false.
+    const std::vector<ForceIdElement> text = {{true, 1}, {false, 0.0}, {true, 2}};
+    const auto r = xllama::parse_force_ids(true, text, 8);
+    CHECK(r.error == ForceIdsError::BadId);
+    CHECK(r.ids.empty()); // nothing half-parsed leaks to the caller
+    // A bad id wins over an oversize list: the element check runs first.
+    CHECK(xllama::parse_force_ids(true, nums({1, 2, -1}), 1).error == ForceIdsError::BadId);
+}
+
+TEST_CASE("force_ids: more ids than max_tokens is TooMany, naming the count") {
+    using xllama::ForceIdsError;
+    const auto r = xllama::parse_force_ids(true, nums({1, 2, 3}), 2);
+    CHECK(r.error == ForceIdsError::TooMany);
+    CHECK(r.ids.size() == 3);
+    CHECK(xllama::force_ids_message(r.error, r.ids.size()) ==
+          "max_tokens must cover the 3 forced ids");
+    CHECK(xllama::parse_force_ids(true, nums({1}), 0).error == ForceIdsError::TooMany);
+}
+
+TEST_CASE("force_ids: a field that is not an array is NotArray, elements ignored") {
+    using xllama::ForceIdsError;
+    // "xllama_force_ids": 5, "5", {...}, null, true: the JSON layer passes is_array = false.
+    const auto r = xllama::parse_force_ids(false, nums({1, 2}), 8);
+    CHECK(r.error == ForceIdsError::NotArray);
+    CHECK(r.ids.empty());
+    CHECK(xllama::force_ids_message(r.error, 0) ==
+          "'xllama_force_ids' must be an array of token ids");
+    CHECK(xllama::force_ids_message(ForceIdsError::BadId, 0) ==
+          "'xllama_force_ids' must hold whole non-negative numbers");
+    CHECK(xllama::force_ids_message(ForceIdsError::None, 0).empty());
 }

@@ -198,4 +198,12 @@ inline std::size_t need_mb_from(const char* text, std::size_t fallback) {
     return v;
 }
 
+// Admission of POST /v1/images/upscale (uwp/api-server.cpp): one upscale at a time and never while
+// a model preload runs (both want the GPU pool the memory gate just measured). `got_lock` = the
+// upscale mutex was free (try_lock won); `model_preloading` = session_hub().preloading. Anything
+// else is the bounded 503 "busy" (kApiBusyStatus) before a ticket or a body parse.
+inline bool upscale_admit(bool got_lock, bool model_preloading) {
+    return got_lock && !model_preloading;
+}
+
 } // namespace xllama::upscale

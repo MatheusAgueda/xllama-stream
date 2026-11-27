@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <string>
+#include <thread>
 
 using xllama::parse_http_head;
 
@@ -88,4 +89,32 @@ TEST_CASE("http_write_deadline: a 30 s floor plus 256 KiB/s for the bytes") {
     // A 40 MB upscale reply to a slow client still fits; nothing overflows near SIZE_MAX.
     CHECK(xllama::http_write_deadline(40'000'000) > std::chrono::seconds(180));
     CHECK(xllama::http_write_deadline(SIZE_MAX) > std::chrono::hours(1));
+}
+
+TEST_CASE("ReplyDeadlineMark: close the socket only after a write deadline (013d403)") {
+    xllama::ReplyDeadlineMark mark;
+    CHECK_FALSE(mark.close_socket()); // a normal reply: the release closes gracefully
+    mark.expired();                   // a store passed http_write_deadline and was cancelled
+    CHECK(mark.close_socket());       // nothing else would end the stalled connection
+}
+
+TEST_CASE("ReplyDeadlineMark: a new connection on a reused thread starts clean") {
+    xllama::ReplyDeadlineMark mark;
+    mark.expired();
+    mark.expired(); // several cancelled writes on one connection are still one close
+    CHECK(mark.close_socket());
+    mark.begin(); // the pool hands the thread to the next, healthy client
+    CHECK_FALSE(mark.close_socket());
+}
+
+TEST_CASE("ReplyDeadlineMark: the mark lives per thread, as the server declares it") {
+    thread_local xllama::ReplyDeadlineMark mark;
+    mark.begin();
+    mark.expired();
+    bool other_thread_closes = true;
+    std::thread([&] {
+        other_thread_closes = mark.close_socket(); // that thread's own, untouched mark
+    }).join();
+    CHECK_FALSE(other_thread_closes);
+    CHECK(mark.close_socket());
 }
