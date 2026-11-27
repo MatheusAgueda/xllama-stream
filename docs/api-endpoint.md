@@ -242,8 +242,10 @@ a dropped connection.
 
 The reply follows the OpenAI shape: `id` (unique `chatcmpl-…`), `object: chat.completion`,
 `created`, `model`, `choices[0]` (`message`, `finish_reason` — `length` only when the token
-cap is hit, else `stop`; and `logprobs: null`, omitting which breaks openai-python/LangChain
-Pydantic validation), and a `usage` block from `InferenceResult`: `prompt_tokens` is the prompt's length
+cap is hit, else `stop`; and `logprobs`, always present because omitting it breaks openai-python/LangChain
+Pydantic validation: `null` unless the request sets `"logprobs": true` or `xllama_force_ids`, then
+`{content: [{token, logprob, id, argmax, top_logprobs: []}], sum_logprob, argmax_count}` — plain
+non-streamed replies only; SSE chunks and tool-call replies keep `null`), and a `usage` block from `InferenceResult`: `prompt_tokens` is the prompt's length
 (`n_prompt`), not the tokens prefilled after a KV prefix reuse (`n_p_eval`), and
 `completion_tokens` is `n_eval`. A top-level `timings` object reports numeric
 `prefill_ms` and `decode_ms` rounded to one decimal, plus `prompt_n` (`n_p_eval`,
