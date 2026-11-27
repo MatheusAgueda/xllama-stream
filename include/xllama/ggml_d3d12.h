@@ -61,6 +61,9 @@ struct D3d12MatmulDesc {
 
 // The MUL_MAT rules of supports_op.
 bool d3d12_mm_supported(const D3d12MatmulDesc& d);
+// Columns of one dispatch: ne11 * ne12 * ne13 (a 2-D weight over a contiguous
+// src1), -1 for a malformed shape.
+std::int64_t d3d12_mm_cols(const D3d12MatmulDesc& d);
 
 struct D3d12Dispatch {
     std::uint32_t groups_x = 0; // ceil(N / kD3d12MmvRows)

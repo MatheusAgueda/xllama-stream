@@ -145,10 +145,23 @@ TEST_CASE("ggml_d3d12: supports_op rules for MUL_MAT") {
     t.ne10 = 1024; // K mismatch
     CHECK_FALSE(d3d12_mm_supported(t));
     t = d;
-    t.ne12 = 4; // batched attention-style matmul
+    t.ne12 = 4; // ssm_out over 4 sequences (B3): a 2-D weight, columns flattened
+    CHECK(d3d12_mm_supported(t));
+    CHECK(d3d12_mm_cols(t) == 4);
+    t.ne11 = 256;
+    t.ne13 = 2;
+    CHECK(d3d12_mm_cols(t) == 2048);
+    CHECK(d3d12_mm_supported(t));
+    t.ne11 = 65535; // 65535 x 4 x 2 columns: past the dispatch's group limit
     CHECK_FALSE(d3d12_mm_supported(t));
     t = d;
-    t.ne02 = 2; // 3-D weight
+    t.ne12 = 0; // malformed
+    CHECK(d3d12_mm_cols(t) == -1);
+    CHECK_FALSE(d3d12_mm_supported(t));
+    t = d;
+    t.ne02 = 2; // 3-D weight (batched attention-style matmul)
+    CHECK_FALSE(d3d12_mm_supported(t));
+    t.ne12 = 2;
     CHECK_FALSE(d3d12_mm_supported(t));
     t = d;
     t.src1_contiguous = false;
