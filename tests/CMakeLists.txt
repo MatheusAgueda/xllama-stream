@@ -63,6 +63,7 @@ add_executable(xllama-tests
     test_compute_admission.cpp
     test_api_connection.cpp
     test_api_pull.cpp
+    test_api_hardening.cpp
     test_embedding.cpp
     test_autopilot.cpp
     test_speculative.cpp
@@ -79,6 +80,7 @@ target_include_directories(xllama-tests PRIVATE
 target_compile_definitions(xllama-tests PRIVATE
     GOLDEN_JSON_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../diffusion/golden_vectors.json"
     CLIP_TOKENIZER_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../diffusion/clip_tokenizer"
+    API_SERVER_CPP_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../uwp/api-server.cpp"
     PATCH_0026_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../patches/0026-kv-cache-on-device.patch"
     PARITY_GOLDEN_BIN="${CMAKE_CURRENT_SOURCE_DIR}/golden/logits-smol-short.bin"
     LLAMA_TEMPLATES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/models/templates")

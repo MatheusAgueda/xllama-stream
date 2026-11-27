@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <utility>
 
@@ -58,6 +59,21 @@ class ComputeJobAdmission {
 
   private:
     std::shared_ptr<State> m_state = std::make_shared<State>();
+};
+
+// The compute permit and the hub lock one API request holds while it works, in that order. A
+// reply is written AFTER release(): a client that never reads then stalls only its own connection
+// until http_write_deadline, not the slot every other request queues behind.
+struct ComputeScope {
+    ComputeJobAdmission::Handle permit;
+    std::unique_lock<std::mutex> hub;
+
+    // Hub lock first, then the permit (the reverse of the acquisition order). Idempotent.
+    void release() {
+        if (hub.owns_lock())
+            hub.unlock();
+        permit.reset();
+    }
 };
 
 inline ComputeJobAdmission& process_compute_job_admission() {

@@ -557,7 +557,7 @@ with the variable and checks the same reads and kept experts, the same tokens an
 logits within 1e-4 of the resident model. Unset, nothing changes.
 
 `0026-kv-cache-on-device.patch` (independent of the others; `src/llama-kv-cache.cpp`):
-with `LLAMA_KV_ON_DEVICE` set (and not `0`), `llama_kv_cache` puts each layer's K
+with `LLAMA_KV_ON_DEVICE` on (its first character set and not `0`, like `XLLAMA_ATTN_GPU`: `1`, `10`, `yes` are on; unset, empty, `0`, `00` are off), `llama_kv_cache` puts each layer's K
 and V cache in that layer's device buffer type even when `offload_kqv` is off,
 as 0010 does for the recurrent states. xllama keeps `offload_kqv` off on D3D12
 (`apply_gguf_gpu_context`), so without it the cache is CPU memory and a

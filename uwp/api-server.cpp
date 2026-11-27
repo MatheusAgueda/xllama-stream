@@ -24,6 +24,7 @@
     #include "xllama/api_activity.h"
     #include "xllama/api_auth.h"
     #include "xllama/api_connection.h"
+    #include "xllama/api_limits.h"
     #include "xllama/api_policy.h"
     #include "xllama/api_pull_policy.h"
     #include "xllama/api_timings.h"
@@ -32,6 +33,7 @@
     #include "xllama/force_ids.h"
     #include "xllama/http_framing.h"
     #include "xllama/model_provision.h"
+    #include "xllama/model_spelling.h"
     #include "xllama/path_utils.h"
     #include "xllama/personalize.h"
     #include "xllama/platform.h"
@@ -693,24 +695,42 @@ void split_messages(JsonArray const& messages, std::string& system,
         final_user = cur_user; // trailing user turn is the one we answer
 }
 
-// True when the console can serve `model` now: the resident model, or a
-// LocalState\models\<id> directory with a loadable layout. Raw paths (model.txt
-// may name one) are left to the session loader. The caller holds hub.mtx, so
-// this must not call current_model_id() (it try_locks the same mutex).
-bool model_servable_locked(const std::string& model) {
-    if (model.find_first_of("\\/:") != std::string::npos)
+// True when `model` is an exact manifest entry name. Same cache-and-refresh-on-miss as
+// catalogue_session_policy (the caller holds hub.mtx, which serialises the static): a model
+// published while the server runs is picked up on its first request.
+bool manifest_has_spelling(const std::string& model) {
+    static std::vector<::xllama::ManifestEntry> cache;
+    const std::wstring wname = ::xllama::utf8_to_wstring(model);
+    if (::xllama::find_model_spelling(cache, wname))
         return true;
+    cache = ::xllama::LoadModelManifest();
+    return ::xllama::find_model_spelling(cache, wname) != nullptr;
+}
+
+// True when the console can serve `model` now. Spellings are matched byte for byte, never
+// case-folded or merged (model_spelling.h): each is its own Session id with its own manifest
+// env, so one the console does not know is 404 instead of registering a new id.
+//   path spelling  the resident model, the model.txt hint, or a manifest entry name
+//   bare id        the resident model, or a LocalState\models\<id> directory of exactly that
+//                  name (NTFS would also open a case variant of it) with a loadable layout
+// The caller holds hub.mtx, so this must not call current_model_id() (it try_locks the same mutex).
+bool model_servable_locked(const std::string& model) {
     if (::xllama::session_hub().model == model)
         return true;
+    if (::xllama::model_id_is_path(model))
+        return ::xllama::path_spelling_known(model, manifest_has_spelling(model),
+                                             std::string_view(), read_local_text("model.txt"));
     std::error_code ec;
-    const std::filesystem::path dir =
-        std::filesystem::path(::xllama::resolve_local_path("models")) / model;
-    if (!std::filesystem::is_directory(dir, ec))
-        return false;
-    std::vector<std::string> files;
-    for (const auto& f : std::filesystem::directory_iterator(dir, ec))
-        files.push_back(f.path().filename().string());
-    return ::xllama::model_dir_files_ready(files);
+    const std::filesystem::path root = ::xllama::resolve_local_path("models");
+    for (const auto& entry : std::filesystem::directory_iterator(root, ec)) {
+        if (entry.path().filename().string() != model || !entry.is_directory(ec))
+            continue;
+        std::vector<std::string> files;
+        for (const auto& f : std::filesystem::directory_iterator(entry.path(), ec))
+            files.push_back(f.path().filename().string());
+        return ::xllama::model_dir_files_ready(files);
+    }
+    return false;
 }
 
 std::string model_not_found(const std::string& model) {
@@ -1683,6 +1703,26 @@ std::string read_file_bytes(const std::string& path) {
 
 // POST /v1/preferences — append one preference sample (same contract as UI rate).
 std::string handle_preferences(const std::string& body, const char*& status) {
+    // Quotas first, before any parse or disk write (xllama::PreferenceQuota): the body, the rate
+    // across clients, and the file's total size. No compute permit is taken, by design.
+    static ::xllama::PreferenceQuota quota;
+    std::error_code size_ec;
+    const uintmax_t store_bytes = std::filesystem::file_size(
+        ::xllama::resolve_local_path(::xllama::kPreferenceSamplesRelPath), size_ec);
+    switch (quota.admit(body.size(), size_ec ? 0 : store_bytes,
+                        ::xllama::PreferenceQuota::Clock::now())) {
+    case ::xllama::PreferenceQuota::Verdict::TooLarge:
+        status = "413 Payload Too Large";
+        return error_json("preference sample too large");
+    case ::xllama::PreferenceQuota::Verdict::RateLimited:
+        status = "429 Too Many Requests";
+        return error_json("too many preference samples; retry later");
+    case ::xllama::PreferenceQuota::Verdict::StoreFull:
+        status = "507 Insufficient Storage";
+        return error_json("training/samples.jsonl is full");
+    case ::xllama::PreferenceQuota::Verdict::Ok:
+        break;
+    }
     JsonObject root{nullptr};
     if (!JsonObject::TryParse(winrt::to_hstring(body), root) || root == nullptr) {
         status = "400 Bad Request";
@@ -2007,16 +2047,26 @@ void handle_pull(StreamSocket const& socket, const std::string& body, uint64_t g
         return;
     }
 
-    auto pull_guard = g_pull_gate.try_acquire();
-    if (!pull_guard.owns_lock()) {
+    // Gate and compute permit first: before the reply stream opens or a byte is downloaded.
+    // Busy is a 503 with nothing written; the permit stays held through the download and the
+    // load, and every reply below is written after release_pull().
+    auto pull = ::xllama::admit_pull(g_pull_gate, [] { return acquire_compute_job_or_busy(); });
+    if (pull.status == ::xllama::PullAdmitStatus::PullInProgress) {
         write_response(socket, "409 Conflict",
                        ollama_error_json("another model pull is in progress"));
         return;
     }
+    if (pull.status == ::xllama::PullAdmitStatus::Busy) {
+        activity().busy();
+        write_response(socket, "503 Service Unavailable", ollama_error_json("busy"));
+        return;
+    }
+    const auto release_pull = [&pull] { pull.release(); };
 
     {
         std::lock_guard<std::mutex> state_lock(g_state_mtx);
         if (g_status.state != ServerState::Running || generation != g_generation) {
+            release_pull();
             write_response(socket, "503 Service Unavailable", ollama_error_json("server stopped"));
             return;
         }
@@ -2066,6 +2116,7 @@ void handle_pull(StreamSocket const& socket, const std::string& body, uint64_t g
         }
     }
     if (!download_ok) {
+        release_pull();
         const std::string message = ::xllama::wstring_to_utf8(download_error);
         if (output) {
             (void)output->write_line(ollama_error_json(message));
@@ -2083,24 +2134,13 @@ void handle_pull(StreamSocket const& socket, const std::string& body, uint64_t g
     if (output)
         (void)output->write_line(pull_event_json("loading model"));
 
-    auto compute_permit = acquire_compute_job_or_busy();
-    if (!compute_permit) {
-        const std::string message = "busy";
-        if (output) {
-            (void)output->write_line(ollama_error_json(message));
-            output->finish();
-        } else {
-            write_response(socket, "503 Service Unavailable", ollama_error_json(message));
-        }
-        return;
-    }
-
     bool server_active = false;
     {
         std::lock_guard<std::mutex> state_lock(g_state_mtx);
         server_active = g_status.state == ServerState::Running && generation == g_generation;
     }
     if (!server_active) {
+        release_pull();
         const std::string message = "server stopped before model load";
         if (output) {
             (void)output->write_line(ollama_error_json(message));
@@ -2131,6 +2171,7 @@ void handle_pull(StreamSocket const& socket, const std::string& body, uint64_t g
         else
             load_error = "server stopped before model load";
     }
+    release_pull(); // the load is done: the success or error reply below holds no slot
     if (!loaded) {
         const std::string message = "model downloaded but could not load: " + load_error;
         if (output) {
@@ -2195,6 +2236,54 @@ const char* framing_status(int code) {
     }
 }
 
+::xllama::ApiAuthStats& auth_stats() {
+    static ::xllama::ApiAuthStats stats;
+    return stats;
+}
+
+// The peer's address, for the Bearer-failure counts only.
+std::string client_address(StreamSocket const& socket) {
+    try {
+        return winrt::to_string(socket.Information().RemoteAddress().DisplayName());
+    } catch (...) {
+        return "unknown";
+    }
+}
+
+// Bytes of text a chat body asks the server to tokenize: every JSON string value in it. Only
+// parsed when the body itself is past the cap (text can never exceed the body).
+size_t json_string_bytes(IJsonValue const& value, int depth = 0) {
+    if (depth > 32) // nesting this deep is not a prompt: count it as over the cap
+        return ::xllama::kApiMaxPromptTextBytes + 1;
+    switch (value.ValueType()) {
+    case JsonValueType::String:
+        return winrt::to_string(value.GetString()).size();
+    case JsonValueType::Array: {
+        size_t n = 0;
+        for (auto&& e : value.GetArray())
+            n += json_string_bytes(e, depth + 1);
+        return n;
+    }
+    case JsonValueType::Object: {
+        size_t n = 0;
+        for (auto&& kv : value.GetObject())
+            n += json_string_bytes(kv.Value(), depth + 1);
+        return n;
+    }
+    default:
+        return 0;
+    }
+}
+
+size_t chat_text_bytes(const std::string& body) {
+    if (body.size() <= ::xllama::kApiMaxPromptTextBytes)
+        return body.size();
+    JsonObject root{nullptr};
+    if (!JsonObject::TryParse(winrt::to_hstring(body), root) || root == nullptr)
+        return 0; // the handler answers 400 for it
+    return json_string_bytes(root);
+}
+
 // Serve one accepted socket. Runs on a thread-pool work item, never inline
 // in ConnectionReceived: the listener does not raise the next connection
 // until that callback returns, so an in-line SSE reply hid the permit from
@@ -2224,10 +2313,34 @@ void handle_connection(StreamSocket const& socket, uint64_t generation,
             return;
         }
 
-        if (!api_key.empty() && !::xllama::bearer_matches(req.authorization, api_key)) {
-            ::xllama::log_output("[api] unauthorized: " + req.method + " " + req.path + "\n");
+        // Bearer check (phase 1 counts and serves a failure, phase 2 answers 401; see api_auth.h).
+        // /health above is the only route that skips it.
+        const ::xllama::ApiAuthPhase auth_phase =
+            ::xllama::api_auth_phase_from_text(read_local_text("api-auth.txt"));
+        const ::xllama::ApiAuthDecision auth =
+            ::xllama::decide_api_auth(auth_phase, api_key, req.authorization);
+        if (auth.failed) {
+            auth_stats().record_failure(client_address(socket), auth.allow);
+            ::xllama::log_output(std::string(auth.allow ? "[api] bearer failed (served): "
+                                                        : "[api] unauthorized: ") +
+                                 req.method + " " + req.path + "\n");
+        }
+        if (!auth.allow) {
             write_response(socket, "401 Unauthorized",
                            "{\"error\":{\"message\":\"unauthorized\",\"type\":\"auth\"}}");
+            return;
+        }
+
+        // Failure counts per client address. Behind a valid key in BOTH phases (phase 1 would
+        // otherwise show the LAN's client addresses to anyone); never the key itself.
+        if (req.method == "GET" && req.path == "/v1/auth/stats") {
+            if (!::xllama::bearer_matches(req.authorization, api_key)) {
+                write_response(socket, "401 Unauthorized",
+                               "{\"error\":{\"message\":\"unauthorized\",\"type\":\"auth\"}}");
+                return;
+            }
+            write_response(socket, "200 OK",
+                           ::xllama::api_auth_stats_json(auth_phase, auth_stats().snapshot()));
             return;
         }
 
@@ -2256,17 +2369,34 @@ void handle_connection(StreamSocket const& socket, uint64_t generation,
                 return;
             }
             const bool stream = stream_request == StreamRequest::Yes;
-            auto compute_permit = acquire_compute_job_or_busy();
-            if (!compute_permit) {
-                activity().busy();
-                write_response(socket, ::xllama::kApiBusyStatus, error_json("busy"));
-                return;
+            // The text cap comes before the permit: an oversized prompt is 413 and never queues
+            // for, nor takes, the slot (BPE over 8 MiB with the permit held is minutes of it).
+            ::xllama::ComputeScope scope;
+            {
+                auto admitted = ::xllama::admit_text_then_permit(
+                    chat_text_bytes(req.body), [] { return acquire_compute_job_or_busy(); });
+                if (admitted.status == ::xllama::TextAdmitStatus::TooLarge) {
+                    write_response(
+                        socket, "413 Payload Too Large",
+                        error_json("prompt text exceeds " +
+                                   std::to_string(::xllama::kApiMaxPromptTextBytes / 1024) +
+                                   " KiB"));
+                    return;
+                }
+                if (admitted.status == ::xllama::TextAdmitStatus::Busy) {
+                    activity().busy();
+                    write_response(socket, ::xllama::kApiBusyStatus, error_json("busy"));
+                    return;
+                }
+                scope.permit = std::move(admitted.permit);
             }
-            // Keep the lease for the whole reply, including every SSE event.
-            // Dropped on return, throw, or client-disconnect abort.
-            (void)compute_permit;
-            std::unique_lock<std::mutex> lk = acquire_hub_or_busy();
-            if (!lk.owns_lock()) {
+            // Keep the lease for the whole reply, including every SSE event, and drop it
+            // (scope.release()) before the final reply write: a client that never reads must not
+            // hold the slot past its write deadline. Also dropped on return, throw, or
+            // client-disconnect abort.
+            scope.hub = acquire_hub_or_busy();
+            if (!scope.hub.owns_lock()) {
+                scope.release();
                 activity().busy();
                 write_response(socket, "503 Service Unavailable", error_json("busy"));
                 return;
@@ -2280,6 +2410,7 @@ void handle_connection(StreamSocket const& socket, uint64_t generation,
                     g_status.state == ServerState::Running && generation == g_generation;
             }
             if (!active_generation) {
+                scope.release();
                 write_response(socket, "503 Service Unavailable", error_json("server stopped"));
                 return;
             }
@@ -2298,6 +2429,7 @@ void handle_connection(StreamSocket const& socket, uint64_t generation,
             // Record before writing: a client that disconnects makes
             // write_response throw, and the request was still served.
             record_outcome(ticket, status, json);
+            scope.release();
             // A streamed reply is already on the socket; an empty body means the
             // stream (or its error event) was the response.
             if (stream && json.empty())
@@ -2314,15 +2446,17 @@ void handle_connection(StreamSocket const& socket, uint64_t generation,
             embedding_api = req.path == "/api/embed"        ? EmbeddingApi::Ollama
                             : req.path == "/api/embeddings" ? EmbeddingApi::Legacy
                                                             : EmbeddingApi::OpenAI;
-            auto compute_permit = acquire_compute_job_or_busy();
-            if (!compute_permit) {
+            ::xllama::ComputeScope scope;
+            scope.permit = acquire_compute_job_or_busy();
+            if (!scope.permit) {
                 activity().busy();
                 write_response(socket, ::xllama::kApiBusyStatus,
                                embedding_error_json(embedding_api, "busy"));
                 return;
             }
-            std::unique_lock<std::mutex> lk = acquire_hub_or_busy();
-            if (!lk.owns_lock()) {
+            scope.hub = acquire_hub_or_busy();
+            if (!scope.hub.owns_lock()) {
+                scope.release();
                 activity().busy();
                 write_response(socket, "503 Service Unavailable",
                                embedding_error_json(embedding_api, "busy"));
@@ -2334,6 +2468,7 @@ void handle_connection(StreamSocket const& socket, uint64_t generation,
                 active = g_status.state == ServerState::Running && generation == g_generation;
             }
             if (!active) {
+                scope.release();
                 write_response(socket, "503 Service Unavailable",
                                embedding_error_json(embedding_api, "server stopped"));
                 return;
@@ -2350,6 +2485,7 @@ void handle_connection(StreamSocket const& socket, uint64_t generation,
             // Record before writing: a client that disconnects makes
             // write_response throw, and the request was still served.
             record_outcome(ticket, status, json);
+            scope.release();
             write_response(socket, status, json);
             return;
         }
@@ -2376,14 +2512,16 @@ void handle_connection(StreamSocket const& socket, uint64_t generation,
 
         // #118: image generation — shares compute admission and the hub slot.
         if (req.method == "POST" && req.path == "/v1/images/generations") {
-            auto compute_permit = acquire_compute_job_or_busy();
-            if (!compute_permit) {
+            ::xllama::ComputeScope scope;
+            scope.permit = acquire_compute_job_or_busy();
+            if (!scope.permit) {
                 activity().busy();
                 write_response(socket, ::xllama::kApiBusyStatus, error_json("busy"));
                 return;
             }
-            std::unique_lock<std::mutex> lk = acquire_hub_or_busy();
-            if (!lk.owns_lock()) {
+            scope.hub = acquire_hub_or_busy();
+            if (!scope.hub.owns_lock()) {
+                scope.release();
                 activity().busy();
                 write_response(socket, ::xllama::kApiBusyStatus, error_json("busy"));
                 return;
@@ -2394,6 +2532,7 @@ void handle_connection(StreamSocket const& socket, uint64_t generation,
                 active = g_status.state == ServerState::Running && generation == g_generation;
             }
             if (!active) {
+                scope.release();
                 write_response(socket, "503 Service Unavailable", error_json("server stopped"));
                 return;
             }
@@ -2409,6 +2548,7 @@ void handle_connection(StreamSocket const& socket, uint64_t generation,
             // Record before writing: a client that disconnects makes
             // write_response throw, and the request was still served.
             record_outcome(ticket, status, json);
+            scope.release();
             write_response(socket, status, json);
             return;
         }
@@ -2559,9 +2699,12 @@ void start_server(int requested_port) {
         if (api_key.empty()) {
             if (key_present)
                 ::xllama::log_output("[api] api.key ignored: shorter than 32 characters\n");
-            ::xllama::log_output("[api] no api.key: the LAN endpoint is unauthenticated\n");
+            ::xllama::log_output("[api] no api.key: bearer failures are counted for every request; "
+                                 "api-auth.txt=enforce would answer 401 to all but /health\n");
         } else {
-            ::xllama::log_output("[api] api.key loaded: bearer required\n");
+            ::xllama::log_output(
+                "[api] api.key loaded: bearer verified (api-auth.txt=enforce "
+                "turns failures into 401; otherwise they are counted and served)\n");
         }
         listener.ConnectionReceived(
             [generation, api_key](StreamSocketListener const&,

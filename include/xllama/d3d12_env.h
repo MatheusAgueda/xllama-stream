@@ -33,12 +33,13 @@ inline long long fa_decode_kv_from_env(const char* s, bool fap_ok) {
 }
 
 // LLAMA_KV_ON_DEVICE as llama.cpp patch 0026 reads it (patches/0026-kv-cache-on-device.patch,
-// llama_kv_cache's constructor): `kv_dev && strcmp(kv_dev, "0") != 0`. Unlike env_flag_on, the
-// whole text counts: set and not exactly "0" is on, so "" and "00" turn it ON. This function is a
-// mirror (the patch cannot include xllama headers); test_d3d12_env.cpp reads the patch file and
-// fails if its expression drifts from this one.
+// llama_kv_cache's constructor): `kv_dev && *kv_dev && *kv_dev != '0'`, the same first-character
+// rule as env_flag_on (XLLAMA_ATTN_GPU). It used to be `strcmp(kv_dev, "0") != 0`, which turned ""
+// and "00" ON; production sets only "1", "0" or nothing, which read the same under both. This
+// function is a mirror (the patch cannot include xllama headers); test_d3d12_env.cpp reads the
+// patch file and fails if its expression drifts from this one.
 inline bool kv_on_device_from_env(const char* s) {
-    return s && std::strcmp(s, "0") != 0;
+    return env_flag_on(s);
 }
 
 } // namespace xllama

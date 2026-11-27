@@ -7,6 +7,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+- **LAN API (security):** two auth phases chosen at run time by `LocalState/api-auth.txt`
+  (phase 1, default: Bearer failures are counted per client at `GET /v1/auth/stats` and
+  still served; phase 2, `enforce`: `401` everywhere but `/health`, a missing or short
+  `api.key` included). The compute permit and hub lock are released before the final reply
+  write; a chat whose text passes 256 KiB is `413` before the permit; `/api/pull` takes
+  the permit first (busy is `503`, nothing written); `/v1/preferences` has size, rate and
+  file quotas; an unknown `model` spelling is `404` instead of a new session id.
+  `LLAMA_KV_ON_DEVICE` now parses like `XLLAMA_ATTN_GPU` (`""` and `"00"` are off).
+
 - **Session:** the disk prefix cache root is wiped the first time a process uses
   it; later sessions keep the files of the live ones. Saves and lookups
   remove entries older than `XLLAMA_PREFIX_CACHE_TTL_S` (default 30 minutes).

@@ -3,8 +3,7 @@
 //
 // The environment parses that gate the GPU attention path (include/xllama/d3d12_env.h): the
 // XLLAMA_ATTN_GPU flag, XLLAMA_FA_DECODE_KV, and LLAMA_KV_ON_DEVICE of llama.cpp patch 0026. They
-// document today's exact semantics, quirks included: a test that fails here means a behaviour
-// change, which belongs in its own commit.
+// document the exact semantics: a test that fails here means a behaviour change.
 
 #include <doctest/doctest.h>
 
@@ -55,14 +54,23 @@ TEST_CASE("fa_decode_kv_from_env: strtoll leniency is kept, and the kernels gate
     CHECK(fa_decode_kv_from_env(nullptr, false) == 0);
 }
 
-TEST_CASE("kv_on_device_from_env (LLAMA_KV_ON_DEVICE): set and not exactly \"0\"") {
+TEST_CASE("kv_on_device_from_env (LLAMA_KV_ON_DEVICE): parses like XLLAMA_ATTN_GPU") {
+    using xllama::env_flag_on;
     using xllama::kv_on_device_from_env;
-    CHECK_FALSE(kv_on_device_from_env(nullptr)); // unset
-    CHECK_FALSE(kv_on_device_from_env("0"));
+    // The values production sets (tools/fap_*.py, sxs logs, LocalState manifests): "1", "0", unset.
     CHECK(kv_on_device_from_env("1"));
-    CHECK(kv_on_device_from_env(""));   // unlike env_flag_on, set-but-empty is ON
-    CHECK(kv_on_device_from_env("00")); // and so is anything but the exact text "0"
-    CHECK(kv_on_device_from_env("false"));
+    CHECK_FALSE(kv_on_device_from_env("0"));
+    CHECK_FALSE(kv_on_device_from_env(nullptr));
+    // The old quirk is gone: set-but-empty and "00" are off, as for env_flag_on.
+    CHECK_FALSE(kv_on_device_from_env(""));
+    CHECK_FALSE(kv_on_device_from_env("00"));
+    CHECK_FALSE(kv_on_device_from_env("01"));
+    CHECK(kv_on_device_from_env("10"));
+    CHECK(kv_on_device_from_env("yes"));
+    CHECK(kv_on_device_from_env("false")); // first character only, as XLLAMA_ATTN_GPU
+    for (const char* v : {static_cast<const char*>(nullptr), "", "0", "00", "01", "1", "10", "yes",
+                          "false", " 0", "x"})
+        CHECK(kv_on_device_from_env(v) == env_flag_on(v));
 }
 
 #ifdef PATCH_0026_PATH
@@ -73,6 +81,7 @@ TEST_CASE("kv_on_device_from_env mirrors the expression in patch 0026") {
     // The patch cannot include xllama headers; if either line changes, kv_on_device_from_env and
     // its cases above have to change with it.
     CHECK(patch.find("getenv(\"LLAMA_KV_ON_DEVICE\")") != std::string::npos);
-    CHECK(patch.find("offload || (kv_dev && strcmp(kv_dev, \"0\") != 0)") != std::string::npos);
+    CHECK(patch.find("offload || (kv_dev && *kv_dev && *kv_dev != '0')") != std::string::npos);
+    CHECK(patch.find("strcmp(kv_dev") == std::string::npos); // the old whole-text test is gone
 }
 #endif

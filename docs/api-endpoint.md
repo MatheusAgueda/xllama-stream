@@ -27,6 +27,18 @@ once each time the listener starts; restart the listener after changing it.
 Short keys are ignored with a log warning. Without a valid key the endpoint is
 unauthenticated. The key and request body are never logged on an auth failure.
 
+Two phases, chosen at run time with no rebuild by `LocalState/api-auth.txt`
+(read on every request; its first word `enforce` selects phase 2, a missing file
+or anything else is phase 1):
+
+- **Phase 1 (default)**: with a key provisioned the Bearer is verified, and a
+  failure is counted per client address and still served. The counts (never the
+  key) are at `GET /v1/auth/stats`, which always needs a valid Bearer:
+  `{"phase":"observe","failures":N,"served":N,"denied":N,"other":N,"clients":{"<addr>":N}}`
+  (`other` = clients past the 64 tracked).
+- **Phase 2** (`enforce`): a missing or wrong Bearer is `401` on every route but
+  `/health`, and so is a missing or short `api.key` (fail closed).
+
 `OPTIONS`, `GET /` and `GET /health` remain open. Every other route, including
 model discovery, returns `401 Unauthorized` with
 `{"error":{"message":"unauthorized","type":"auth"}}` for a missing or invalid
@@ -65,7 +77,10 @@ live XAML chat UI.
   to a full prefill. A model id that is neither resident nor a loadable
   `LocalState\models\<id>` directory gets **`404`** "model '<id>' is not on this
   console; see GET /v1/models" (chat and embeddings), before any load is
-  attempted.
+  attempted. Spellings are matched byte for byte, never case-folded or merged: a
+  path spelling must be the resident model, the `model.txt` hint or the exact
+  name of a manifest entry (declared aliases keep their own env), else `404`
+  instead of a new session id.
 - **GGUF GPU layers:** a GGUF session gets the catalogue entry's `gpu_layers`
   (D3 default per model). `LocalState\gguf_gpu_layers.txt`, when present,
   overrides it for the GUI and this API alike; `0` forces the CPU. A change
@@ -237,7 +252,8 @@ Framing is exact ([ADR 0006](adr/0006-http-framing.md)). `Content-Length` must
 be one plain decimal (repeats must agree), else `400`; any `Transfer-Encoding`
 gets `411` (OpenAI SDKs send Content-Length). A body over 8 MiB is `413`, a head
 over 64 KiB is `431`, and a body shorter than declared is `400` with nothing
-dispatched. The head must arrive within 10 s and the body within 15 s, else `408`. Malformed JSON / wrong-typed fields get `400`, never
+dispatched. A chat whose text (all JSON string values) passes 256 KiB is `413`,
+answered before the compute slot is taken. The head must arrive within 10 s and the body within 15 s, else `408`. Malformed JSON / wrong-typed fields get `400`, never
 a dropped connection.
 
 The reply follows the OpenAI shape: `id` (unique `chatcmpl-…`), `object: chat.completion`,
@@ -326,7 +342,9 @@ Embedding models retain their own pooling behavior from GGUF metadata. The API d
 ### Preferences (`POST /v1/preferences`)
 
 Same validation as the UI **rate** op. Appends one JSONL line to
-`LocalState\training\samples.jsonl`.
+`LocalState\training\samples.jsonl`. It takes no compute permit, so it is
+bounded on its own: a body over 64 KiB is `413`, more than 30 samples per minute
+(all clients together) is `429`, and a file that would pass 32 MiB is `507`.
 
 ```bash
 curl -s http://<ip-xbox>:11434/v1/preferences \
@@ -411,7 +429,7 @@ curl -sS -o /tmp/xllama-gui-busy.json -w '%{http_code}\n' \
 - No `internetClientServer` / public inbound — `privateNetworkClientServer` (already in the
   manifest) covers LAN only.
 - No `llama.cpp/tools/server` or cpp-httplib imported into the MSIX.
-- Without `LocalState/api.key` the endpoint is **unauthenticated**; see [Bearer key](#bearer-key).
+- Without `LocalState/api.key` the endpoint serves unauthenticated until `LocalState/api-auth.txt` says `enforce`; see [Bearer key](#bearer-key).
 - ~~Memory note: the server's `Session` is independent of the UI's…~~ **Done
   (PR #161/#164)**: server and UI share the one `session_hub()` Session behind
   the same mutex — two loaded copies can no longer happen.

@@ -1167,11 +1167,11 @@ TEST_CASE(
     llama_log_set(nullptr, nullptr);
 }
 
-// llama.cpp patch 0026 (LLAMA_KV_ON_DEVICE, set and not "0"): the KV cache goes on the layer's
-// device even with offload_kqv off. On this CPU-only host the device IS the CPU, so the switch
-// must change nothing: same greedy tokens, same logits after the prompt, as with the variable
-// unset or "0" (the d3d12 backend, where the buffer really moves, is the console's to check).
-// Its own name, not "expert cache*": expert-cache-host.yml counts exactly two of those.
+// llama.cpp patch 0026 (LLAMA_KV_ON_DEVICE on: first character set and not '0'): the KV cache goes
+// on the layer's device even with offload_kqv off. On this CPU-only host the device IS the CPU, so
+// the switch must change nothing: same greedy tokens, same logits after the prompt, as with the
+// variable unset or "0" (the d3d12 backend, where the buffer really moves, is the console's to
+// check). Its own name, not "expert cache*": expert-cache-host.yml counts exactly two of those.
 TEST_CASE("kv on device: LLAMA_KV_ON_DEVICE decodes like the default (opt-in: "
           "XLLAMA_EC_TEST_MODEL)") {
     const char* path = std::getenv("XLLAMA_EC_TEST_MODEL");

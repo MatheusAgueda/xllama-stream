@@ -1,0 +1,418 @@
+// Copyright (c) 2024 Gianluca Mazza
+// SPDX-License-Identifier: MIT
+//
+// S1 hardening of the LAN API (uwp/api-server.cpp): the two auth phases, the compute permit and
+// hub lock released before the final reply write, the prompt text cap, /api/pull admission order,
+// the /v1/preferences quotas, and the exact model spellings. The decisions live in WinRT-free
+// headers; the handler's call ORDER is pinned by reading the source (as test_d3d12_env.cpp does
+// for patch 0026), because the handler itself only builds in the UWP job.
+
+#include "xllama/api_auth.h"
+#include "xllama/api_limits.h"
+#include "xllama/api_pull_policy.h"
+#include "xllama/compute_admission.h"
+#include "xllama/http_framing.h"
+#include "xllama/model_spelling.h"
+
+#include <doctest/doctest.h>
+
+#include <chrono>
+#include <fstream>
+#include <iterator>
+#include <mutex>
+#include <string>
+#include <vector>
+
+using namespace xllama;
+
+namespace {
+const std::string kKey = "0123456789abcdef0123456789ABCDEF";
+
+std::string read_file(const char* path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+// The text of `src` from the first `from` to the next `to` after it.
+std::string slice(const std::string& src, const std::string& from, const std::string& to) {
+    const size_t a = src.find(from);
+    REQUIRE(a != std::string::npos);
+    const size_t b = src.find(to, a + from.size());
+    REQUIRE(b != std::string::npos);
+    return src.substr(a, b - a);
+}
+} // namespace
+
+// ---- 1. auth: two phases ---------------------------------------------------------------------
+
+TEST_CASE("auth phase: api-auth.txt picks the phase, anything but 'enforce' is phase 1") {
+    CHECK(api_auth_phase_from_text("") == ApiAuthPhase::Observe);
+    CHECK(api_auth_phase_from_text(" \r\n") == ApiAuthPhase::Observe);
+    CHECK(api_auth_phase_from_text("observe") == ApiAuthPhase::Observe);
+    CHECK(api_auth_phase_from_text("enforce") == ApiAuthPhase::Enforce);
+    CHECK(api_auth_phase_from_text("  ENFORCE\r\n") == ApiAuthPhase::Enforce);
+    CHECK(api_auth_phase_from_text("Enforce # on 2026-12-01") == ApiAuthPhase::Enforce);
+    CHECK(api_auth_phase_from_text("enforced") == ApiAuthPhase::Observe);
+    CHECK(api_auth_phase_from_text("enforc") == ApiAuthPhase::Observe);
+    CHECK(api_auth_phase_from_text("1") == ApiAuthPhase::Observe);
+    CHECK(api_auth_phase_from_text("# enforce") == ApiAuthPhase::Observe);
+}
+
+TEST_CASE("auth phase 2: a missing, short, empty or wrong Bearer is denied (401)") {
+    const ApiAuthPhase p = ApiAuthPhase::Enforce;
+    const ApiAuthDecision ok = decide_api_auth(p, kKey, "Bearer " + kKey);
+    CHECK(ok.allow);
+    CHECK_FALSE(ok.failed);
+    const std::string wrong = "Bearer " + kKey.substr(0, kKey.size() - 1) + "x";
+    for (const std::string& header :
+         {std::string(), std::string("Bearer "), std::string("Bearer short"), wrong, kKey}) {
+        const ApiAuthDecision d = decide_api_auth(p, kKey, header);
+        CHECK_FALSE(d.allow);
+        CHECK(d.failed);
+    }
+    // Fail closed: api.key missing, or shorter than 32 characters (api_key_from_text gives "").
+    const std::string no_key = api_key_from_text(std::string(31, 'k'));
+    CHECK(no_key.empty());
+    for (const std::string& header :
+         {std::string(), std::string("Bearer "), std::string("Bearer ") + std::string(31, 'k'),
+          "Bearer " + kKey}) {
+        const ApiAuthDecision d = decide_api_auth(p, no_key, header);
+        CHECK_FALSE(d.allow);
+        CHECK(d.failed);
+    }
+}
+
+TEST_CASE("auth phase 1: a Bearer failure is counted and still served") {
+    const ApiAuthPhase p = ApiAuthPhase::Observe;
+    CHECK(decide_api_auth(p, kKey, "Bearer " + kKey).allow);
+    CHECK_FALSE(decide_api_auth(p, kKey, "Bearer " + kKey).failed);
+    for (const std::string& header :
+         {std::string(), std::string("Bearer "), std::string("Bearer short"),
+          "Bearer " + kKey.substr(1) + "x"}) {
+        const ApiAuthDecision d = decide_api_auth(p, kKey, header);
+        CHECK(d.allow);  // served
+        CHECK(d.failed); // and counted
+    }
+    // No usable key at all: everything is served and counted, nothing can match.
+    const ApiAuthDecision none = decide_api_auth(p, "", "Bearer anything");
+    CHECK(none.allow);
+    CHECK(none.failed);
+}
+
+TEST_CASE("auth stats: counts per client, bounded, never the key") {
+    ApiAuthStats stats;
+    stats.record_failure("192.0.2.7", true);
+    stats.record_failure("192.0.2.7", true);
+    stats.record_failure("192.0.2.8", false);
+    ApiAuthStats::Snapshot s = stats.snapshot();
+    CHECK(s.failures == 3);
+    CHECK(s.served == 2);
+    CHECK(s.denied == 1);
+    CHECK(s.clients.size() == 2);
+
+    // More distinct clients than kMaxClients: the memory stays bounded, the total stays exact.
+    for (size_t i = 0; i < ApiAuthStats::kMaxClients + 10; ++i)
+        stats.record_failure("198.51.100." + std::to_string(i), true);
+    s = stats.snapshot();
+    CHECK(s.clients.size() == ApiAuthStats::kMaxClients);
+    CHECK(s.other > 0);
+    CHECK(s.failures == 3 + ApiAuthStats::kMaxClients + 10);
+
+    const std::string json = api_auth_stats_json(ApiAuthPhase::Observe, s);
+    CHECK(json.find("\"phase\":\"observe\"") != std::string::npos);
+    CHECK(json.find("\"failures\":" + std::to_string(s.failures)) != std::string::npos);
+    CHECK(json.find("\"192.0.2.7\":2") != std::string::npos);
+    CHECK(json.find(kKey) == std::string::npos);
+    CHECK(json.find("Bearer") == std::string::npos);
+    CHECK(api_auth_stats_json(ApiAuthPhase::Enforce, ApiAuthStats::Snapshot{})
+              .find("\"phase\":\"enforce\"") != std::string::npos);
+
+    // A client string with quote, backslash or control bytes cannot break the JSON out.
+    ApiAuthStats odd;
+    odd.record_failure(std::string("a\"b\\c\n"), true);
+    const std::string odd_json = api_auth_stats_json(ApiAuthPhase::Observe, odd.snapshot());
+    CHECK(odd_json.find("\"a?b?c?\":1") != std::string::npos);
+}
+
+// ---- 2. the permit and hub lock are free before the final reply write ------------------------
+
+TEST_CASE("compute scope: release() frees the hub lock and the permit before the reply write") {
+    ComputeJobAdmission admission;
+    std::mutex hub;
+    ComputeScope scope;
+    scope.permit = admission.try_acquire();
+    scope.hub = std::unique_lock<std::mutex>(hub, std::try_to_lock);
+    REQUIRE(scope.permit);
+    REQUIRE(scope.hub.owns_lock());
+    CHECK_FALSE(admission.try_acquire()); // held while the work runs
+
+    // The reply write of a client that never reads: whatever it blocks on, it sees the slot free.
+    bool slot_free_during_write = false;
+    bool hub_free_during_write = false;
+    const auto write_reply = [&] {
+        slot_free_during_write = static_cast<bool>(admission.try_acquire());
+        std::unique_lock<std::mutex> probe(hub, std::try_to_lock);
+        hub_free_during_write = probe.owns_lock();
+    };
+    scope.release();
+    write_reply();
+    CHECK(slot_free_during_write);
+    CHECK(hub_free_during_write);
+    scope.release(); // idempotent
+}
+
+TEST_CASE("compute scope: a scope that never got the hub still frees its permit") {
+    ComputeJobAdmission admission;
+    ComputeScope scope;
+    scope.permit = admission.try_acquire();
+    scope.release();
+    CHECK(admission.try_acquire());
+}
+
+TEST_CASE("handler order: chat, embeddings and images release before their final write") {
+    const std::string src = read_file(API_SERVER_CPP_PATH);
+    REQUIRE_FALSE(src.empty());
+    const std::string chat =
+        slice(src, "req.path == \"/v1/chat/completions\"", "EmbeddingApi embedding_api;");
+    const std::string emb =
+        slice(src, "EmbeddingApi embedding_api;", "// #118: preference capture");
+    const std::string img = slice(src, "req.path == \"/v1/images/generations\"", "// 4x upscale");
+    for (const std::string* route : {&chat, &emb, &img}) {
+        const size_t release = route->rfind("scope.release();");
+        const size_t final_write = route->rfind("write_response(socket, status, json);");
+        REQUIRE(release != std::string::npos);
+        REQUIRE(final_write != std::string::npos);
+        CHECK(release < final_write);
+        // No bare permit or lock left that would outlive the write.
+        CHECK(route->find("auto compute_permit") == std::string::npos);
+        CHECK(route->find("std::unique_lock<std::mutex> lk") == std::string::npos);
+    }
+}
+
+// ---- 3. prompt text cap (413) ----------------------------------------------------------------
+
+TEST_CASE("prompt cap: over 256 KiB is 413 and never touches the permit") {
+    static_assert(kApiMaxPromptTextBytes == 256 * 1024);
+    static_assert(kApiMaxPromptTextBytes < kHttpMaxBody);
+    ComputeJobAdmission admission;
+    int acquire_calls = 0;
+    const auto acquire = [&] {
+        ++acquire_calls;
+        return admission.try_acquire();
+    };
+
+    TextAdmission over = admit_text_then_permit(kApiMaxPromptTextBytes + 1, acquire);
+    CHECK(over.status == TextAdmitStatus::TooLarge);
+    CHECK_FALSE(over.permit);
+    CHECK(acquire_calls == 0); // the permit was not even asked for
+    CHECK(admit_text_then_permit(kHttpMaxBody, acquire).status == TextAdmitStatus::TooLarge);
+    CHECK(acquire_calls == 0);
+
+    // The slot is free: 413 left it free; and while another job holds it, oversize is still 413
+    // (not 503) and the holder keeps it.
+    auto holder = admission.try_acquire();
+    REQUIRE(holder);
+    CHECK(admit_text_then_permit(kApiMaxPromptTextBytes + 1, acquire).status ==
+          TextAdmitStatus::TooLarge);
+    CHECK(acquire_calls == 0);
+    CHECK(admit_text_then_permit(10, acquire).status == TextAdmitStatus::Busy);
+    CHECK(acquire_calls == 1);
+    holder.reset();
+
+    TextAdmission at_cap = admit_text_then_permit(kApiMaxPromptTextBytes, acquire);
+    CHECK(at_cap.status == TextAdmitStatus::Admitted);
+    CHECK(at_cap.permit);
+    CHECK(acquire_calls == 2);
+}
+
+TEST_CASE("handler order: the chat route asks for its permit through the text cap") {
+    const std::string src = read_file(API_SERVER_CPP_PATH);
+    const std::string chat =
+        slice(src, "req.path == \"/v1/chat/completions\"", "EmbeddingApi embedding_api;");
+    const size_t cap = chat.find("admit_text_then_permit(");
+    const size_t direct = chat.find("acquire_compute_job_or_busy()");
+    REQUIRE(cap != std::string::npos);
+    REQUIRE(direct != std::string::npos);
+    CHECK(cap < direct); // the only acquisition is the callback of the capped admission
+    CHECK(chat.find("413 Payload Too Large") != std::string::npos);
+}
+
+// ---- 4. /api/pull: admission first, zero bytes when busy ------------------------------------
+
+TEST_CASE("pull admission: permit busy is 503 with zero bytes written and the gate released") {
+    ComputeJobAdmission admission;
+    ApiPullGate gate;
+    auto other_job = admission.try_acquire(); // an inference holds the slot
+    REQUIRE(other_job);
+
+    size_t bytes_written = 0;
+    bool download_started = false;
+    PullAdmission a = admit_pull(gate, [&] { return admission.try_acquire(); });
+    if (a.status == PullAdmitStatus::Admitted) { // what the handler does after admission
+        bytes_written += 64;                     // the "pulling manifest" line
+        download_started = true;
+    }
+    CHECK(a.status == PullAdmitStatus::Busy);
+    CHECK(bytes_written == 0);
+    CHECK_FALSE(download_started);
+    CHECK_FALSE(a.permit);
+    CHECK_FALSE(a.gate.owns_lock());
+    CHECK(gate.try_acquire().owns_lock()); // a later pull is not locked out by the refused one
+    other_job.reset();
+}
+
+TEST_CASE("pull admission: gate busy is 409, admitted holds both until release()") {
+    ComputeJobAdmission admission;
+    ApiPullGate gate;
+    PullAdmission first = admit_pull(gate, [&] { return admission.try_acquire(); });
+    REQUIRE(first.status == PullAdmitStatus::Admitted);
+    CHECK(first.permit);
+    CHECK(first.gate.owns_lock());
+
+    int asked = 0;
+    PullAdmission second = admit_pull(gate, [&] {
+        ++asked;
+        return admission.try_acquire();
+    });
+    CHECK(second.status == PullAdmitStatus::PullInProgress);
+    CHECK(asked == 0); // a second pull does not even reach for the permit
+    CHECK_FALSE(admission.try_acquire());
+
+    first.release(); // before the final reply write
+    CHECK(admission.try_acquire());
+    CHECK(gate.try_acquire().owns_lock());
+}
+
+TEST_CASE("handler order: handle_pull admits before the stream opens and before the download") {
+    const std::string src = read_file(API_SERVER_CPP_PATH);
+    const std::string pull =
+        slice(src, "void handle_pull(", "// \"200 OK\" -> 200 for the activity record.");
+    const size_t admit = pull.find("admit_pull(");
+    const size_t stream = pull.find("std::make_unique<PullJsonStream>");
+    const size_t download = pull.find("DownloadAsync(");
+    REQUIRE(admit != std::string::npos);
+    REQUIRE(stream != std::string::npos);
+    REQUIRE(download != std::string::npos);
+    CHECK(admit < stream);
+    CHECK(stream < download);
+    // No second, late acquisition after the download.
+    CHECK(pull.find("acquire_compute_job_or_busy()", download) == std::string::npos);
+    CHECK(pull.find("503 Service Unavailable", admit) < stream);
+}
+
+// ---- 5. /v1/preferences quotas ---------------------------------------------------------------
+
+TEST_CASE("preferences quota: a flood stays bounded, the window slides") {
+    PreferenceQuota quota;
+    const auto t0 = PreferenceQuota::Clock::now();
+    int ok = 0;
+    int limited = 0;
+    for (int i = 0; i < 1000; ++i) {
+        const auto v = quota.admit(200, 0, t0 + std::chrono::milliseconds(i));
+        ok += v == PreferenceQuota::Verdict::Ok;
+        limited += v == PreferenceQuota::Verdict::RateLimited;
+    }
+    CHECK(ok == kPreferenceMaxPerWindow);
+    CHECK(limited == 1000 - kPreferenceMaxPerWindow);
+    // A window later it admits again.
+    CHECK(quota.admit(200, 0, t0 + kPreferenceWindow + std::chrono::seconds(2)) ==
+          PreferenceQuota::Verdict::Ok);
+}
+
+TEST_CASE("preferences quota: body size and file size are refused before the rate") {
+    PreferenceQuota quota;
+    const auto now = PreferenceQuota::Clock::now();
+    CHECK(quota.admit(kPreferenceMaxBody, 0, now) == PreferenceQuota::Verdict::Ok);
+    CHECK(quota.admit(kPreferenceMaxBody + 1, 0, now) == PreferenceQuota::Verdict::TooLarge);
+    CHECK(quota.admit(10, kPreferenceMaxStoreBytes, now) == PreferenceQuota::Verdict::StoreFull);
+    CHECK(quota.admit(10, kPreferenceMaxStoreBytes - 10, now) == PreferenceQuota::Verdict::Ok);
+    // Refusals for size do not eat the rate budget.
+    PreferenceQuota fresh;
+    for (int i = 0; i < 100; ++i)
+        CHECK(fresh.admit(kPreferenceMaxBody + 1, 0, now) == PreferenceQuota::Verdict::TooLarge);
+    CHECK(fresh.admit(10, 0, now) == PreferenceQuota::Verdict::Ok);
+}
+
+TEST_CASE("handler order: handle_preferences checks the quota before it parses or writes") {
+    const std::string src = read_file(API_SERVER_CPP_PATH);
+    const std::string prefs =
+        slice(src, "std::string handle_preferences(", "// GET /v1/training/status");
+    const size_t quota = prefs.find("quota.admit(");
+    const size_t parse = prefs.find("JsonObject::TryParse");
+    const size_t write = prefs.find("append_preference_sample_file");
+    REQUIRE(quota != std::string::npos);
+    CHECK(quota < parse);
+    CHECK(quota < write);
+    CHECK(prefs.find("acquire_compute_job") ==
+          std::string::npos); // no permit: inference is not blocked
+}
+
+// ---- 6. model spellings ----------------------------------------------------------------------
+
+namespace {
+struct StubEntry {
+    std::wstring name;
+    std::wstring env; // stands in for ManifestEntry::env
+};
+} // namespace
+
+TEST_CASE("model spelling: an unknown spelling is not servable (404), none is folded or merged") {
+    const std::wstring declared = L"D:\\DevelopmentFiles\\xllama\\models\\qwen35-9b";
+    const std::vector<StubEntry> manifest{{L"qwen35-9b", L"A=1"}, {declared, L"A=2"}};
+    const auto known = [&](const std::string& model, const std::string& resident = "",
+                           const std::string& hint = "") {
+        const std::wstring w(model.begin(), model.end());
+        return path_spelling_known(model, find_model_spelling(manifest, w) != nullptr, resident,
+                                   hint);
+    };
+    CHECK(known("D:\\DevelopmentFiles\\xllama\\models\\qwen35-9b"));
+    // Other spellings of the same file are unknown: case, slash direction, drive letter, a trailing
+    // slash.
+    CHECK_FALSE(known("d:\\DevelopmentFiles\\xllama\\models\\qwen35-9b"));
+    CHECK_FALSE(known("D:/DevelopmentFiles/xllama/models/qwen35-9b"));
+    CHECK_FALSE(known("D:\\DevelopmentFiles\\xllama\\models\\qwen35-9b\\"));
+    CHECK_FALSE(known("D:\\DevelopmentFiles\\xllama\\models\\Qwen35-9B"));
+    CHECK_FALSE(known("E:\\anything\\else"));
+    CHECK_FALSE(known(""));
+    // The resident model and the operator's model.txt hint are exact matches too.
+    CHECK(known("E:\\resident", "E:\\resident"));
+    CHECK_FALSE(known("E:\\resident2", "E:\\resident"));
+    CHECK(known("E:\\hint", "", "E:\\hint"));
+    CHECK_FALSE(known("E:\\hint ", "", "E:\\hint"));
+}
+
+TEST_CASE("model spelling: a declared alias keeps its own entry and env") {
+    const std::vector<StubEntry> manifest{{L"qwen35-9b", L"XLLAMA_ATTN_GPU=1"},
+                                          {L"D:\\m\\qwen35-9b", L"XLLAMA_ATTN_GPU=0"},
+                                          {L"d:\\m\\qwen35-9b", L"LLAMA_KV_ON_DEVICE=1"}};
+    const StubEntry* bare = find_model_spelling(manifest, L"qwen35-9b");
+    const StubEntry* upper = find_model_spelling(manifest, L"D:\\m\\qwen35-9b");
+    const StubEntry* lower = find_model_spelling(manifest, L"d:\\m\\qwen35-9b");
+    REQUIRE(bare);
+    REQUIRE(upper);
+    REQUIRE(lower);
+    CHECK(bare->env == L"XLLAMA_ATTN_GPU=1");
+    CHECK(upper->env == L"XLLAMA_ATTN_GPU=0"); // not merged into the bare id or its case variant
+    CHECK(lower->env == L"LLAMA_KV_ON_DEVICE=1");
+    CHECK(bare != upper);
+    CHECK(upper != lower);
+    CHECK(find_model_spelling(manifest, L"QWEN35-9B") == nullptr);
+    CHECK(find_model_spelling(manifest, L"D:\\m\\QWEN35-9B") == nullptr);
+}
+
+TEST_CASE("model spelling: what counts as a path") {
+    CHECK(model_id_is_path("D:\\m\\x"));
+    CHECK(model_id_is_path("/mnt/x"));
+    CHECK(model_id_is_path("a:b"));
+    CHECK_FALSE(model_id_is_path("qwen35-9b"));
+    CHECK_FALSE(model_id_is_path(""));
+}
+
+TEST_CASE("handler order: model_servable_locked no longer admits any path unconditionally") {
+    const std::string src = read_file(API_SERVER_CPP_PATH);
+    const std::string fn =
+        slice(src, "bool model_servable_locked(", "std::string model_not_found(");
+    CHECK(fn.find("path_spelling_known(") != std::string::npos);
+    // A bare id is a directory of exactly that name, not whatever the filesystem folds it to.
+    CHECK(fn.find("filename().string() != model") != std::string::npos);
+}
