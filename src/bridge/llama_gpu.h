@@ -10,6 +10,7 @@
 #include "gguf.h"
 #include "llama.h"
 #include "xllama/ggml_d3d12.h"
+#include "xllama/inference_params.h"
 #include "xllama/platform.h"
 #include "xllama/speculative.h"
 
@@ -201,6 +202,30 @@ inline void set_env_str(const char* name, const char* v) {
         if (kv.first == name)
             return;
     put_env(name, v);
+}
+
+// The expert cache's cumulative counters (llama.cpp patch 0027); `present` stays false without a
+// cache or without the patch. A request's own figures: end.since(begin).
+inline ExpertStats expert_stats_snapshot(const llama_model* model) {
+    ExpertStats s;
+#ifdef LLAMA_HAS_EXPERT_STATS
+    llama_expert_stats raw = {};
+    raw.size = sizeof(raw);
+    if (llama_model_expert_stats(model, &raw)) {
+        s.present = true;
+        s.hits = raw.hits;
+        s.misses = raw.misses;
+        s.swaps = raw.swaps;
+        s.em_swaps = raw.em_swaps;
+        s.bytes = raw.bytes;
+        s.read_us = raw.read_us;
+        s.em_reads = raw.em_reads;
+        s.em_bytes = raw.em_bytes;
+    }
+#else
+    (void)model;
+#endif
+    return s;
 }
 
 inline void apply_gguf_residency(bool stream, llama_model_params& mparams, int expert_slots = 0,

@@ -249,6 +249,10 @@ HttpRequest read_request(StreamSocket const& socket) {
 // one thread-pool thread.
 thread_local ::xllama::ReplyDeadlineMark t_reply_deadline;
 
+// Where the request this thread serves was, in ms since its socket was accepted (api_timings.h):
+// the permit, the first and the last token. Same thread as t_reply_deadline, same reason.
+thread_local ::xllama::RequestStamps t_stamps;
+
 // Store and flush what `writer` holds (`bytes` of it) within http_write_deadline.
 // Past it the operation is cancelled and this throws, which every caller already
 // handles as «the client is gone»; an error from the store itself throws as before.
@@ -501,7 +505,7 @@ class SseStream {
                          JsonValue::CreateNumberValue(result.n_prompt + result.n_eval));
             add_reasoning_usage(usage, result);
             const JsonObject timings =
-                JsonObject::Parse(winrt::to_hstring(::xllama::api_timings_json(result)));
+                JsonObject::Parse(winrt::to_hstring(::xllama::api_timings_json(result, &t_stamps)));
             send_chunk(JsonObject{}, JsonValue::CreateStringValue(winrt::hstring(reason)), &usage,
                        &timings);
             end();
@@ -911,8 +915,8 @@ std::string completion_json(const std::string& model, JsonObject const& message,
     resp.Insert(L"model", JsonValue::CreateStringValue(winrt::to_hstring(model)));
     resp.Insert(L"choices", choices);
     resp.Insert(L"usage", usage);
-    resp.Insert(L"timings",
-                JsonObject::Parse(winrt::to_hstring(::xllama::api_timings_json(result))));
+    resp.Insert(L"timings", JsonObject::Parse(
+                                winrt::to_hstring(::xllama::api_timings_json(result, &t_stamps))));
     status = "200 OK";
     return winrt::to_string(resp.Stringify());
 }
@@ -993,7 +997,9 @@ std::string handle_tool_proposal_locked(JsonObject const& root, ::xllama::ToolRe
     gp.grammar = std::move(grammar); // ADR 0005: the template's own constraint
     append_client_stops(root, gp.stop_sequences);
 
+    const auto t_gen0 = std::chrono::steady_clock::now();
     const ::xllama::InferenceResult generated = session->generate(gp);
+    t_stamps.generated(t_gen0, std::chrono::steady_clock::now(), generated.t_first_token_ms);
     if (!generated.success) {
         status = "500 Internal Server Error";
         return error_json("generation failed: " + generated.error_msg);
@@ -1252,12 +1258,15 @@ std::string handle_chat_locked(const std::string& body, const char*& status,
         // stream withholds any suffix that could still become a stop.
         ::xllama::StopSequenceFilter stop_filter(gp.stop_sequences);
         gp.on_token = [&sse, &stop_filter](std::string_view piece) {
+            t_stamps.first(std::chrono::steady_clock::now());
             const std::string text = stop_filter.push(piece);
             if (!text.empty())
                 sse->write_delta(text);
         };
         try {
+            const auto t_gen0 = std::chrono::steady_clock::now();
             const ::xllama::InferenceResult r = session->generate(gp);
+            t_stamps.generated(t_gen0, std::chrono::steady_clock::now(), r.t_first_token_ms);
             // 200 is already on the wire: only the stream can report the outcome.
             // A client that disconnected aborts the loop; the partial result is
             // still a success, and the finish write is dropped by the dead socket.
@@ -1284,7 +1293,9 @@ std::string handle_chat_locked(const std::string& body, const char*& status,
         }
         return std::string(); // handle_connection must not write a second response
     }
+    const auto t_gen0 = std::chrono::steady_clock::now();
     const ::xllama::InferenceResult r = session->generate(gp);
+    t_stamps.generated(t_gen0, std::chrono::steady_clock::now(), r.t_first_token_ms);
     if (!r.success) {
         status = "500 Internal Server Error";
         return error_json("generation failed: " + r.error_msg);
@@ -2401,6 +2412,7 @@ void handle_connection(StreamSocket const& socket, uint64_t generation,
                 write_response(socket, "503 Service Unavailable", error_json("busy"));
                 return;
             }
+            t_stamps.permit(std::chrono::steady_clock::now()); // the compute permit and the session
             // stop/rebind may have happened after this callback was queued. Do
             // not let an old listener recreate the lazily-owned Session.
             bool active_generation = false;
@@ -2595,6 +2607,8 @@ void handle_connection(StreamSocket const& socket, uint64_t generation,
 // thread is only the bounded-gate 503; every other reply runs on the work item.
 void dispatch_connection(StreamSocket const& socket, uint64_t generation,
                          const std::string& api_key) {
+    const auto accepted =
+        std::chrono::steady_clock::now(); // the stamps of the reply count from here
     auto slot = ::xllama::process_api_connection_gate().try_acquire();
     if (!slot) {
         try {
@@ -2607,9 +2621,11 @@ void dispatch_connection(StreamSocket const& socket, uint64_t generation,
     auto held = std::make_shared<::xllama::ApiConnectionGate::Handle>(std::move(slot));
     try {
         winrt::Windows::System::Threading::ThreadPool::RunAsync(
-            [socket, generation, held, api_key](winrt::Windows::Foundation::IAsyncAction const&) {
+            [socket, generation, held, api_key,
+             accepted](winrt::Windows::Foundation::IAsyncAction const&) {
                 auto client = activity().client();
                 t_reply_deadline.begin();
+                t_stamps.begin(accepted);
                 handle_connection(socket, generation, api_key);
                 // After a write deadline nothing else ends the connection: the
                 // cancelled store kept the socket open with no FIN for the

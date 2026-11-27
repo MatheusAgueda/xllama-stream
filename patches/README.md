@@ -572,6 +572,24 @@ at 4K, 320 MiB at 16K), or the buffer is write-combined and CPU reads of it
 crawl. The memory moves from the CPU heap to D3D12_Host. Unset, the placement is
 upstream's.
 
+`0027-expert-cache-stats.patch` (applies after 0026; `include/llama.h`, `src/llama-model.cpp`,
+`src/llama-expert-cache.{h,cpp}`; instruments only, no op changes): `llama_model_expert_stats(model,
+&stats)` (`LLAMA_HAS_EXPERT_STATS`) copies the expert cache's cumulative counters - hits, misses, swaps,
+expert-major swaps, bytes read, read microseconds (the last load op's time included: the stats line
+adds it the same way), expert-major reads and bytes - into a caller struct whose first field is its own
+`size` (a smaller struct from an older header is filled up to its size; fields are only appended).
+`false` when the model has no cache. The counters are the existing atomics; nothing new is counted. The
+bridge (`llama_gpu.h` `expert_stats_snapshot`, `Session::generate` and `run_inference_llama`) takes one
+snapshot when a request starts and one when it ends, and the API reply's `timings` carries the
+difference as `"expert":{"hits":..,"misses":..,"swaps":..,"em_swaps":..,"bytes":..,"read_us":..,
+"em_reads":..,"em_bytes":..}`, only for a model with a cache (`include/xllama/api_timings.h`). The same
+`timings` gains `"stamps":{"permit_ms":..,"first_ms":..,"last_ms":..}`, ms since the socket was
+accepted: the compute permit and the session granted, the first generated token (measured in the
+stream callback when streaming, else derived from `t_first_token_ms`), and generate() returning. The
+snapshots are taken while no graph runs (one inference at a time, one context per model), so the
+difference is exact; a counter read costs one relaxed atomic load each, twice per request. Host test:
+`expert cache: decodes like the resident model` checks the snapshot against the final stats line.
+
 ## Applying
 
 ```bash

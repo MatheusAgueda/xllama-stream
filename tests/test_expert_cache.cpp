@@ -239,6 +239,11 @@ struct EcRun {
     uint32_t n_ubatch = 0;
     std::vector<llama_token> tokens;
     std::vector<float> logits; // after the prompt
+    // llama_model_expert_stats (patch 0027): the cumulative counters after the prompt and after the
+    // last token, taken just before the context goes
+    bool has_stats = false;
+    llama_expert_stats after_prompt = {};
+    llama_expert_stats at_end = {};
 };
 
 // used_override > 0 replaces the model's experts-per-token, which is what bounds
@@ -297,6 +302,8 @@ EcRun run_greedy(const char* path, uint32_t slots, uint32_t n_ubatch, int64_t us
             const int32_t head = split > 0 && split < n ? split : 0;
             bool ok = head == 0 || llama_decode(ctx, llama_batch_get_one(toks.data(), head)) == 0;
             ok = ok && llama_decode(ctx, llama_batch_get_one(toks.data() + head, n - head)) == 0;
+            r.after_prompt.size = sizeof(r.after_prompt);
+            r.has_stats = llama_model_expert_stats(model, &r.after_prompt);
             for (int i = 0; ok && i < n_gen; ++i) {
                 const float* lg = llama_get_logits_ith(ctx, -1);
                 if (i == 0)
@@ -309,6 +316,8 @@ EcRun run_greedy(const char* path, uint32_t slots, uint32_t n_ubatch, int64_t us
                 ok = llama_decode(ctx, llama_batch_get_one(&r.tokens.back(), 1)) == 0;
             }
             r.ok = ok;
+            r.at_end.size = sizeof(r.at_end);
+            llama_model_expert_stats(model, &r.at_end);
         }
         llama_free(ctx);
     }
@@ -501,11 +510,19 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
         REQUIRE(plain.ok);
         CHECK(plain.n_ubatch == cached.n_ubatch);
         long long plain_misses = -1;
+        // The per-request counters are the stats line's: the snapshot before the context goes
+        // agrees with the line the cache logs when the model is freed (nothing ran in between)
+        REQUIRE(plain.has_stats);
+        CHECK(plain.at_end.hits >= plain.after_prompt.hits);
+        CHECK(plain.at_end.misses >= plain.after_prompt.misses);
+        CHECK(plain.at_end.bytes > 0);
+        CHECK(plain.at_end.swaps == 0);
         {
             std::lock_guard<std::mutex> lock(log.mtx);
             MESSAGE(log.final_line);
             plain_misses = misses_of(log.final_line);
             CHECK(plain_misses > 0);
+            CHECK(static_cast<long long>(plain.at_end.misses) == plain_misses);
             CHECK(prefetched_of(log.final_line) == -1);
             const IoStats io = io_of(log.final_line);
             CHECK(io.direct >= 0);
@@ -650,6 +667,10 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
             CHECK(swaps_of(log.final_line) > 0);
             CHECK(misses_of(log.final_line) >= 0);
             CHECK(misses_of(log.final_line) < plain_misses);
+            // the snapshot says the same (expert-major swaps are not in the line's count)
+            REQUIRE(swapped.has_stats);
+            CHECK(static_cast<long long>(swapped.at_end.swaps) == swaps_of(log.final_line));
+            CHECK(static_cast<long long>(swapped.at_end.misses) == misses_of(log.final_line));
         }
 
         // Swap tail (LLAMA_EXPERT_SWAP_TAIL): the weakest ranks of the top-k take
