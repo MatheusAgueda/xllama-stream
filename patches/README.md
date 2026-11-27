@@ -590,6 +590,23 @@ snapshots are taken while no graph runs (one inference at a time, one context pe
 difference is exact; a counter read costs one relaxed atomic load each, twice per request. Host test:
 `expert cache: decodes like the resident model` checks the snapshot against the final stats line.
 
+`0028-expert-cache-route-hash.patch` (applies after 0027; `include/llama.h`, `src/llama-model.cpp`,
+`src/llama-expert-cache.{h,cpp}`; instruments only): a 64-bit FNV-1a hash of the routing the cache
+actually served. Per layer, a chain over the FINAL expert ids (after cache-aware swaps; int16 LE, in
+token order) of every token the layer saw, taken where the plan pins them (so the GPU route's replay
+and the CPU path hash the same ids) and in the expert-major prep for prompt ubatches (hashed once, at
+`pos == 0`, so a prompt split into other ubatches hashes the same). The request's value folds the layers
+in layer-id order (4 bytes layer id LE, then the layer's 8 bytes LE). `llama_expert_stats` gains
+`route_hash` and `route_n` (the (token, layer) pairs covered; appended, so an older caller's struct is
+unaffected) and `llama_model_expert_route_reset(model)` restarts the chains (`LLAMA_HAS_EXPERT_ROUTE_HASH`).
+The bridge resets as a request starts, and the reply's `expert` object gains `"route":"<16 hex>"` and
+`"route_n":N` (a hex string: JSON numbers are doubles in a WinRT client). A turn that reuses the KV
+cache hashes only the tokens it computed. Equal prompt, sampling and cache state give equal `route`
+(the same calls, whatever their ubatch size or path; a prompt cut into other decode calls is another
+request: the last layer computes only each call's output token); a different route with the same
+tokens is a routing change. Cost: one multiply and xor per id byte, 2
+bytes per id, `n_used` ids per token per layer.
+
 ## Applying
 
 ```bash

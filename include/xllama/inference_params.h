@@ -212,6 +212,11 @@ struct ExpertStats {
     uint64_t read_us = 0;  ///< Wall time of the load ops.
     uint64_t em_reads = 0; ///< Expert tensors read by expert-major ubatches.
     uint64_t em_bytes = 0; ///< Their bytes.
+    /// FNV-1a 64 over the FINAL expert ids of every (token, layer) of the request (patch 0028);
+    /// not a difference: the bridge restarts it at the request's start. 0 when the patch is absent.
+    uint64_t route_hash = 0;
+    uint64_t route_n = 0; ///< The (token, layer) pairs it covers.
+    bool has_route = false;
 
     /// This snapshot minus `before` (a counter that went down reads 0).
     ExpertStats since(const ExpertStats& before) const {
@@ -226,6 +231,9 @@ struct ExpertStats {
         r.read_us = d(read_us, before.read_us);
         r.em_reads = d(em_reads, before.em_reads);
         r.em_bytes = d(em_bytes, before.em_bytes);
+        r.route_hash = route_hash; // a running chain, restarted per request: copied, not subtracted
+        r.route_n = route_n;
+        r.has_route = has_route;
         return r;
     }
 };

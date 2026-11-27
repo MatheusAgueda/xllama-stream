@@ -73,6 +73,31 @@ TEST_CASE("expert stats: since() is a per-request delta and never goes negative"
     CHECK_FALSE(end.since(xllama::ExpertStats{}).present);
 }
 
+TEST_CASE("api timings: the route hash is a 16-digit hex string, copied and not subtracted") {
+    xllama::ExpertStats begin;
+    begin.present = true;
+    begin.has_route = true; // the bridge restarts the chain before taking `begin`: route 0, n 0
+    xllama::ExpertStats end = begin;
+    end.route_hash = 0xcbf29ce484222325ULL; // a value past 2^53: a double would lose its low bits
+    end.route_n = 160;
+    const xllama::ExpertStats d = end.since(begin);
+    CHECK(d.has_route);
+    CHECK(d.route_hash == 0xcbf29ce484222325ULL);
+    CHECK(d.route_n == 160);
+
+    xllama::InferenceResult result;
+    result.expert = d;
+    const std::string json = xllama::api_timings_json(result);
+    CHECK(json.find(R"("route":"cbf29ce484222325","route_n":160}})") != std::string::npos);
+    // small values keep their leading zeros
+    result.expert.route_hash = 0xabc;
+    CHECK(xllama::api_timings_json(result).find(R"("route":"0000000000000abc")") !=
+          std::string::npos);
+    // a library without patch 0028 has no route: the object stays as it was
+    result.expert.has_route = false;
+    CHECK(xllama::api_timings_json(result).find("route") == std::string::npos);
+}
+
 TEST_CASE("api timings: request stamps in ms since accept, unset ones left out") {
     using Clock = std::chrono::steady_clock;
     using ms = std::chrono::milliseconds;

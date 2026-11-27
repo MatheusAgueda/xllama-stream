@@ -1,0 +1,173 @@
+diff --git a/include/llama.h b/include/llama.h
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -44,6 +44,9 @@
+ // llama_model_expert_stats exists (xllama patch 0027-expert-cache-stats)
+ #define LLAMA_HAS_EXPERT_STATS 1
+ 
++// llama_expert_stats::route_hash / route_n and llama_model_expert_route_reset exist (xllama patch 0028)
++#define LLAMA_HAS_EXPERT_ROUTE_HASH 1
++
+ #define LLAMA_FILE_MAGIC_GGLA 0x67676c61u // 'ggla'
+ #define LLAMA_FILE_MAGIC_GGSN 0x6767736eu // 'ggsn'
+ #define LLAMA_FILE_MAGIC_GGSQ 0x67677371u // 'ggsq'
+@@ -633,11 +636,20 @@
+         uint64_t read_us;   // wall time of the load ops (their slowest thread), the last one included
+         uint64_t em_reads;  // expert tensors read by expert-major ubatches
+         uint64_t em_bytes;  //   and their bytes
++        // patch 0028: a 64-bit FNV-1a of the experts that actually ran (after any cache-aware swap), per
++        // layer in token order, folded over the layers in layer order, since the model was loaded or
++        // llama_model_expert_route_reset; route_n = the (token, layer) pairs hashed. Equal routes, equal
++        // hash: a hash is a fingerprint of a whole request, not a counter - do not subtract two of them.
++        uint64_t route_hash;
++        uint64_t route_n;
+     };
+ 
+     // false when the model has no expert cache (or size is 0); out is untouched then
+     LLAMA_API bool llama_model_expert_stats(const struct llama_model * model, struct llama_expert_stats * out);
+ 
++    // restart the route hash (and route_n) at a request's start; no graph may be running (patch 0028)
++    LLAMA_API void llama_model_expert_route_reset(const struct llama_model * model);
++
+     // Get the model's RoPE frequency scaling factor
+     LLAMA_API float llama_model_rope_freq_scale_train(const struct llama_model * model);
+ 
+diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
+--- a/src/llama-expert-cache.cpp
++++ b/src/llama-expert-cache.cpp
+@@ -211,9 +211,24 @@
+     return std::min((int32_t) (2.0 * std::log2((double) d)), EC_RD_BUCKETS - 1);
+ }
+ 
++// 64-bit FNV-1a: the route hash of a request (llama_expert_stats::route_hash). Per layer it runs over
++// the experts that ran, each as its low 16 bits little-endian, the tokens of the layer in order
++static constexpr uint64_t EC_FNV_BASIS = 0xcbf29ce484222325ull;
++static constexpr uint64_t EC_FNV_PRIME = 0x100000001b3ull;
++
++static inline uint64_t ec_fnv_byte(uint64_t h, uint32_t b) {
++    return (h ^ (uint64_t) (b & 0xff)) * EC_FNV_PRIME;
++}
++
++static inline uint64_t ec_fnv_id(uint64_t h, int32_t e) {
++    return ec_fnv_byte(ec_fnv_byte(h, (uint32_t) e), (uint32_t) e >> 8);
++}
++
+ struct ec_layer {
+     llama_expert_cache * cache = nullptr;
+     int32_t id = -1;
++    uint64_t route_h = EC_FNV_BASIS; // the route hash of this layer's experts since the last reset
++    uint64_t route_n = 0;            //   and the tokens it covers
+     std::vector<size_t>   tensors;   // indices into llama_expert_cache::tensors
+     std::vector<int32_t>  slot_of;   // expert -> slot, -1 if not resident
+     std::vector<int32_t>  expert_of; // slot -> expert, -1 if empty
+@@ -1748,10 +1763,12 @@
+ 
+     // resident experts: pin them for this ubatch
+     uint64_t hits = 0;
++    uint64_t rh = L.route_h; // the route hash takes the ids as they are, in the pass that reads them anyway
+     for (int64_t i1 = 0; i1 < n_tokens; ++i1) {
+         for (int64_t i0 = 0; i0 < n_used; ++i0) {
+             const int32_t e = ec_id_at(ids, i0, i1);
+             GGML_ASSERT(e >= 0 && e < n_expert);
++            rh = ec_fnv_id(rh, e);
+             const int32_t s = L.slot_of[e];
+             if (s >= 0 && L.used[s] != tick) {
+                 L.used[s] = tick;
+@@ -1763,6 +1780,8 @@
+             }
+         }
+     }
++    L.route_h = rh;
++    L.route_n += (uint64_t) n_tokens;
+     // the candidates' values do not change while the misses below take slots (a taken slot is
+     // pinned): decay them once
+     if (lrfu) {
+@@ -2580,14 +2599,25 @@
+     E.first.resize((size_t) n_expert);
+     E.pairs.resize((size_t) (n_used*n_tokens));
+     uint64_t h = 1469598103934665603ull ^ (uint64_t) n_tokens; // FNV-1a of the ids
++    // the route hash (llama_expert_stats): the layer's first expert tensor takes the ids, as the plan
++    // does for a small ubatch, so the hash does not depend on how the prompt was split into ubatches
++    const bool route = E.pos == 0;
++    uint64_t   rh    = L.route_h;
+     for (int64_t i1 = 0; i1 < n_tokens; ++i1) {
+         for (int64_t i0 = 0; i0 < n_used; ++i0) {
+             const int32_t e = ec_id_at(ids, i0, i1);
+             GGML_ASSERT(e >= 0 && e < n_expert);
+             E.count[e]++;
+             h = (h ^ (uint64_t) (uint32_t) e) * 1099511628211ull;
++            if (route) {
++                rh = ec_fnv_id(rh, e);
++            }
+         }
+     }
++    if (route) {
++        L.route_h = rh;
++        L.route_n += (uint64_t) n_tokens;
++    }
+     E.list.clear();
+     int32_t at = 0;
+     for (int32_t e = 0; e < n_expert; ++e) {
+@@ -3212,9 +3242,33 @@
+     }
+     s.em_reads = cache.em_reads.load();
+     s.em_bytes = cache.em_bytes.load();
++    // the layers' hashes folded in layer order: the layer id (4 bytes), then its hash (8), little-endian
++    std::vector<const ec_layer *> by_id;
++    for (const auto & it : cache.layers) {
++        by_id.push_back(it.second.get());
++        s.route_n += it.second->route_n;
++    }
++    std::sort(by_id.begin(), by_id.end(), [](const ec_layer * a, const ec_layer * b) { return a->id < b->id; });
++    uint64_t h = EC_FNV_BASIS;
++    for (const ec_layer * l : by_id) {
++        for (int i = 0; i < 4; ++i) {
++            h = ec_fnv_byte(h, (uint32_t) l->id >> (8*i));
++        }
++        for (int i = 0; i < 8; ++i) {
++            h = ec_fnv_byte(h, (uint32_t) (l->route_h >> (8*i)));
++        }
++    }
++    s.route_hash = h;
+     memcpy(out, &s, std::min(out->size, sizeof(s)));
+ }
+ 
++void llama_expert_cache_route_reset(llama_expert_cache & cache) {
++    for (auto & it : cache.layers) {
++        it.second->route_h = EC_FNV_BASIS;
++        it.second->route_n = 0;
++    }
++}
++
+ uint32_t llama_expert_cache_n_slots(const llama_expert_cache & cache) {
+     return cache.n_slots;
+ }
+diff --git a/src/llama-expert-cache.h b/src/llama-expert-cache.h
+--- a/src/llama-expert-cache.h
++++ b/src/llama-expert-cache.h
+@@ -60,6 +60,9 @@
+ // the cumulative counters (llama_model_expert_stats): fills out up to out->size bytes
+ void llama_expert_cache_stats(const llama_expert_cache & cache, llama_expert_stats * out);
+ 
++// restart the route hash of llama_expert_stats (patch 0028)
++void llama_expert_cache_route_reset(llama_expert_cache & cache);
++
+ // predicted experts per token read ahead, 0 when prefetch is off
+ uint32_t llama_expert_cache_prefetch(const llama_expert_cache & cache);
+ 
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -3406,6 +3406,12 @@
+     return true;
+ }
+ 
++void llama_model_expert_route_reset(const struct llama_model * model) {
++    if (model != nullptr && model->expert_cache) {
++        llama_expert_cache_route_reset(*model->expert_cache);
++    }
++}
++
+ int32_t llama_model_n_devices(const struct llama_model * model) {
+     return (int32_t)model->devices.size();
+ }

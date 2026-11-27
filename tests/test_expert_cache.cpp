@@ -517,6 +517,15 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
         CHECK(plain.at_end.misses >= plain.after_prompt.misses);
         CHECK(plain.at_end.bytes > 0);
         CHECK(plain.at_end.swaps == 0);
+        // The route hash (patch 0028): same prompt, same routing -> same hash, however the run is
+        // otherwise configured (cached and plain agree: swap ratio 0 serves the router's own ids),
+        // and the decode moved it
+        CHECK(plain.at_end.route_n > plain.after_prompt.route_n);
+        CHECK(plain.at_end.route_n > 0);
+        CHECK(plain.at_end.route_hash != plain.after_prompt.route_hash);
+        CHECK(plain.at_end.route_hash == cached.at_end.route_hash);
+        CHECK(plain.at_end.route_n == cached.at_end.route_n);
+        CHECK(plain.after_prompt.route_hash == cached.after_prompt.route_hash);
         {
             std::lock_guard<std::mutex> lock(log.mtx);
             MESSAGE(log.final_line);
@@ -1112,6 +1121,19 @@ TEST_CASE(
             CHECK(s.kept > 0);
         CHECK(s.kept <= s.reads);
         CHECK(misses_of(final_line) > 0); // the decode
+        {
+            // The route hash does not depend on how the prompt was cut into ubatches nor on the
+            // expert-major path: one 64-token expert-major ubatch against the plain path's
+            // cap-sized ones, the same ids reach the same per-layer chain. (A prompt cut into
+            // several decode calls is not the same request: the last layer computes each call's
+            // output token.)
+            const EcRun noem = run_greedy(path, c.slots, 512, c.used, 24, 0.0f, c.split);
+            REQUIRE(noem.ok);
+            CHECK(em.at_end.route_n > 0);
+            CHECK(em.at_end.route_hash == noem.at_end.route_hash);
+            CHECK(em.at_end.route_n == noem.at_end.route_n);
+            CHECK(em.after_prompt.route_hash == noem.after_prompt.route_hash);
+        }
         // auto (the default): any resident expert may come from the file
         CHECK(s.mode == "auto");
         CHECK(s.from_file >= 0);

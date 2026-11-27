@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <iomanip>
 #include <locale>
 #include <sstream>
@@ -79,7 +80,15 @@ inline std::string api_timings_json(const InferenceResult& result,
         out << ",\"expert\":{\"hits\":" << e.hits << ",\"misses\":" << e.misses
             << ",\"swaps\":" << e.swaps << ",\"em_swaps\":" << e.em_swaps
             << ",\"bytes\":" << e.bytes << ",\"read_us\":" << e.read_us
-            << ",\"em_reads\":" << e.em_reads << ",\"em_bytes\":" << e.em_bytes << "}";
+            << ",\"em_reads\":" << e.em_reads << ",\"em_bytes\":" << e.em_bytes;
+        if (e.has_route) {
+            // A hex string: a JSON number is a double in a WinRT client and loses bits past 2^53.
+            char hex[17];
+            std::snprintf(hex, sizeof(hex), "%016llx",
+                          static_cast<unsigned long long>(e.route_hash));
+            out << ",\"route\":\"" << hex << "\",\"route_n\":" << e.route_n;
+        }
+        out << "}";
     }
     out << "}";
     return out.str();

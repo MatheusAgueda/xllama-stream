@@ -535,6 +535,7 @@ InferenceResult run_inference_llama(const InferenceParams& params) {
     tokens.resize(static_cast<size_t>(n_tokens));
 
     log_output(("[xllama] prompt tokens: " + std::to_string(tokens.size()) + "\n").c_str());
+    expert_route_reset(model.get());
     const ExpertStats expert_before = expert_stats_snapshot(model.get());
     const auto t_prompt0 = std::chrono::steady_clock::now();
     // Prefill chunking and the context guard live in decode_loop.h — see there
