@@ -1,6 +1,7 @@
 // Copyright (c) 2024 Gianluca Mazza
 // SPDX-License-Identifier: MIT
 
+#include "xllama/batch_policy.h"
 #include "xllama/chat_prompt.h"
 #include "xllama/path_utils.h"
 #include "xllama/session.h"
@@ -15,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 
 TEST_CASE("SessionHub: failed create leaves the hub empty and bumps generation") {
     auto& hub = xllama::session_hub();
@@ -1084,7 +1086,10 @@ TEST_CASE("Session: batched prefill matches per-prompt generate (opt-in: XLLAMA_
         const std::vector<xllama::GenerateParams> sub(reqs.begin(), reqs.begin() + k);
         const auto got = batched->generate_batch(sub);
         REQUIRE(got.size() == static_cast<size_t>(k));
-        int shared_n = 0;
+        int shortest = got[0].n_prompt;
+        for (const auto& r : got)
+            shortest = std::min(shortest, r.n_prompt);
+        const int e = shortest - 1; // equal counts shared, the rest alone
         for (int i = 0; i < k; ++i) {
             CAPTURE(i);
             REQUIRE_MESSAGE(got[i].success, got[i].error_msg);
@@ -1092,10 +1097,12 @@ TEST_CASE("Session: batched prefill matches per-prompt generate (opt-in: XLLAMA_
             CHECK(got[i].batch.index == i);
             CHECK(got[i].batch.ms > 0.0);
             CHECK(got[i].t_p_eval_ms >= got[i].batch.ms);
-            shared_n += got[i].n_prompt - 1;
+            CHECK(got[i].batch.n_tokens == k * e);
+            CHECK(got[i].batch.n_shared_decodes == 1); // default n_batch holds it all
+            CHECK(got[i].batch.own_n == got[i].n_prompt - e);
+            CHECK(got[i].batch.own_decodes == 1);
             same(got[i], lone[static_cast<size_t>(i)]);
         }
-        CHECK(got[0].batch.n_tokens == shared_n);
     }
 
     // The single-sequence path on the multi-sequence context, after a batch:
@@ -1124,6 +1131,136 @@ TEST_CASE("Session: batched prefill matches per-prompt generate (opt-in: XLLAMA_
     CHECK_FALSE(rejected[1].success);
     CHECK(rejected[1].error_msg.find("outside the vocabulary") != std::string::npos);
     CHECK(rejected[0].error_msg.find("batch rejected") != std::string::npos);
+}
+
+namespace {
+xllama::GenerateParams b3_chat(const std::string& user, int n_predict) {
+    xllama::GenerateParams gp;
+    gp.prompt = "<|im_start|>user\n" + user + "<|im_end|>\n<|im_start|>assistant\n";
+    gp.n_predict = n_predict;
+    gp.temperature = 0;
+    gp.logprobs = true;
+    return gp;
+}
+
+// A batching session with a small logical batch, so the shared prefill takes
+// several chunks: n_batch 24 over k = 3 is 8 tokens per sequence per decode.
+constexpr int kB3SmallBatch = 24;
+std::unique_ptr<xllama::Session> b3_small_batch_session(const char* model, std::string& error) {
+    xllama::SessionParams sp;
+    sp.model_path = model;
+    sp.n_ctx = 512;
+    sp.n_threads = 2;
+    sp.n_batch = kB3SmallBatch;
+    sp.n_ubatch = kB3SmallBatch;
+    sp.env = {{"XLLAMA_BATCH_SEQS", "3"}};
+    return xllama::Session::create(sp, &error);
+}
+} // namespace
+
+// B3: the shared part takes the same count E = shortest - 1 from every sequence,
+// so with prompts of three different lengths it is ceil(3 E / n_batch) decodes,
+// and each request's own pass (its remaining <= n_batch tokens) is one.
+TEST_CASE(
+    "Session: batched prefill decode counts with unequal prompts (opt-in: XLLAMA_TEST_MODEL)") {
+    const char* model = std::getenv("XLLAMA_TEST_MODEL");
+    if (!model)
+        return;
+    std::string error;
+    auto s = b3_small_batch_session(model, error);
+    REQUIRE_MESSAGE(s, error);
+    REQUIRE(s->batch_seqs() == 3);
+    const std::vector<xllama::GenerateParams> reqs = {
+        b3_chat("Say hello.", 12),
+        b3_chat("Count from one to five in words.", 12),
+        b3_chat("Name the planet closest to the Sun and give one fact about it.", 12),
+    };
+    const auto got = s->generate_batch(reqs);
+    REQUIRE(got.size() == 3);
+    for (const auto& r : got)
+        REQUIRE_MESSAGE(r.success, r.error_msg);
+    const int len0 = got[0].n_prompt, len1 = got[1].n_prompt, len2 = got[2].n_prompt;
+    CAPTURE(len0);
+    CAPTURE(len1);
+    CAPTURE(len2);
+    // The case needs three lengths, more than one shared chunk, and every
+    // remainder within one n_batch.
+    REQUIRE(len0 < len1);
+    REQUIRE(len1 < len2);
+    const int e = len0 - 1;
+    REQUIRE(3 * e > kB3SmallBatch);
+    REQUIRE(len2 - e <= kB3SmallBatch);
+    const int expect_shared = (3 * e + kB3SmallBatch - 1) / kB3SmallBatch;
+    const xllama::BatchPrefillPlan plan =
+        xllama::batch_prefill_plan({len0, len1, len2}, kB3SmallBatch);
+    CHECK(plan.n_shared_decodes() == expect_shared);
+    for (int i = 0; i < 3; ++i) {
+        CAPTURE(i);
+        CHECK(got[i].batch.n_tokens == 3 * e);
+        CHECK(got[i].batch.n_shared_decodes == expect_shared);
+        CHECK(got[i].batch.own_n == got[i].n_prompt - e);
+        CHECK(got[i].batch.own_decodes == 1);
+    }
+    // And the replies are the lone ones, on the same small-batch context.
+    for (int i = 0; i < 3; ++i) {
+        CAPTURE(i);
+        const auto lone = s->generate(reqs[static_cast<size_t>(i)]);
+        REQUIRE_MESSAGE(lone.success, lone.error_msg);
+        REQUIRE(lone.logprobs.size() == got[i].logprobs.size());
+        for (size_t t = 0; t < lone.logprobs.size(); ++t) {
+            CAPTURE(t);
+            CHECK(lone.logprobs[t].id == got[i].logprobs[t].id);
+        }
+        CHECK(lone.output_text == got[i].output_text);
+    }
+}
+
+// B3 isolation: a neighbour's prompt never reaches another sequence. [A, B, C]
+// and [A, B', C], B' a different prompt of a different length (A stays the
+// shortest, so the shared count E is the same): A's and C's tokens AND
+// logprobs are identical, bit for bit.
+TEST_CASE(
+    "Session: a batched neighbour does not change another reply (opt-in: XLLAMA_TEST_MODEL)") {
+    const char* model = std::getenv("XLLAMA_TEST_MODEL");
+    if (!model)
+        return;
+    std::string error;
+    auto s = b3_small_batch_session(model, error);
+    REQUIRE_MESSAGE(s, error);
+    const xllama::GenerateParams a = b3_chat("Say hello.", 16);
+    const xllama::GenerateParams b = b3_chat("Count from one to five in words.", 16);
+    const xllama::GenerateParams b2 =
+        b3_chat("List three colours of the rainbow, one per line, and nothing else at all.", 16);
+    const xllama::GenerateParams c =
+        b3_chat("Name the planet closest to the Sun and give one fact about it.", 16);
+    const auto one = s->generate_batch({a, b, c});
+    const auto two = s->generate_batch({a, b2, c});
+    REQUIRE(one.size() == 3);
+    REQUIRE(two.size() == 3);
+    for (int i = 0; i < 3; ++i) {
+        REQUIRE_MESSAGE(one[i].success, one[i].error_msg);
+        REQUIRE_MESSAGE(two[i].success, two[i].error_msg);
+    }
+    REQUIRE(one[1].n_prompt != two[1].n_prompt);
+    REQUIRE(one[0].n_prompt < one[1].n_prompt);
+    REQUIRE(one[0].n_prompt < two[1].n_prompt);
+    REQUIRE(one[0].n_prompt < one[2].n_prompt);
+    CHECK(one[0].batch.n_tokens == two[0].batch.n_tokens);
+    for (const int i : {0, 2}) {
+        CAPTURE(i);
+        const auto& x = one[static_cast<size_t>(i)];
+        const auto& y = two[static_cast<size_t>(i)];
+        REQUIRE(x.logprobs.size() == static_cast<size_t>(x.n_eval));
+        REQUIRE(x.logprobs.size() == y.logprobs.size());
+        for (size_t t = 0; t < x.logprobs.size(); ++t) {
+            CAPTURE(t);
+            CHECK(x.logprobs[t].id == y.logprobs[t].id);
+            CHECK(x.logprobs[t].logprob == y.logprobs[t].logprob); // exact
+            CHECK(x.logprobs[t].argmax == y.logprobs[t].argmax);
+        }
+        CHECK(x.output_text == y.output_text);
+    }
+    CHECK(one[1].output_text != two[1].output_text);
 }
 
 // B3 off (XLLAMA_BATCH_SEQS unset, the default): the session reports one

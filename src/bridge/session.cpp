@@ -1176,39 +1176,30 @@ class LlamaSession final : public Session {
         return m_batch_seqs;
     }
 
-    // Every prompt but its last token, decoded in shared batches: sequence i
-    // holds request i at positions 0..len_i-2. Each chunk gives every sequence
-    // that still has tokens an equal share of n_batch, so split_equal (hybrid
-    // memory) cuts the chunk into few ubatches. No outputs are requested: the
-    // last tokens are decoded one per sequence afterwards.
+    // The shared part of batch_prefill_plan: positions [0, plan.shared) of every
+    // prompt, sequence i = request i. Every chunk holds the same count from every
+    // sequence, so split_equal (hybrid memory) forms its ubatches without a
+    // per-length tail. No outputs: the logits come from each own pass.
     bool prefill_shared(llama_context* ctx, const std::vector<std::vector<llama_token>>& toks,
-                        InferenceWatchdog& wd) {
+                        const BatchPrefillPlan& plan, InferenceWatchdog& wd, int& n_decodes) {
         const int k = static_cast<int>(toks.size());
-        const int n_batch = std::max(1, static_cast<int>(llama_n_batch(ctx)));
-        std::vector<int> done(static_cast<size_t>(k), 0);
-        const auto left = [&](int i) {
-            return static_cast<int>(toks[static_cast<size_t>(i)].size()) - 1 -
-                   done[static_cast<size_t>(i)];
-        };
-        llama_batch batch = llama_batch_init(n_batch, 0, 1);
-        int n_total = 0;
+        int widest = 0;
+        for (const int c : plan.shared_chunks)
+            widest = std::max(widest, c);
+        if (widest == 0)
+            return true;
+        llama_batch batch = llama_batch_init(widest * k, 0, 1);
+        int done = 0;
         bool ok = true;
-        for (;;) {
-            int n_active = 0;
-            for (int i = 0; i < k; ++i)
-                n_active += left(i) > 0 ? 1 : 0;
-            if (n_active == 0)
-                break;
+        for (const int c : plan.shared_chunks) {
             if (wd.aborted()) {
                 ok = false;
                 break;
             }
-            const int share = std::max(1, n_batch / n_active);
             int n = 0;
-            for (int i = 0; i < k && n < n_batch; ++i) {
-                const int take = std::min({left(i), share, n_batch - n});
-                for (int t = 0; t < take; ++t) {
-                    const int pos = done[static_cast<size_t>(i)] + t;
+            for (int i = 0; i < k; ++i)
+                for (int t = 0; t < c; ++t) {
+                    const int pos = done + t;
                     batch.token[n] = toks[static_cast<size_t>(i)][static_cast<size_t>(pos)];
                     batch.pos[n] = static_cast<llama_pos>(pos);
                     batch.n_seq_id[n] = 1;
@@ -1216,15 +1207,49 @@ class LlamaSession final : public Session {
                     batch.logits[n] = 0;
                     ++n;
                 }
-                done[static_cast<size_t>(i)] += std::max(0, take);
-            }
             batch.n_tokens = n;
+            ++n_decodes;
             if (llama_decode(ctx, batch) != 0) {
                 ok = false;
                 break;
             }
-            n_total += n;
-            wd.note_prefill_chunk(n_total);
+            done += c;
+            wd.note_prefill_chunk(done * k);
+        }
+        llama_batch_free(batch);
+        return ok;
+    }
+
+    // One request's own pass: positions [from, len) of `toks` on `seq`, alone,
+    // in chunks of at most n_batch; only the prompt's last token has logits
+    // (the first sample reads them).
+    bool prefill_own(llama_context* ctx, const std::vector<llama_token>& toks, int from,
+                     llama_seq_id seq, InferenceWatchdog& wd, int& n_decodes) {
+        const int len = static_cast<int>(toks.size());
+        const int n_batch = std::max(1, static_cast<int>(llama_n_batch(ctx)));
+        llama_batch batch = llama_batch_init(std::min(n_batch, len - from), 0, 1);
+        bool ok = true;
+        for (int pos = from; pos < len;) {
+            if (wd.aborted()) {
+                ok = false;
+                break;
+            }
+            const int n = std::min(n_batch, len - pos);
+            for (int t = 0; t < n; ++t) {
+                batch.token[t] = toks[static_cast<size_t>(pos + t)];
+                batch.pos[t] = static_cast<llama_pos>(pos + t);
+                batch.n_seq_id[t] = 1;
+                batch.seq_id[t][0] = seq;
+                batch.logits[t] = pos + t == len - 1 ? 1 : 0;
+            }
+            batch.n_tokens = n;
+            ++n_decodes;
+            if (llama_decode(ctx, batch) != 0) {
+                ok = false;
+                break;
+            }
+            pos += n;
+            wd.note_prefill_chunk(pos - from);
         }
         llama_batch_free(batch);
         return ok;
@@ -1275,16 +1300,23 @@ class LlamaSession final : public Session {
                 return fail_all("batch rejected: request " + std::to_string(i) + " is empty");
             }
         }
-        // One unified KV holds every sequence: while request i decodes, the
-        // later ones' prefixes are still resident. Worst case is request 0:
-        // all prefixes + its last token + one generated token.
-        // tail[i] = cells the sequences after i hold.
+        // Equal counts from every prompt in the shared decodes, the rest alone
+        // (batch_policy.h). One unified KV holds every sequence: while request
+        // i runs, the later ones' shared prefixes (plan.shared cells each) are
+        // still resident; the earlier ones are gone. tail[i] = cells the
+        // sequences after i hold.
+        std::vector<int> lengths(static_cast<size_t>(k));
+        for (int i = 0; i < k; ++i)
+            lengths[static_cast<size_t>(i)] = static_cast<int>(toks[static_cast<size_t>(i)].size());
+        const BatchPrefillPlan plan =
+            batch_prefill_plan(lengths, static_cast<int>(llama_n_batch(ctx)));
         std::vector<int> tail(static_cast<size_t>(k) + 1, 0);
         for (int i = k - 1; i >= 0; --i)
-            tail[static_cast<size_t>(i)] = tail[static_cast<size_t>(i) + 1] +
-                                           static_cast<int>(toks[static_cast<size_t>(i)].size()) -
-                                           1;
-        const int need = tail[0] + 1 + 1;
+            tail[static_cast<size_t>(i)] = tail[static_cast<size_t>(i) + 1] + plan.shared;
+        int need = k * plan.shared;
+        for (int i = 0; i < k; ++i) // its prompt + one generated token
+            need = std::max(need,
+                            lengths[static_cast<size_t>(i)] + 1 + tail[static_cast<size_t>(i) + 1]);
         if (need > m_n_ctx)
             return fail_all("prompt too long: the batch needs " + std::to_string(need) +
                             " cells, n_ctx=" + std::to_string(m_n_ctx));
@@ -1302,12 +1334,12 @@ class LlamaSession final : public Session {
         const ExpertStats shared_before = expert_stats_snapshot(m_model.get());
         BatchPrefillInfo info;
         info.k = k;
-        info.n_tokens = tail[0];
+        info.n_tokens = k * plan.shared;
         {
             InferenceWatchdog wd(g0.progress(), g0.abort_flag);
             wd.enter_prefill(info.n_tokens);
             const auto t0 = std::chrono::steady_clock::now();
-            if (!prefill_shared(ctx, toks, wd)) {
+            if (!prefill_shared(ctx, toks, plan, wd, info.n_shared_decodes)) {
                 std::string err = "prompt decode failed";
                 const bool stalled = wd.stalled();
                 if (stalled)
@@ -1327,8 +1359,9 @@ class LlamaSession final : public Session {
         {
             char lb[160];
             snprintf(lb, sizeof(lb),
-                     "[xllama] session generate_batch: k=%d shared prefill %.1fms (%d tok)\n", k,
-                     info.ms, info.n_tokens);
+                     "[xllama] session generate_batch: k=%d shared prefill %.1fms (%d tok, %d "
+                     "decodes)\n",
+                     k, info.ms, info.n_tokens, info.n_shared_decodes);
             log_output(lb);
         }
 
@@ -1340,19 +1373,22 @@ class LlamaSession final : public Session {
             const int len = static_cast<int>(tokens.size());
             res.batch = info;
             res.batch.index = i;
+            res.batch.own_n = len - plan.shared;
             res.n_prompt = len;
             res.n_p_eval = len;
 
             expert_route_reset(m_model.get());
             const ExpertStats expert_before = expert_stats_snapshot(m_model.get());
             InferenceWatchdog wd(gp.progress(), gp.abort_flag);
-            wd.enter_prefill(1);
-            const auto t_last0 = std::chrono::steady_clock::now();
-            // The last prompt token, with its logits row: the first sample reads it.
-            const bool last_ok = !wd.aborted() && detail::decode_one(ctx, tokens.back(), seq);
-            const double own_ms = std::chrono::duration<double, std::milli>(
-                                      std::chrono::steady_clock::now() - t_last0)
-                                      .count();
+            wd.enter_prefill(res.batch.own_n);
+            const auto t_own0 = std::chrono::steady_clock::now();
+            // The rest of the prompt, alone; its last token has the logits row
+            // the first sample reads.
+            const bool last_ok =
+                prefill_own(ctx, tokens, plan.shared, seq, wd, res.batch.own_decodes);
+            const double own_ms =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_own0)
+                    .count();
             res.t_p_eval_ms = info.ms + own_ms;
             if (!last_ok) {
                 res.stalled = wd.stalled();
@@ -1361,7 +1397,7 @@ class LlamaSession final : public Session {
                 llama_memory_seq_rm(mem, seq, -1, -1);
                 continue;
             }
-            wd.prefill_done(1, own_ms);
+            wd.prefill_done(res.batch.own_n, own_ms);
 
             // A fresh chain per request, as a full-prompt generate() builds.
             LlamaSamplerPtr sampler(llama_sampler_chain_init(llama_sampler_chain_default_params()));
@@ -1374,7 +1410,7 @@ class LlamaSession final : public Session {
             const std::unordered_set<llama_token> preserved = preserved_ids(vocab, gp);
             std::vector<llama_token> history(tokens.begin(), tokens.end());
 
-            // #173 per sequence: its own cells and the later prefixes still resident.
+            // #173 per sequence: its own cells and the later shared prefixes.
             const int room = m_n_ctx - len - tail[static_cast<size_t>(i) + 1];
             const int n_predict_eff = std::max(0, std::min(gp.n_predict, room));
             const auto t_decode0 = std::chrono::steady_clock::now();
@@ -1437,9 +1473,10 @@ class LlamaSession final : public Session {
                 log_output("[xllama] session generate_batch: " + res.error_msg + "\n");
             char lb[200];
             snprintf(lb, sizeof(lb),
-                     "[xllama] session generate_batch: seq %d n=%d last=%.1fms decode=%.1fms "
-                     "drafted=%d spec_accept=%d\n",
-                     i, dlr.n_generated, own_ms, res.t_eval_ms, dlr.n_drafted, dlr.n_accepted);
+                     "[xllama] session generate_batch: seq %d n=%d own=%d tok/%d decodes "
+                     "%.1fms decode=%.1fms drafted=%d spec_accept=%d\n",
+                     i, dlr.n_generated, res.batch.own_n, res.batch.own_decodes, own_ms,
+                     res.t_eval_ms, dlr.n_drafted, dlr.n_accepted);
             log_output(lb);
             if (!removed || dlr.rewind_failed || res.stalled) {
                 llama_memory_clear(mem, true);

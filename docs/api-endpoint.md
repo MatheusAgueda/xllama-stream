@@ -284,8 +284,10 @@ Series S (2026-10-16, `lfm25-1.2b-instruct`, 52-token reply): first byte at 11 m
 ### Batched chat (`POST /v1/xllama/batch`)
 
 For eval clients: up to k chat requests of one model in one call. The prompts are prefilled
-together (one sequence each, all but their last token, in shared batches), then each reply is
-decoded alone, in request order. Measured on the Series X 35B MoE, whose experts stream from
+together, one sequence each: the shared decodes take the same number of tokens from every
+prompt (the shortest prompt minus one), so llama.cpp never splits them into per-length
+ubatches. Then, in request order, each request decodes the rest of its prompt alone and its
+reply. Measured on the Series X 35B MoE, whose experts stream from
 the SSD: 2 prompts per batch cost 0.651x a lone prefill each, 4 prompts 0.420x.
 
 ```json
@@ -295,9 +297,10 @@ the SSD: 2 prompts per batch cost 0.651x a lone prefill each, 4 prompts 0.420x.
 
 The answer is `{"results": [...]}`, one entry per request in order. Each entry is the body
 `/v1/chat/completions` would return for that request. Its `timings` add a `batch` object:
-`k`, `index`, `prefill_ms` and `prefill_n` (the shared prefill, repeated in every entry), and
-the shared prefill's expert counters when the model has an expert cache. `timings.prefill_ms`
-is the shared prefill plus this request's own last-token decode. `decode_ms`, `expert` and
+`k`, `index`, `prefill_ms`, `prefill_n` and `n_shared_decodes` (the shared prefill, repeated
+in every entry), `own_prefill_n` (this request's prompt tokens after the shared part), and the
+shared prefill's expert counters when the model has an expert cache. `timings.prefill_ms` is the
+shared prefill plus this request's own prompt pass. `decode_ms`, `expert` and
 `stamps` are this request's own.
 
 Each request is a stateless plain chat with the same validation as `/v1/chat/completions`.

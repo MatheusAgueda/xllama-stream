@@ -453,6 +453,80 @@ TEST_CASE("batch policy: the summed prompts plus the longest reply must fit n_ct
     CHECK(batch_admit_tokens({2000000000, 2000000000}, {1}, 4096) == BatchAdmit::TooManyTokens);
 }
 
+// The shared decodes take the same count from every sequence (no split_equal tail);
+// the rest of each prompt is its own pass.
+TEST_CASE(
+    "batch policy: the prefill plan shares equal counts and leaves the rest to each own pass") {
+    using V = std::vector<int>;
+    SUBCASE("equal lengths: everything but the last token is shared, one decode") {
+        const BatchPrefillPlan p = batch_prefill_plan({10, 10, 10}, 2048);
+        CHECK(p.shared == 9);
+        CHECK(p.shared_chunks == V{9});
+        CHECK(p.n_shared_decodes() == 1);
+        CHECK(p.own == V{1, 1, 1});
+        CHECK(p.own_decodes == V{1, 1, 1});
+    }
+    SUBCASE("a one-token prompt: E = 0, no shared decode, whole prompts alone") {
+        const BatchPrefillPlan p = batch_prefill_plan({1, 7, 12}, 2048);
+        CHECK(p.shared == 0);
+        CHECK(p.n_shared_decodes() == 0);
+        CHECK(p.own == V{1, 7, 12});
+        CHECK(p.own_decodes == V{1, 1, 1});
+    }
+    SUBCASE("four unequal lengths: E = shortest - 1 from each, in order") {
+        const BatchPrefillPlan p = batch_prefill_plan({13, 5, 20, 9}, 2048);
+        CHECK(p.shared == 4);
+        CHECK(p.shared_chunks == V{4});
+        CHECK(p.own == V{9, 1, 16, 5});
+        CHECK(p.own_decodes == V{1, 1, 1, 1});
+        // n_batch 8: 2 per sequence per chunk, ceil(4 * 4 / 8) = 2 decodes.
+        const BatchPrefillPlan q = batch_prefill_plan({13, 5, 20, 9}, 8);
+        CHECK(q.shared_chunks == V{2, 2});
+        CHECK(q.own_decodes == V{2, 1, 2, 1});
+    }
+    SUBCASE("a remainder above n_batch is chunked on its own sequence") {
+        const BatchPrefillPlan p = batch_prefill_plan({3, 40}, 16);
+        CHECK(p.shared == 2);
+        CHECK(p.shared_chunks == V{2});
+        CHECK(p.own == V{1, 38});
+        CHECK(p.own_decodes == V{1, 3});
+    }
+    SUBCASE("n_batch below k: no room for an equal chunk, nothing shared") {
+        const BatchPrefillPlan p = batch_prefill_plan({10, 10, 10}, 2);
+        CHECK(p.shared == 0);
+        CHECK(p.n_shared_decodes() == 0);
+        CHECK(p.own_decodes == V{5, 5, 5});
+    }
+    SUBCASE("k not dividing n_batch: ceil(E / floor(n_batch / k)) decodes") {
+        // n_batch 16, k 3: 5 per sequence (15 rows). E = 15 → 3 = ceil(45 / 16);
+        // E = 16 → 4, one above ceil(48 / 16) = 3.
+        CHECK(batch_prefill_plan({16, 16, 16}, 16).shared_chunks == V{5, 5, 5});
+        CHECK(batch_prefill_plan({17, 17, 17}, 16).shared_chunks == V{5, 5, 5, 1});
+    }
+    SUBCASE("invariants over a sweep") {
+        for (const int n_batch : {1, 2, 3, 7, 16, 512})
+            for (const V& lengths : {V{1}, V{2, 2}, V{5, 3, 9}, V{30, 31, 29, 100}, V{1, 1000}}) {
+                CAPTURE(n_batch);
+                const BatchPrefillPlan p = batch_prefill_plan(lengths, n_batch);
+                const int k = static_cast<int>(lengths.size());
+                int sum = 0;
+                for (const int c : p.shared_chunks) {
+                    CHECK(c > 0);
+                    CHECK(c * k <= n_batch);
+                    sum += c;
+                }
+                CHECK(sum == p.shared);
+                REQUIRE(p.own.size() == lengths.size());
+                for (size_t i = 0; i < lengths.size(); ++i) {
+                    CHECK(p.own[i] == lengths[i] - p.shared);
+                    CHECK(p.own[i] >= 1);
+                    CHECK(p.own_decodes[i] == (p.own[i] + n_batch - 1) / n_batch);
+                }
+            }
+    }
+    CHECK(batch_prefill_plan({}, 512).own.empty());
+}
+
 TEST_CASE("handler order: the batch route is behind auth and the text cap, and releases first") {
     const std::string src = read_file(API_SERVER_CPP_PATH);
     REQUIRE_FALSE(src.empty());

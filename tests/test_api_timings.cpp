@@ -163,10 +163,13 @@ TEST_CASE("api timings: a batch object only for a batched result (B3)") {
     result.batch.k = 3;
     result.batch.index = 1;
     result.batch.n_tokens = 18;
+    result.batch.n_shared_decodes = 1;
     result.batch.ms = 25.04;
+    result.batch.own_n = 4;
     CHECK(xllama::api_timings_json(result) ==
           R"({"prefill_ms":30.0,"decode_ms":5.0,"prompt_n":7,"predicted_n":2,)"
-          R"("batch":{"k":3,"index":1,"prefill_ms":25.0,"prefill_n":18}})");
+          R"("batch":{"k":3,"index":1,"prefill_ms":25.0,"prefill_n":18,"n_shared_decodes":1,)"
+          R"("own_prefill_n":4}})");
 
     result.batch.expert.present = true;
     result.batch.expert.hits = 4;
@@ -176,6 +179,7 @@ TEST_CASE("api timings: a batch object only for a batched result (B3)") {
     result.batch.ms = std::numeric_limits<double>::quiet_NaN();
     CHECK(xllama::api_timings_json(result) ==
           R"({"prefill_ms":30.0,"decode_ms":5.0,"prompt_n":7,"predicted_n":2,)"
-          R"("batch":{"k":3,"index":1,"prefill_ms":0.0,"prefill_n":18,)"
+          R"("batch":{"k":3,"index":1,"prefill_ms":0.0,"prefill_n":18,"n_shared_decodes":1,)"
+          R"("own_prefill_n":4,)"
           R"("expert":{"hits":4,"misses":1,"bytes":100,"read_us":9}}})");
 }
