@@ -90,6 +90,19 @@ inline std::string api_timings_json(const InferenceResult& result,
         }
         out << "}";
     }
+    // B3: only a batched result has it. prefill_ms above is the shared prefill plus this request's
+    // own pass (its prompt after the shared part); here is the shared part, which every result of
+    // the batch repeats, and the length of this request's own pass.
+    if (result.batch.k > 0) {
+        const BatchPrefillInfo& b = result.batch;
+        out << ",\"batch\":{\"k\":" << b.k << ",\"index\":" << b.index
+            << ",\"prefill_ms\":" << ms(b.ms) << ",\"prefill_n\":" << b.n_tokens
+            << ",\"n_shared_decodes\":" << b.n_shared_decodes << ",\"own_prefill_n\":" << b.own_n;
+        if (b.expert.present)
+            out << ",\"expert\":{\"hits\":" << b.expert.hits << ",\"misses\":" << b.expert.misses
+                << ",\"bytes\":" << b.expert.bytes << ",\"read_us\":" << b.expert.read_us << "}";
+        out << "}";
+    }
     out << "}";
     return out.str();
 }

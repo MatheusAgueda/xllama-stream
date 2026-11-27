@@ -238,6 +238,19 @@ struct ExpertStats {
     }
 };
 
+/// B3 (Session::generate_batch): the shared prefill one result took part in.
+/// k == 0 = not batched (every other path), and nothing else is meaningful.
+struct BatchPrefillInfo {
+    int k = 0;                // requests in the batch
+    int index = 0;            // this result's position in it
+    int n_tokens = 0;         // tokens the shared prefill decoded: k x (shortest prompt - 1)
+    int n_shared_decodes = 0; // llama_decode calls of the shared prefill
+    double ms = 0.0;          // wall time of the shared prefill
+    ExpertStats expert;       // expert-cache counters of the shared prefill
+    int own_n = 0;            // this request's own pass: its prompt tokens after the shared part
+    int own_decodes = 0;      // llama_decode calls of that own pass
+};
+
 /// Result of an inference call.
 struct InferenceResult {
     /// Whether generation succeeded.
@@ -317,6 +330,10 @@ struct InferenceResult {
     /// Per reply token, when the call asked for them (GenerateParams::logprobs
     /// or forced_tokens). Empty otherwise.
     std::vector<TokenLogprob> logprobs;
+
+    /// Set by Session::generate_batch only. t_p_eval_ms then = batch.ms + this
+    /// request's own pass (its prompt after the shared part); expert = this request's own counters.
+    BatchPrefillInfo batch;
 };
 
 } // namespace xllama

@@ -7,6 +7,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+- **Session / LAN API (B3):** a shared multi-sequence prefill. Set `XLLAMA_BATCH_SEQS=k` in
+  a model's catalogue `env`, and `Session::generate_batch` prefills up to k prompts together
+  (equal counts from every prompt, so llama.cpp's `split_equal` never cuts per-length tails),
+  then decodes each prompt's rest and its reply alone. `POST /v1/xllama/batch` serves it with chat's gates plus a
+  cap on the summed prompt tokens. Unset or 1 leaves every path as before.
+
 - **LAN API (security):** two auth phases chosen at run time by `LocalState/api-auth.txt`
   (phase 1, default: Bearer failures are counted per client at `GET /v1/auth/stats` and
   still served; phase 2, `enforce`: `401` everywhere but `/health`, a missing or short

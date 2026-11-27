@@ -28,6 +28,7 @@
     #include "xllama/api_policy.h"
     #include "xllama/api_pull_policy.h"
     #include "xllama/api_timings.h"
+    #include "xllama/batch_policy.h"
     #include "xllama/chat_prompt.h"
     #include "xllama/compute_admission.h"
     #include "xllama/force_ids.h"
@@ -886,7 +887,8 @@ JsonObject logprobs_json(const std::vector<::xllama::TokenLogprob>& lps) {
 std::string completion_json(const std::string& model, JsonObject const& message,
                             winrt::hstring const& finish_reason,
                             const ::xllama::InferenceResult& result, const char*& status,
-                            const std::vector<::xllama::TokenLogprob>* logprobs = nullptr) {
+                            const std::vector<::xllama::TokenLogprob>* logprobs = nullptr,
+                            const ::xllama::RequestStamps* stamps = nullptr) {
     JsonObject choice;
     choice.Insert(L"index", JsonValue::CreateNumberValue(0));
     choice.Insert(L"message", message);
@@ -915,8 +917,8 @@ std::string completion_json(const std::string& model, JsonObject const& message,
     resp.Insert(L"model", JsonValue::CreateStringValue(winrt::to_hstring(model)));
     resp.Insert(L"choices", choices);
     resp.Insert(L"usage", usage);
-    resp.Insert(L"timings", JsonObject::Parse(
-                                winrt::to_hstring(::xllama::api_timings_json(result, &t_stamps))));
+    resp.Insert(L"timings", JsonObject::Parse(winrt::to_hstring(::xllama::api_timings_json(
+                                result, stamps != nullptr ? stamps : &t_stamps))));
     status = "200 OK";
     return winrt::to_string(resp.Stringify());
 }
@@ -1039,100 +1041,59 @@ std::string handle_tool_proposal_locked(JsonObject const& root, ::xllama::ToolRe
                            status);
 }
 
-// Handles one chat request under session_hub().mtx (already locked by the caller).
-std::string handle_chat_locked(const std::string& body, const char*& status,
-                               ::xllama::ApiActivity::Ticket& ticket, StreamSocket const& socket,
-                               bool stream) {
-    JsonObject root{nullptr};
-    if (!JsonObject::TryParse(winrt::to_hstring(body), root) || root == nullptr) {
+// ---- one chat request, shared by /v1/chat/completions and the B3 batch route ----
+
+// messages[] of a chat request. Empty = read; otherwise the 400 body (status set).
+std::string read_chat_messages(JsonObject const& root, std::string& system,
+                               std::vector<::xllama::ChatTurn>& history, std::string& final_user,
+                               const char*& status) {
+    if (!root.HasKey(L"messages") ||
+        root.GetNamedValue(L"messages").ValueType() != JsonValueType::Array) {
         status = "400 Bad Request";
-        return error_json("invalid JSON body");
+        return error_json("missing or non-array 'messages'");
     }
-
-    // A tool proposal is parsed here and executed by the client. This process
-    // does not run tools. Plain chat (no schema, empty tools, tool_choice none)
-    // stays on ChatFormat below.
-    ::xllama::ToolRequest request = ::xllama::parse_tool_request(body);
-    if (!request.error.empty()) {
+    split_messages(root.GetNamedArray(L"messages"), system, history, final_user);
+    if (final_user.empty()) {
         status = "400 Bad Request";
-        return error_json(request.error);
+        return error_json("no user message to complete");
     }
-    const bool proposal = request.disposition == ::xllama::ApiToolDisposition::Proposal ||
-                          request.disposition == ::xllama::ApiToolDisposition::Legacy;
+    return std::string();
+}
 
-    std::string model = winrt::to_string(root.GetNamedString(L"model", L""));
-    if (model.empty())
-        model = read_local_text("model.txt"); // field-test fallback
-    if (model.empty()) {
+// max_tokens and the sampling numbers against the catalogue context, before any
+// model load (F01). Empty = valid; otherwise the 400 body (status set).
+std::string read_chat_limits(JsonObject const& root, int policy_n_ctx, int& n_predict,
+                             const char*& status) {
+    const ::xllama::ApiTokenLimit limit = read_max_tokens(root, policy_n_ctx);
+    if (!limit.error.empty()) {
         status = "400 Bad Request";
-        return error_json("missing 'model' (and no LocalState\\model.txt fallback)");
+        return error_json(limit.error);
     }
-    ticket.model(model);
-    if (!model_servable_locked(model)) {
-        status = "404 Not Found"; // OpenAI: model_not_found; was a 500 with a path
-        return error_json(model_not_found(model));
+    n_predict = limit.value;
+    const std::string sampling_error = check_sampling(root);
+    if (!sampling_error.empty()) {
+        status = "400 Bad Request";
+        return error_json(sampling_error);
     }
+    return std::string();
+}
 
-    std::string system, final_user;
-    std::vector<::xllama::ChatTurn> history;
-    if (!proposal) {
-        if (!root.HasKey(L"messages") ||
-            root.GetNamedValue(L"messages").ValueType() != JsonValueType::Array) {
-            status = "400 Bad Request";
-            return error_json("missing or non-array 'messages'");
-        }
-        split_messages(root.GetNamedArray(L"messages"), system, history, final_user);
-        if (final_user.empty()) {
-            status = "400 Bad Request";
-            return error_json("no user message to complete");
-        }
-    }
-    // Lazily (re)create the resident Session when the requested model differs
-    // (hub.mtx is held by the caller; the swap invalidates the GUI's KV-reuse
-    // state via hub.generation, which its next turn detects). Catalogue n_ctx
-    // / role (coding) apply the same policy as the chat UI.
-    ::xllama::Session* session = nullptr;
-    bool model_is_coding = false;
-    int policy_n_ctx = ::xllama::kDefaultNCtx;
-    int n_predict = 0;
-    {
-        std::string err;
-        const CatalogueSessionPolicy policy = catalogue_session_policy(model);
+// A chat request ready to generate: its format (stops, reply post-processing)
+// and its GenerateParams, prompt fitted to n_ctx.
+struct ChatPlan {
+    ::xllama::ChatFormat fmt;
+    ::xllama::GenerateParams gp;
+};
 
-        // Embedding models must not be used for chat completion.
-        if (policy.embedding) {
-            status = "400 Bad Request";
-            return error_json("model '" + model +
-                              "' is an embedding model and cannot be used for chat completions; "
-                              "use /api/embed or /v1/embeddings instead");
-        }
-
-        model_is_coding = policy.coding;
-        policy_n_ctx = policy.n_ctx;
-        const ::xllama::ApiTokenLimit limit = read_max_tokens(root, policy_n_ctx);
-        if (!limit.error.empty()) {
-            status = "400 Bad Request";
-            return error_json(limit.error);
-        }
-        n_predict = limit.value;
-        const std::string sampling_error = check_sampling(root);
-        if (!sampling_error.empty()) {
-            status = "400 Bad Request";
-            return error_json(sampling_error);
-        }
-        // ADR 0007: the GUI's resolver, adapter included (audit F03).
-        const ::xllama::SessionParams sp = ::xllama::CatalogueSessionParams(model);
-        session = ::xllama::session_hub().ensure_locked(model, sp, &err);
-        if (!session) {
-            status = "500 Internal Server Error";
-            return error_json("session create failed: " + err);
-        }
-    }
-
-    if (proposal)
-        return handle_tool_proposal_locked(root, request, session, model, model_is_coding,
-                                           policy_n_ctx, n_predict, ticket, status);
-
+// Everything between a resident session and generate(): system prompt default,
+// format and thinking, max_tokens/thinking budget, scoring, the prompt fitted to
+// n_ctx, sampling, prefix cache opt-in, client stops. Empty = planned; otherwise
+// the 400 body (status set).
+std::string plan_chat_locked(JsonObject const& root, ::xllama::Session* session,
+                             const std::string& model, bool model_is_coding, int policy_n_ctx,
+                             int n_predict, std::string system,
+                             const std::vector<::xllama::ChatTurn>& history,
+                             const std::string& final_user, ChatPlan& plan, const char*& status) {
     // Small instruct models degrade badly with an empty system turn (they
     // hallucinate the next role instead of answering); the chat UI always seeds
     // one. Match it when the client sends no system message — coding models get
@@ -1140,12 +1101,14 @@ std::string handle_chat_locked(const std::string& body, const char*& status,
     if (system.empty())
         system = model_is_coding ? ::xllama::kCodingSystemPrompt : ::xllama::kDefaultSystemPrompt;
 
-    ::xllama::ChatFormat fmt = ::xllama::chat_format_for(model);
+    ::xllama::ChatFormat& fmt = plan.fmt;
+    fmt = ::xllama::chat_format_for(model);
     // The tool path renders the GGUF's Jinja with this flag; plain chat used to
     // drop it, so a Qwen3.x hybrid answered without reasoning whatever was asked.
     if (const std::optional<bool> think = requested_thinking(root))
         ::xllama::request_thinking(fmt, model, *think);
-    ::xllama::GenerateParams gp;
+    ::xllama::GenerateParams& gp = plan.gp;
+    gp = ::xllama::GenerateParams{};
     gp.stop_sequences = fmt.stop_sequences;
     gp.reuse_kv = false; // OpenAI chat is stateless: messages[] carry full history
     // Validated above, before the model load: the budget below needs to know how
@@ -1225,6 +1188,116 @@ std::string handle_chat_locked(const std::string& body, const char*& status,
         }
     }
 
+    return std::string();
+}
+
+// The non-streamed chat.completion body of one finished generation.
+std::string chat_reply_json(const std::string& model, const ::xllama::ChatFormat& fmt,
+                            const ::xllama::GenerateParams& gp, const ::xllama::InferenceResult& r,
+                            const char*& status, const ::xllama::RequestStamps* stamps = nullptr) {
+    const std::string content = fmt.postprocess_output(r.output_text);
+
+    JsonObject message;
+    message.Insert(L"role", JsonValue::CreateStringValue(L"assistant"));
+    message.Insert(L"content", JsonValue::CreateStringValue(winrt::to_hstring(content)));
+    // "length" only when we actually hit the token cap; a model that ends on its
+    // EOS token before the cap stops naturally, which ended_with_stop (a textual
+    // stop-sequence match) does not capture — deduce it from the token count.
+    const bool hit_cap = r.n_eval >= gp.n_predict;
+    return completion_json(model, message, hit_cap ? L"length" : L"stop", r, status,
+                           gp.logprobs || !gp.forced_tokens.empty() ? &r.logprobs : nullptr,
+                           stamps);
+}
+
+// Handles one chat request under session_hub().mtx (already locked by the caller).
+std::string handle_chat_locked(const std::string& body, const char*& status,
+                               ::xllama::ApiActivity::Ticket& ticket, StreamSocket const& socket,
+                               bool stream) {
+    JsonObject root{nullptr};
+    if (!JsonObject::TryParse(winrt::to_hstring(body), root) || root == nullptr) {
+        status = "400 Bad Request";
+        return error_json("invalid JSON body");
+    }
+
+    // A tool proposal is parsed here and executed by the client. This process
+    // does not run tools. Plain chat (no schema, empty tools, tool_choice none)
+    // stays on ChatFormat below.
+    ::xllama::ToolRequest request = ::xllama::parse_tool_request(body);
+    if (!request.error.empty()) {
+        status = "400 Bad Request";
+        return error_json(request.error);
+    }
+    const bool proposal = request.disposition == ::xllama::ApiToolDisposition::Proposal ||
+                          request.disposition == ::xllama::ApiToolDisposition::Legacy;
+
+    std::string model = winrt::to_string(root.GetNamedString(L"model", L""));
+    if (model.empty())
+        model = read_local_text("model.txt"); // field-test fallback
+    if (model.empty()) {
+        status = "400 Bad Request";
+        return error_json("missing 'model' (and no LocalState\\model.txt fallback)");
+    }
+    ticket.model(model);
+    if (!model_servable_locked(model)) {
+        status = "404 Not Found"; // OpenAI: model_not_found; was a 500 with a path
+        return error_json(model_not_found(model));
+    }
+
+    std::string system, final_user;
+    std::vector<::xllama::ChatTurn> history;
+    if (!proposal) {
+        std::string bad = read_chat_messages(root, system, history, final_user, status);
+        if (!bad.empty())
+            return bad;
+    }
+    // Lazily (re)create the resident Session when the requested model differs
+    // (hub.mtx is held by the caller; the swap invalidates the GUI's KV-reuse
+    // state via hub.generation, which its next turn detects). Catalogue n_ctx
+    // / role (coding) apply the same policy as the chat UI.
+    ::xllama::Session* session = nullptr;
+    bool model_is_coding = false;
+    int policy_n_ctx = ::xllama::kDefaultNCtx;
+    int n_predict = 0;
+    {
+        std::string err;
+        const CatalogueSessionPolicy policy = catalogue_session_policy(model);
+
+        // Embedding models must not be used for chat completion.
+        if (policy.embedding) {
+            status = "400 Bad Request";
+            return error_json("model '" + model +
+                              "' is an embedding model and cannot be used for chat completions; "
+                              "use /api/embed or /v1/embeddings instead");
+        }
+
+        model_is_coding = policy.coding;
+        policy_n_ctx = policy.n_ctx;
+        std::string bad = read_chat_limits(root, policy_n_ctx, n_predict, status);
+        if (!bad.empty())
+            return bad;
+        // ADR 0007: the GUI's resolver, adapter included (audit F03).
+        const ::xllama::SessionParams sp = ::xllama::CatalogueSessionParams(model);
+        session = ::xllama::session_hub().ensure_locked(model, sp, &err);
+        if (!session) {
+            status = "500 Internal Server Error";
+            return error_json("session create failed: " + err);
+        }
+    }
+
+    if (proposal)
+        return handle_tool_proposal_locked(root, request, session, model, model_is_coding,
+                                           policy_n_ctx, n_predict, ticket, status);
+
+    ChatPlan plan;
+    {
+        std::string bad = plan_chat_locked(root, session, model, model_is_coding, policy_n_ctx,
+                                           n_predict, system, history, final_user, plan, status);
+        if (!bad.empty())
+            return bad;
+    }
+    const ::xllama::ChatFormat& fmt = plan.fmt;
+    ::xllama::GenerateParams& gp = plan.gp;
+
     // Every request check is done: from here on, a streamed reply owns the
     // socket. The head is written before SseStream exists, so a failure that is
     // provably byte-free can still answer with JSON.
@@ -1301,17 +1374,7 @@ std::string handle_chat_locked(const std::string& body, const char*& status,
         return error_json("generation failed: " + r.error_msg);
     }
     ticket.tokens(r.n_prompt, r.n_eval);
-    const std::string content = fmt.postprocess_output(r.output_text);
-
-    JsonObject message;
-    message.Insert(L"role", JsonValue::CreateStringValue(L"assistant"));
-    message.Insert(L"content", JsonValue::CreateStringValue(winrt::to_hstring(content)));
-    // "length" only when we actually hit the token cap; a model that ends on its
-    // EOS token before the cap stops naturally, which ended_with_stop (a textual
-    // stop-sequence match) does not capture — deduce it from the token count.
-    const bool hit_cap = r.n_eval >= gp.n_predict;
-    return completion_json(model, message, hit_cap ? L"length" : L"stop", r, status,
-                           gp.logprobs || !gp.forced_tokens.empty() ? &r.logprobs : nullptr);
+    return chat_reply_json(model, fmt, gp, r, status);
 }
 
 // The single model the server can currently serve: the resident one, else the
@@ -2295,6 +2358,214 @@ size_t chat_text_bytes(const std::string& body) {
     return json_string_bytes(root);
 }
 
+// ---------------------------------------------------------------------------
+// B3: POST /v1/xllama/batch — shared multi-sequence prefill (Session::generate_batch)
+// ---------------------------------------------------------------------------
+
+// A 400 for request i of a batch, from the chat helpers' own error body.
+std::string batch_item_error(size_t i, const std::string& item_json) {
+    return error_json("requests[" + std::to_string(i) + "]: " + error_text(item_json));
+}
+
+// {"model": M, "requests": [<chat.completions body>, ...]} → {"results": [<chat.completion>, ...]}
+// in request order. Under hub.mtx (the caller holds the permit and the lock, as for chat). Every
+// request is a stateless, non-streamed plain chat (no tools) of the batch's model: validated in
+// full — messages, max_tokens, sampling, thinking budget, force ids, prompt fitted to n_ctx —
+// before anything is generated, and the prompts plus the longest reply must fit n_ctx together.
+// More requests than the model's XLLAMA_BATCH_SEQS (1 when unset: one request) is a 400.
+std::string handle_batch_locked(const std::string& body, const char*& status,
+                                ::xllama::ApiActivity::Ticket& ticket) {
+    JsonObject root{nullptr};
+    if (!JsonObject::TryParse(winrt::to_hstring(body), root) || root == nullptr) {
+        status = "400 Bad Request";
+        return error_json("invalid JSON body");
+    }
+    std::string model =
+        root.HasKey(L"model") && root.GetNamedValue(L"model").ValueType() == JsonValueType::String
+            ? winrt::to_string(root.GetNamedString(L"model"))
+            : std::string();
+    if (model.empty())
+        model = read_local_text("model.txt"); // same fallback as chat
+    if (model.empty()) {
+        status = "400 Bad Request";
+        return error_json("missing 'model' (and no LocalState\\model.txt fallback)");
+    }
+    ticket.model(model);
+    if (!model_servable_locked(model)) {
+        status = "404 Not Found";
+        return error_json(model_not_found(model));
+    }
+    if (!root.HasKey(L"requests") ||
+        root.GetNamedValue(L"requests").ValueType() != JsonValueType::Array) {
+        status = "400 Bad Request";
+        return error_json("missing or non-array 'requests'");
+    }
+    const JsonArray items = root.GetNamedArray(L"requests");
+    const size_t k = items.Size();
+    // Before the model load: the hard ceiling no session exceeds.
+    switch (::xllama::batch_admit_count(k, ::xllama::kMaxBatchSeqs)) {
+    case ::xllama::BatchAdmit::Empty:
+        status = "400 Bad Request";
+        return error_json("'requests' is empty");
+    case ::xllama::BatchAdmit::TooMany:
+        status = "400 Bad Request";
+        return error_json("a batch holds at most " + std::to_string(::xllama::kMaxBatchSeqs) +
+                          " requests");
+    default:
+        break;
+    }
+    const CatalogueSessionPolicy policy = catalogue_session_policy(model);
+    if (policy.embedding) {
+        status = "400 Bad Request";
+        return error_json("model '" + model +
+                          "' is an embedding model and cannot be used for chat "
+                          "completions");
+    }
+
+    struct Item {
+        JsonObject root{nullptr};
+        std::string system, final_user;
+        std::vector<::xllama::ChatTurn> history;
+        int n_predict = 0;
+        ChatPlan plan;
+    };
+    std::vector<Item> work(k);
+    for (size_t i = 0; i < k; ++i) {
+        Item& it = work[i];
+        const IJsonValue v = items.GetAt(static_cast<uint32_t>(i));
+        if (v.ValueType() != JsonValueType::Object) {
+            status = "400 Bad Request";
+            return error_json("requests[" + std::to_string(i) + "]: not an object");
+        }
+        it.root = v.GetObject();
+        // One model per batch: a request naming another is the client's mistake, not a swap.
+        if (it.root.HasKey(L"model")) {
+            const IJsonValue m = it.root.GetNamedValue(L"model");
+            if (m.ValueType() != JsonValueType::String ||
+                winrt::to_string(m.GetString()) != model) {
+                status = "400 Bad Request";
+                return error_json("requests[" + std::to_string(i) +
+                                  "]: 'model' differs from the batch's");
+            }
+        }
+        if (it.root.HasKey(L"stream")) {
+            const IJsonValue sv = it.root.GetNamedValue(L"stream");
+            if (sv.ValueType() != JsonValueType::Boolean || sv.GetBoolean()) {
+                status = "400 Bad Request";
+                return error_json("requests[" + std::to_string(i) +
+                                  "]: a batch is not streamed ('stream' must be false or absent)");
+            }
+        }
+        const ::xllama::ToolRequest tools =
+            ::xllama::parse_tool_request(winrt::to_string(it.root.Stringify()));
+        if (!tools.error.empty() || tools.disposition != ::xllama::ApiToolDisposition::None) {
+            status = "400 Bad Request";
+            return error_json("requests[" + std::to_string(i) +
+                              "]: tools are not served in a batch (use /v1/chat/completions)");
+        }
+        std::string bad = read_chat_messages(it.root, it.system, it.history, it.final_user, status);
+        if (bad.empty())
+            bad = read_chat_limits(it.root, policy.n_ctx, it.n_predict, status);
+        if (!bad.empty())
+            return batch_item_error(i, bad);
+    }
+
+    ::xllama::Session* session = nullptr;
+    {
+        std::string err;
+        const ::xllama::SessionParams sp = ::xllama::CatalogueSessionParams(model);
+        session = ::xllama::session_hub().ensure_locked(model, sp, &err);
+        if (!session) {
+            status = "500 Internal Server Error";
+            return error_json("session create failed: " + err);
+        }
+    }
+    // The resident model's own sequence count: XLLAMA_BATCH_SEQS from its catalogue env.
+    const int seqs = session->batch_seqs();
+    if (::xllama::batch_admit_count(k, seqs) != ::xllama::BatchAdmit::Ok) {
+        status = "400 Bad Request";
+        return error_json("a batch of " + std::to_string(k) + " exceeds this model's " +
+                          std::to_string(seqs) + " sequence(s) (XLLAMA_BATCH_SEQS)");
+    }
+
+    std::vector<int> prompt_tokens(k), max_tokens(k);
+    for (size_t i = 0; i < k; ++i) {
+        Item& it = work[i];
+        std::string bad =
+            plan_chat_locked(it.root, session, model, policy.coding, policy.n_ctx, it.n_predict,
+                             it.system, it.history, it.final_user, it.plan, status);
+        if (!bad.empty())
+            return batch_item_error(i, bad);
+        prompt_tokens[i] = session->count_tokens(it.plan.gp.prompt);
+        max_tokens[i] = it.plan.gp.n_predict;
+    }
+    if (::xllama::batch_admit_tokens(prompt_tokens, max_tokens, policy.n_ctx) !=
+        ::xllama::BatchAdmit::Ok) {
+        int sum = 0, longest = 0;
+        for (size_t i = 0; i < k; ++i) {
+            sum += prompt_tokens[i];
+            longest = std::max(longest, max_tokens[i]);
+        }
+        status = "400 Bad Request";
+        return error_json("batch too long: the prompts need " + std::to_string(sum) +
+                          " tokens plus " + std::to_string(longest) +
+                          " for the longest reply, but n_ctx is " + std::to_string(policy.n_ctx));
+    }
+
+    // Each result gets its own first/last stamps from its own tokens; the permit is shared.
+    std::vector<::xllama::RequestStamps> stamps(k, t_stamps);
+    std::vector<::xllama::GenerateParams> gps;
+    gps.reserve(k);
+    for (size_t i = 0; i < k; ++i) {
+        ::xllama::GenerateParams gp = work[i].plan.gp;
+        ::xllama::RequestStamps* st = &stamps[i];
+        gp.on_token = [st](std::string_view) {
+            const auto now = std::chrono::steady_clock::now();
+            st->first(now);
+            st->last(now);
+        };
+        gps.push_back(std::move(gp));
+    }
+    const auto t_gen0 = std::chrono::steady_clock::now();
+    const std::vector<::xllama::InferenceResult> results = session->generate_batch(gps);
+    const auto t_gen1 = std::chrono::steady_clock::now();
+    t_stamps.generated(t_gen0, t_gen1, 0.0);
+    if (results.size() != k) {
+        status = "500 Internal Server Error";
+        return error_json("generation failed: batch returned " + std::to_string(results.size()) +
+                          " results for " + std::to_string(k) + " requests");
+    }
+
+    int n_prompt = 0, n_eval = 0;
+    size_t n_ok = 0;
+    std::string out = "{\"results\":[";
+    for (size_t i = 0; i < k; ++i) {
+        const ::xllama::InferenceResult& r = results[i];
+        if (i > 0)
+            out += ",";
+        if (!r.success) {
+            out += error_json("generation failed: " + r.error_msg);
+            continue;
+        }
+        ++n_ok;
+        n_prompt += r.n_prompt;
+        n_eval += r.n_eval;
+        if (stamps[i].first_ms < 0.0)
+            stamps[i].generated(t_gen0, t_gen1, r.t_first_token_ms);
+        const char* item_status = "200 OK";
+        out +=
+            chat_reply_json(model, work[i].plan.fmt, work[i].plan.gp, r, item_status, &stamps[i]);
+    }
+    out += "]}";
+    ticket.tokens(n_prompt, n_eval);
+    if (n_ok == 0) {
+        status = "500 Internal Server Error";
+        return error_json("generation failed: " + results.front().error_msg);
+    }
+    status = "200 OK"; // a failed request in a served batch is its own {"error":...} entry
+    return out;
+}
+
 // Serve one accepted socket. Runs on a thread-pool work item, never inline
 // in ConnectionReceived: the listener does not raise the next connection
 // until that callback returns, so an in-line SSE reply hid the permit from
@@ -2368,6 +2639,64 @@ void handle_connection(StreamSocket const& socket, uint64_t generation,
 
         if (req.method == "POST" && req.path == "/api/pull") {
             handle_pull(socket, req.body, generation);
+            return;
+        }
+
+        // B3: k chat requests prefilled together, then each decoded alone (handle_batch_locked).
+        // Same gates as chat, in the same order: auth above, the text cap (over the whole body,
+        // so every prompt counts) before the permit, the permit and hub lock, the live-generation
+        // check, and the lease dropped before the final write.
+        if (req.method == "POST" && req.path == "/v1/xllama/batch") {
+            ::xllama::ComputeScope scope;
+            {
+                auto admitted = ::xllama::admit_text_then_permit(
+                    chat_text_bytes(req.body), [] { return acquire_compute_job_or_busy(); });
+                if (admitted.status == ::xllama::TextAdmitStatus::TooLarge) {
+                    write_response(
+                        socket, "413 Payload Too Large",
+                        error_json("prompt text exceeds " +
+                                   std::to_string(::xllama::kApiMaxPromptTextBytes / 1024) +
+                                   " KiB"));
+                    return;
+                }
+                if (admitted.status == ::xllama::TextAdmitStatus::Busy) {
+                    activity().busy();
+                    write_response(socket, ::xllama::kApiBusyStatus, error_json("busy"));
+                    return;
+                }
+                scope.permit = std::move(admitted.permit);
+            }
+            scope.hub = acquire_hub_or_busy();
+            if (!scope.hub.owns_lock()) {
+                scope.release();
+                activity().busy();
+                write_response(socket, "503 Service Unavailable", error_json("busy"));
+                return;
+            }
+            t_stamps.permit(std::chrono::steady_clock::now());
+            bool active_generation = false;
+            {
+                std::lock_guard<std::mutex> state_lock(g_state_mtx);
+                active_generation =
+                    g_status.state == ServerState::Running && generation == g_generation;
+            }
+            if (!active_generation) {
+                scope.release();
+                write_response(socket, "503 Service Unavailable", error_json("server stopped"));
+                return;
+            }
+            auto ticket = activity().begin("batch");
+            const char* status = "200 OK";
+            std::string json;
+            try {
+                json = handle_batch_locked(req.body, status, ticket);
+            } catch (...) {
+                status = "400 Bad Request";
+                json = error_json("malformed request body");
+            }
+            record_outcome(ticket, status, json);
+            scope.release();
+            write_response(socket, status, json);
             return;
         }
 

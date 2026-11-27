@@ -10,6 +10,7 @@
 #include "xllama/api_auth.h"
 #include "xllama/api_limits.h"
 #include "xllama/api_pull_policy.h"
+#include "xllama/batch_policy.h"
 #include "xllama/compute_admission.h"
 #include "xllama/http_framing.h"
 #include "xllama/model_spelling.h"
@@ -415,4 +416,181 @@ TEST_CASE("handler order: model_servable_locked no longer admits any path uncond
     CHECK(fn.find("path_spelling_known(") != std::string::npos);
     // A bare id is a directory of exactly that name, not whatever the filesystem folds it to.
     CHECK(fn.find("filename().string() != model") != std::string::npos);
+}
+
+// ---- 7. B3 batch route: /v1/xllama/batch ----------------------------------------------------
+
+TEST_CASE("batch policy: XLLAMA_BATCH_SEQS parses to 1 unless it is a number of at least 2") {
+    CHECK(batch_seqs_from_env(nullptr) == 1);
+    CHECK(batch_seqs_from_env("") == 1);
+    CHECK(batch_seqs_from_env("1") == 1);
+    CHECK(batch_seqs_from_env("0") == 1);
+    CHECK(batch_seqs_from_env("-3") == 1);
+    CHECK(batch_seqs_from_env("abc") == 1);
+    CHECK(batch_seqs_from_env("4x") == 1);
+    CHECK(batch_seqs_from_env("2") == 2);
+    CHECK(batch_seqs_from_env("4") == 4);
+    CHECK(batch_seqs_from_env("999") == kMaxBatchSeqs);
+}
+
+// output_reserve asserts max(n_outputs, n_seq_max) <= n_outputs_max: the GPU path's cap of 1 (+
+// draft) must rise to the sequence count, and llama.cpp's default (0 = n_batch) must stay.
+TEST_CASE("batch policy: the logits-row cap covers every sequence of a batching context") {
+    constexpr uint32_t kMax = static_cast<uint32_t>(kMaxBatchSeqs);
+    CHECK(outputs_max_for_seqs(1u, 1u) == 1u);
+    CHECK(outputs_max_for_seqs(1u, 4u) == 4u);
+    CHECK(outputs_max_for_seqs(5u, 4u) == 5u);
+    CHECK(outputs_max_for_seqs(4u, 4u) == 4u);
+    CHECK(outputs_max_for_seqs(0u, 4u) == 0u);
+    CHECK(outputs_max_for_seqs(1u, kMax) == kMax);
+}
+
+TEST_CASE("batch policy: empty and over-sequence batches are refused, batching off serves one") {
+    CHECK(batch_admit_count(0, 4) == BatchAdmit::Empty);
+    CHECK(batch_admit_count(1, 4) == BatchAdmit::Ok);
+    CHECK(batch_admit_count(4, 4) == BatchAdmit::Ok);
+    CHECK(batch_admit_count(5, 4) == BatchAdmit::TooMany);
+    // XLLAMA_BATCH_SEQS unset: one request only.
+    CHECK(batch_admit_count(1, 1) == BatchAdmit::Ok);
+    CHECK(batch_admit_count(2, 1) == BatchAdmit::TooMany);
+    CHECK(batch_admit_count(2, 0) == BatchAdmit::TooMany);
+    CHECK(batch_admit_count(0, 1) == BatchAdmit::Empty);
+}
+
+TEST_CASE("batch policy: the summed prompts plus the longest reply must fit n_ctx") {
+    CHECK(batch_admit_tokens({100, 200, 300}, {50, 100, 10}, 700) == BatchAdmit::Ok);
+    CHECK(batch_admit_tokens({100, 200, 300}, {50, 101, 10}, 700) == BatchAdmit::TooManyTokens);
+    // Each prompt alone would fit; together they do not.
+    CHECK(batch_admit_tokens({400, 400}, {1, 1}, 512) == BatchAdmit::TooManyTokens);
+    CHECK(batch_admit_tokens({2000000000, 2000000000}, {1}, 4096) == BatchAdmit::TooManyTokens);
+}
+
+// The shared decodes take the same count from every sequence (no split_equal tail);
+// the rest of each prompt is its own pass.
+TEST_CASE(
+    "batch policy: the prefill plan shares equal counts and leaves the rest to each own pass") {
+    using V = std::vector<int>;
+    SUBCASE("equal lengths: everything but the last token is shared, one decode") {
+        const BatchPrefillPlan p = batch_prefill_plan({10, 10, 10}, 2048);
+        CHECK(p.shared == 9);
+        CHECK(p.shared_chunks == V{9});
+        CHECK(p.n_shared_decodes() == 1);
+        CHECK(p.own == V{1, 1, 1});
+        CHECK(p.own_decodes == V{1, 1, 1});
+    }
+    SUBCASE("a one-token prompt: E = 0, no shared decode, whole prompts alone") {
+        const BatchPrefillPlan p = batch_prefill_plan({1, 7, 12}, 2048);
+        CHECK(p.shared == 0);
+        CHECK(p.n_shared_decodes() == 0);
+        CHECK(p.own == V{1, 7, 12});
+        CHECK(p.own_decodes == V{1, 1, 1});
+    }
+    SUBCASE("four unequal lengths: E = shortest - 1 from each, in order") {
+        const BatchPrefillPlan p = batch_prefill_plan({13, 5, 20, 9}, 2048);
+        CHECK(p.shared == 4);
+        CHECK(p.shared_chunks == V{4});
+        CHECK(p.own == V{9, 1, 16, 5});
+        CHECK(p.own_decodes == V{1, 1, 1, 1});
+        // n_batch 8: 2 per sequence per chunk, ceil(4 * 4 / 8) = 2 decodes.
+        const BatchPrefillPlan q = batch_prefill_plan({13, 5, 20, 9}, 8);
+        CHECK(q.shared_chunks == V{2, 2});
+        CHECK(q.own_decodes == V{2, 1, 2, 1});
+    }
+    SUBCASE("a remainder above n_batch is chunked on its own sequence") {
+        const BatchPrefillPlan p = batch_prefill_plan({3, 40}, 16);
+        CHECK(p.shared == 2);
+        CHECK(p.shared_chunks == V{2});
+        CHECK(p.own == V{1, 38});
+        CHECK(p.own_decodes == V{1, 3});
+    }
+    SUBCASE("n_batch below k: no room for an equal chunk, nothing shared") {
+        const BatchPrefillPlan p = batch_prefill_plan({10, 10, 10}, 2);
+        CHECK(p.shared == 0);
+        CHECK(p.n_shared_decodes() == 0);
+        CHECK(p.own_decodes == V{5, 5, 5});
+    }
+    SUBCASE("k not dividing n_batch: ceil(E / floor(n_batch / k)) decodes") {
+        // n_batch 16, k 3: 5 per sequence (15 rows). E = 15 → 3 = ceil(45 / 16);
+        // E = 16 → 4, one above ceil(48 / 16) = 3.
+        CHECK(batch_prefill_plan({16, 16, 16}, 16).shared_chunks == V{5, 5, 5});
+        CHECK(batch_prefill_plan({17, 17, 17}, 16).shared_chunks == V{5, 5, 5, 1});
+    }
+    SUBCASE("invariants over a sweep") {
+        for (const int n_batch : {1, 2, 3, 7, 16, 512})
+            for (const V& lengths : {V{1}, V{2, 2}, V{5, 3, 9}, V{30, 31, 29, 100}, V{1, 1000}}) {
+                CAPTURE(n_batch);
+                const BatchPrefillPlan p = batch_prefill_plan(lengths, n_batch);
+                const int k = static_cast<int>(lengths.size());
+                int sum = 0;
+                for (const int c : p.shared_chunks) {
+                    CHECK(c > 0);
+                    CHECK(c * k <= n_batch);
+                    sum += c;
+                }
+                CHECK(sum == p.shared);
+                REQUIRE(p.own.size() == lengths.size());
+                for (size_t i = 0; i < lengths.size(); ++i) {
+                    CHECK(p.own[i] == lengths[i] - p.shared);
+                    CHECK(p.own[i] >= 1);
+                    CHECK(p.own_decodes[i] == (p.own[i] + n_batch - 1) / n_batch);
+                }
+            }
+    }
+    CHECK(batch_prefill_plan({}, 512).own.empty());
+}
+
+TEST_CASE("handler order: the batch route is behind auth and the text cap, and releases first") {
+    const std::string src = read_file(API_SERVER_CPP_PATH);
+    REQUIRE_FALSE(src.empty());
+    const size_t auth = src.find("if (!auth.allow) {");
+    const size_t route_at = src.find("req.path == \"/v1/xllama/batch\"");
+    REQUIRE(auth != std::string::npos);
+    REQUIRE(route_at != std::string::npos);
+    CHECK(auth < route_at); // /health is the only route before the Bearer check
+    const std::string route =
+        slice(src, "req.path == \"/v1/xllama/batch\"", "req.path == \"/v1/chat/completions\"");
+    const size_t cap = route.find("admit_text_then_permit(");
+    const size_t direct = route.find("acquire_compute_job_or_busy()");
+    const size_t hub = route.find("acquire_hub_or_busy()");
+    const size_t live = route.find("generation == g_generation");
+    const size_t handler = route.find("handle_batch_locked(");
+    REQUIRE(cap != std::string::npos);
+    REQUIRE(direct != std::string::npos);
+    REQUIRE(hub != std::string::npos);
+    REQUIRE(live != std::string::npos);
+    REQUIRE(handler != std::string::npos);
+    CHECK(cap < direct);
+    CHECK(direct < hub);
+    CHECK(hub < live);
+    CHECK(live < handler);
+    CHECK(route.find("413 Payload Too Large") != std::string::npos);
+    const size_t release = route.rfind("scope.release();");
+    const size_t final_write = route.rfind("write_response(socket, status, json);");
+    REQUIRE(release != std::string::npos);
+    REQUIRE(final_write != std::string::npos);
+    CHECK(release < final_write);
+    CHECK(route.find("auto compute_permit") == std::string::npos);
+    CHECK(route.find("std::unique_lock<std::mutex> lk") == std::string::npos);
+}
+
+TEST_CASE("handler order: handle_batch_locked checks spelling, count, and summed tokens") {
+    const std::string src = read_file(API_SERVER_CPP_PATH);
+    const std::string fn =
+        slice(src, "std::string handle_batch_locked(", "// Serve one accepted socket.");
+    const size_t spelling = fn.find("model_servable_locked(model)");
+    const size_t ceiling = fn.find("batch_admit_count(k, ::xllama::kMaxBatchSeqs)");
+    const size_t load = fn.find("ensure_locked(");
+    const size_t seqs = fn.find("batch_admit_count(k, seqs)");
+    const size_t plan = fn.find("plan_chat_locked(");
+    const size_t summed = fn.find("batch_admit_tokens(");
+    const size_t generate = fn.find("generate_batch(");
+    for (size_t at : {spelling, ceiling, load, seqs, plan, summed, generate})
+        REQUIRE(at != std::string::npos);
+    CHECK(spelling < load); // an unknown spelling is 404 before any model load
+    CHECK(ceiling < load);
+    CHECK(load < seqs);
+    CHECK(seqs < plan);
+    CHECK(plan < summed); // every prompt fitted (fit_prompt) before the sum
+    CHECK(summed < generate);
+    CHECK(fn.find("read_chat_limits(") < load); // max_tokens and sampling before the load (F01)
 }

@@ -262,6 +262,32 @@ struct Session {
         return nullptr;
     }
 
+    // B3: how many requests one generate_batch call may carry — the context's
+    // sequence count (XLLAMA_BATCH_SEQS, read at load; 1 = batching off).
+    virtual int batch_seqs() const {
+        return 1;
+    }
+
+    // B3: prefill every request's prompt in shared batches (one sequence each),
+    // then decode each reply alone, in order. One result per request, same
+    // order. Each request is a stateless turn: reuse_kv/reset_kv, save_prefix
+    // and n_keep are ignored, and the resident conversation (sequence 0) and the
+    // disk prefix cache are neither read nor kept — the session's KV is empty
+    // afterwards. This default (and a session with batch_seqs() == 1) runs the
+    // requests one after another through generate(), with reuse_kv forced off.
+    virtual std::vector<InferenceResult> generate_batch(const std::vector<GenerateParams>& reqs) {
+        std::vector<InferenceResult> out;
+        out.reserve(reqs.size());
+        for (const GenerateParams& r : reqs) {
+            GenerateParams one = r;
+            one.reuse_kv = false;
+            one.reset_kv = false;
+            one.save_prefix = false;
+            out.push_back(generate(one));
+        }
+        return out;
+    }
+
     virtual ~Session() = default;
 };
 
