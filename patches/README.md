@@ -626,6 +626,26 @@ false` (as `LLAMA_EXPERT_TRACE` always did), so the GPU route's replay is off in
 for studies, not for serving. Not run on the console: the node is a CPU custom op like the select op,
 which the D3D12 scheduler already places; its scores copy is the only extra traffic.
 
+`0030-expert-cache-swap-weak.patch` (applies after 0029; `src/llama-expert-cache.{h,cpp}`; default off):
+`LLAMA_EXPERT_SWAP_WEAK=1`, only with a swap ratio, changes which missing experts the residents stand in
+for. `ec_swap_missing` walks the missing ranks of the top-k weakest first, gives each the strongest
+resident left outside it, and stops at the first pair that fails `s[r] > 0 && s[r] >= r_j * s[m]`
+(`r_j` = the ratio, 0 in the `LLAMA_EXPERT_SWAP_TAIL` ranks). With the flag, `ec_swap_weak` makes as many
+stand-ins as any pairing allows and spends them on the weakest missing ranks: the `t` weakest missing take
+the first `t` residents outside the top-k in rank order (strongest with strongest), `t` the largest for
+which every pair passes. A pair's need falls with the rank, so this sorted pairing is a maximum matching
+(the harness `tests/harness/expert_cache_em_swap.cpp` checks it against augmenting paths); the walk
+spends its strongest resident on the weakest missing rank, the one that needs it least, and runs out of
+residents strong enough for the ranks above. It applies wherever the walk did (decode select, prompt
+ubatches, `SWAP_BATCH`, expert-major at `EM_SWAP`).
+`llama_ec_route_info` gains `swap_weak` (appended; the size check covers it), and the D3D12 route kernel
+runs the same search under c7 bit 5, so the GPU route keeps the host's ids bit for bit (selftest `route`).
+Replay of a production routing trace (15171 tokens, 40 layers, the per-layer slots in production, ratio
+0.5, simulated with LRU): 17.58 reads per token with the walk, 13.74 with the flag (-21.8 %); the share
+of the top-k router mass given up 0.0435 -> 0.0551. The same number of stand-ins spent on the strongest missing ranks first reads
+13.85 and gives up 0.0580: weakest first is better on both. Quality is measured on the console before
+any promotion.
+
 ## Applying
 
 ```bash

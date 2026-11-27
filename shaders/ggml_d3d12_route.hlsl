@@ -294,6 +294,8 @@ groupshared uint gs_v;
 // also writes the weights at u5 + c9 and the slots, clamped into [0, c8 =
 // n_slots), at u5 + c10, which the emit kernel would have copied from the
 // record after the gate; on a miss neither is touched (the host writes them).
+// bit 5 swaps weak (LLAMA_EXPERT_SWAP_WEAK, patch 0030 ec_swap_weak): as many
+// stand-ins as the pair test allows, on the weakest missing ranks.
 RWByteAddressBuffer U3 : register(u3);
 RWByteAddressBuffer U4 : register(u4);
 RWByteAddressBuffer U5 : register(u5);
@@ -392,27 +394,68 @@ void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
         return;
 
     const uint n_used = c1;
-    // ec_swap_missing: residents outside the top n_used stand in for missing
-    // experts inside it, strongest resident for weakest missing
     uint swaps = 0u;
-    uint i = n_used;
-    for (int jj = (int)n_used - 1; jj >= 0; --jj) {
-        const uint m = gs_order[jj];
-        if (gs_res[m] >= 0)
-            continue;
-        while (i < n && gs_res[gs_order[i]] < 0)
+    if ((c7 & 32u) != 0u) {
+        // ec_swap_weak: the t weakest missing ranks take the first t residents
+        // outside the top n_used in rank order, t the largest for which every
+        // pair passes (the need falls with the rank: a maximum matching)
+        uint miss[16];
+        uint cand[16];
+        uint nm = 0u, nc = 0u;
+        for (uint j = 0u; j < n_used; ++j) {
+            if (gs_res[gs_order[j]] < 0) {
+                miss[nm] = j;
+                nm++;
+            }
+        }
+        for (uint q = n_used; q < n && nc < nm; ++q) {
+            if (gs_res[gs_order[q]] >= 0) {
+                cand[nc] = q;
+                nc++;
+            }
+        }
+        uint t = min(nm, nc);
+        for (; t > 0u; --t) {
+            bool ok = true;
+            for (uint k = 0u; k < t; ++k) {
+                const uint j = miss[nm - t + k];
+                const uint sr = gs_p[gs_order[cand[k]]];
+                const uint rj = n_used - j <= c3 ? 0u : c2;
+                if (sr == 0u || sr < mul32(rj, gs_p[gs_order[j]]))
+                    ok = false;
+            }
+            if (ok)
+                break;
+        }
+        for (uint k = 0u; k < t; ++k) {
+            const uint j = miss[nm - t + k];
+            const uint m = gs_order[j];
+            gs_order[j] = gs_order[cand[k]];
+            gs_order[cand[k]] = m;
+        }
+        swaps = t;
+    } else {
+        // ec_swap_missing: residents outside the top n_used stand in for missing
+        // experts inside it, strongest resident for weakest missing
+        uint i = n_used;
+        for (int jj = (int)n_used - 1; jj >= 0; --jj) {
+            const uint m = gs_order[jj];
+            if (gs_res[m] >= 0)
+                continue;
+            while (i < n && gs_res[gs_order[i]] < 0)
+                i++;
+            if (i == n)
+                break;
+            const uint r = gs_order[i];
+            const uint rj = n_used - (uint)jj <= c3 ? 0u : c2;
+            const uint sr = gs_p[r];
+            if (sr == 0u || sr < mul32(rj, gs_p[m]))
+                break;
+            gs_order[jj] = r;
+            gs_order[i] = m;
             i++;
-        if (i == n)
-            break;
-        const uint r = gs_order[i];
-        const uint rj = n_used - (uint)jj <= c3 ? 0u : c2;
-        const uint sr = gs_p[r];
-        if (sr == 0u || sr < mul32(rj, gs_p[m]))
-            break;
-        gs_order[jj] = r;
-        gs_order[i] = m;
-        i++;
-        swaps++;
+            swaps++;
+        }
     }
 
     uint wv[16];

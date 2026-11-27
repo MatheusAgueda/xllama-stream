@@ -705,6 +705,27 @@ TEST_CASE("expert cache: decodes like the resident model (opt-in: XLLAMA_EC_TEST
             CHECK(misses_of(log.final_line) < plain_misses);
         }
 
+        // Weak stand-ins (LLAMA_EXPERT_SWAP_WEAK, patch 0030): as many stand-ins
+        // as the ratio test allows, on the weakest missing ranks. Same ubatches,
+        // the run holds together and still reads less than exact routing.
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            log.final_line.clear();
+        }
+        set_env_k("LLAMA_EXPERT_SWAP_WEAK", 1);
+        const EcRun weak = run_greedy(path, c.slots, 512, c.used, 24, 0.5f);
+        set_env_k("LLAMA_EXPERT_SWAP_WEAK", -1);
+        REQUIRE(weak.ok);
+        CHECK(weak.n_ubatch == cached.n_ubatch);
+        CHECK(weak.tokens.size() == swapped.tokens.size());
+        {
+            std::lock_guard<std::mutex> lock(log.mtx);
+            MESSAGE(log.final_line);
+            CHECK(swaps_of(log.final_line) > 0);
+            CHECK(misses_of(log.final_line) >= 0);
+            CHECK(misses_of(log.final_line) < plain_misses);
+        }
+
         // Routing trace (LLAMA_EXPERT_TRACE): a ratio above 1 never swaps, so the
         // run is exact routing through the select op - same tokens and misses as
         // plain - and the file holds one "ECT1" record per layer and ubatch with

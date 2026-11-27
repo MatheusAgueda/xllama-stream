@@ -768,6 +768,7 @@ struct llama_ec_route_info {
     std::int32_t plain;
     const std::int32_t* slot_of;
     const void* layer_id;
+    std::int32_t swap_weak; // patch 0030: LLAMA_EXPERT_SWAP_WEAK
 };
 extern "C" int llama_ec_route_query(const ggml_tensor* node, llama_ec_route_info* out);
 extern "C" void llama_ec_route_prepare(const ggml_tensor* node);
@@ -3195,16 +3196,44 @@ void route_weights(const float* probs, const std::int32_t* ids, int n_used, bool
             w[k] = w[k] * scale;
 }
 
-// ec_select of one token (ec_rank, ec_swap_missing), for the selftests:
-// ids = the top n_used after the swaps; returns the swaps.
+// ec_select of one token (ec_rank, ec_swap_missing; weak: ec_swap_weak), for
+// the selftests: ids = the top n_used after the swaps; returns the swaps.
 std::uint32_t route_select(const float* s, const std::int32_t* res, int n_expert, int n_used,
-                           float ratio, int tail, std::int32_t* ids) {
+                           float ratio, int tail, std::int32_t* ids, bool weak = false) {
     std::vector<std::int32_t> order(static_cast<std::size_t>(n_expert));
     for (int e = 0; e < n_expert; ++e)
         order[e] = e;
     std::sort(order.begin(), order.end(), [s](std::int32_t a, std::int32_t b) {
         return s[a] > s[b] || (s[a] == s[b] && a < b);
     });
+    if (weak) {
+        // the t weakest missing ranks take the first t residents outside the
+        // top n_used, t the largest for which every pair passes the test
+        std::vector<int> miss, cand;
+        for (int j = 0; j < n_used; ++j)
+            if (res[order[j]] < 0)
+                miss.push_back(j);
+        for (int i = n_used; i < n_expert && cand.size() < miss.size(); ++i)
+            if (res[order[i]] >= 0)
+                cand.push_back(i);
+        const int nm = static_cast<int>(miss.size());
+        int t = static_cast<int>(cand.size());
+        for (; t > 0; --t) {
+            bool ok = true;
+            for (int k = 0; k < t && ok; ++k) {
+                const int j = miss[nm - t + k];
+                const float sr = s[order[cand[k]]];
+                const float rj = n_used - j <= tail ? 0.0f : ratio;
+                ok = sr > 0.0f && !(sr < rj * s[order[j]]);
+            }
+            if (ok)
+                break;
+        }
+        for (int k = 0; k < t; ++k)
+            std::swap(order[miss[nm - t + k]], order[cand[k]]);
+        std::copy(order.begin(), order.begin() + n_used, ids);
+        return static_cast<std::uint32_t>(t);
+    }
     std::uint32_t swaps = 0;
     std::int64_t i = n_used;
     for (std::int64_t j = n_used - 1; j >= 0; --j) {
@@ -3424,7 +3453,8 @@ const char* route_match(ggml_cgraph* cgraph, int gi, ggml_tensor* sig_cand, int 
                                 cb,
                                 sb,
                                 0,
-                                (r->norm ? 1u : 0u) | (r->scaled ? 2u : 0u) | (sig ? 4u : 0u)};
+                                (r->norm ? 1u : 0u) | (r->scaled ? 2u : 0u) | (sig ? 4u : 0u) |
+                                    (ri1.swap_weak != 0 ? 32u : 0u)};
     std::copy(std::begin(c), std::end(c), r->c);
     return nullptr;
 }
@@ -7971,6 +8001,7 @@ struct RouteCfg {
     float scale;
     int logits;
     bool sig;
+    bool weak = false; // c7 bit 5, LLAMA_EXPERT_SWAP_WEAK
 };
 
 std::vector<RouteCfg> route_cfgs() {
@@ -8017,6 +8048,35 @@ std::vector<RouteCfg> route_cfgs() {
     add([](RouteCfg& c) { c.sig = false; });
     for (int s = 0; s < 10; ++s)
         add([](RouteCfg&) {});
+    // weak stand-ins: the ratio and tail grid, all or no residents, ties, 16 used
+    for (const float r : {0.0f, 0.5f, 1.0f})
+        for (const int t : {0, 2})
+            add([&](RouteCfg& c) {
+                c.weak = true;
+                c.ratio = r;
+                c.tail = t;
+            });
+    for (const int res : {0, 1})
+        add([&](RouteCfg& c) {
+            c.weak = true;
+            c.res = res;
+        });
+    add([](RouteCfg& c) {
+        c.weak = true;
+        c.logits = 1;
+    });
+    add([](RouteCfg& c) {
+        c.weak = true;
+        c.u = 16;
+    });
+    add([](RouteCfg& c) {
+        c.weak = true;
+        c.e = 64;
+        c.u = 16;
+        c.ratio = 0.35f;
+    });
+    for (int s = 0; s < 6; ++s)
+        add([](RouteCfg& c) { c.weak = true; });
     return v;
 }
 
@@ -8093,7 +8153,8 @@ D3d12SelftestRow run_route_case() {
                                      cb,
                                      sb,
                                      static_cast<std::uint32_t>(i + 1),
-                                     (c.norm ? 1u : 0u) | (c.scaled ? 2u : 0u) | (c.sig ? 4u : 0u)};
+                                     (c.norm ? 1u : 0u) | (c.scaled ? 2u : 0u) | (c.sig ? 4u : 0u) |
+                                         (c.weak ? 32u : 0u)};
         std::copy(std::begin(cc), std::end(cc), op.c);
         if (i % 2 == 1) {
             op.c[7] |= 16u;
@@ -8145,10 +8206,10 @@ D3d12SelftestRow run_route_case() {
             char msg[200];
             std::snprintf(msg, sizeof(msg),
                           "case %zu (e %d u %d res %d ratio %g tail %d norm %d scale %g logits %d "
-                          "sig %d): %s",
+                          "sig %d weak %d): %s",
                           i, c.e, c.u, c.res, static_cast<double>(c.ratio), c.tail, c.norm ? 1 : 0,
                           c.scaled ? static_cast<double>(c.scale) : 0.0, c.logits, c.sig ? 1 : 0,
-                          what);
+                          c.weak ? 1 : 0, what);
             first = msg;
         }
     };
@@ -8203,7 +8264,7 @@ D3d12SelftestRow run_route_case() {
         }
         std::int32_t ids[kRouteMaxUsed] = {};
         const std::uint32_t want_swaps =
-            route_select(probs.data(), mirror[i].data(), c.e, c.u, c.ratio, c.tail, ids);
+            route_select(probs.data(), mirror[i].data(), c.e, c.u, c.ratio, c.tail, ids, c.weak);
         if (std::memcmp(ids, rec(i) + kRecIds, nu * 4) != 0) {
             fail(i, "experts");
             continue;

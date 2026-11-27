@@ -1,0 +1,130 @@
+diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
+--- a/src/llama-expert-cache.cpp
++++ b/src/llama-expert-cache.cpp
+@@ -312,6 +312,7 @@
+     uint32_t n_expert_used = 1;
+     float    swap_ratio    = 0.0f;
+     uint32_t swap_tail     = 0; // LLAMA_EXPERT_SWAP_TAIL: weakest ranks of the top-k a resident takes at any score
++    bool     swap_weak     = false; // LLAMA_EXPERT_SWAP_WEAK: maximum stand-ins, the weakest missing ranks first
+     bool     swap_batch    = false; // LLAMA_EXPERT_SWAP_BATCH: a ubatch's own reads count as resident
+     float    em_swap       = 0.0f;  // LLAMA_EXPERT_EM_SWAP: the swap ratio of expert-major ubatches, 0 = exact there
+     double   lrfu_half     = 0.0;   // LLAMA_EXPERT_LRFU: eviction half-life in plan ticks, 0 = LRU
+@@ -1420,8 +1421,55 @@
+ // ratio of two scores: unnormalized probabilities give the same swaps); in the weakest n_tail ranks
+ // any resident with a positive score stands in (cache-conditional top-k: those ranks are computed
+ // when free and never read); res = expert -> resident (>= 0) or missing; returns the swaps made
++//
++// weak (LLAMA_EXPERT_SWAP_WEAK): the same test per pair, as many stand-ins as it allows, spent on the
++// weakest missing ranks: the t weakest missing take the t strongest residents outside the top n_used,
++// the strongest of those missing with the strongest resident, t the largest for which every pair
++// passes. A pair's need (ratio times the missing score, 0 in the tail) falls with the rank, so this
++// sorted pairing is a maximum matching and the t weakest are always a feasible set: the walk below
++// stops at its first failure and gives its strongest resident to the weakest missing expert instead
++static uint64_t ec_swap_weak(const std::vector<int32_t> & res, std::vector<int32_t> & order, const float * s, int64_t n_used,
++                             float ratio, int64_t n_tail) {
++    const int64_t n_expert = (int64_t) order.size();
++    GGML_ASSERT(n_used <= 64);
++    int64_t miss[64]; // ranks of the missing experts inside the top n_used, strongest first
++    int64_t cand[64]; // ranks of the residents outside it, strongest first (at most one per missing)
++    int64_t nm = 0, nc = 0;
++    for (int64_t j = 0; j < n_used; ++j) {
++        if (res[order[j]] < 0) {
++            miss[nm++] = j;
++        }
++    }
++    for (int64_t i = n_used; i < n_expert && nc < nm; ++i) {
++        if (res[order[i]] >= 0) {
++            cand[nc++] = i;
++        }
++    }
++    int64_t t = std::min(nm, nc);
++    for (; t > 0; --t) {
++        bool ok = true;
++        for (int64_t k = 0; k < t && ok; ++k) {
++            const int64_t j = miss[nm - t + k];
++            const int32_t m = order[j];
++            const int32_t r = order[cand[k]];
++            const float   rj = n_used - j <= n_tail ? 0.0f : ratio;
++            ok = s[r] > 0.0f && !(s[r] < rj*s[m]);
++        }
++        if (ok) {
++            break;
++        }
++    }
++    for (int64_t k = 0; k < t; ++k) {
++        std::swap(order[miss[nm - t + k]], order[cand[k]]);
++    }
++    return (uint64_t) t;
++}
++
+ static uint64_t ec_swap_missing(const std::vector<int32_t> & res, std::vector<int32_t> & order, const float * s, int64_t n_used,
+-                                float ratio, int64_t n_tail) {
++                                float ratio, int64_t n_tail, bool weak) {
++    if (weak) {
++        return ec_swap_weak(res, order, s, n_used, ratio, n_tail);
++    }
+     const int64_t n_expert = (int64_t) order.size();
+     uint64_t swaps = 0;
+     int64_t i = n_used; // next resident candidate outside the top-k, strongest first
+@@ -1500,7 +1548,7 @@
+                 L.prob[e] = p == p ? p : 0.0f; // NaN (a NaN or infinite logit) ranks last
+             }
+             ec_rank(order, L.prob.data());
+-            ec_swap_missing(L.slot_of, order, L.prob.data(), w, C.swap_ratio, C.swap_tail);
++            ec_swap_missing(L.slot_of, order, L.prob.data(), w, C.swap_ratio, C.swap_tail, C.swap_weak);
+         } else {
+             for (int32_t e = 0; e < n_expert; ++e) {
+                 order[e] = e;
+@@ -1617,7 +1665,7 @@
+         for (int64_t t = 0; t < n_tokens; ++t) {
+             const float * s = (const float *) ((const char *) scores->data + t*scores->nb[1]);
+             ec_rank(order, s);
+-            ec_swap_missing(em ? L.avail : L.slot_of, order, s, n_used, ratio, tail);
++            ec_swap_missing(em ? L.avail : L.slot_of, order, s, n_used, ratio, tail, C.swap_weak);
+             for (int64_t k = 0; k < n_used; ++k) {
+                 L.avail[order[k]] = std::max(L.avail[order[k]], 0);
+             }
+@@ -1648,7 +1696,7 @@
+         if (defer) {
+             std::copy(order.begin(), order.begin() + n_used, L.dtop.begin());
+         }
+-        const uint64_t sw = ec_swap_missing(*res, order, s, n_used, ratio, tail);
++        const uint64_t sw = ec_swap_missing(*res, order, s, n_used, ratio, tail, C.swap_weak);
+         swaps += sw;
+ 
+         int32_t * out = (int32_t *) ((char *) dst->data + t*dst->nb[1]);
+@@ -3012,6 +3060,15 @@
+         LLAMA_LOG_INFO("%s: expert cache: swap tail %u of %u ranks (a resident stands in at any score)\n",
+             __func__, cache->swap_tail, cache->n_expert_used);
+     }
++    // LLAMA_EXPERT_SWAP_WEAK=1: ec_swap_missing gives as many missing experts a stand-in as the ratio
++    // test allows, the weakest missing ranks first (off by default; only with a swap ratio, whose
++    // routing it changes). Replay of the HumanEval routing trace (E3 27/11): 17.58 -> 13.74 reads per
++    // token at the production per-layer slots, the net router mass given up 0.0435 -> 0.0551
++    const char * swk = getenv("LLAMA_EXPERT_SWAP_WEAK");
++    cache->swap_weak = swk != nullptr && *swk != '\0' && atoi(swk) != 0 && cache->swap_ratio > 0.0f;
++    if (cache->swap_weak) {
++        LLAMA_LOG_INFO("%s: expert cache: swap weak on (maximum stand-ins, the weakest missing ranks first)\n", __func__);
++    }
+     // LLAMA_EXPERT_SWAP_BATCH=1: in a multi-token ubatch the experts read for one token count as
+     // resident for the others (off by default; the prefetch keeps predicting per token)
+     const char * sb = getenv("LLAMA_EXPERT_SWAP_BATCH");
+@@ -3378,6 +3435,7 @@
+     out->n_slots    = (int32_t) L->expert_of.size();
+     out->swap_tail  = (int32_t) C.swap_tail;
+     out->swap_ratio = C.swap_ratio;
++    out->swap_weak  = C.swap_weak ? 1 : 0;
+     out->plain      = C.trace == nullptr && !(C.defer_b > 0.0) && C.pf_k == 0 && L->dwant.empty() && L->n_pf == 0;
+     out->slot_of    = L->slot_of.data();
+     out->layer_id   = L;
+diff --git a/src/llama-expert-cache.h b/src/llama-expert-cache.h
+--- a/src/llama-expert-cache.h
++++ b/src/llama-expert-cache.h
+@@ -84,6 +84,7 @@
+                                 // depend only on the scores, the residency and the plan's state
+     const int32_t * slot_of;    // expert -> slot, -1 if not resident (stable until the layer's plan)
+     const void    * layer_id;   // the same for the ops of one layer
++    int32_t         swap_weak;  // LLAMA_EXPERT_SWAP_WEAK: maximum stand-ins, the weakest missing ranks first
+ };
+ 
+ extern "C" int  llama_ec_route_query(const ggml_tensor * node, llama_ec_route_info * out);
