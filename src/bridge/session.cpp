@@ -9,16 +9,20 @@
 #include "xllama/inference_params.h"
 #include "xllama/path_utils.h"
 #include "xllama/platform.h"
+#include "xllama/prefix_cache.h"
 #include "xllama/routing_policy.h"
 #include "xllama/session_hub.h"
 #include "xllama/utf8_utils.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
+#include <set>
 #include <string>
 
 // Backend availability. A build defines XLLAMA_USE_ORT when ORT GenAI is linked.
@@ -435,7 +439,8 @@ std::unique_ptr<Session> create_ort(const SessionParams& sp, std::string* err) {
 
     #include "llama.h"
 
-    #include "decode_loop.h" // shared prefill + generation loops; needs llama.h
+    #include "decode_loop.h"     // shared prefill + generation loops; needs llama.h
+    #include "decode_loop_mtp.h" // MTP self-speculation (sidecar head, patch 0012)
     #include "llama_gpu.h"
     #include "sampler_chain.h" // shared sampler chain (#125); needs llama.h
     #include "xllama/llama_raii.h"
@@ -458,6 +463,15 @@ class LlamaSession final : public Session {
     // the whole conversation. Created lazily on the first generate().
     GgufCpuThreadpools m_cpu_pools; // declared before m_ctx: must outlive it
     LlamaContextPtr m_ctx;
+    // MTP self-speculation (decode_loop_mtp.h): the head's own context, the
+    // common/speculative state driving it, and the loop's handle on both.
+    // Declared after m_ctx so they go first — the drafter reads the target's
+    // hidden rows. m_mtp_n = drafts per round (XLLAMA_MTP_DRAFT, 0 = off).
+    int m_mtp_n = 0;
+    float m_mtp_p_min = 0.0f;
+    LlamaContextPtr m_mtp_ctx;
+    common_speculative_ptr m_mtp_spec;
+    MtpDrafter m_mtp;
     // #175 decision: sampler state follows the KV lifecycle, mirroring the ORT
     // persistent generator — the penalty window (and the dist RNG) live as long
     // as the conversation, so the tail of the previous reply stays penalized at
@@ -486,12 +500,77 @@ class LlamaSession final : public Session {
     // not [0, kv_len) and the shift arithmetic below would lie.
     bool m_can_shift = false;
 
+    // #170c: a hybrid (or recurrent) cache refuses #170a's partial tail erase —
+    // the recurrent state has no per-token history — so every LAN-API turn,
+    // regenerate and edit re-prefilled from token 0. On the console (Qwen3.6
+    // 35B-A3B, Gated DeltaNet + attention) that was 48-53 tokens, 8-10 s, per
+    // request. Upstream's server answers with context checkpoints and so does
+    // this: snapshot only the recurrent half (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY,
+    // 63 MiB there whatever the prompt length) at the points a later prompt
+    // tends to diverge after, and when a rewind is refused restore the longest
+    // one inside the common prefix — the attention half then rewinds normally.
+    // A checkpoint names the history it absorbed, so its validity is a prefix
+    // compare against the new prompt, not bookkeeping across clears.
+    struct RsCheckpoint {
+        std::vector<llama_token> tokens; // the history the state absorbed
+        std::vector<uint8_t> state;      // llama_state_seq_get_data_ext, PARTIAL_ONLY
+    };
+    // 2 x 63 MiB on the console, whose heap has ~0.5 GB free with the model in.
+    static constexpr size_t kRsCheckpoints = 2;
+    // Heap a new checkpoint must leave free (XLLAMA_RS_CKPT_RESERVE_MB, default 384):
+    // the 122B's are 149 MiB each, and the console's heap has less to spare there.
+    static size_t rs_ckpt_reserve_mb() {
+        static const size_t v = [] {
+            const char* s = std::getenv("XLLAMA_RS_CKPT_RESERVE_MB");
+            return s && *s ? static_cast<size_t>(std::strtoul(s, nullptr, 10)) : size_t(384);
+        }();
+        return v;
+    }
+    // A turn's last 4 tokens are what the next request re-renders differently:
+    // Qwen's "<think>\n\n</think>\n\n" generation prompt is dropped from the
+    // history (upstream checkpoints at the same offset).
+    static constexpr size_t kRsCheckpointTail = 4;
+    // A divergence point is kept only when it spares at least this much prefill.
+    static constexpr size_t kRsCheckpointMinGain = 16;
+    std::vector<RsCheckpoint> m_rs_ckpts; // least recently used first
+    bool m_rs_ckpt_enabled = false;       // hybrid or recurrent memory (ensure_ctx)
+    // After a #169 shift the recurrent state still holds the evicted history, so
+    // a checkpoint taken then carries the approximation the resident cache
+    // already serves #170a's pure extensions with — no stricter, no looser.
+
+    // Prefix cache on disk (XLLAMA_PREFIX_CACHE_MIB, off by default). The
+    // #170c checkpoints hold the recurrent half only, so they help a request
+    // that shares its prefix with the RESIDENT history. The LAN API serves
+    // several clients through one session, and their conversations interleave
+    // (A, B, A'): B overwrites A's attention KV, and A' re-prefilled from token
+    // 0 — 27.8 s for a 1500-token code prompt on the console. At the same
+    // split points as the checkpoints, a full-prompt prefill of a request that
+    // opts in (GenerateParams::save_prefix: the file holds the prompt's token
+    // history) also writes the FULL sequence state (attention + recurrent) to
+    // a file, streamed by llama.cpp with no whole-state heap buffer; a later
+    // full prompt (opted in or not) restores the longest saved prefix that
+    // beats the in-memory paths. Each session writes only its own directory,
+    // removed with the session, so a file is never read by another model or
+    // context shape.
+    uint64_t m_pc_budget = 0; // bytes on disk; 0 = off
+    size_t m_pc_min = 256;    // shortest history worth a file (XLLAMA_PREFIX_CACHE_MIN)
+    std::string m_pc_dir;     // this session's directory, created by the first save
+    std::string m_pc_fp;      // state_fingerprint() the files were written under
+    PrefixCacheIndex m_pc;
+    std::chrono::seconds m_pc_ttl{1800}; // XLLAMA_PREFIX_CACHE_TTL_S
+    std::string m_pc_root;
+
     explicit LlamaSession(LlamaModelPtr model, LlamaAdapterLoraPtr adapter, float lora_scale,
                           int n_ctx, int n_threads, int n_batch, int n_ubatch, bool kv_q8,
-                          bool prompt_lookup, int gpu_layers)
+                          bool prompt_lookup, int gpu_layers, int mtp_n = 0, float mtp_p_min = 0.0f)
         : m_model(std::move(model)), m_adapter(std::move(adapter)), m_lora_scale(lora_scale),
           m_n_ctx(n_ctx), m_n_threads(n_threads), m_n_batch(n_batch), m_n_ubatch(n_ubatch),
-          m_kv_q8(kv_q8), m_prompt_lookup(prompt_lookup), m_gpu_layers(gpu_layers) {}
+          m_mtp_n(mtp_n), m_mtp_p_min(mtp_p_min), m_kv_q8(kv_q8), m_prompt_lookup(prompt_lookup),
+          m_gpu_layers(gpu_layers) {}
+
+    ~LlamaSession() override {
+        drop_prefix_files();
+    }
 
     const void* resident_llama_model() const override {
         return m_model.get();
@@ -506,7 +585,12 @@ class LlamaSession final : public Session {
         {
             llama_context_params cparams = llama_context_default_params();
             cparams.n_ctx = m_n_ctx;
-            cparams.n_threads = m_n_threads;
+            // XLLAMA_CPU_THREADS_TG (catalogue env, 1..n_threads): threads of a
+            // one-token decode graph; with GPU layers its CPU splits are the
+            // MoE router + expert reads and a few tiny ops, where every node
+            // pays a barrier across the pool.
+            const char* tg = std::getenv("XLLAMA_CPU_THREADS_TG");
+            cparams.n_threads = tg && *tg ? std::clamp(std::atoi(tg), 1, m_n_threads) : m_n_threads;
             // Prefill (any ubatch > 1 token) runs on n_threads_batch, whose
             // default is GGML_DEFAULT_N_THREADS (4) regardless of n_threads —
             // left unset it caps prefill at 4 threads while decode gets 6 (#168).
@@ -515,8 +599,34 @@ class LlamaSession final : public Session {
                 cparams.n_batch = static_cast<uint32_t>(m_n_batch);
             if (m_n_ubatch > 0)
                 cparams.n_ubatch = static_cast<uint32_t>(m_n_ubatch);
-            apply_gguf_gpu_context(m_gpu_layers, cparams,
-                                   gguf_gpu_outputs_max(for_embedding, m_prompt_lookup));
+            // MTP: the model must carry the head (patch 0012 sidecar), and the
+            // recurrent layers keep a snapshot per draft so a rejected tail rolls
+            // back (llama.cpp n_rs_seq; the verify batch is 1 + m_mtp_n rows).
+            const bool mtp_on =
+                m_mtp_n > 0 && !for_embedding && llama_model_n_layer_nextn(m_model.get()) > 0;
+            if (m_mtp_n > 0 && !for_embedding && !mtp_on)
+                log_output("[xllama] mtp: XLLAMA_MTP_DRAFT set but the model has no MTP "
+                           "layer (XLLAMA_MTP_SIDECAR?) — off\n");
+            uint32_t outputs_max = gguf_gpu_outputs_max(for_embedding, m_prompt_lookup);
+            if (mtp_on) {
+                cparams.n_rs_seq = static_cast<uint32_t>(m_mtp_n);
+                outputs_max = std::max(outputs_max, 1u + static_cast<uint32_t>(m_mtp_n));
+                // llama-batch asserts n_ubatch > n_rs_seq + 1 (the kept tail): a
+                // catalogue n_ubatch below that would abort the first prefill.
+                cparams.n_ubatch = std::max(cparams.n_ubatch, cparams.n_rs_seq + 2);
+            }
+            apply_gguf_gpu_context(m_gpu_layers, cparams, outputs_max);
+    #ifdef XLLAMA_UWP
+            // The session's decode loop asks for the same rows on the CPU, so
+            // the CPU path takes the cap too: the default reserve is n_ubatch
+            // logits rows, 512 x 248320 x 4 B = 529 MiB on Qwen3.5, which kept
+            // a 4.2 GB IQ3_M from getting a context under the Series X's
+            // 4.86 GB heap (2026-11-09).
+            if (m_gpu_layers <= 0) {
+                if (outputs_max > 0)
+                    cparams.n_outputs_max = outputs_max;
+            }
+    #endif
             if (for_embedding) {
                 // Non-causal embedding graphs cannot split a sequence into
                 // physical micro-batches (llama.cpp asserts instead of failing).
@@ -543,7 +653,8 @@ class LlamaSession final : public Session {
                 m_kv_q8 = false;
                 m_ctx.reset(llama_init_from_model(m_model.get(), cparams));
             }
-            m_cpu_pools.attach(m_gpu_layers, m_ctx.get(), m_n_threads, m_n_threads);
+            m_cpu_pools.attach(m_gpu_layers, m_ctx.get(), static_cast<int>(cparams.n_threads),
+                               static_cast<int>(cparams.n_threads_batch));
             log_gguf_ws("after context");
             if (!m_ctx) {
                 if (err)
@@ -567,6 +678,9 @@ class LlamaSession final : public Session {
                          (int)llama_model_n_swa(m_model.get()));
                 log_output(cb);
             }
+            m_rs_ckpt_enabled =
+                llama_model_is_hybrid(m_model.get()) || llama_model_is_recurrent(m_model.get());
+            m_rs_ckpts.clear();
             // Apply runtime LoRA after context exists (llama_set_adapters_lora is
             // context-scoped). Must re-apply if context is ever recreated.
             if (m_adapter) {
@@ -581,8 +695,353 @@ class LlamaSession final : public Session {
                 }
                 log_output("[xllama] session: runtime LoRA adapter applied\n");
             }
+            if (mtp_on)
+                init_mtp(cparams);
         }
         return true;
+    }
+
+    // The MTP head's context: same model, LLAMA_CONTEXT_TYPE_MTP (llama.cpp
+    // builds only the nextn block there, with a plain KV cache of its own), as
+    // many positions as the target. One logits row: draft() decodes one token,
+    // the catch-up mirror none. A failure leaves the session drafting-free.
+    void init_mtp(llama_context_params cparams) {
+        cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        cparams.n_rs_seq = 0;
+        cparams.ctx_other = m_ctx.get();
+        cparams.n_ctx = llama_n_ctx(m_ctx.get());
+        cparams.n_outputs_max = 1;
+        cparams.embeddings = false;
+        m_mtp_ctx.reset(llama_init_from_model(m_model.get(), cparams));
+        if (!m_mtp_ctx) {
+            log_output("[xllama] mtp: draft context failed — drafting off (target keeps "
+                       "n_rs_seq " +
+                       std::to_string(m_mtp_n) + ")\n");
+            return;
+        }
+        m_cpu_pools.attach(m_gpu_layers, m_mtp_ctx.get(), static_cast<int>(cparams.n_threads),
+                           static_cast<int>(cparams.n_threads_batch));
+        common_params_speculative sp;
+        sp.types = {COMMON_SPECULATIVE_TYPE_DRAFT_MTP};
+        sp.draft.n_max = m_mtp_n;
+        sp.draft.n_min = 0;
+        sp.draft.p_min = m_mtp_p_min;
+        sp.draft.backend_sampling = false;
+        sp.draft.ctx_tgt = m_ctx.get();
+        sp.draft.ctx_dft = m_mtp_ctx.get();
+        m_mtp_spec.reset(common_speculative_init(sp, 1));
+        if (!m_mtp_spec) {
+            log_output("[xllama] mtp: common_speculative_init failed — drafting off\n");
+            m_mtp_ctx.reset();
+            return;
+        }
+        m_mtp.ctx_dft = m_mtp_ctx.get();
+        m_mtp.spec = m_mtp_spec.get();
+        m_mtp.n_max = m_mtp_n;
+        m_mtp.broken = false;
+        m_mtp.mirror = common_batch(m_ctx.get());
+        m_mtp.verify = common_batch(m_ctx.get());
+        log_gguf_ws("after mtp context");
+        char cb[160];
+        snprintf(cb, sizeof(cb),
+                 "[xllama] mtp: drafter ready — %d draft/round, p_min %.2f, n_rs_seq %u, "
+                 "n_ctx %u\n",
+                 m_mtp_n, (double)m_mtp_p_min, llama_n_rs_seq(m_ctx.get()),
+                 llama_n_ctx(m_mtp_ctx.get()));
+        log_output(cb);
+    }
+
+    // #170c: the longest checkpoint whose history is a prefix of
+    // tokens[0, limit); m_rs_ckpts.size() when none fits.
+    size_t best_rs_checkpoint(const std::vector<llama_token>& tokens, size_t limit) const {
+        size_t best = m_rs_ckpts.size();
+        for (size_t i = 0; i < m_rs_ckpts.size(); ++i) {
+            const std::vector<llama_token>& h = m_rs_ckpts[i].tokens;
+            if (h.empty() || h.size() > limit ||
+                (best < m_rs_ckpts.size() && h.size() <= m_rs_ckpts[best].tokens.size()))
+                continue;
+            if (std::equal(h.begin(), h.end(), tokens.begin()))
+                best = i;
+        }
+        return best;
+    }
+
+    // #170c: restore the longest checkpoint whose history is a prefix of
+    // tokens[0, limit) and erase the attention tail past it. Returns the
+    // restored length, 0 when none fits or the restore failed — then the
+    // recurrent half may be half-written and the caller must clear the cache.
+    size_t restore_rs_checkpoint(llama_context* ctx, const std::vector<llama_token>& tokens,
+                                 size_t limit) {
+        const size_t best = best_rs_checkpoint(tokens, limit);
+        if (best == m_rs_ckpts.size())
+            return 0;
+        // Most recently used goes last; the restored state is the newest use.
+        std::rotate(m_rs_ckpts.begin() + best, m_rs_ckpts.begin() + best + 1, m_rs_ckpts.end());
+        const RsCheckpoint& ck = m_rs_ckpts.back();
+        const size_t n = ck.tokens.size();
+        if (llama_state_seq_set_data_ext(ctx, ck.state.data(), ck.state.size(), 0,
+                                         LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0)
+            return 0;
+        // The recurrent half now ends at n-1, so this erase is the attention
+        // tail only — the same one a pure-attention cache does in #170a.
+        if (!llama_memory_seq_rm(llama_get_memory(ctx), 0, static_cast<llama_pos>(n), -1))
+            return 0;
+        return n;
+    }
+
+    // #170c: snapshot the recurrent half after history[0, n). A checkpoint of
+    // the same history is only marked used (a restored turn re-reaches it); the
+    // least recently used one lends its buffer. An allocation failure drops the
+    // checkpoints, never the request.
+    void save_rs_checkpoint(llama_context* ctx, const llama_token* history, size_t n) {
+        for (size_t i = 0; i < m_rs_ckpts.size(); ++i) {
+            const std::vector<llama_token>& h = m_rs_ckpts[i].tokens;
+            if (h.size() == n && std::equal(h.begin(), h.end(), history)) {
+                std::rotate(m_rs_ckpts.begin() + i, m_rs_ckpts.begin() + i + 1, m_rs_ckpts.end());
+                return;
+            }
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        const size_t size =
+            llama_state_seq_get_size_ext(ctx, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (size == 0)
+            return;
+        RsCheckpoint ck;
+        if (m_rs_ckpts.size() >= kRsCheckpoints) {
+            ck = std::move(m_rs_ckpts.front());
+            m_rs_ckpts.erase(m_rs_ckpts.begin());
+        }
+        // A new buffer only with heap to spare after it: the prefill and decode that follow
+        // allocate too, and a bad_alloc there ends the app (chain94, 122B: 2 x 149 MiB held, the
+        // next 2327-token prefill died with 0x8007000E). A lent buffer costs nothing. The
+        // smaller of the two headrooms decides: chain96 failed a 149 MiB buffer with avail_phys
+        // at 879 MB, so the commit limit is the one heap allocations meet.
+        if (ck.state.capacity() < size) {
+            const size_t phys = avail_phys_mb();
+            const size_t commit = avail_commit_mb();
+            const size_t avail = phys == 0 ? commit : commit == 0 ? phys : std::min(phys, commit);
+            const size_t need = size / (1024 * 1024) + rs_ckpt_reserve_mb();
+            if (avail != 0 && avail < need) {
+                char sb[224];
+                snprintf(
+                    sb, sizeof(sb),
+                    "[xllama] session: KV checkpoint at %zu tokens skipped — avail_phys %zu MB, "
+                    "commit_avail %zu MB < %zu MB, %zu held (#170c)\n",
+                    n, phys, commit, need, m_rs_ckpts.size());
+                log_output(sb);
+                return;
+            }
+        }
+        try {
+            ck.state.resize(size);
+            ck.tokens.assign(history, history + n);
+        } catch (const std::bad_alloc&) {
+            m_rs_ckpts.clear();
+            m_rs_ckpts.shrink_to_fit();
+            char fb[224];
+            snprintf(fb, sizeof(fb),
+                     "[xllama] session: KV checkpoint allocation failed — checkpoints dropped "
+                     "(#170c; private %zu MB, avail_phys %zu MB, commit_avail %zu MB)\n",
+                     private_mb(), avail_phys_mb(), avail_commit_mb());
+            log_output(fb);
+            return;
+        }
+        if (llama_state_seq_get_data_ext(ctx, ck.state.data(), size, 0,
+                                         LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != size) {
+            log_output("[xllama] session: KV checkpoint snapshot failed (#170c)\n");
+            return;
+        }
+        m_rs_ckpts.push_back(std::move(ck));
+        char cb[192];
+        snprintf(cb, sizeof(cb),
+                 "[xllama] session: KV checkpoint at %zu tokens — %.1f MiB in %.1f ms, %zu held "
+                 "(#170c)\n",
+                 n, (double)size / (1024.0 * 1024.0),
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                     .count(),
+                 m_rs_ckpts.size());
+        log_output(cb);
+    }
+
+    // Prefix cache: the knobs, read once at creation (after the catalogue env
+    // is applied). XLLAMA_PREFIX_CACHE_DIR names the root; on the console it
+    // defaults to LocalState\prefix-cache, on the host the cache is off without
+    // it. The first session of a process to use a root wipes it (what an earlier
+    // process wrote never reaches a new one); later sessions keep the files of
+    // the live ones. Each session then takes its own "pc-<n>" directory.
+    void init_prefix_cache() {
+        const char* mib = std::getenv("XLLAMA_PREFIX_CACHE_MIB");
+        const uint64_t budget = mib && *mib ? std::strtoull(mib, nullptr, 10) << 20 : 0;
+        if (budget == 0)
+            return;
+        const char* dir = std::getenv("XLLAMA_PREFIX_CACHE_DIR");
+        std::string root = dir && *dir ? dir : "";
+    #ifdef XLLAMA_UWP
+        if (root.empty())
+            root = resolve_local_path("prefix-cache");
+    #endif
+        if (root.empty()) {
+            log_output("[xllama] session: prefix cache off — XLLAMA_PREFIX_CACHE_DIR unset\n");
+            return;
+        }
+        if (const char* s = std::getenv("XLLAMA_PREFIX_CACHE_MIN"); s && *s)
+            m_pc_min = std::max<size_t>(std::strtoul(s, nullptr, 10), kRsCheckpointMinGain);
+        m_pc_root = root;
+        m_pc_ttl = prefix_cache_ttl(std::getenv("XLLAMA_PREFIX_CACHE_TTL_S"));
+        static std::mutex wiped_mu;
+        static std::set<std::string> wiped;
+        bool first_use = false;
+        {
+            std::lock_guard<std::mutex> lk(wiped_mu);
+            first_use = wiped.insert(root).second;
+        }
+        if (first_use) {
+            const size_t removed = wipe_prefix_cache_files(root);
+            log_output("[xllama] session: prefix cache start wipe — " + std::to_string(removed) +
+                       " files removed\n");
+        }
+        static std::atomic<unsigned> serial{0};
+        m_pc_dir = root + "/pc-" + std::to_string(++serial);
+        m_pc_budget = budget;
+        char lb[96];
+        snprintf(lb, sizeof(lb), "[xllama] session: prefix cache on — %llu MiB, min %zu tokens, ",
+                 static_cast<unsigned long long>(budget >> 20), m_pc_min);
+        log_output(lb + m_pc_dir + "\n");
+    }
+
+    void drop_prefix_files() {
+        m_pc.clear();
+        if (m_pc_dir.empty())
+            return;
+        std::error_code ec;
+        std::filesystem::remove_all(m_pc_dir, ec);
+    }
+
+    // Prefix cache: write the full state of history[0, n), at a #170c split
+    // point of a full-prompt prefill (the cells there are exactly that
+    // history). An identical history already on disk is only marked used. A
+    // failed write turns the cache off for the session: on the console that
+    // is a full disk, and every later request would pay the failing write.
+    void save_prefix_cache(llama_context* ctx, const llama_token* history, size_t n) {
+        if (m_pc_budget == 0)
+            return;
+        prune_prefix_cache_files(m_pc_root, m_pc_ttl);
+        m_pc.prune(m_pc_dir, m_pc_ttl);
+        if (n < m_pc_min || llama_n_rs_seq(ctx) > 0)
+            return;
+        const std::string fp = state_fingerprint();
+        if (fp != m_pc_fp) {
+            drop_prefix_files();
+            m_pc_fp = fp;
+        }
+        if (const int i = m_pc.find_exact(history, n); i >= 0) {
+            m_pc.touch(static_cast<size_t>(i));
+            return;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        const std::string name = PrefixCacheIndex::file_name(fp, history, n);
+        const std::string path = m_pc_dir + "/" + name;
+        const std::string tmp = path + ".tmp";
+        std::error_code ec;
+        std::filesystem::create_directories(m_pc_dir, ec);
+        // A rename, so a crash never leaves a half file under a live name.
+        const size_t bytes = ec ? 0 : llama_state_seq_save_file(ctx, tmp.c_str(), 0, history, n);
+        if (bytes > 0)
+            std::filesystem::rename(tmp, path, ec);
+        if (bytes == 0 || ec) {
+            std::filesystem::remove(tmp, ec);
+            drop_prefix_files();
+            m_pc_budget = 0;
+            char fb[128];
+            snprintf(fb, sizeof(fb),
+                     "[xllama] session: prefix cache save at %zu tokens failed — off for this "
+                     "session\n",
+                     n);
+            log_output(fb);
+            return;
+        }
+        PrefixCacheEntry e;
+        e.tokens.assign(history, history + n);
+        e.file = name;
+        e.bytes = bytes;
+        for (const std::string& f : m_pc.add(std::move(e), m_pc_budget))
+            std::filesystem::remove(m_pc_dir + "/" + f, ec);
+        char cb[192];
+        snprintf(cb, sizeof(cb),
+                 "[xllama] session: prefix cache save — %zu tokens, %.1f MiB in %.1f ms, %zu files "
+                 "/ %.1f MiB held\n",
+                 n, (double)bytes / (1024.0 * 1024.0),
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                     .count(),
+                 m_pc.entries().size(), (double)m_pc.total_bytes() / (1024.0 * 1024.0));
+        log_output(cb);
+    }
+
+    // Prefix cache: on a full prompt, restore the longest saved history that
+    // is a prefix of tokens[0, size-1) when it keeps at least
+    // kRsCheckpointMinGain more tokens than the in-memory paths would — all of
+    // the common prefix on a pure extension, else the best #170c checkpoint
+    // inside it. Returns the restored length (m_kv_tokens is that history).
+    // 0 leaves the cache untouched, except after a refused load: then the
+    // cache is cleared and m_kv_tokens empty, and the request prefills in full.
+    size_t restore_prefix_cache(llama_context* ctx, const std::vector<llama_token>& tokens,
+                                size_t common) {
+        if (m_pc_budget == 0)
+            return 0;
+        m_pc.prune(m_pc_dir, m_pc_ttl);
+        if (m_pc.entries().empty() || tokens.size() < 2 || llama_n_rs_seq(ctx) > 0 ||
+            state_fingerprint() != m_pc_fp)
+            return 0;
+        size_t keep = common;
+        if (common < m_kv_tokens.size()) {
+            const size_t ck = best_rs_checkpoint(tokens, common);
+            keep = ck < m_rs_ckpts.size() ? m_rs_ckpts[ck].tokens.size() : 0;
+        }
+        const int found = m_pc.find(tokens.data(), tokens.size() - 1, keep + kRsCheckpointMinGain);
+        if (found < 0)
+            return 0;
+        const auto t0 = std::chrono::steady_clock::now();
+        const size_t i = static_cast<size_t>(found);
+        const PrefixCacheEntry& e = m_pc.entries()[i];
+        const std::string path = m_pc_dir + "/" + e.file;
+        std::error_code ec;
+        const uintmax_t on_disk = std::filesystem::file_size(path, ec);
+        std::vector<llama_token> got;
+        size_t n_got = 0, read = 0;
+        if (!ec && on_disk == e.bytes) {
+            got.resize(e.tokens.size());
+            llama_memory_clear(llama_get_memory(ctx), true);
+            m_kv_tokens.clear();
+            read = llama_state_seq_load_file(ctx, path.c_str(), 0, got.data(), got.size(), &n_got);
+        }
+        if (read != e.bytes || n_got != e.tokens.size() ||
+            !std::equal(got.begin(), got.end(), e.tokens.begin())) {
+            char fb[160];
+            snprintf(fb, sizeof(fb),
+                     "[xllama] session: prefix cache restore of %zu tokens refused — file "
+                     "dropped, %s\n",
+                     e.tokens.size(), got.empty() ? "size mismatch" : "full re-prefill");
+            log_output(fb);
+            std::filesystem::remove(path, ec);
+            m_pc.remove(i);
+            if (!got.empty())
+                llama_memory_clear(llama_get_memory(ctx), true);
+            return 0;
+        }
+        m_pc.touch(i);
+        m_kv_tokens = std::move(got);
+        // The file holds the target's cells only: the drafter restarts empty.
+        m_mtp.keep_prefix(0);
+        char cb[192];
+        snprintf(cb, sizeof(cb),
+                 "[xllama] session: prefix cache restore — %zu of %zu prompt tokens from disk in "
+                 "%.1f ms (in memory: %zu)\n",
+                 m_kv_tokens.size(), tokens.size(),
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                     .count(),
+                 keep);
+        log_output(cb);
+        return m_kv_tokens.size();
     }
 
     InferenceResult generate(const GenerateParams& gp) override {
@@ -600,6 +1059,21 @@ class LlamaSession final : public Session {
         const bool full_prompt = gp.reset_kv || !gp.reuse_kv;
 
         const llama_vocab* vocab = llama_model_get_vocab(m_model.get());
+
+        // Scoring: a forced reply is checked before any prefill is paid for.
+        std::vector<llama_token> forced;
+        if (!gp.forced_tokens.empty()) {
+            const int n_vocab = llama_vocab_n_tokens(vocab);
+            forced.reserve(gp.forced_tokens.size());
+            for (const int32_t id : gp.forced_tokens) {
+                if (id < 0 || id >= n_vocab) {
+                    res.error_msg = "forced token " + std::to_string(id) +
+                                    " outside the vocabulary of " + std::to_string(n_vocab);
+                    return res;
+                }
+                forced.push_back(static_cast<llama_token>(id));
+            }
+        }
 
         // parse_special=true: every Session caller (chat UI, API endpoint, bench)
         // passes a TEMPLATED prompt, whose <|im_start|>/<|im_end|> markers must
@@ -635,28 +1109,64 @@ class LlamaSession final : public Session {
         // diverges immediately and degrades to the old full clear.
         llama_memory_t mem = llama_get_memory(ctx);
         size_t kv_keep = 0;
+        // #170c: where a refused rewind diverged, snapped back to just after the
+        // last control token before it (a turn marker: <|im_start|>,
+        // <|start_header_id|>...). Calls sharing a system prompt diverge inside
+        // the user turn, each at its own word ("Which planet is" / "Which
+        // planet has"); the turn boundary is what the next one shares too.
+        size_t rs_common = 0;
         if (full_prompt) {
             const size_t max_keep = tokens.empty() ? 0 : tokens.size() - 1;
             while (kv_keep < m_kv_tokens.size() && kv_keep < max_keep &&
                    m_kv_tokens[kv_keep] == tokens[kv_keep])
                 ++kv_keep;
-            if (kv_keep > 0) {
+            // Prefix cache: a saved prefix longer than the in-memory paths keep
+            // replaces the resident history; a refused load emptied it.
+            const size_t from_disk = restore_prefix_cache(ctx, tokens, kv_keep);
+            res.n_prefix_cache_tokens = static_cast<int>(from_disk);
+            kv_keep = std::min(kv_keep, m_kv_tokens.size());
+            if (from_disk > 0) {
+                kv_keep = from_disk;
+            } else if (kv_keep > 0) {
                 // Pure extension (no divergent tail) needs no removal. When a
                 // tail must go, honor seq_rm's result: hybrid caches (LFM2's
                 // attn+recurrent) refuse a partial tail erase — the recurrent
                 // state cannot be rewound — and mutate NOTHING on failure, so
                 // decoding on top would corrupt the output. Degrade to a full
                 // clear + re-prefill instead.
+                // With MTP the recurrent half keeps n_rs_seq rollback snapshots,
+                // and llama.cpp accepts any rollback up to that depth — but the
+                // snapshots are only those the LAST ubatch wrote (a one-token
+                // decode leaves the older slots stale), so a prefix rewind of
+                // 1..n_rs_seq would resume from a wrong state with no error.
+                // Only the verify loop rolls back through them; here the
+                // checkpoint path stays the one way back, as before MTP.
                 if (kv_keep < m_kv_tokens.size() &&
-                    !llama_memory_seq_rm(mem, 0, static_cast<llama_pos>(kv_keep), -1)) {
+                    (llama_n_rs_seq(ctx) > 0 ||
+                     !llama_memory_seq_rm(mem, 0, static_cast<llama_pos>(kv_keep), -1))) {
+                    rs_common = kv_keep;
+                    while (rs_common > 0 && !llama_vocab_is_control(vocab, tokens[rs_common - 1]))
+                        --rs_common;
+                    if (rs_common == 0)
+                        rs_common = kv_keep; // plain text: no turn marker to snap to
+                    const size_t restored = restore_rs_checkpoint(ctx, tokens, kv_keep);
                     char rb[256];
-                    snprintf(rb, sizeof(rb),
-                             "[xllama] session: KV rewind unsupported (hybrid cache) — "
-                             "full re-prefill (#170): common=%zu resident=%zu prompt=%zu\n",
-                             kv_keep, m_kv_tokens.size(), tokens.size());
+                    if (restored > 0) {
+                        snprintf(rb, sizeof(rb),
+                                 "[xllama] session: KV checkpoint restore — kept %zu of %zu "
+                                 "tokens (common=%zu resident=%zu) (#170c)\n",
+                                 restored, tokens.size(), kv_keep, m_kv_tokens.size());
+                        kv_keep = restored;
+                    } else {
+                        snprintf(rb, sizeof(rb),
+                                 "[xllama] session: KV rewind unsupported (hybrid cache) — "
+                                 "full re-prefill (#170): common=%zu resident=%zu prompt=%zu "
+                                 "checkpoints=%zu\n",
+                                 kv_keep, m_kv_tokens.size(), tokens.size(), m_rs_ckpts.size());
+                        llama_memory_clear(mem, true);
+                        kv_keep = 0;
+                    }
                     log_output(rb);
-                    llama_memory_clear(mem, true);
-                    kv_keep = 0;
                 } else {
                     char pb[128];
                     snprintf(pb, sizeof(pb),
@@ -738,6 +1248,7 @@ class LlamaSession final : public Session {
                                       m_kv_tokens.begin() + keep + n_discard);
                     kv_len -= n_discard;
                     shifted = true;
+                    m_mtp.keep_prefix(0); // its cells sit at the pre-shift positions
                     char sb[160];
                     snprintf(sb, sizeof(sb),
                              "[xllama] session: context shift — evicted %d tokens past "
@@ -769,9 +1280,54 @@ class LlamaSession final : public Session {
         // LOGICAL batch only — the physical ubatch stays 512 (#172 optimum),
         // which is what the prefill rate was measured on.
         InferenceWatchdog wd(gp.progress(), gp.abort_flag);
+        if (n_pf >= 256)
+            log_gguf_ws("at prefill"); // both pools before a long prefill: what it has to grow into
         wd.enter_prefill(n_pf);
         const auto t_prefill0 = std::chrono::steady_clock::now();
-        if (!prefill_chunked(ctx, pf, n_pf, &wd)) {
+        // MTP: the drafter holds what the target kept, and mirrors every
+        // prefill chunk while the target's hidden rows of that chunk are live.
+        m_mtp.keep_prefix(static_cast<llama_pos>(kv_len));
+        PrefillChunkHook mtp_hook = [this](const llama_token* t, int n, llama_pos pos0) {
+            return mtp_mirror_chunk(m_mtp, t, n, pos0);
+        };
+        const PrefillChunkHook* after_chunk = m_mtp.usable() ? &mtp_hook : nullptr;
+        // #170c: split the prefill where checkpoints go — positions in the
+        // history this prefill completes: the divergence point a refused
+        // rewind fell back from (the next prompt likely shares it: a system
+        // prompt, a fixed instruction) and the prompt end minus the re-rendered
+        // tail (the next API turn, a regenerate, an edit of the last message).
+        const size_t pf_begin = static_cast<size_t>(kv_len);
+        const size_t pf_end = pf_begin + static_cast<size_t>(n_pf);
+        std::vector<size_t> rs_at;
+        std::vector<llama_token> rs_history; // a continuation's resident + delta
+        if (m_rs_ckpt_enabled && (full_prompt || m_kv_tokens.size() == pf_begin)) {
+            if (rs_common >= pf_begin + kRsCheckpointMinGain &&
+                rs_common + kRsCheckpointTail < pf_end)
+                rs_at.push_back(rs_common);
+            if (pf_end > pf_begin + kRsCheckpointTail)
+                rs_at.push_back(pf_end - kRsCheckpointTail);
+            if (!full_prompt && !rs_at.empty()) {
+                rs_history = m_kv_tokens;
+                rs_history.insert(rs_history.end(), tokens.begin(), tokens.end());
+            }
+        }
+        const llama_token* rs_hist = full_prompt ? tokens.data() : rs_history.data();
+        bool prefilled = true;
+        int n_done = 0;
+        for (const size_t at : rs_at) {
+            const int seg = static_cast<int>(at - pf_begin) - n_done;
+            if (!prefill_chunked(ctx, pf + n_done, seg, &wd, n_done, after_chunk)) {
+                prefilled = false;
+                break;
+            }
+            n_done += seg;
+            save_rs_checkpoint(ctx, rs_hist, at);
+            if (full_prompt && gp.save_prefix)
+                save_prefix_cache(ctx, rs_hist, at);
+        }
+        if (prefilled)
+            prefilled = prefill_chunked(ctx, pf + n_done, n_pf - n_done, &wd, n_done, after_chunk);
+        if (!prefilled) {
             if (wd.stalled()) {
                 res.stalled = true;
                 res.error_msg = wd.stall_error();
@@ -785,6 +1341,7 @@ class LlamaSession final : public Session {
             // m_kv_tokens) from decoding on top of half a prefill.
             m_kv_tokens.clear();
             llama_memory_clear(mem, true);
+            m_mtp.keep_prefix(0);
             return res;
         }
         res.t_p_eval_ms =
@@ -799,6 +1356,8 @@ class LlamaSession final : public Session {
             m_kv_tokens.assign(tokens.begin(), tokens.end());
         else
             m_kv_tokens.insert(m_kv_tokens.end(), tokens.begin(), tokens.end());
+        if (m_mtp.usable())
+            common_speculative_begin(m_mtp.spec, 0, m_kv_tokens);
 
         // Shared with run_inference — see src/bridge/sampler_chain.h and #125.
         // SamplingConfig::is_greedy() also covers temperature 0, where the full
@@ -867,8 +1426,47 @@ class LlamaSession final : public Session {
         dlp.prompt_lookup = m_prompt_lookup;
         dlp.token_history = &m_kv_tokens;
         dlp.watchdog = &wd;
-        wd.enter_decode(n_predict_eff);
-        const DecodeLoopResult dlr = decode_loop(dlp, res.output_text);
+        if (!forced.empty()) {
+            dlp.forced = &forced;
+            dlp.n_predict = std::min(n_predict_eff, static_cast<int>(forced.size()));
+            dlp.stop_sequences = nullptr;
+        }
+        if (gp.logprobs || !forced.empty()) {
+            res.logprobs.reserve(static_cast<size_t>(dlp.n_predict));
+            dlp.logprobs = &res.logprobs;
+        }
+        // Thinking budget: the closer as ids (its "</think>" a special token, so
+        // parse_special) and the end tag, which must be one token to be watched.
+        std::vector<llama_token> think_close;
+        if (gp.think_budget > 0 && !dlp.grammar && !dlp.forced) {
+            llama_token end_id = -1;
+            const std::string closer = kThinkBudgetClose;
+            const int32_t n_close =
+                -llama_tokenize(vocab, closer.c_str(), static_cast<int32_t>(closer.size()), nullptr,
+                                0, false, true);
+            if (llama_tokenize(vocab, kThinkEndTag, static_cast<int32_t>(sizeof(kThinkEndTag) - 1),
+                               &end_id, 1, false, true) == 1 &&
+                n_close > 0) {
+                think_close.resize(static_cast<size_t>(n_close));
+                if (llama_tokenize(vocab, closer.c_str(), static_cast<int32_t>(closer.size()),
+                                   think_close.data(), n_close, false, true) == n_close) {
+                    dlp.think_budget = gp.think_budget;
+                    dlp.think_end = end_id;
+                    dlp.think_close = &think_close;
+                }
+            }
+            if (!dlp.think_close)
+                log_output("[xllama] thinking budget ignored: this vocabulary has no single "
+                           "</think> token\n");
+        }
+        wd.enter_decode(dlp.n_predict);
+        const bool use_mtp = m_mtp.usable() && !dlp.grammar && !dlp.forced && !dlp.logprobs &&
+                             !think_budget_armed(dlp);
+        const DecodeLoopResult dlr = use_mtp ? decode_loop_mtp(dlp, m_mtp, res.output_text)
+                                             : decode_loop(dlp, res.output_text);
+        // A classic turn (grammar, scoring) leaves the drafter without its
+        // generated tokens: a gap its attention simply skips (M-RoPE positions
+        // only have to move forward, so the next mirror still lands).
         const int n_generated = dlr.n_generated;
         const bool stopped_by_seq = dlr.ended_with_stop;
 
@@ -881,11 +1479,14 @@ class LlamaSession final : public Session {
         res.ended_with_stop = stopped_by_seq;
         res.n_drafted = dlr.n_drafted;
         res.n_spec_accepted = dlr.n_accepted;
+        res.n_think = dlr.n_think;
+        res.think_forced = dlr.think_forced;
         if (dlr.rewind_failed) {
             // History and KV are untrustworthy — same class as a decode failure.
             m_kv_tokens.clear();
             if (m_ctx)
                 llama_memory_clear(llama_get_memory(m_ctx.get()), /*data=*/true);
+            m_mtp.keep_prefix(0);
             res.success = false;
             res.error_msg =
                 "speculative KV rewind unsupported (disable prompt_lookup for this model)";
@@ -908,6 +1509,24 @@ class LlamaSession final : public Session {
                  n_generated, res.t_p_eval_ms, res.n_p_eval, gp.reuse_kv && !gp.reset_kv,
                  dlr.n_drafted, dlr.n_accepted);
         log_output(log_buf);
+        // Where decode time goes: llama_decode vs sampling, and how often llama
+        // reused the previous compute graph instead of rebuilding and splitting it
+        // (the count is the context's, since it was created).
+        snprintf(log_buf, sizeof(log_buf),
+                 "[xllama] session decode: %.1f ms in llama_decode, %.1f ms sampling, "
+                 "graphs reused %d\n",
+                 dlr.decode_ms, dlr.sample_ms, llama_perf_context(m_ctx.get()).n_reused);
+        log_output(log_buf);
+        if (use_mtp) {
+            snprintf(log_buf, sizeof(log_buf),
+                     "[xllama] mtp: rounds=%d drafted=%d accepted=%d (%.3f) tok/round=%.3f "
+                     "draft=%.1fms mirror=%.1fms%s\n",
+                     dlr.n_rounds, dlr.n_drafted, dlr.n_accepted,
+                     dlr.n_drafted > 0 ? (double)dlr.n_accepted / dlr.n_drafted : 0.0,
+                     dlr.n_rounds > 0 ? (double)n_generated / dlr.n_rounds : 0.0, dlr.draft_ms,
+                     dlr.mirror_ms, dlr.mtp_failed ? " FAILED" : "");
+            log_output(log_buf);
+        }
 
         return res;
     }
@@ -999,6 +1618,7 @@ class LlamaSession final : public Session {
         // invalidate its token mirror; the next chat turn will prefill cleanly.
         m_kv_tokens.clear();
         llama_memory_clear(llama_get_memory(ctx), true);
+        m_mtp.keep_prefix(0);
         llama_set_embeddings(ctx, true);
         struct EmbeddingContextReset {
             llama_context* ctx;
@@ -1269,6 +1889,9 @@ class LlamaSession final : public Session {
             return false;
         }
         m_kv_tokens = std::move(tokens);
+        // The file holds the target's cells only: the drafter restarts empty
+        // (drafts read just the new tokens until the history refills).
+        m_mtp.keep_prefix(0);
         char lb[160];
         snprintf(lb, sizeof(lb),
                  "[xllama] session: KV state loaded — %zu tokens, %.1f MB (#170b)\n",
@@ -1296,9 +1919,29 @@ std::unique_ptr<Session> create_llama(const SessionParams& sp, std::string* err)
     }
 
     llama_model_params mparams = llama_model_default_params();
-    const int gpu_layers =
-        apply_gguf_gpu_layers(sp.stream_weights ? 0 : sp.n_gpu_layers, mparams, abs_path);
-    apply_gguf_residency(sp.stream_weights, mparams);
+    // the expert cache (which wins over stream) keeps the experts on the CPU itself
+    const bool cpu_only = sp.stream_weights && sp.expert_slots <= 0;
+    apply_env_overrides(sp.env); // first: the set_env_int below honour it
+    // MTP self-speculation (decode_loop_mtp.h): XLLAMA_MTP_SIDECAR names the
+    // head's GGUF (patch 0012 adds its block to this model), XLLAMA_MTP_DRAFT
+    // the drafts per round (default 1, 0 = load nothing), XLLAMA_MTP_PMIN the
+    // head's confidence below which a round decodes one token (default 0).
+    int mtp_n = 0;
+    float mtp_p_min = 0.0f;
+    if (const char* sc = std::getenv("XLLAMA_MTP_SIDECAR"); sc && *sc) {
+        mtp_n = 1;
+        if (const char* s = std::getenv("XLLAMA_MTP_DRAFT"); s && *s)
+            mtp_n = std::clamp(std::atoi(s), 0, 8);
+        if (const char* s = std::getenv("XLLAMA_MTP_PMIN"); s && *s)
+            mtp_p_min = std::clamp(static_cast<float>(std::atof(s)), 0.0f, 1.0f);
+        mparams.load_mtp = mtp_n > 0;
+        log_output("[xllama] mtp: sidecar " + std::string(sc) + ", " + std::to_string(mtp_n) +
+                   " draft/round\n");
+    }
+    const int gpu_layers = apply_gguf_gpu_layers(cpu_only ? 0 : sp.n_gpu_layers, mparams, abs_path);
+    apply_gguf_residency(sp.stream_weights, mparams, sp.expert_slots, sp.expert_swap,
+                         sp.expert_prefetch, sp.expert_major, sp.expert_prefetch_ahead);
+    apply_expert_used_override(mparams, abs_path);
 
     install_llama_log();
     llama_model* raw_model = llama_model_load_from_file(abs_path.c_str(), mparams);
@@ -1325,9 +1968,11 @@ std::unique_ptr<Session> create_llama(const SessionParams& sp, std::string* err)
     int n_threads = sp.n_threads > 0 ? sp.n_threads : detect_threads_llama();
     int n_ctx = sp.n_ctx > 0 ? sp.n_ctx : kDefaultNCtx;
     log_output("[xllama] Session: GGUF model loaded via llama.cpp (persistent)\n");
-    return std::make_unique<LlamaSession>(LlamaModelPtr(raw_model), std::move(adapter),
-                                          sp.lora_scale, n_ctx, n_threads, sp.n_batch, sp.n_ubatch,
-                                          sp.kv_q8, sp.prompt_lookup, gpu_layers);
+    auto session = std::make_unique<LlamaSession>(
+        LlamaModelPtr(raw_model), std::move(adapter), sp.lora_scale, n_ctx, n_threads, sp.n_batch,
+        sp.n_ubatch, sp.kv_q8, sp.prompt_lookup, gpu_layers, mtp_n, mtp_p_min);
+    session->init_prefix_cache();
+    return session;
 }
 } // namespace detail
 

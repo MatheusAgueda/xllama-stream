@@ -16,6 +16,8 @@
 // (D2a run 1: ffn_down N=2048 under 100 GB/s at 64), short K starves 128
 // (run 2: lm_head K=1024 fell from 110 to 64 GB/s).
 // SV_GroupID.y is the activation column (prefill), y = 0 for decode.
+// A kernel with more constants defines PARAMS_EXTRA (its fields, after pad1)
+// before including this file (ggml_d3d12_mmid_iq4_xs.hlsl).
 
 #define NUM_ROWS 4
 #ifndef NUM_THREADS
@@ -32,6 +34,9 @@ cbuffer Params : register(b0) {
     uint y_stride;    // floats between output columns (nb1 / 4)
     uint pad0;
     uint pad1;
+#ifdef PARAMS_EXTRA
+    PARAMS_EXTRA
+#endif
 };
 
 ByteAddressBuffer W : register(t0);

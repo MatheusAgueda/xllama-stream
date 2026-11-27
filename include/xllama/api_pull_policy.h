@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "xllama/compute_admission.h"
 #include "xllama/withdrawn_models.h"
 
 #include <mutex>
@@ -73,5 +74,40 @@ class ApiPullGate {
   private:
     std::mutex m_mutex;
 };
+
+// POST /api/pull admission: the pull gate, then the compute permit, BEFORE the reply stream opens
+// or a byte is downloaded. Busy is 503 with nothing written; a second pull is 409. The permit is
+// held through the download and the model load (the pull needs the slot at the end anyway and
+// used to find it taken after the whole download), and the caller releases it before its final
+// reply write.
+enum class PullAdmitStatus { Admitted, PullInProgress, Busy };
+
+struct PullAdmission {
+    PullAdmitStatus status = PullAdmitStatus::PullInProgress;
+    std::unique_lock<std::mutex> gate;
+    ComputeJobAdmission::Handle permit;
+
+    void release() {
+        permit.reset();
+        if (gate.owns_lock())
+            gate.unlock();
+    }
+};
+
+template <typename AcquirePermit>
+PullAdmission admit_pull(ApiPullGate& gate, AcquirePermit&& acquire_permit) {
+    PullAdmission a;
+    a.gate = gate.try_acquire();
+    if (!a.gate.owns_lock())
+        return a;
+    a.permit = acquire_permit();
+    if (!a.permit) {
+        a.gate.unlock();
+        a.status = PullAdmitStatus::Busy;
+        return a;
+    }
+    a.status = PullAdmitStatus::Admitted;
+    return a;
+}
 
 } // namespace xllama

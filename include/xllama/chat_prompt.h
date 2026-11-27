@@ -119,10 +119,18 @@ struct ChatFormat {
     // (thinking models). Empty-think stripping for Qwen3 no-think always runs.
     bool strip_thinking_content = false;
 
+    // Final generation header only, in place of gen_suffix: "<think>\n" when a
+    // client asked a Qwen3.x hybrid to reason (request_thinking). History turns
+    // keep gen_suffix — they were answered without reasoning in the KV — and the
+    // output is read as if it began with this opener, so a reply cut mid-thought
+    // comes back empty rather than as raw reasoning.
+    std::string think_open;
+
     // Full multi-turn prompt ending with the assistant generation header +
-    // gen_suffix. gen_suffix is appended ONLY to the final (trailing) assistant
-    // header, never to completed history turns. History turns are complete
-    // (user + assistant) exchanges.
+    // gen_suffix. Completed history assistant turns carry gen_suffix too, ahead
+    // of their text: the turn was generated after it, so the next full render
+    // extends the resident KV instead of diverging at the suffix. History turns
+    // are complete (user + assistant) exchanges.
     std::string render_prompt(const std::string& system, const std::vector<ChatTurn>& history,
                               const std::string& final_user) const;
 
@@ -145,5 +153,22 @@ struct ChatFormat {
 
 // Select the chat format for a catalogue id / filename (as model_is_qwen does today).
 ChatFormat chat_format_for(const std::string& model_id);
+
+// chat_template_kwargs.enable_thinking on the plain chat path, as the Qwen3.5/3.6
+// Jinja renders it: on → the generation prompt ends "<think>\n" and the reasoning
+// is stripped from the reply; off → the empty-think prefill, also for ids named
+// "thinking". Qwen3.x ChatML only — every other format is left as it was.
+void request_thinking(ChatFormat& fmt, const std::string& model_id, bool on);
+
+// What a thinking budget (GenerateParams::think_budget) writes for the model once
+// the budget is spent with the reasoning still open: the stop-thinking sentence
+// the Qwen3 technical report (§4.3, "thinking budget") inserts, then the closer
+// in the template's own "</think>\n\n" shape. The model was trained to answer
+// from its partial reasoning after it. The leading blank line ends whatever
+// sentence the budget cut.
+inline constexpr char kThinkBudgetClose[] =
+    "\n\nConsidering the limited time by the user, I have to give the solution based on the "
+    "thinking directly now.\n</think>\n\n";
+inline constexpr char kThinkEndTag[] = "</think>";
 
 } // namespace xllama

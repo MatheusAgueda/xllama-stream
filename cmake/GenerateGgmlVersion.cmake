@@ -29,18 +29,26 @@ endif()
 if(CMAKE_MATCH_1 STREQUAL "ON")
     string(APPEND LLAMA_VERSION "-dev")
 endif()
-find_program(GIT_EXE NAMES git git.exe REQUIRED)
-execute_process(COMMAND "${GIT_EXE}" rev-parse --short HEAD
-    WORKING_DIRECTORY "${GGML_SOURCE_DIR}"
-    OUTPUT_VARIABLE GGML_BUILD_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE
-    COMMAND_ERROR_IS_FATAL ANY)
-set(LLAMA_BUILD_COMMIT "${GGML_BUILD_COMMIT}")
-execute_process(COMMAND "${GIT_EXE}" diff-index --quiet HEAD -- .
-    WORKING_DIRECTORY "${GGML_SOURCE_DIR}" RESULT_VARIABLE dirty)
-if(dirty EQUAL 1)
+if(NOT "$ENV{XLLAMA_GGML_COMMIT}" STREQUAL "")
+    # A source tree without git metadata (the local build extracts GitHub's tarball
+    # of the pinned commit and applies the patches): the caller names the commit.
+    set(GGML_BUILD_COMMIT "$ENV{XLLAMA_GGML_COMMIT}")
+    set(LLAMA_BUILD_COMMIT "${GGML_BUILD_COMMIT}")
     string(APPEND GGML_BUILD_COMMIT "-dirty")
-elseif(NOT dirty EQUAL 0)
-    message(FATAL_ERROR "Cannot determine ggml working-tree identity")
+else()
+    find_program(GIT_EXE NAMES git git.exe REQUIRED)
+    execute_process(COMMAND "${GIT_EXE}" rev-parse --short HEAD
+        WORKING_DIRECTORY "${GGML_SOURCE_DIR}"
+        OUTPUT_VARIABLE GGML_BUILD_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE
+        COMMAND_ERROR_IS_FATAL ANY)
+    set(LLAMA_BUILD_COMMIT "${GGML_BUILD_COMMIT}")
+    execute_process(COMMAND "${GIT_EXE}" diff-index --quiet HEAD -- .
+        WORKING_DIRECTORY "${GGML_SOURCE_DIR}" RESULT_VARIABLE dirty)
+    if(dirty EQUAL 1)
+        string(APPEND GGML_BUILD_COMMIT "-dirty")
+    elseif(NOT dirty EQUAL 0)
+        message(FATAL_ERROR "Cannot determine ggml working-tree identity")
+    endif()
 endif()
 configure_file("${GGML_SOURCE_DIR}/src/ggml-version.h.in" "${OUTPUT_FILE}" @ONLY)
 get_filename_component(output_dir "${OUTPUT_FILE}" DIRECTORY)

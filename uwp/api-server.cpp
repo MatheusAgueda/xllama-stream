@@ -22,13 +22,18 @@
     #include "inference-bridge.h"
     #include "model-downloader.h"
     #include "xllama/api_activity.h"
+    #include "xllama/api_auth.h"
     #include "xllama/api_connection.h"
+    #include "xllama/api_limits.h"
     #include "xllama/api_policy.h"
     #include "xllama/api_pull_policy.h"
+    #include "xllama/api_timings.h"
     #include "xllama/chat_prompt.h"
     #include "xllama/compute_admission.h"
+    #include "xllama/force_ids.h"
     #include "xllama/http_framing.h"
     #include "xllama/model_provision.h"
+    #include "xllama/model_spelling.h"
     #include "xllama/path_utils.h"
     #include "xllama/personalize.h"
     #include "xllama/platform.h"
@@ -42,6 +47,7 @@
     #include "xllama/tool_request.h"
     #include "xllama/tool_template.h"
     #include "xllama/tool_transcript.h"
+    #include "xllama/upscale/tile_plan.h"
     #include "xllama/utf8_utils.h"
 
     #include <algorithm>
@@ -49,12 +55,14 @@
     #include <charconv>
     #include <chrono>
     #include <climits>
+    #include <cmath>
     #include <cstdio>
     #include <cstdlib>
     #include <ctime>
     #include <filesystem>
     #include <memory>
     #include <mutex>
+    #include <optional>
     #include <stdexcept>
     #include <string>
     #include <vector>
@@ -113,10 +121,12 @@ StreamSocketListener g_listener{nullptr};
 constexpr int kDefaultPort = 11434; // Ollama default port, familiar to clients
 
 // Read and trim a small LocalState text file; empty string if absent.
-std::string read_local_text(const char* name) {
+std::string read_local_text(const char* name, bool* present = nullptr) {
     std::string out;
     const std::string p = ::xllama::resolve_local_path(name);
     FILE* f = _wfopen(winrt::to_hstring(p).c_str(), L"r");
+    if (present)
+        *present = f != nullptr;
     if (!f)
         return out;
     char buf[512];
@@ -151,6 +161,7 @@ int listen_port() {
 struct HttpRequest {
     std::string method;
     std::string path;
+    std::string authorization;
     std::string body;
     // 0 = a complete, exactly framed request. Otherwise the 4xx to answer with
     // (parse_http_head's codes, 400 for a short body, 408 past a deadline).
@@ -213,6 +224,7 @@ HttpRequest read_request(StreamSocket const& socket) {
     }
     req.method = head.method;
     req.path = head.path;
+    req.authorization = head.authorization;
 
     const auto body_deadline = clock::now() + ::xllama::kHttpBodyDeadline;
     while (data.size() - head.body_start < head.content_length) {
@@ -231,26 +243,71 @@ HttpRequest read_request(StreamSocket const& socket) {
     return req;
 }
 
+// Set on the thread that hit a write deadline; the work item that served the
+// connection closes the socket (dispatch_connection). Every reply, the streamed
+// tokens included (session->generate calls on_token inline), is written on that
+// one thread-pool thread.
+thread_local ::xllama::ReplyDeadlineMark t_reply_deadline;
+
+// Store and flush what `writer` holds (`bytes` of it) within http_write_deadline.
+// Past it the operation is cancelled and this throws, which every caller already
+// handles as «the client is gone»; an error from the store itself throws as before.
+template <typename Op>
+void await_reply_io(Op const& op, winrt::Windows::Foundation::TimeSpan limit) {
+    if (op.wait_for(limit) == winrt::Windows::Foundation::AsyncStatus::Started) {
+        op.Cancel();
+        t_reply_deadline.expired();
+        throw winrt::hresult_error(HRESULT_FROM_WIN32(ERROR_TIMEOUT), L"reply write deadline");
+    }
+    op.GetResults();
+}
+
+void store_with_deadline(DataWriter const& writer, size_t bytes) {
+    const auto limit = std::chrono::duration_cast<winrt::Windows::Foundation::TimeSpan>(
+        ::xllama::http_write_deadline(bytes));
+    await_reply_io(writer.StoreAsync(), limit);
+    await_reply_io(writer.FlushAsync(), limit);
+}
+
 void write_raw(StreamSocket const& socket, const std::string& out) {
     DataWriter writer(socket.OutputStream());
     writer.UnicodeEncoding(UnicodeEncoding::Utf8);
     writer.WriteString(winrt::to_hstring(out));
-    writer.StoreAsync().get();
-    writer.FlushAsync().get();
+    store_with_deadline(writer, out.size());
     writer.DetachStream();
 }
 
-void write_response(StreamSocket const& socket, const char* status, const std::string& json) {
+std::string response_head(const char* status, size_t content_length) {
     std::string out = "HTTP/1.1 ";
     out += status;
     out += "\r\nContent-Type: application/json\r\nContent-Length: ";
-    out += std::to_string(json.size());
+    out += std::to_string(content_length);
     // Allow-Origin alone is not enough for browser clients: they send a custom
     // Authorization header + application/json, which triggers a CORS preflight
     // (handled separately in handle_connection).
     out += "\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n";
+    return out;
+}
+
+void write_response(StreamSocket const& socket, const char* status, const std::string& json) {
+    std::string out = response_head(status, json.size());
     out += json;
     write_raw(socket, out);
+}
+
+// Tens of MB of base64 (the upscale result): the UTF-8 bytes as they are, without write_raw's
+// UTF-16 round trip, which would hold the body three times over in the shared heap.
+void write_response_bytes(StreamSocket const& socket, const char* status, const std::string& json) {
+    const std::string head = response_head(status, json.size());
+    auto bytes = [](const std::string& s) {
+        const auto* p = reinterpret_cast<const uint8_t*>(s.data());
+        return winrt::array_view<const uint8_t>(p, p + s.size());
+    };
+    DataWriter writer(socket.OutputStream());
+    writer.WriteBytes(bytes(head));
+    writer.WriteBytes(bytes(json));
+    store_with_deadline(writer, head.size() + json.size());
+    writer.DetachStream();
 }
 
 class PullJsonStream {
@@ -278,8 +335,7 @@ class PullJsonStream {
         frame += "\r\n";
         try {
             m_writer.WriteString(winrt::to_hstring(frame));
-            m_writer.StoreAsync().get();
-            m_writer.FlushAsync().get();
+            store_with_deadline(m_writer, frame.size());
             return true;
         } catch (...) {
             return false;
@@ -292,8 +348,7 @@ class PullJsonStream {
         m_finished = true;
         try {
             m_writer.WriteString(L"0\r\n\r\n");
-            m_writer.StoreAsync().get();
-            m_writer.FlushAsync().get();
+            store_with_deadline(m_writer, 5);
             m_writer.DetachStream();
         } catch (...) {
         }
@@ -348,10 +403,10 @@ SseHeadStatus write_sse_head(StreamSocket const& socket) {
     try {
         DataWriter writer(socket.OutputStream());
         writer.UnicodeEncoding(UnicodeEncoding::Utf8);
-        writer.WriteString(winrt::to_hstring(::xllama::sse_response_head()));
+        const std::string head = ::xllama::sse_response_head();
+        writer.WriteString(winrt::to_hstring(head));
         try {
-            writer.StoreAsync().get();
-            writer.FlushAsync().get();
+            store_with_deadline(writer, head.size());
             writer.DetachStream();
             return SseHeadStatus::Written;
         } catch (...) {
@@ -361,6 +416,8 @@ SseHeadStatus write_sse_head(StreamSocket const& socket) {
         return SseHeadStatus::FailedBeforeBytes;
     }
 }
+
+void add_reasoning_usage(JsonObject& usage, const ::xllama::InferenceResult& result);
 
 // Streamed chat completion (docs/api-endpoint.md): each token piece leaves as one
 // `chat.completion.chunk` event, then the finish chunk, then `[DONE]`. A streamed
@@ -426,7 +483,7 @@ class SseStream {
         }
     }
 
-    void finish(const wchar_t* reason, int prompt_tokens, int completion_tokens) {
+    void finish(const wchar_t* reason, const ::xllama::InferenceResult& result) {
         if (m_finished)
             return;
         try {
@@ -438,11 +495,15 @@ class SseStream {
             return;
         try {
             JsonObject usage;
-            usage.Insert(L"prompt_tokens", JsonValue::CreateNumberValue(prompt_tokens));
-            usage.Insert(L"completion_tokens", JsonValue::CreateNumberValue(completion_tokens));
+            usage.Insert(L"prompt_tokens", JsonValue::CreateNumberValue(result.n_prompt));
+            usage.Insert(L"completion_tokens", JsonValue::CreateNumberValue(result.n_eval));
             usage.Insert(L"total_tokens",
-                         JsonValue::CreateNumberValue(prompt_tokens + completion_tokens));
-            send_chunk(JsonObject{}, JsonValue::CreateStringValue(winrt::hstring(reason)), &usage);
+                         JsonValue::CreateNumberValue(result.n_prompt + result.n_eval));
+            add_reasoning_usage(usage, result);
+            const JsonObject timings =
+                JsonObject::Parse(winrt::to_hstring(::xllama::api_timings_json(result)));
+            send_chunk(JsonObject{}, JsonValue::CreateStringValue(winrt::hstring(reason)), &usage,
+                       &timings);
             end();
         } catch (...) {
             stop();
@@ -488,7 +549,7 @@ class SseStream {
     }
 
     void send_chunk(JsonObject const& delta, IJsonValue const& finish_reason,
-                    JsonObject const* usage) {
+                    JsonObject const* usage, JsonObject const* timings = nullptr) {
         JsonObject choice;
         choice.Insert(L"index", JsonValue::CreateNumberValue(0));
         choice.Insert(L"delta", delta);
@@ -505,6 +566,8 @@ class SseStream {
         chunk.Insert(L"choices", choices);
         if (usage != nullptr)
             chunk.Insert(L"usage", *usage);
+        if (timings != nullptr)
+            chunk.Insert(L"timings", *timings);
         send(winrt::to_string(chunk.Stringify()));
     }
 
@@ -514,8 +577,7 @@ class SseStream {
         try {
             const std::string framed = ::xllama::chunk_frame(::xllama::sse_event(payload));
             m_writer.WriteString(winrt::to_hstring(framed));
-            m_writer.StoreAsync().get();
-            m_writer.FlushAsync().get();
+            store_with_deadline(m_writer, framed.size());
             return true;
         } catch (...) {
             // The client is gone: stop emitting and abort the generation.
@@ -529,10 +591,10 @@ class SseStream {
             return;
         m_finished = true;
         try {
-            m_writer.WriteString(winrt::to_hstring(::xllama::chunk_frame(::xllama::sse_done()) +
-                                                   ::xllama::chunk_final()));
-            m_writer.StoreAsync().get();
-            m_writer.FlushAsync().get();
+            const std::string tail =
+                ::xllama::chunk_frame(::xllama::sse_done()) + ::xllama::chunk_final();
+            m_writer.WriteString(winrt::to_hstring(tail));
+            store_with_deadline(m_writer, tail.size());
             m_writer.DetachStream();
         } catch (...) {
             if (m_abort)
@@ -633,24 +695,42 @@ void split_messages(JsonArray const& messages, std::string& system,
         final_user = cur_user; // trailing user turn is the one we answer
 }
 
-// True when the console can serve `model` now: the resident model, or a
-// LocalState\models\<id> directory with a loadable layout. Raw paths (model.txt
-// may name one) are left to the session loader. The caller holds hub.mtx, so
-// this must not call current_model_id() (it try_locks the same mutex).
-bool model_servable_locked(const std::string& model) {
-    if (model.find_first_of("\\/:") != std::string::npos)
+// True when `model` is an exact manifest entry name. Same cache-and-refresh-on-miss as
+// catalogue_session_policy (the caller holds hub.mtx, which serialises the static): a model
+// published while the server runs is picked up on its first request.
+bool manifest_has_spelling(const std::string& model) {
+    static std::vector<::xllama::ManifestEntry> cache;
+    const std::wstring wname = ::xllama::utf8_to_wstring(model);
+    if (::xllama::find_model_spelling(cache, wname))
         return true;
+    cache = ::xllama::LoadModelManifest();
+    return ::xllama::find_model_spelling(cache, wname) != nullptr;
+}
+
+// True when the console can serve `model` now. Spellings are matched byte for byte, never
+// case-folded or merged (model_spelling.h): each is its own Session id with its own manifest
+// env, so one the console does not know is 404 instead of registering a new id.
+//   path spelling  the resident model, the model.txt hint, or a manifest entry name
+//   bare id        the resident model, or a LocalState\models\<id> directory of exactly that
+//                  name (NTFS would also open a case variant of it) with a loadable layout
+// The caller holds hub.mtx, so this must not call current_model_id() (it try_locks the same mutex).
+bool model_servable_locked(const std::string& model) {
     if (::xllama::session_hub().model == model)
         return true;
+    if (::xllama::model_id_is_path(model))
+        return ::xllama::path_spelling_known(model, manifest_has_spelling(model),
+                                             std::string_view(), read_local_text("model.txt"));
     std::error_code ec;
-    const std::filesystem::path dir =
-        std::filesystem::path(::xllama::resolve_local_path("models")) / model;
-    if (!std::filesystem::is_directory(dir, ec))
-        return false;
-    std::vector<std::string> files;
-    for (const auto& f : std::filesystem::directory_iterator(dir, ec))
-        files.push_back(f.path().filename().string());
-    return ::xllama::model_dir_files_ready(files);
+    const std::filesystem::path root = ::xllama::resolve_local_path("models");
+    for (const auto& entry : std::filesystem::directory_iterator(root, ec)) {
+        if (entry.path().filename().string() != model || !entry.is_directory(ec))
+            continue;
+        std::vector<std::string> files;
+        for (const auto& f : std::filesystem::directory_iterator(entry.path(), ec))
+            files.push_back(f.path().filename().string());
+        return ::xllama::model_dir_files_ready(files);
+    }
+    return false;
 }
 
 std::string model_not_found(const std::string& model) {
@@ -687,15 +767,21 @@ void append_client_stops(JsonObject const& root, std::vector<std::string>& stops
 
 // Sampling numbers, validated before any model load (F01). Ranges are
 // OpenAI's: temperature 0..2, top_p 0..1. A seed is a whole number; a negative
-// one (llama.cpp's "-1 = random") keeps the default seed.
+// one (llama.cpp's "-1 = random") keeps the default seed. top_k and
+// repetition_penalty are llama-server's (0 = that stage off); a model card's
+// recommended sampler (Qwen3.6 thinking: 0.6 / 0.95 / 20 / 1.0) needs both.
+// thinking_budget is checked against max_tokens where both are known.
 std::string check_sampling(JsonObject const& root) {
     struct Range {
         const char* key;
         double lo, hi;
         bool whole;
     };
-    for (const Range& r : {Range{"temperature", 0.0, 2.0, false}, Range{"top_p", 0.0, 1.0, false},
-                           Range{"seed", -2147483648.0, 4294967295.0, true}}) {
+    for (const Range& r :
+         {Range{"temperature", 0.0, 2.0, false}, Range{"top_p", 0.0, 1.0, false},
+          Range{"seed", -2147483648.0, 4294967295.0, true}, Range{"top_k", 0.0, 1000000.0, true},
+          Range{"repetition_penalty", 0.0, 2.0, false},
+          Range{"thinking_budget", 1.0, 2147483647.0, true}}) {
         const winrt::hstring name = winrt::to_hstring(r.key);
         if (!root.HasKey(name))
             continue;
@@ -718,26 +804,103 @@ void fill_sampling(JsonObject const& root, ::xllama::GenerateParams& gp) {
         if (seed >= 0)
             gp.seed = static_cast<uint32_t>(seed);
     }
+    if (root.HasKey(L"top_k"))
+        gp.top_k = static_cast<int>(root.GetNamedNumber(L"top_k"));
+    if (root.HasKey(L"repetition_penalty"))
+        gp.repetition_penalty = static_cast<float>(root.GetNamedNumber(L"repetition_penalty"));
+}
+
+// "thinking_budget" (the name Qwen's own API gives it): with the reasoning opened
+// (chat_template_kwargs.enable_thinking), at most this many reply tokens of it
+// before the session closes it and the model answers. 0 = none asked. Range
+// already checked by check_sampling.
+int requested_think_budget(JsonObject const& root) {
+    return root.HasKey(L"thinking_budget")
+               ? static_cast<int>(root.GetNamedNumber(L"thinking_budget"))
+               : 0;
+}
+
+// usage.completion_tokens_details.reasoning_tokens (OpenAI's field) when a
+// thinking budget was armed, plus whether the budget closed the reasoning.
+void add_reasoning_usage(JsonObject& usage, const ::xllama::InferenceResult& result) {
+    if (result.n_think <= 0)
+        return;
+    JsonObject details;
+    details.Insert(L"reasoning_tokens", JsonValue::CreateNumberValue(result.n_think));
+    usage.Insert(L"completion_tokens_details", details);
+    usage.Insert(L"xllama_thinking_forced", JsonValue::CreateBooleanValue(result.think_forced));
+}
+
+// chat_template_kwargs.enable_thinking when it is a boolean, as the Jinja
+// templates read it; absent or any other type → the model's default.
+std::optional<bool> requested_thinking(JsonObject const& root) {
+    if (!root.HasKey(L"chat_template_kwargs") ||
+        root.GetNamedValue(L"chat_template_kwargs").ValueType() != JsonValueType::Object)
+        return std::nullopt;
+    const JsonObject kwargs = root.GetNamedObject(L"chat_template_kwargs");
+    if (!kwargs.HasKey(L"enable_thinking") ||
+        kwargs.GetNamedValue(L"enable_thinking").ValueType() != JsonValueType::Boolean)
+        return std::nullopt;
+    return kwargs.GetNamedBoolean(L"enable_thinking");
+}
+
+// "xllama_prefix_cache": true lets this request's prompt be saved to the disk
+// prefix cache when the model's catalogue entry enables it. Without it the
+// prompt is never written there (a non-boolean is ignored, like "logprobs").
+void fill_prefix_cache(JsonObject const& root, ::xllama::GenerateParams& gp) {
+    if (root.HasKey(L"xllama_prefix_cache") &&
+        root.GetNamedValue(L"xllama_prefix_cache").ValueType() == JsonValueType::Boolean)
+        gp.save_prefix = root.GetNamedBoolean(L"xllama_prefix_cache");
+}
+
+// choices[0].logprobs for a scored reply: OpenAI's {"content": [{"token",
+// "logprob"}]} plus each token's id and argmax flag (an id list a later request
+// can force back as xllama_force_ids), and the reply's totals.
+JsonObject logprobs_json(const std::vector<::xllama::TokenLogprob>& lps) {
+    JsonArray content;
+    double sum = 0.0;
+    int argmax = 0;
+    for (const ::xllama::TokenLogprob& t : lps) {
+        JsonObject o;
+        o.Insert(L"token", JsonValue::CreateStringValue(winrt::to_hstring(t.piece)));
+        o.Insert(L"logprob", JsonValue::CreateNumberValue(t.logprob));
+        o.Insert(L"id", JsonValue::CreateNumberValue(t.id));
+        o.Insert(L"argmax", JsonValue::CreateBooleanValue(t.argmax));
+        o.Insert(L"top_logprobs", JsonArray{});
+        content.Append(o);
+        sum += t.logprob;
+        argmax += t.argmax ? 1 : 0;
+    }
+    JsonObject out;
+    out.Insert(L"content", content);
+    out.Insert(L"sum_logprob", JsonValue::CreateNumberValue(sum));
+    out.Insert(L"argmax_count", JsonValue::CreateNumberValue(argmax));
+    return out;
 }
 
 // One OpenAI chat.completion body. `message` is choices[0].message.
 std::string completion_json(const std::string& model, JsonObject const& message,
-                            winrt::hstring const& finish_reason, int prompt_tokens,
-                            int completion_tokens, const char*& status) {
+                            winrt::hstring const& finish_reason,
+                            const ::xllama::InferenceResult& result, const char*& status,
+                            const std::vector<::xllama::TokenLogprob>* logprobs = nullptr) {
     JsonObject choice;
     choice.Insert(L"index", JsonValue::CreateNumberValue(0));
     choice.Insert(L"message", message);
     // openai-python / LangChain deserialize into Pydantic models and choke when
     // logprobs is absent; emit it explicitly as null.
-    choice.Insert(L"logprobs", JsonValue::CreateNullValue());
+    if (logprobs != nullptr)
+        choice.Insert(L"logprobs", logprobs_json(*logprobs));
+    else
+        choice.Insert(L"logprobs", JsonValue::CreateNullValue());
     choice.Insert(L"finish_reason", JsonValue::CreateStringValue(finish_reason));
     JsonArray choices;
     choices.Append(choice);
 
     JsonObject usage;
-    usage.Insert(L"prompt_tokens", JsonValue::CreateNumberValue(prompt_tokens));
-    usage.Insert(L"completion_tokens", JsonValue::CreateNumberValue(completion_tokens));
-    usage.Insert(L"total_tokens", JsonValue::CreateNumberValue(prompt_tokens + completion_tokens));
+    usage.Insert(L"prompt_tokens", JsonValue::CreateNumberValue(result.n_prompt));
+    usage.Insert(L"completion_tokens", JsonValue::CreateNumberValue(result.n_eval));
+    usage.Insert(L"total_tokens", JsonValue::CreateNumberValue(result.n_prompt + result.n_eval));
+    add_reasoning_usage(usage, result);
 
     JsonObject resp;
     const std::string id =
@@ -748,6 +911,8 @@ std::string completion_json(const std::string& model, JsonObject const& message,
     resp.Insert(L"model", JsonValue::CreateStringValue(winrt::to_hstring(model)));
     resp.Insert(L"choices", choices);
     resp.Insert(L"usage", usage);
+    resp.Insert(L"timings",
+                JsonObject::Parse(winrt::to_hstring(::xllama::api_timings_json(result))));
     status = "200 OK";
     return winrt::to_string(resp.Stringify());
 }
@@ -779,10 +944,14 @@ std::string handle_tool_proposal_locked(JsonObject const& root, ::xllama::ToolRe
         request.messages.insert(request.messages.begin(), std::move(system));
     }
 
+    const bool enable_thinking = requested_thinking(root).value_or(
+        !(::xllama::model_is_qwen3(model) && !::xllama::model_is_thinking(model)));
+
     ::xllama::GenerateParams gp;
     gp.reuse_kv = false;
     gp.n_predict = n_predict;
     fill_sampling(root, gp);
+    fill_prefix_cache(root, gp);
     std::vector<std::string> template_stops;
     std::vector<std::string> preserved_tokens;
     ::xllama::GrammarSpec grammar;
@@ -793,8 +962,9 @@ std::string handle_tool_proposal_locked(JsonObject const& root, ::xllama::ToolRe
             request.messages, request.tools, policy_n_ctx, gp.n_predict,
             [&](const std::vector<::xllama::ChatMessage>& messages,
                 const std::vector<::xllama::ToolSpec>& tools) {
-                const ::xllama::ToolTemplateResult rendered = ::xllama::render_tool_prompt(
-                    llama_model, "", messages, tools, request.choice, request.forced_name);
+                const ::xllama::ToolTemplateResult rendered =
+                    ::xllama::render_tool_prompt(llama_model, "", messages, tools, request.choice,
+                                                 request.forced_name, enable_thinking);
                 if (!rendered.ok)
                     throw std::runtime_error(rendered.error);
                 template_stops = rendered.stop_sequences;
@@ -832,7 +1002,7 @@ std::string handle_tool_proposal_locked(JsonObject const& root, ::xllama::ToolRe
     const bool hit_cap = generated.n_eval >= gp.n_predict;
     const ::xllama::ToolParseResult parsed = ::xllama::parse_tool_generation(
         session->resident_llama_model(), "", fit.messages, request.tools, request.choice,
-        request.forced_name, generated.output_text, hit_cap);
+        request.forced_name, generated.output_text, hit_cap, enable_thinking);
     const ::xllama::ChoiceAssembly assembly =
         ::xllama::assemble_choice(generated.output_text, parsed.content, parsed.calls, hit_cap,
                                   ::xllama::model_is_thinking(model));
@@ -859,8 +1029,8 @@ std::string handle_tool_proposal_locked(JsonObject const& root, ::xllama::ToolRe
         }
         message.Insert(L"tool_calls", calls);
     }
-    return completion_json(model, message, winrt::to_hstring(assembly.finish_reason),
-                           generated.n_prompt, generated.n_eval, status);
+    return completion_json(model, message, winrt::to_hstring(assembly.finish_reason), generated,
+                           status);
 }
 
 // Handles one chat request under session_hub().mtx (already locked by the caller).
@@ -964,13 +1134,51 @@ std::string handle_chat_locked(const std::string& body, const char*& status,
     if (system.empty())
         system = model_is_coding ? ::xllama::kCodingSystemPrompt : ::xllama::kDefaultSystemPrompt;
 
-    const ::xllama::ChatFormat fmt = ::xllama::chat_format_for(model);
+    ::xllama::ChatFormat fmt = ::xllama::chat_format_for(model);
+    // The tool path renders the GGUF's Jinja with this flag; plain chat used to
+    // drop it, so a Qwen3.x hybrid answered without reasoning whatever was asked.
+    if (const std::optional<bool> think = requested_thinking(root))
+        ::xllama::request_thinking(fmt, model, *think);
     ::xllama::GenerateParams gp;
     gp.stop_sequences = fmt.stop_sequences;
     gp.reuse_kv = false; // OpenAI chat is stateless: messages[] carry full history
     // Validated above, before the model load: the budget below needs to know how
     // much room the reply asks for.
     gp.n_predict = n_predict;
+    // A thinking budget only means something with the reasoning opened by the
+    // prompt, and must leave the answer room inside max_tokens.
+    if (const int budget = requested_think_budget(root); budget > 0 && !fmt.think_open.empty()) {
+        if (budget >= gp.n_predict) {
+            status = "400 Bad Request";
+            return error_json(
+                "thinking_budget must be below max_tokens (the answer comes after it)");
+        }
+        gp.think_budget = budget;
+    }
+
+    // Scoring (research API): "logprobs": true reports each reply token's log
+    // probability; "xllama_force_ids": [ids] makes the reply those ids (a
+    // reference reply from an earlier call), scored under this load's knobs.
+    if (root.HasKey(L"logprobs") &&
+        root.GetNamedValue(L"logprobs").ValueType() == JsonValueType::Boolean)
+        gp.logprobs = root.GetNamedBoolean(L"logprobs");
+    if (root.HasKey(L"xllama_force_ids")) {
+        const bool is_array =
+            root.GetNamedValue(L"xllama_force_ids").ValueType() == JsonValueType::Array;
+        std::vector<::xllama::ForceIdElement> elems;
+        if (is_array) {
+            for (auto&& e : root.GetNamedArray(L"xllama_force_ids")) {
+                const bool is_number = e.ValueType() == JsonValueType::Number;
+                elems.push_back({is_number, is_number ? e.GetNumber() : 0.0});
+            }
+        }
+        auto forced = ::xllama::parse_force_ids(is_array, elems, gp.n_predict);
+        if (forced.error != ::xllama::ForceIdsError::None) {
+            status = "400 Bad Request";
+            return error_json(::xllama::force_ids_message(forced.error, forced.ids.size()));
+        }
+        gp.forced_tokens = std::move(forced.ids);
+    }
 
     // Same budget as the chat UI, same primitive, same tokenizer: the oldest
     // messages[] entries are dropped until the prompt plus the requested reply fit
@@ -997,6 +1205,7 @@ std::string handle_chat_locked(const std::string& body, const char*& status,
         gp.prompt = fit.prompt;
     }
     fill_sampling(root, gp);
+    fill_prefix_cache(root, gp);
     // Client-supplied stop: a string or an array of strings, added to the
     // format's own stops so clients can bound output.
     if (root.HasKey(L"stop")) {
@@ -1064,7 +1273,7 @@ std::string handle_chat_locked(const std::string& body, const char*& status,
             if (!tail.empty())
                 sse->write_delta(tail);
             const bool streamed_cap = r.n_eval >= gp.n_predict;
-            sse->finish(streamed_cap ? L"length" : L"stop", r.n_prompt, r.n_eval);
+            sse->finish(streamed_cap ? L"length" : L"stop", r);
             status = "200 OK";
         } catch (...) {
             // Generation or JSON serialization failed after the head was sent.
@@ -1090,8 +1299,8 @@ std::string handle_chat_locked(const std::string& body, const char*& status,
     // EOS token before the cap stops naturally, which ended_with_stop (a textual
     // stop-sequence match) does not capture — deduce it from the token count.
     const bool hit_cap = r.n_eval >= gp.n_predict;
-    return completion_json(model, message, hit_cap ? L"length" : L"stop", r.n_prompt, r.n_eval,
-                           status);
+    return completion_json(model, message, hit_cap ? L"length" : L"stop", r, status,
+                           gp.logprobs || !gp.forced_tokens.empty() ? &r.logprobs : nullptr);
 }
 
 // The single model the server can currently serve: the resident one, else the
@@ -1123,6 +1332,22 @@ std::vector<std::string> servable_model_ids() {
             files.push_back(f.path().filename().string());
         if (::xllama::model_dir_files_ready(files))
             ids.push_back(entry.path().filename().string());
+    }
+    // Catalogue entries named by a model directory outside LocalState (an Xbox's
+    // D:\DevelopmentFiles\xllama\models\<id>, uploaded over SMB): the id is that
+    // path, which POST "model" takes as is (model_servable_locked).
+    for (const auto& e : ::xllama::LoadModelManifest()) {
+        const std::string id = winrt::to_string(e.name);
+        if (id.find_first_of("\\/:") == std::string::npos ||
+            std::find(ids.begin(), ids.end(), id) != ids.end())
+            continue;
+        std::error_code dec;
+        std::vector<std::string> files;
+        for (const auto& f :
+             std::filesystem::directory_iterator(std::filesystem::path(e.name), dec))
+            files.push_back(f.path().filename().string());
+        if (!dec && ::xllama::model_dir_files_ready(files))
+            ids.push_back(id);
     }
     std::sort(ids.begin(), ids.end());
     const std::string current = current_model_id();
@@ -1478,6 +1703,26 @@ std::string read_file_bytes(const std::string& path) {
 
 // POST /v1/preferences — append one preference sample (same contract as UI rate).
 std::string handle_preferences(const std::string& body, const char*& status) {
+    // Quotas first, before any parse or disk write (xllama::PreferenceQuota): the body, the rate
+    // across clients, and the file's total size. No compute permit is taken, by design.
+    static ::xllama::PreferenceQuota quota;
+    std::error_code size_ec;
+    const uintmax_t store_bytes = std::filesystem::file_size(
+        ::xllama::resolve_local_path(::xllama::kPreferenceSamplesRelPath), size_ec);
+    switch (quota.admit(body.size(), size_ec ? 0 : store_bytes,
+                        ::xllama::PreferenceQuota::Clock::now())) {
+    case ::xllama::PreferenceQuota::Verdict::TooLarge:
+        status = "413 Payload Too Large";
+        return error_json("preference sample too large");
+    case ::xllama::PreferenceQuota::Verdict::RateLimited:
+        status = "429 Too Many Requests";
+        return error_json("too many preference samples; retry later");
+    case ::xllama::PreferenceQuota::Verdict::StoreFull:
+        status = "507 Insufficient Storage";
+        return error_json("training/samples.jsonl is full");
+    case ::xllama::PreferenceQuota::Verdict::Ok:
+        break;
+    }
     JsonObject root{nullptr};
     if (!JsonObject::TryParse(winrt::to_hstring(body), root) || root == nullptr) {
         status = "400 Bad Request";
@@ -1630,6 +1875,79 @@ std::string handle_images_locked(const std::string& body, const char*& status) {
     return winrt::to_string(out.Stringify());
 }
 
+// POST /v1/images/upscale (alias POST /v1/upscale, the Ally's gv-media contract):
+//   {"image_b64": "<JPEG/PNG…>", "format": "png"|"jpg", "max_side": 0, "pad": 16}
+//   → {"image_b64", "model", "input": "WxH", "size": "WxH", "seconds", "gpu_seconds", "tile",
+//   "pad", "tiles"}
+// Runs on its own lock beside the chat (upscale.cpp); one upscale at a time, a second one gets 503.
+std::mutex g_upscale_mtx;
+
+std::string handle_upscale(const std::string& body, const char*& status) {
+    JsonObject root{nullptr};
+    if (!JsonObject::TryParse(winrt::to_hstring(body), root) || root == nullptr) {
+        status = "400 Bad Request";
+        return error_json("invalid JSON body");
+    }
+    if (root.GetNamedBoolean(L"release", false)) {
+        ::xllama::bridge::release_upscale();
+        JsonObject ok;
+        ok.Insert(L"released", JsonValue::CreateBooleanValue(true));
+        status = "200 OK";
+        return winrt::to_string(ok.Stringify());
+    }
+    const auto image =
+        ::xllama::upscale::base64_decode(winrt::to_string(root.GetNamedString(L"image_b64", L"")));
+    if (!image || image->empty()) {
+        status = "400 Bad Request";
+        return error_json("missing or invalid 'image_b64'");
+    }
+    const std::string format = winrt::to_string(root.GetNamedString(L"format", L"png"));
+    const int max_side = ::xllama::clamp_api_int(root.GetNamedNumber(L"max_side", 0), 0, 65535);
+    const int pad = ::xllama::clamp_api_int(root.GetNamedNumber(L"pad", 16), 0, 128);
+    auto r = ::xllama::bridge::run_upscale(*image, format, max_side, pad);
+    if (r.status != 200) {
+        // 503 = the memory gate: nothing touched the device, try later or elsewhere
+        if (r.status == 503) {
+            status = "503 Service Unavailable";
+            return error_json("upscale refused: " + r.error);
+        }
+        status = r.status == 413 ? "413 Payload Too Large" : "500 Internal Server Error";
+        return error_json("upscale failed: " + r.error);
+    }
+    auto num = [](double v) { return JsonValue::CreateNumberValue(v); };
+    auto dims = [](int w, int h) {
+        return JsonValue::CreateStringValue(
+            winrt::to_hstring(std::to_string(w) + "x" + std::to_string(h)));
+    };
+    JsonObject out; // everything but the image; the image is spliced in as text below
+    out.Insert(L"model", JsonValue::CreateStringValue(L"realesrgan-x4plus-xbox"));
+    out.Insert(L"format", JsonValue::CreateStringValue(format == "png" ? L"png" : L"jpg"));
+    out.Insert(L"input", dims(r.in_w, r.in_h));
+    out.Insert(L"size", dims(r.out_w, r.out_h));
+    out.Insert(L"seconds", num(std::round(r.seconds * 100) / 100));
+    out.Insert(L"gpu_seconds", num(std::round(r.gpu_seconds * 100) / 100));
+    out.Insert(L"tile", num(r.tile));
+    out.Insert(L"pad", num(r.pad));
+    out.Insert(L"tiles", num(r.tiles));
+    out.Insert(L"session_built", JsonValue::CreateBooleanValue(r.session_built));
+    out.Insert(L"dxgi_before_mb", num(static_cast<double>(r.dxgi_before_mb)));
+    out.Insert(L"dxgi_after_mb", num(static_cast<double>(r.dxgi_after_mb)));
+    out.Insert(L"dxgi_budget_mb", num(static_cast<double>(r.dxgi_budget_mb)));
+    const std::string meta = winrt::to_string(out.Stringify()); // "{...}", never empty
+    // A JsonValue would hold the base64 in UTF-16 (twice its size) and Stringify would copy it
+    // again.
+    std::string b64 = base64_encode(r.bytes);
+    std::string().swap(r.bytes);
+    std::string json;
+    json.reserve(b64.size() + meta.size() + 16);
+    json += "{\"image_b64\":\"";
+    json += b64;
+    json += "\",";
+    json.append(meta, 1, std::string::npos);
+    status = "200 OK";
+    return json;
+}
+
 bool same_pull_manifest_entry(const ::xllama::ManifestEntry& a, const ::xllama::ManifestEntry& b) {
     if (a.name != b.name || a.kind != b.kind || a.role != b.role ||
         a.hf_base_url != b.hf_base_url || a.n_ctx != b.n_ctx || a.files.size() != b.files.size())
@@ -1729,16 +2047,26 @@ void handle_pull(StreamSocket const& socket, const std::string& body, uint64_t g
         return;
     }
 
-    auto pull_guard = g_pull_gate.try_acquire();
-    if (!pull_guard.owns_lock()) {
+    // Gate and compute permit first: before the reply stream opens or a byte is downloaded.
+    // Busy is a 503 with nothing written; the permit stays held through the download and the
+    // load, and every reply below is written after release_pull().
+    auto pull = ::xllama::admit_pull(g_pull_gate, [] { return acquire_compute_job_or_busy(); });
+    if (pull.status == ::xllama::PullAdmitStatus::PullInProgress) {
         write_response(socket, "409 Conflict",
                        ollama_error_json("another model pull is in progress"));
         return;
     }
+    if (pull.status == ::xllama::PullAdmitStatus::Busy) {
+        activity().busy();
+        write_response(socket, "503 Service Unavailable", ollama_error_json("busy"));
+        return;
+    }
+    const auto release_pull = [&pull] { pull.release(); };
 
     {
         std::lock_guard<std::mutex> state_lock(g_state_mtx);
         if (g_status.state != ServerState::Running || generation != g_generation) {
+            release_pull();
             write_response(socket, "503 Service Unavailable", ollama_error_json("server stopped"));
             return;
         }
@@ -1751,7 +2079,14 @@ void handle_pull(StreamSocket const& socket, const std::string& body, uint64_t g
         (void)output->write_line(pull_event_json("pulling model"));
     }
 
-    const std::string model_dir = ::xllama::resolve_local_path("models/" + model_name);
+    // A catalogue entry named by an absolute path (a drive or UNC path) downloads
+    // straight into that directory, so big models can live on another volume.
+    const bool absolute_dir =
+        model_name.size() > 2 &&
+        ((model_name[1] == ':' && (model_name[2] == '\\' || model_name[2] == '/')) ||
+         (model_name[0] == '\\' && model_name[1] == '\\'));
+    const std::string model_dir =
+        absolute_dir ? model_name : ::xllama::resolve_local_path("models/" + model_name);
     bool download_ok = false;
     std::wstring download_error;
     {
@@ -1781,6 +2116,7 @@ void handle_pull(StreamSocket const& socket, const std::string& body, uint64_t g
         }
     }
     if (!download_ok) {
+        release_pull();
         const std::string message = ::xllama::wstring_to_utf8(download_error);
         if (output) {
             (void)output->write_line(ollama_error_json(message));
@@ -1798,24 +2134,13 @@ void handle_pull(StreamSocket const& socket, const std::string& body, uint64_t g
     if (output)
         (void)output->write_line(pull_event_json("loading model"));
 
-    auto compute_permit = acquire_compute_job_or_busy();
-    if (!compute_permit) {
-        const std::string message = "busy";
-        if (output) {
-            (void)output->write_line(ollama_error_json(message));
-            output->finish();
-        } else {
-            write_response(socket, "503 Service Unavailable", ollama_error_json(message));
-        }
-        return;
-    }
-
     bool server_active = false;
     {
         std::lock_guard<std::mutex> state_lock(g_state_mtx);
         server_active = g_status.state == ServerState::Running && generation == g_generation;
     }
     if (!server_active) {
+        release_pull();
         const std::string message = "server stopped before model load";
         if (output) {
             (void)output->write_line(ollama_error_json(message));
@@ -1846,6 +2171,7 @@ void handle_pull(StreamSocket const& socket, const std::string& body, uint64_t g
         else
             load_error = "server stopped before model load";
     }
+    release_pull(); // the load is done: the success or error reply below holds no slot
     if (!loaded) {
         const std::string message = "model downloaded but could not load: " + load_error;
         if (output) {
@@ -1910,13 +2236,62 @@ const char* framing_status(int code) {
     }
 }
 
+::xllama::ApiAuthStats& auth_stats() {
+    static ::xllama::ApiAuthStats stats;
+    return stats;
+}
+
+// The peer's address, for the Bearer-failure counts only.
+std::string client_address(StreamSocket const& socket) {
+    try {
+        return winrt::to_string(socket.Information().RemoteAddress().DisplayName());
+    } catch (...) {
+        return "unknown";
+    }
+}
+
+// Bytes of text a chat body asks the server to tokenize: every JSON string value in it. Only
+// parsed when the body itself is past the cap (text can never exceed the body).
+size_t json_string_bytes(IJsonValue const& value, int depth = 0) {
+    if (depth > 32) // nesting this deep is not a prompt: count it as over the cap
+        return ::xllama::kApiMaxPromptTextBytes + 1;
+    switch (value.ValueType()) {
+    case JsonValueType::String:
+        return winrt::to_string(value.GetString()).size();
+    case JsonValueType::Array: {
+        size_t n = 0;
+        for (auto&& e : value.GetArray())
+            n += json_string_bytes(e, depth + 1);
+        return n;
+    }
+    case JsonValueType::Object: {
+        size_t n = 0;
+        for (auto&& kv : value.GetObject())
+            n += json_string_bytes(kv.Value(), depth + 1);
+        return n;
+    }
+    default:
+        return 0;
+    }
+}
+
+size_t chat_text_bytes(const std::string& body) {
+    if (body.size() <= ::xllama::kApiMaxPromptTextBytes)
+        return body.size();
+    JsonObject root{nullptr};
+    if (!JsonObject::TryParse(winrt::to_hstring(body), root) || root == nullptr)
+        return 0; // the handler answers 400 for it
+    return json_string_bytes(root);
+}
+
 // Serve one accepted socket. Runs on a thread-pool work item, never inline
 // in ConnectionReceived: the listener does not raise the next connection
 // until that callback returns, so an in-line SSE reply hid the permit from
 // every subsequent LAN request (console 1.6.0.1284). The compute permit is
 // a stack RAII handle; a client drop mid-SSE aborts generate() and this
 // frame unwinds, which releases the slot.
-void handle_connection(StreamSocket const& socket, uint64_t generation) {
+void handle_connection(StreamSocket const& socket, uint64_t generation,
+                       const std::string& api_key) {
     try {
         const HttpRequest req = read_request(socket);
         if (req.status != 0) {
@@ -1935,6 +2310,37 @@ void handle_connection(StreamSocket const& socket, uint64_t generation) {
         // Health probe (also the spike gate: curl http://<ip>:<port>/ -> 200).
         if (req.method == "GET" && (req.path == "/" || req.path == "/health")) {
             write_response(socket, "200 OK", "{\"status\":\"ok\",\"service\":\"xllama\"}");
+            return;
+        }
+
+        // Bearer check (phase 1 counts and serves a failure, phase 2 answers 401; see api_auth.h).
+        // /health above is the only route that skips it.
+        const ::xllama::ApiAuthPhase auth_phase =
+            ::xllama::api_auth_phase_from_text(read_local_text("api-auth.txt"));
+        const ::xllama::ApiAuthDecision auth =
+            ::xllama::decide_api_auth(auth_phase, api_key, req.authorization);
+        if (auth.failed) {
+            auth_stats().record_failure(client_address(socket), auth.allow);
+            ::xllama::log_output(std::string(auth.allow ? "[api] bearer failed (served): "
+                                                        : "[api] unauthorized: ") +
+                                 req.method + " " + req.path + "\n");
+        }
+        if (!auth.allow) {
+            write_response(socket, "401 Unauthorized",
+                           "{\"error\":{\"message\":\"unauthorized\",\"type\":\"auth\"}}");
+            return;
+        }
+
+        // Failure counts per client address. Behind a valid key in BOTH phases (phase 1 would
+        // otherwise show the LAN's client addresses to anyone); never the key itself.
+        if (req.method == "GET" && req.path == "/v1/auth/stats") {
+            if (!::xllama::bearer_matches(req.authorization, api_key)) {
+                write_response(socket, "401 Unauthorized",
+                               "{\"error\":{\"message\":\"unauthorized\",\"type\":\"auth\"}}");
+                return;
+            }
+            write_response(socket, "200 OK",
+                           ::xllama::api_auth_stats_json(auth_phase, auth_stats().snapshot()));
             return;
         }
 
@@ -1963,17 +2369,34 @@ void handle_connection(StreamSocket const& socket, uint64_t generation) {
                 return;
             }
             const bool stream = stream_request == StreamRequest::Yes;
-            auto compute_permit = acquire_compute_job_or_busy();
-            if (!compute_permit) {
-                activity().busy();
-                write_response(socket, ::xllama::kApiBusyStatus, error_json("busy"));
-                return;
+            // The text cap comes before the permit: an oversized prompt is 413 and never queues
+            // for, nor takes, the slot (BPE over 8 MiB with the permit held is minutes of it).
+            ::xllama::ComputeScope scope;
+            {
+                auto admitted = ::xllama::admit_text_then_permit(
+                    chat_text_bytes(req.body), [] { return acquire_compute_job_or_busy(); });
+                if (admitted.status == ::xllama::TextAdmitStatus::TooLarge) {
+                    write_response(
+                        socket, "413 Payload Too Large",
+                        error_json("prompt text exceeds " +
+                                   std::to_string(::xllama::kApiMaxPromptTextBytes / 1024) +
+                                   " KiB"));
+                    return;
+                }
+                if (admitted.status == ::xllama::TextAdmitStatus::Busy) {
+                    activity().busy();
+                    write_response(socket, ::xllama::kApiBusyStatus, error_json("busy"));
+                    return;
+                }
+                scope.permit = std::move(admitted.permit);
             }
-            // Keep the lease for the whole reply, including every SSE event.
-            // Dropped on return, throw, or client-disconnect abort.
-            (void)compute_permit;
-            std::unique_lock<std::mutex> lk = acquire_hub_or_busy();
-            if (!lk.owns_lock()) {
+            // Keep the lease for the whole reply, including every SSE event, and drop it
+            // (scope.release()) before the final reply write: a client that never reads must not
+            // hold the slot past its write deadline. Also dropped on return, throw, or
+            // client-disconnect abort.
+            scope.hub = acquire_hub_or_busy();
+            if (!scope.hub.owns_lock()) {
+                scope.release();
                 activity().busy();
                 write_response(socket, "503 Service Unavailable", error_json("busy"));
                 return;
@@ -1987,6 +2410,7 @@ void handle_connection(StreamSocket const& socket, uint64_t generation) {
                     g_status.state == ServerState::Running && generation == g_generation;
             }
             if (!active_generation) {
+                scope.release();
                 write_response(socket, "503 Service Unavailable", error_json("server stopped"));
                 return;
             }
@@ -2005,6 +2429,7 @@ void handle_connection(StreamSocket const& socket, uint64_t generation) {
             // Record before writing: a client that disconnects makes
             // write_response throw, and the request was still served.
             record_outcome(ticket, status, json);
+            scope.release();
             // A streamed reply is already on the socket; an empty body means the
             // stream (or its error event) was the response.
             if (stream && json.empty())
@@ -2021,15 +2446,17 @@ void handle_connection(StreamSocket const& socket, uint64_t generation) {
             embedding_api = req.path == "/api/embed"        ? EmbeddingApi::Ollama
                             : req.path == "/api/embeddings" ? EmbeddingApi::Legacy
                                                             : EmbeddingApi::OpenAI;
-            auto compute_permit = acquire_compute_job_or_busy();
-            if (!compute_permit) {
+            ::xllama::ComputeScope scope;
+            scope.permit = acquire_compute_job_or_busy();
+            if (!scope.permit) {
                 activity().busy();
                 write_response(socket, ::xllama::kApiBusyStatus,
                                embedding_error_json(embedding_api, "busy"));
                 return;
             }
-            std::unique_lock<std::mutex> lk = acquire_hub_or_busy();
-            if (!lk.owns_lock()) {
+            scope.hub = acquire_hub_or_busy();
+            if (!scope.hub.owns_lock()) {
+                scope.release();
                 activity().busy();
                 write_response(socket, "503 Service Unavailable",
                                embedding_error_json(embedding_api, "busy"));
@@ -2041,6 +2468,7 @@ void handle_connection(StreamSocket const& socket, uint64_t generation) {
                 active = g_status.state == ServerState::Running && generation == g_generation;
             }
             if (!active) {
+                scope.release();
                 write_response(socket, "503 Service Unavailable",
                                embedding_error_json(embedding_api, "server stopped"));
                 return;
@@ -2057,6 +2485,7 @@ void handle_connection(StreamSocket const& socket, uint64_t generation) {
             // Record before writing: a client that disconnects makes
             // write_response throw, and the request was still served.
             record_outcome(ticket, status, json);
+            scope.release();
             write_response(socket, status, json);
             return;
         }
@@ -2083,14 +2512,16 @@ void handle_connection(StreamSocket const& socket, uint64_t generation) {
 
         // #118: image generation — shares compute admission and the hub slot.
         if (req.method == "POST" && req.path == "/v1/images/generations") {
-            auto compute_permit = acquire_compute_job_or_busy();
-            if (!compute_permit) {
+            ::xllama::ComputeScope scope;
+            scope.permit = acquire_compute_job_or_busy();
+            if (!scope.permit) {
                 activity().busy();
                 write_response(socket, ::xllama::kApiBusyStatus, error_json("busy"));
                 return;
             }
-            std::unique_lock<std::mutex> lk = acquire_hub_or_busy();
-            if (!lk.owns_lock()) {
+            scope.hub = acquire_hub_or_busy();
+            if (!scope.hub.owns_lock()) {
+                scope.release();
                 activity().busy();
                 write_response(socket, ::xllama::kApiBusyStatus, error_json("busy"));
                 return;
@@ -2101,6 +2532,7 @@ void handle_connection(StreamSocket const& socket, uint64_t generation) {
                 active = g_status.state == ServerState::Running && generation == g_generation;
             }
             if (!active) {
+                scope.release();
                 write_response(socket, "503 Service Unavailable", error_json("server stopped"));
                 return;
             }
@@ -2116,7 +2548,33 @@ void handle_connection(StreamSocket const& socket, uint64_t generation) {
             // Record before writing: a client that disconnects makes
             // write_response throw, and the request was still served.
             record_outcome(ticket, status, json);
+            scope.release();
             write_response(socket, status, json);
+            return;
+        }
+
+        // 4x upscale on the GPU, beside the chat: not the compute permit nor the hub
+        // (handle_upscale).
+        if (req.method == "POST" &&
+            (req.path == "/v1/images/upscale" || req.path == "/v1/upscale")) {
+            std::unique_lock<std::mutex> up(g_upscale_mtx, std::try_to_lock);
+            if (!::xllama::upscale::upscale_admit(up.owns_lock(),
+                                                  ::xllama::session_hub().preloading.load())) {
+                activity().busy();
+                write_response(socket, ::xllama::kApiBusyStatus, error_json("busy"));
+                return;
+            }
+            auto ticket = activity().begin("upscale");
+            const char* status = "200 OK";
+            std::string json;
+            try {
+                json = handle_upscale(req.body, status);
+            } catch (...) {
+                status = "500 Internal Server Error";
+                json = error_json("upscale failed");
+            }
+            record_outcome(ticket, status, json);
+            write_response_bytes(socket, status, json);
             return;
         }
 
@@ -2135,7 +2593,8 @@ void handle_connection(StreamSocket const& socket, uint64_t generation) {
 
 // Return from ConnectionReceived immediately after queueing. A write on this
 // thread is only the bounded-gate 503; every other reply runs on the work item.
-void dispatch_connection(StreamSocket const& socket, uint64_t generation) {
+void dispatch_connection(StreamSocket const& socket, uint64_t generation,
+                         const std::string& api_key) {
     auto slot = ::xllama::process_api_connection_gate().try_acquire();
     if (!slot) {
         try {
@@ -2148,9 +2607,22 @@ void dispatch_connection(StreamSocket const& socket, uint64_t generation) {
     auto held = std::make_shared<::xllama::ApiConnectionGate::Handle>(std::move(slot));
     try {
         winrt::Windows::System::Threading::ThreadPool::RunAsync(
-            [socket, generation, held](winrt::Windows::Foundation::IAsyncAction const&) {
+            [socket, generation, held, api_key](winrt::Windows::Foundation::IAsyncAction const&) {
                 auto client = activity().client();
-                handle_connection(socket, generation);
+                t_reply_deadline.begin();
+                handle_connection(socket, generation, api_key);
+                // After a write deadline nothing else ends the connection: the
+                // cancelled store kept the socket open with no FIN for the
+                // 200 s the stalled client was watched (console 2026-11-26).
+                // Only then: on every other reply the release closes it
+                // gracefully, and an explicit Close with a read pending turns a
+                // 408 into a reset (1.6.0.1234).
+                if (t_reply_deadline.close_socket()) {
+                    try {
+                        socket.Close();
+                    } catch (...) {
+                    }
+                }
                 (void)held;
                 (void)client;
             });
@@ -2221,10 +2693,23 @@ void start_server(int requested_port) {
     }
     try {
         StreamSocketListener listener;
+        bool key_present = false;
+        const std::string key_text = read_local_text("api.key", &key_present);
+        const std::string api_key = ::xllama::api_key_from_text(key_text);
+        if (api_key.empty()) {
+            if (key_present)
+                ::xllama::log_output("[api] api.key ignored: shorter than 32 characters\n");
+            ::xllama::log_output("[api] no api.key: bearer failures are counted for every request; "
+                                 "api-auth.txt=enforce would answer 401 to all but /health\n");
+        } else {
+            ::xllama::log_output(
+                "[api] api.key loaded: bearer verified (api-auth.txt=enforce "
+                "turns failures into 401; otherwise they are counted and served)\n");
+        }
         listener.ConnectionReceived(
-            [generation](StreamSocketListener const&,
-                         StreamSocketListenerConnectionReceivedEventArgs const& a) {
-                dispatch_connection(a.Socket(), generation);
+            [generation, api_key](StreamSocketListener const&,
+                                  StreamSocketListenerConnectionReceivedEventArgs const& a) {
+                dispatch_connection(a.Socket(), generation, api_key);
             });
         listener.BindServiceNameAsync(winrt::to_hstring(std::to_string(port))).get();
         {

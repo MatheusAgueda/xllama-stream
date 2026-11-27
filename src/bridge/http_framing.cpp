@@ -91,6 +91,7 @@ HttpHead parse_http_head(std::string_view data, size_t max_body) {
         head.path.erase(q);
 
     bool have_length = false;
+    bool have_authorization = false;
     size_t pos = line_end == std::string_view::npos ? text.size() : line_end + 2;
     while (pos < text.size()) {
         size_t eol = text.find("\r\n", pos);
@@ -107,6 +108,12 @@ HttpHead parse_http_head(std::string_view data, size_t max_body) {
                 return fail(400, "malformed header field");
         const std::string key = lower(name);
         const std::string_view value = trim(field.substr(colon + 1));
+        if (key == "authorization") {
+            if (have_authorization)
+                return fail(400, "repeated Authorization");
+            have_authorization = true;
+            head.authorization = std::string(value);
+        }
         if (key == "transfer-encoding")
             return fail(411, "chunked transfer-encoding not supported; send Content-Length");
         if (key == "content-length") {

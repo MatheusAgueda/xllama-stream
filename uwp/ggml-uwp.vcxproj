@@ -162,6 +162,8 @@
     <ClCompile Include="..\llama.cpp\src\llama-context.cpp" />
     <ClCompile Include="..\llama.cpp\src\llama-cparams.cpp" />
     <ClCompile Include="..\llama.cpp\src\llama-grammar.cpp" />
+    <!-- patch 0004 (patches/README.md): exists only after scripts/apply-uwp-patches.sh -->
+    <ClCompile Include="..\llama.cpp\src\llama-expert-cache.cpp" />
     <ClCompile Include="..\llama.cpp\src\llama-graph.cpp" />
     <ClCompile Include="..\llama.cpp\src\llama-hparams.cpp" />
     <ClCompile Include="..\llama.cpp\src\llama-impl.cpp" />

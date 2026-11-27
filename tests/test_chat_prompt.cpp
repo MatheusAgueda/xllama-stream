@@ -256,14 +256,18 @@ TEST_CASE("chatml render is byte-exact with the legacy hand-built prompt") {
     CHECK(f.render_prompt(sys, hist, final_user) == legacy);
 }
 
-TEST_CASE("chatml render appends qwen suffix only to the trailing header") {
+TEST_CASE("chatml render keeps the qwen suffix on history turns and the trailing header") {
     const ChatFormat f = chat_format_for("qwen35-0.8b");
     const std::string p = f.render_prompt("sys", {{"u1", "a1"}}, "u2");
     // Trailing header carries the suffix...
     CHECK(p.substr(p.size() - f.gen_suffix.size()) == f.gen_suffix);
-    // ...but the completed history assistant turn does not.
-    const std::string hist_hdr = "<|im_start|>assistant\na1<|im_end|>\n";
+    // ...and so does the completed history turn, as it was generated.
+    const std::string hist_hdr = "<|im_start|>assistant\n<think>\n\n</think>\n\na1<|im_end|>\n";
     CHECK(p.find(hist_hdr) != std::string::npos);
+    // Non-Qwen3 ChatML history stays bare.
+    const std::string bare =
+        chat_format_for("smollm2-360m-cpu-int4").render_prompt("sys", {{"u1", "a1"}}, "u2");
+    CHECK(bare.find("<|im_start|>assistant\na1<|im_end|>\n") != std::string::npos);
 }
 
 TEST_CASE("gemma render merges system into the first user turn, no bos/system") {
@@ -349,11 +353,9 @@ TEST_CASE("postprocess_output strips empty think for chatml, passthrough otherwi
 // The core KV-reuse safety net: the string a reused KV holds after a turn — the
 // full prompt, the assistant output, plus the delta for the next turn — must
 // equal a cold full re-prefill of the same conversation with that turn appended.
-// Only meaningful when gen_suffix is empty: a non-empty suffix is prefilled into
-// the KV but intentionally absent from stored output, a known/preserved
-// discrepancy (see chat_prompt.cpp risks), so the strings would differ by design.
+// Holds with a gen_suffix too (Qwen3 no-think, MiniCPM5): history turns carry it,
+// so a hybrid cache that cannot rewind still sees a pure extension.
 static void check_kv_reuse_invariant(const ChatFormat& f) {
-    REQUIRE(f.gen_suffix.empty());
     const std::string sys = "sys";
     const std::vector<ChatTurn> hist = {{"u1", "a1"}};
     const std::string final_user = "u2";
@@ -376,11 +378,13 @@ static void check_kv_reuse_invariant(const ChatFormat& f) {
     CHECK(base + raw_out + f.render_delta(next_user, /*prev_ended_with_stop=*/false) == cold);
 }
 
-TEST_CASE("kv-reuse invariant holds for chatml, gemma, llama3, and phi3") {
+TEST_CASE("kv-reuse invariant holds for chatml, gemma, llama3, phi3, qwen3 and minicpm5") {
     check_kv_reuse_invariant(chat_format_for("smollm2-360m-cpu-int4"));
     check_kv_reuse_invariant(chat_format_for("gemma3-270m"));
     check_kv_reuse_invariant(chat_format_for("llama32-3b"));
     check_kv_reuse_invariant(chat_format_for("phi35-mini"));
+    check_kv_reuse_invariant(chat_format_for("qwen36-35b-a3b-heretic"));
+    check_kv_reuse_invariant(chat_format_for("minicpm5-1b-Q4_K_M.gguf"));
 }
 
 TEST_CASE("render_system_prefix is the exact head of render_prompt (#169)") {
@@ -397,4 +401,48 @@ TEST_CASE("render_system_prefix is the exact head of render_prompt (#169)") {
     // MergeIntoFirstUser (Gemma): no standalone system block exists — the
     // prefix is empty and the caller pins only the BOS.
     CHECK(chat_format_for("gemma3-270m").render_system_prefix(sys).empty());
+}
+
+TEST_CASE("request_thinking: a Qwen3.x hybrid reasons on request, history keeps its prefill") {
+    const std::string id =
+        "D:\\DevelopmentFiles\\xllama\\models\\qwen36-ornith15-35b-a3b-abliterated-iq3s";
+    ChatFormat f = chat_format_for(id);
+    const std::string off = f.render_prompt("sys", {{"u1", "a1"}}, "u2");
+    request_thinking(f, id, true);
+    const std::string on = f.render_prompt("sys", {{"u1", "a1"}}, "u2");
+    // The Qwen3.6 Jinja with enable_thinking unset/true: the header opens the block.
+    const std::string open_hdr = "<|im_start|>assistant\n<think>\n";
+    CHECK(on.substr(on.size() - open_hdr.size()) == open_hdr);
+    // Everything before the final header is the no-think render, byte for byte.
+    CHECK(on.substr(0, on.size() - std::string("<think>\n").size()) ==
+          off.substr(0, off.size() - f.gen_suffix.size()));
+    CHECK(on.find("<|im_start|>assistant\n<think>\n\n</think>\n\na1<|im_end|>\n") !=
+          std::string::npos);
+    CHECK(f.render_delta("u3", true).substr(f.render_delta("u3", true).size() - open_hdr.size()) ==
+          open_hdr);
+    // The reply never carries the prompt's opener: the closer ends the reasoning...
+    CHECK(f.postprocess_output("Count the pairs.\n</think>\n\n738") == "738");
+    // ...and a reply cut mid-thought is no answer, not raw reasoning.
+    CHECK(f.postprocess_output("still counting, a ranges over").empty());
+}
+
+TEST_CASE(
+    "request_thinking off on a thinking id gets the empty prefill; other families untouched") {
+    const std::string id = "qwen35-9b-ds4pro-thinking";
+    ChatFormat f = chat_format_for(id);
+    CHECK(f.gen_suffix.empty());
+    request_thinking(f, id, false);
+    CHECK(f.gen_suffix == qwen_no_think_gen_suffix("qwen35-0.8b"));
+    CHECK(f.think_open.empty());
+    const std::string p = f.render_prompt("sys", {}, "u");
+    CHECK(p.substr(p.size() - f.gen_suffix.size()) == f.gen_suffix);
+    for (const char* other :
+         {"qwen25-coder-1.5b", "gemma3-270m", "smollm2-360m-cpu-int4", "lfm25-1.2b-thinking"}) {
+        ChatFormat a = chat_format_for(other);
+        const std::string before = a.render_prompt("sys", {{"u1", "a1"}}, "u2");
+        request_thinking(a, other, true);
+        CHECK(a.render_prompt("sys", {{"u1", "a1"}}, "u2") == before);
+        request_thinking(a, other, false);
+        CHECK(a.render_prompt("sys", {{"u1", "a1"}}, "u2") == before);
+    }
 }

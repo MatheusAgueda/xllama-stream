@@ -358,6 +358,7 @@
     <ClCompile Include="inference-bridge.cpp" />
     <ClCompile Include="native_capture.cpp" />
     <ClCompile Include="diffuse.cpp" />
+    <ClCompile Include="upscale.cpp" />
     <ClCompile Include="op-repro.cpp" />
   </ItemGroup>
 

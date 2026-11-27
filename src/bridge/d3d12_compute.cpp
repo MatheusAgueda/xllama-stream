@@ -155,9 +155,19 @@ bool QueueFence::init(ID3D12Device* device, std::string* err) {
 }
 
 bool QueueFence::signal_and_wait(ID3D12CommandQueue* queue, bool spin) {
+    UINT64 v = 0;
+    return signal(queue, &v) && wait(v, spin);
+}
+
+bool QueueFence::signal(ID3D12CommandQueue* queue, UINT64* value) {
     const UINT64 v = ++value_;
     if (FAILED(queue->Signal(fence_.Get(), v)))
         return false;
+    *value = v;
+    return true;
+}
+
+bool QueueFence::wait(UINT64 v, bool spin) {
     if (spin) {
         while (fence_->GetCompletedValue() < v)
             YieldProcessor();

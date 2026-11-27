@@ -1,0 +1,372 @@
+diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
+--- a/src/llama-expert-cache.cpp
++++ b/src/llama-expert-cache.cpp
+@@ -187,6 +187,18 @@
+     uint32_t   gen  = 0;
+ };
+ 
++// LLAMA_EXPERT_HOST: a copy between a slot and an entry of the layer's host tier, done by the load op
++// before its disk reads. SAVE: the slot's expert (the plan's victim) to the entry; FILL: the entry's
++// expert to the slot; SWAP: both at once (the victim takes the entry the missing expert leaves)
++enum ec_hkind : uint8_t { EC_H_SAVE, EC_H_FILL, EC_H_SWAP };
++
++struct ec_hjob {
++    int32_t slot;
++    int32_t expert; // the expert the slot holds after the job
++    int32_t entry;
++    uint8_t kind;
++};
++
+ // LLAMA_EXPERT_RD: reuse distances d >= 1 (plan ticks) in half-octave buckets floor(2 log2 d)
+ static constexpr int32_t EC_RD_BUCKETS = 24;
+ 
+@@ -255,6 +267,22 @@
+     std::vector<uint8_t> em_state;
+     uint64_t em_hash = 0;
+     bool     em_open = false;
++
++    // LLAMA_EXPERT_HOST: the layer's victim tier, h_n entries of h_eb bytes in host memory (each expert
++    // tensor of the layer at h_toff in an entry). An expert evicted from a slot is copied to the least
++    // recently written entry; a missing expert found there is copied back instead of read from the
++    // file (exclusive: it leaves the entry, which takes the slot's victim). Entries are copies of the
++    // file's bytes, so a stale one only costs a read. The plan queues the copies, the load op does them
++    std::unique_ptr<char[]> h_buf;
++    size_t  h_eb    = 0;
++    int32_t h_n     = 0;
++    bool    h_tried = false; // allocated at the layer's first plan
++    std::vector<size_t>   h_toff;
++    std::vector<int32_t>  h_of;   // expert -> entry, -1 if not in the tier
++    std::vector<int32_t>  h_exp;  // entry -> expert, -1 if free
++    std::vector<uint64_t> h_used; // entry -> tick of the plan that last wrote or read it (this tick's are pinned)
++    std::vector<ec_hjob>  h_jobs; // the copies of this ubatch's load op
++    std::atomic<int>      h_bar {0}; // threads done with the copies (the disk reads wait for all)
+ };
+ 
+ } // namespace
+@@ -389,6 +417,22 @@
+     std::atomic<uint64_t> em_gpu_wait_us {0}; // thread 0 waiting for the reads
+     std::atomic<uint64_t> em_gpu_cpu     {0}; // dispatches that failed, computed on the CPU instead
+ 
++    // LLAMA_EXPERT_HOST=<MiB>[:<keep MiB>] (0 = off, the default): up to <MiB> of host memory, split
++    // evenly over the layers, as a victim tier behind the slots. Each layer allocates its share at its
++    // first plan, less (or none) when that would leave under <keep> MB (512) of the system's available
++    // physical memory and commit. Not with LLAMA_EXPERT_PREFETCH or LLAMA_EXPERT_DEFER, whose reads
++    // replace slot contents outside the plan
++    uint32_t h_mib     = 0;
++    uint32_t h_keep_mb = 512;
++    bool     h_short   = false; // a layer got fewer entries than its share (logged once)
++    std::atomic<uint64_t> h_alloc   {0}; // bytes allocated over the layers
++    std::atomic<uint64_t> h_entries {0};
++    std::atomic<uint64_t> h_fills   {0}; // missing experts copied from the tier instead of read
++    std::atomic<uint64_t> h_swaps   {0}; //   of those, a victim taking the entry in the same copy
++    std::atomic<uint64_t> h_saves   {0}; // victims copied to the tier
++    std::atomic<uint64_t> h_bytes   {0}; // bytes copied between slots and the tier
++    std::atomic<uint64_t> h_us      {0}; // the load ops' copies (their slowest thread)
++
+     void gpu_free() {
+         if (em_gpu_stage != nullptr) {
+             ggml_backend_buffer_free(em_gpu_stage);
+@@ -462,8 +506,15 @@
+         char io[160] = "";
+         snprintf(io, sizeof(io), "; reads %" PRIu64 " direct, %" PRIu64 " staged, %" PRIu64 " buffered%s%s%s",
+                 n_direct, n_staged, n_buffered, io_split ? ", split" : "", io_pad ? ", pad" : "", qd);
+-        LLAMA_LOG_INFO("expert cache (%s): %u slots x %zu layers, %" PRIu64 " ubatches, %" PRIu64 " hits, %" PRIu64 " misses (%.1f%% hit), %" PRIu64 " swaps, %.1f MiB read in %.0f ms%s%s%s\n",
+-                when, n_slots, layers.size(), n_rounds, h, m, h + m ? 100.0*h/(h + m) : 0.0, swaps.load(), bytes.load()/1024.0/1024.0, us/1000.0, pf, em, io);
++        char ht[224] = "";
++        if (h_mib > 0) {
++            const uint64_t hf = h_fills.load();
++            snprintf(ht, sizeof(ht), "; host tier %.1f MiB (%" PRIu64 " entries), %" PRIu64 " misses from it (%.1f%%, %" PRIu64 " swaps), %" PRIu64 " saved, %.1f MiB copied in %.0f ms",
++                    h_alloc.load()/1024.0/1024.0, h_entries.load(), hf, m ? 100.0*hf/m : 0.0, h_swaps.load(), h_saves.load(),
++                    h_bytes.load()/1024.0/1024.0, h_us.load()/1000.0);
++        }
++        LLAMA_LOG_INFO("expert cache (%s): %u slots x %zu layers, %" PRIu64 " ubatches, %" PRIu64 " hits, %" PRIu64 " misses (%.1f%% hit), %" PRIu64 " swaps, %.1f MiB read in %.0f ms%s%s%s%s\n",
++                when, n_slots, layers.size(), n_rounds, h, m, h + m ? 100.0*h/(h + m) : 0.0, swaps.load(), bytes.load()/1024.0/1024.0, us/1000.0, pf, em, ht, io);
+     }
+ 
+     ~llama_expert_cache() {
+@@ -1061,9 +1112,139 @@
+         ec_evict(L, job.first, job.second);
+     }
+     L.pending.clear();
++    // LLAMA_EXPERT_HOST: copies not done - the slots they filled are emptied, their entries freed
++    for (const ec_hjob & hj : L.h_jobs) {
++        if (hj.kind != EC_H_SAVE) {
++            ec_evict(L, hj.slot, hj.expert);
++        }
++        const int32_t x = L.h_exp[hj.entry];
++        if (x >= 0 && L.h_of[x] == hj.entry) {
++            L.h_of[x] = -1;
++        }
++        L.h_exp[hj.entry] = -1;
++    }
++    L.h_jobs.clear();
++    L.h_bar.store(0, std::memory_order_relaxed);
+     ec_defer_end(L, false);
++}
++
++// LLAMA_EXPERT_HOST: the system's available physical memory and commit, the lower of the two, in MB
++// (SIZE_MAX where not measured)
++static size_t ec_host_avail_mb() {
++#if defined(_WIN32)
++    MEMORYSTATUSEX ms = {};
++    ms.dwLength = sizeof(ms);
++    if (GlobalMemoryStatusEx(&ms)) {
++        return (size_t) (std::min(ms.ullAvailPhys, ms.ullAvailPageFile) >> 20);
++    }
++    return 0;
++#else
++    return SIZE_MAX;
++#endif
+ }
+ 
++// LLAMA_EXPERT_HOST: the layer's share of the tier, at its first plan (the model and the context's
++// buffers are allocated by then). Fewer entries when the share would leave under h_keep_mb available
++static void ec_host_alloc(ec_layer & L) {
++    llama_expert_cache & C = *L.cache;
++    L.h_tried = true;
++
++    const int32_t n_expert = (int32_t) L.slot_of.size();
++    const int32_t n_slots  = (int32_t) L.expert_of.size();
++    L.h_toff.resize(L.tensors.size());
++    size_t eb = 0;
++    for (size_t i = 0; i < L.tensors.size(); ++i) {
++        L.h_toff[i] = eb;
++        eb += (C.tensors[L.tensors[i]].eb + 63) & ~(size_t) 63;
++    }
++    if (eb == 0 || n_expert <= n_slots) {
++        return;
++    }
++
++    const size_t  share = (size_t) C.h_mib*1024*1024 / std::max<size_t>(C.layers.size(), 1);
++    const int64_t want  = std::min<int64_t>((int64_t) (share / eb), n_expert - n_slots);
++    int64_t n = want;
++    const size_t avail = ec_host_avail_mb();
++    if (avail != SIZE_MAX) {
++        const size_t room = avail > C.h_keep_mb ? (avail - C.h_keep_mb)*1024*1024 : 0;
++        n = std::min<int64_t>(n, (int64_t) (room / eb));
++    }
++    char * buf = nullptr;
++    while (n > 0 && (buf = new (std::nothrow) char[(size_t) n*eb]) == nullptr) {
++        n /= 2;
++    }
++    if (L.id == C.first_layer || (n < want && !C.h_short)) {
++        C.h_short = C.h_short || n < want;
++        LLAMA_LOG_INFO("%s: expert cache: host tier of layer %d: %" PRId64 " of %" PRId64 " entries of %.2f MiB, %zu MB available (keep %u)\n",
++                __func__, L.id, n, want, eb/1024.0/1024.0, avail == SIZE_MAX ? (size_t) 0 : avail, C.h_keep_mb);
++    }
++    if (n <= 0) {
++        return;
++    }
++    L.h_buf.reset(buf);
++    L.h_eb = eb;
++    L.h_n  = (int32_t) n;
++    L.h_of.assign(n_expert, -1);
++    L.h_exp.assign((size_t) n, -1);
++    L.h_used.assign((size_t) n, 0);
++    L.h_jobs.reserve((size_t) n_slots);
++    C.h_alloc   += (uint64_t) n*eb;
++    C.h_entries += (uint64_t) n;
++}
++
++// LLAMA_EXPERT_HOST: slot goes from old (-1: empty) to the missing expert e. Queues the copies: e from
++// its entry (true: no read) and old to an entry unless it has one. The entries of this ubatch's
++// experts are pinned (h_used == tick): the load op reads them, no save may take them
++static bool ec_host_plan(ec_layer & L, int32_t slot, int32_t old, int32_t e, uint64_t tick) {
++    const bool keep = old >= 0 && L.h_of[old] < 0;
++    const int32_t he = L.h_of[e];
++    if (he >= 0) {
++        L.h_of[e] = -1;
++        L.h_used[he] = tick;
++        if (keep) {
++            L.h_exp[he]  = old;
++            L.h_of[old]  = he;
++            L.h_jobs.push_back({ slot, e, he, EC_H_SWAP });
++        } else {
++            L.h_exp[he] = -1; // free from the next plan on
++            L.h_jobs.push_back({ slot, e, he, EC_H_FILL });
++        }
++        return true;
++    }
++    if (keep) {
++        int32_t hv = -1;
++        for (int32_t h = 0; h < L.h_n; ++h) {
++            if (L.h_used[h] == tick) {
++                continue;
++            }
++            if (hv < 0 || (L.h_exp[h] < 0) > (L.h_exp[hv] < 0) ||
++                    ((L.h_exp[h] < 0) == (L.h_exp[hv] < 0) && L.h_used[h] < L.h_used[hv])) {
++                hv = h;
++            }
++        }
++        if (hv >= 0) {
++            if (L.h_exp[hv] >= 0) {
++                L.h_of[L.h_exp[hv]] = -1;
++            }
++            L.h_exp[hv]  = old;
++            L.h_of[old]  = hv;
++            L.h_used[hv] = tick;
++            L.h_jobs.push_back({ slot, e, hv, EC_H_SAVE });
++        }
++    }
++    return false;
++}
++
++static void ec_swap_bytes(char * a, char * b, size_t n) {
++    alignas(64) char tmp[16384];
++    for (size_t o = 0; o < n; o += sizeof(tmp)) {
++        const size_t k = std::min(sizeof(tmp), n - o);
++        memcpy(tmp, a + o, k);
++        memcpy(a + o, b + o, k);
++        memcpy(b + o, tmp, k);
++    }
++}
++
+ // close a layer's expert-major round: the experts it read into slots stay resident if every expert
+ // tensor of the layer computed the round, else their slots are emptied
+ static void ec_em_end(ec_layer & L) {
+@@ -1529,6 +1710,20 @@
+         }
+         return victim;
+     };
++    // LLAMA_EXPERT_HOST: the entries of the missing experts are pinned before any victim is saved
++    if (C.h_mib > 0 && !L.h_tried) {
++        ec_host_alloc(L);
++    }
++    if (L.h_n > 0) {
++        for (int64_t i1 = 0; i1 < n_tokens; ++i1) {
++            for (int64_t i0 = 0; i0 < n_used; ++i0) {
++                const int32_t e = ec_id_at(ids, i0, i1);
++                if (L.slot_of[e] < 0 && L.h_of[e] >= 0) {
++                    L.h_used[L.h_of[e]] = tick;
++                }
++            }
++        }
++    }
+     for (int64_t i1 = 0; i1 < n_tokens; ++i1) {
+         for (int64_t i0 = 0; i0 < n_used; ++i0) {
+             const int32_t e = ec_id_at(ids, i0, i1);
+@@ -1539,13 +1734,16 @@
+             if (victim < 0) {
+                 GGML_ABORT("expert cache: layer %d needs more than %d experts in one ubatch - lower n_ubatch", L.id, n_slots);
+             }
+-            if (L.expert_of[victim] >= 0) {
+-                L.slot_of[L.expert_of[victim]] = -1;
++            const int32_t old = L.expert_of[victim];
++            if (old >= 0) {
++                L.slot_of[old] = -1;
+             }
+             L.expert_of[victim] = e;
+             L.slot_of[e]        = victim;
+             L.used[victim]      = tick;
+-            L.pending.emplace_back(victim, e);
++            if (L.h_n == 0 || !ec_host_plan(L, victim, old, e, tick)) {
++                L.pending.emplace_back(victim, e);
++            }
+             if (lrfu) {
+                 L.lrfu_val[victim]  = wtd ? (double) L.wsum[e] : 1.0;
+                 L.lrfu_last[victim] = tick;
+@@ -1622,6 +1820,9 @@
+ 
+     C.hits   += hits;
+     C.misses += L.pending.size();
++    for (const ec_hjob & hj : L.h_jobs) {
++        C.misses += hj.kind != EC_H_SAVE ? 1 : 0;
++    }
+     if (L.id == C.first_layer && ++C.n_rounds % 64 == 0) {
+         C.log_stats("running");
+     }
+@@ -1639,6 +1840,63 @@
+     const size_t n_reads = L.pending.size()*n_t;
+     const size_t n_parts = C.io_split && n_reads > 0 && n_reads < (size_t) nth ? ((size_t) nth + n_reads - 1)/n_reads : 1;
+     const size_t n_jobs  = n_reads*n_parts;
++
++    // LLAMA_EXPERT_HOST: the copies between slots and the tier first, every tensor's in parts over all
++    // threads; the disk reads wait for all of them (a victim's save reads the slot a read then fills,
++    // and a padded read spills past its part)
++    const size_t  n_hc = L.h_jobs.size()*n_t;
++    const int64_t th0  = n_hc > 0 ? ggml_time_us() : 0;
++    if (n_hc > 0) {
++        const size_t hp = n_hc < (size_t) nth ? ((size_t) nth + n_hc - 1)/n_hc : 1;
++        size_t hb = 0;
++        for (size_t j = ith; j < n_hc*hp; j += nth) {
++            const size_t      r  = j / hp;
++            const ec_hjob   & hj = L.h_jobs[r / n_t];
++            const size_t      ti = r % n_t;
++            const ec_tensor & T  = C.tensors[L.tensors[ti]];
++            const size_t part = ((T.eb + hp - 1)/hp + 63) & ~(size_t) 63;
++            const size_t b    = (j % hp)*part;
++            if (b >= T.eb) {
++                continue;
++            }
++            const size_t n = std::min(part, T.eb - b);
++            char * s = (char *) T.t->data + (size_t) hj.slot*T.t->nb[2] + b;
++            char * h = L.h_buf.get() + (size_t) hj.entry*L.h_eb + L.h_toff[ti] + b;
++            if (hj.kind == EC_H_SAVE) {
++                memcpy(h, s, n);
++            } else if (hj.kind == EC_H_FILL) {
++                memcpy(s, h, n);
++            } else {
++                ec_swap_bytes(s, h, n);
++            }
++            hb += n;
++        }
++        if (hb > 0) {
++            C.h_bytes += hb;
++        }
++        if (n_reads > 0) {
++            L.h_bar.fetch_add(1, std::memory_order_acq_rel);
++            while (L.h_bar.load(std::memory_order_acquire) < nth) {
++#if !defined(GGML_BACKEND_DL) && (defined(__x86_64__) || defined(_M_X64))
++                _mm_pause();
++#else
++                std::this_thread::yield();
++#endif
++            }
++        }
++        if (ith == 0) {
++            C.h_us += (uint64_t) (ggml_time_us() - th0);
++            uint64_t nf = 0, ns = 0, nv = 0;
++            for (const ec_hjob & hj : L.h_jobs) {
++                nf += hj.kind != EC_H_SAVE ? 1 : 0;
++                ns += hj.kind == EC_H_SWAP ? 1 : 0;
++                nv += hj.kind == EC_H_SAVE ? 1 : 0;
++            }
++            C.h_fills += nf;
++            C.h_swaps += ns;
++            C.h_saves += nv + ns;
++        }
++    }
+ 
+     const int64_t t0 = (size_t) ith < n_jobs ? ggml_time_us() : 0;
+     size_t bytes = 0;
+@@ -1668,6 +1926,8 @@
+     if (L.load_done.fetch_add(1, std::memory_order_acq_rel) + 1 == nth) {
+         L.load_done.store(0, std::memory_order_relaxed);
+         L.pending.clear();
++        L.h_jobs.clear();
++        L.h_bar.store(0, std::memory_order_relaxed);
+         ec_defer_end(L, true);
+     }
+ 
+@@ -2603,6 +2863,21 @@
+         cache->em_resident = strcmp(res, "slot") == 0 || strcmp(res, "0") == 0 ? 0 :
+                              strcmp(res, "file") == 0 || strcmp(res, "1") == 0 ? 1 : 2;
+     }
++    // LLAMA_EXPERT_HOST=<MiB>[:<keep MiB>]: a victim tier of host memory behind the slots (0 = off)
++    const char * ht = getenv("LLAMA_EXPERT_HOST");
++    if (ht != nullptr && *ht != '\0') {
++        unsigned mib  = 0;
++        unsigned keep = cache->h_keep_mb;
++        if (sscanf(ht, "%u:%u", &mib, &keep) >= 1 && mib > 0 && cache->pf_k == 0 && cache->defer_b == 0.0) {
++            cache->h_mib     = std::min(mib, 1u << 20);
++            cache->h_keep_mb = std::min(keep, 1u << 20);
++            LLAMA_LOG_INFO("%s: expert cache: host tier of up to %u MiB, %u MB kept available\n",
++                    __func__, cache->h_mib, cache->h_keep_mb);
++        } else if (mib > 0) {
++            LLAMA_LOG_WARN("%s: expert cache: LLAMA_EXPERT_HOST=%s ignored (<MiB>[:<keep MiB>], not with LLAMA_EXPERT_PREFETCH or LLAMA_EXPERT_DEFER)\n",
++                    __func__, ht);
++        }
++    }
+ 
+     cache->buft = {
+         /* .iface = */ {

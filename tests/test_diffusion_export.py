@@ -233,6 +233,9 @@ class RequirementsTest(unittest.TestCase):
         for p in ("onnxscript", "onnxruntime"):
             self.assertIn(p, pins)
 
+    @unittest.skipUnless(
+        (ROOT / ".github/dependabot.yml").exists(), "dependabot dropped in the private build fork (4a3e904)"
+    )
     def test_dependabot_no_longer_ignores_export_stack(self):
         text = (ROOT / ".github/dependabot.yml").read_text(encoding="utf-8")
         self.assertNotIn("dependency-name: optimum", text)

@@ -1,0 +1,40 @@
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index 650f5cf..1c28579 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -530,6 +530,11 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
+     // weights leaves on the CPU; next to the router (also F32) it joins the router's CPU
+     // split instead of opening one between the routed experts and the residual adds.
+     // Only the order changes; the graph and its results stay the same.
++    // xllama patch 0009: the router's logits matmul goes right after the shared expert gate's,
++    // and the gate's sigmoid after both. A GPU backend with F32 weights then runs the two
++    // matmuls in the shared expert's submission and leaves the sigmoid to the router's CPU
++    // split (softmax, top-k): still one GPU and one CPU split. build_moe_ffn takes the same
++    // logits through probs_in; only the order changes.
+     ggml_tensor * shared_gate = nullptr;
+     if (ffn_shexp != nullptr) {
+         // Apply shared expert gating as in the reference implementation
+@@ -537,7 +542,14 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
+         // Note: ffn_gate_inp_shexp is the shared expert gate (outputs 1 value per token)
+         shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
+         cb(shared_gate, "shared_expert_gate", il);
++        ggml_build_forward_expand(gf, shared_gate);
++    }
++
++    ggml_tensor * moe_logits = build_lora_mm(model.layers[il].ffn_gate_inp, cur); // [n_expert, n_tokens]
++    cb(moe_logits, "ffn_moe_logits", il);
++    ggml_build_forward_expand(gf, moe_logits);
+ 
++    if (shared_gate != nullptr) {
+         // Apply sigmoid to the gate
+         shared_gate = ggml_sigmoid(ctx0, shared_gate);
+         cb(shared_gate, "shared_expert_gate_sigmoid", il);
+@@ -555,7 +567,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
+             LLM_FFN_SILU, true,
+             hparams.expert_weights_scale,
+             LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
+-            nullptr, model.layers[il].ffn_gate_up_exps,
++            moe_logits, model.layers[il].ffn_gate_up_exps,
+             model.layers[il].ffn_up_exps_s,
+             model.layers[il].ffn_gate_exps_s,
+             model.layers[il].ffn_down_exps_s);

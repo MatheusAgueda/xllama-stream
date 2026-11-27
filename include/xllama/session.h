@@ -14,6 +14,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace xllama {
@@ -64,6 +65,32 @@ struct SessionParams {
     // the title's RAM budget loads and decodes reading only the experts each
     // token routes to. Forces the CPU (no d3d12 layers). apply_gguf_residency.
     bool stream_weights = false;
+
+    // GGUF only (llama.cpp patch 0004): keep this many experts per MoE layer in
+    // the heap and read the others from the model file when the router picks
+    // them, so a MoE larger than the title's memory runs from a fixed-size cache
+    // rather than a mapping the AppContainer caps. 0 = off. The expert matmuls
+    // run on the CPU; n_gpu_layers still offloads the rest of each layer. Takes
+    // precedence over stream_weights. apply_gguf_residency.
+    int expert_slots = 0;
+    // With expert_slots: cache-aware routing, (0, 1]. A resident expert just
+    // outside a token's top-k replaces a missing one when its router score is at
+    // least this fraction of the missing one's. 0 = exact routing.
+    float expert_swap = 0.0f;
+    // With expert_slots: predicted experts per token read ahead
+    // (LLAMA_EXPERT_PREFETCH, 0..64), and the largest prompt ubatch run
+    // expert-major, each expert read once (LLAMA_EXPERT_MAJOR). 0 = off.
+    int expert_prefetch = 0;
+    int expert_major = 0;
+    // With expert_prefetch: predict each layer's experts one layer earlier, so
+    // the reads overlap a whole layer (LLAMA_EXPERT_PREFETCH_AHEAD).
+    bool expert_prefetch_ahead = false;
+    // Tuning variables put in the process environment for the load (catalogue
+    // "env"), which llama.cpp's patches and xllama read there: e.g.
+    // LLAMA_EXPERT_PREFETCH_PRIO, XLLAMA_CPU_POLL. LLAMA_*, GGML_* and XLLAMA_*
+    // names only, sorted by name; a listed name wins over the value xllama would
+    // set itself.
+    std::vector<std::pair<std::string, std::string>> env;
 };
 
 struct GenerateParams {
@@ -93,6 +120,23 @@ struct GenerateParams {
     // A tool template's own grammar (ADR 0005). Empty `gbnf` = unconstrained.
     GrammarSpec grammar;
 
+    // Scoring (llama.cpp sessions). logprobs: report every reply token's log
+    // probability under the raw logits (InferenceResult::logprobs). forced_tokens:
+    // the reply is these ids, decoded one by one in place of sampling — the same
+    // per-token decode a free reply runs, so a reference reply can be scored under
+    // other knobs (expert cache swaps, quantization). Stop sequences and drafting
+    // are off for a forced reply; it implies logprobs.
+    bool logprobs = false;
+    std::vector<int32_t> forced_tokens;
+
+    // Thinking budget (llama.cpp sessions, Qwen3.x with the reasoning opened by
+    // the prompt — request_thinking): after this many generated tokens with no
+    // "</think>" sampled, the loop feeds kThinkBudgetClose itself and samples the
+    // answer, instead of spending n_predict on reasoning a cut reply then drops.
+    // 0 = off. Ignored with a grammar or forced ids; drafting is off while armed.
+    // Must leave room for the answer: callers keep it below n_predict.
+    int think_budget = 0;
+
     // Continuous decoding / KV-cache reuse. Honored by BOTH backends now: the
     // ORT path (persistent generator) and the llama.cpp path (persistent
     // llama_context, KV cache retained across turns — turn-2 prefill 4.07×).
@@ -117,6 +161,13 @@ struct GenerateParams {
     // failing, so long chats stay in the reuse regime past the token budget.
     bool reuse_kv = false;
     bool reset_kv = false;
+
+    // Disk prefix cache (XLLAMA_PREFIX_CACHE_MIB): this full prompt's state —
+    // which holds its token history, i.e. the prompt text — is written to the
+    // cache only when the request opts in. Off by default, so a client whose
+    // text must not sit on the device's disk never leaves it there. Restoring
+    // a prefix an earlier opted-in request saved needs no flag.
+    bool save_prefix = false;
 
     // #169: number of leading prompt tokens pinned across context shifts —
     // the system prompt (plus BOS), which must survive any eviction. 0 = no

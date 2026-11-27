@@ -1,0 +1,330 @@
+diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
+index fcd7535..f9423f7 100644
+--- a/src/llama-expert-cache.cpp
++++ b/src/llama-expert-cache.cpp
+@@ -435,6 +435,18 @@ struct llama_expert_cache {
+     uint32_t em_run = 0;
+     std::atomic<uint64_t> em_run_n {0}; // the spans read
+     std::atomic<uint64_t> em_run_e {0}; //   and the experts they held
++    // LLAMA_EXPERT_EM_WSUM=1 (0 = off, the default): an expert-major ubatch's down projection, its routing
++    // weights and the sum over the token's experts as one op (llama_expert_cache_build_mm_id_wsum) that
++    // writes [n_embd, n_tokens]: the [n_embd, n_used, n_tokens] products and their weighted copy never
++    // take the compute buffer (2 x 32 MiB per 512 tokens at n_embd 2048, n_used 8). The sums run in
++    // double (em_acc): the experts arrive in the order of the cache (resident, then staged chunks),
++    // and the float of a sum of eight exact products in double does not depend on that order
++    bool em_wsum = false;
++    std::atomic<bool> em_wsum_logged {false};
++    std::vector<double> em_acc;             // [n_rows, n_tokens] of the fused op running
++    std::vector<std::vector<float>> em_tmp; // per compute thread (CPU path): a chunk of pairs' output rows
++    std::mutex em_acc_mu[16];               // CPU path: the sums of tokens t % 16
++    std::atomic<uint64_t> em_wsum_n {0};    // fused ops run
+ 
+     // LLAMA_EXPERT_HOST=<MiB>[:<keep MiB>] (0 = off, the default): up to <MiB> of host memory, split
+     // evenly over the layers, as a victim tier behind the slots. Each layer allocates its share at its
+@@ -494,7 +506,7 @@ struct llama_expert_cache {
+                     n ? pf_lag_us.load()/1000.0/n : 0.0, n ? pf_run_us.load()/1000.0/n : 0.0,
+                     pf_ahead ? ", ahead" : "", pf_help ? ", help" : "", prio, mode);
+         }
+-        char em[560] = "";
++        char em[640] = "";
+         if (em_rounds.load() > 0) {
+             static const char * const res_name[] = { "slot", "file", "auto" };
+             const uint64_t sus = em_slot_us.load();
+@@ -508,10 +520,14 @@ struct llama_expert_cache {
+                 snprintf(gp, sizeof(gp), "; gpu %" PRIu64 " dispatches, %" PRIu64 " pairs, %.0f ms, %.0f ms waiting for reads, %" PRIu64 " on the CPU%s",
+                         em_gpu_n.load(), em_gpu_p.load(), em_gpu_us.load()/1000.0, em_gpu_wait_us.load()/1000.0, em_gpu_cpu.load(), rn);
+             }
+-            char es[48] = "";
++            char es[96] = "";
+             if (em_swaps.load() > 0) {
+                 snprintf(es, sizeof(es), ", %" PRIu64 " swaps", em_swaps.load());
+             }
++            if (em_wsum_n.load() > 0) {
++                const size_t n = strlen(es);
++                snprintf(es + n, sizeof(es) - n, ", %" PRIu64 " down x weights fused", em_wsum_n.load());
++            }
+             snprintf(em, sizeof(em), "; expert-major %" PRIu64 " ubatches, %" PRIu64 " read (%.1f MiB), %" PRIu64 " resident, %" PRIu64 " kept, %.0f ms, %" PRIu64 " resident read from the file (%s; stage from slots %.0f MB/s, from the file %.0f MB/s per thread)%s%s",
+                     em_rounds.load(), em_reads.load(), em_bytes.load()/1024.0/1024.0, em_hits.load(), em_kept.load(), em_wall/1000.0,
+                     em_from_file.load(), res_name[em_resident], sus ? (double) em_slot_b.load()/sus : 0.0, fus ? (double) em_file_b.load()/fus : 0.0, gp, es);
+@@ -2248,19 +2264,26 @@ static void ec_spin(int & n) {
+     }
+ }
+ 
++// LLAMA_EXPERT_EM_WSUM: the routing weight of pair (kk, t), weights [1, n_used, n_tokens]
++static inline double ec_wt(const ggml_tensor * wt, int64_t kk, int64_t t) {
++    return (double) *(const float *) ((const char *) wt->data + kk*wt->nb[1] + t*wt->nb[2]);
++}
++
+ // thread 0: dst's pairs of the experts es[i], expert lid[i] of the experts tensor, which is w (the
+ // slots) or the n_as experts at as_data nb2 apart (a staging half). Up to em_gpu_pairs pairs a
+-// dispatch: their activations gathered from b (the matmul's src[1]), the results scattered to dst. A
+-// dispatch the device refuses or fails is computed on the CPU from the quantized activations q
++// dispatch: their activations gathered from b (the matmul's src[1]), the results scattered to dst
++// (fused with the weights src[2]: added, weighted, to the token's sums em_acc). A dispatch the device
++// refuses or fails is computed on the CPU from the quantized activations q
+ static void ec_em_gpu_run(llama_expert_cache & C, ec_em & E, ggml_tensor * dst, ggml_tensor * as_w,
+         char * as_data, size_t as_nb2, int32_t n_as) {
+     const ec_tensor &   T  = C.tensors[E.tensor];
+     ggml_tensor *       w  = T.t;
+     const ggml_tensor * q  = dst->src[0];
+     const ggml_tensor * b  = dst->src[1];
++    const ggml_tensor * wt = dst->src[2]; // LLAMA_EXPERT_EM_WSUM: the routing weights, else nullptr
+     const int64_t k      = w->ne[0];
+     const int64_t n_rows = w->ne[1];
+-    const int64_t n_used = dst->ne[1];
++    const int64_t n_used = wt != nullptr ? wt->ne[1] : dst->ne[1];
+     const int64_t ne11   = b->ne[1];
+     const int32_t P_max  = (int32_t) C.em_gpu_pairs;
+     char *    io = (char *) ggml_backend_buffer_get_base(C.em_gpu_io);
+@@ -2316,7 +2339,18 @@ static void ec_em_gpu_run(llama_expert_cache & C, ec_em & E, ggml_tensor * dst,
+         if (ctx != nullptr) {
+             ggml_free(ctx);
+         }
+-        if (ok) {
++        if (ok && wt != nullptr) {
++            for (int32_t j = 0; j < P; ++j) {
++                const int64_t kk = map[j] % n_used;
++                const int64_t t  = map[j] / n_used;
++                const double  g  = ec_wt(wt, kk, t);
++                const float * y  = Y + (size_t) j*n_rows;
++                double *      a  = C.em_acc.data() + (size_t) t*n_rows;
++                for (int64_t r = 0; r < n_rows; ++r) {
++                    a[r] += g*(double) y[r];
++                }
++            }
++        } else if (ok) {
+             for (int32_t j = 0; j < P; ++j) {
+                 const int64_t kk = map[j] % n_used;
+                 const int64_t t  = map[j] / n_used;
+@@ -2330,15 +2364,26 @@ static void ec_em_gpu_run(llama_expert_cache & C, ec_em & E, ggml_tensor * dst,
+             const size_t qrs  = ggml_row_size(tr->vec_dot_type, k);
+             const char * base = as_w != nullptr ? (const char *) as_w->data : as_data;
+             const size_t nb2  = as_w != nullptr ? as_w->nb[2] : as_nb2;
++            std::vector<float> & row = C.em_tmp[0]; // fused: one pair's outputs before they are summed
++            if (wt != nullptr && (int64_t) row.size() < n_rows) {
++                row.resize((size_t) n_rows);
++            }
+             for (int32_t j = 0; j < P; ++j) {
+                 const int64_t kk  = map[j] % n_used;
+                 const int64_t t   = map[j] / n_used;
+                 const char *  src = (const char *) q->data + (size_t) (kk % ne11 + ne11*t)*qrs;
+                 const char *  wd  = base + (size_t) I[j]*nb2;
+-                float *       out = (float *) ((char *) dst->data + kk*dst->nb[1] + t*dst->nb[2]);
++                float *       out = wt != nullptr ? row.data() : (float *) ((char *) dst->data + kk*dst->nb[1] + t*dst->nb[2]);
+                 for (int64_t r = 0; r < n_rows; ++r) {
+                     tr->vec_dot((int) k, out + r, 0, wd + (size_t) r*w->nb[1], 0, src, 0, 1);
+                 }
++                if (wt != nullptr) {
++                    const double g = ec_wt(wt, kk, t);
++                    double *     a = C.em_acc.data() + (size_t) t*n_rows;
++                    for (int64_t r = 0; r < n_rows; ++r) {
++                        a[r] += g*(double) out[r];
++                    }
++                }
+             }
+         }
+         C.em_gpu_n++;
+@@ -2613,6 +2658,11 @@ static void ec_em_prep(ggml_tensor * dst, int ith, int nth, void * userdata) {
+         }
+     }
+ 
++    // LLAMA_EXPERT_EM_WSUM (the routing weights as a third src): the token sums start at 0
++    if (dst->src[2] != nullptr) {
++        C.em_acc.assign((size_t) (w->ne[1]*n_tokens), 0.0);
++    }
++
+     // LLAMA_EXPERT_EM_GPU: the matmul's read queue, the round's experts (into their slots) first
+     E.gpu = false;
+     if (C.em_gpu_chunk > 0 && nth >= 2 && C.gpu != nullptr && !C.em_gpu_failed && ec_em_gpu_ok(C, C.tensors[E.tensor])) {
+@@ -2637,7 +2687,10 @@ static bool ec_em_resident_from_file(const llama_expert_cache & C) {
+ 
+ // all threads: dst [rows, n_used, n_tokens] (F32) = ggml_mul_mat_id(w, b, ids); the threads take the
+ // experts one at a time, reading a missing one into their staging buffer (and from there into the
+-// slot of the round). src = {the prep op}
++// slot of the round). src = {the prep op[, b]}. Fused (LLAMA_EXPERT_EM_WSUM, src = {prep, b, weights}):
++// dst [rows, n_tokens] = sum over the token's experts of weight x output, the outputs summed into
++// em_acc (a token's sums under the lock of its stripe on the CPU path) and the last thread out
++// writing them to dst
+ static void ec_em_mm(ggml_tensor * dst, int ith, int nth, void * userdata) {
+     const int64_t t0 = ggml_time_us();
+ 
+@@ -2645,14 +2698,19 @@ static void ec_em_mm(ggml_tensor * dst, int ith, int nth, void * userdata) {
+     llama_expert_cache & C = *E.cache;
+     ec_layer & L = *E.layer;
+     const ec_tensor & T = C.tensors[E.tensor];
+-    const ggml_tensor * w = T.t;
+-    const ggml_tensor * q = dst->src[0];
++    const ggml_tensor * w  = T.t;
++    const ggml_tensor * q  = dst->src[0];
++    const ggml_tensor * wt = dst->src[2];
+     const int64_t ne11 = q->src[0]->ne[1]; // b: shape only, its data may already be reused
+ 
+     const ggml_type_traits_cpu * tr = ggml_get_type_traits_cpu(w->type);
+     const int64_t k      = w->ne[0];
+     const int64_t n_rows = w->ne[1];
+-    const int64_t n_used = dst->ne[1];
++    const int64_t n_used = wt != nullptr ? wt->ne[1] : dst->ne[1];
++    std::vector<float> & tmp = C.em_tmp[ith]; // fused, CPU path: a chunk of pairs' rows
++    if (wt != nullptr && !(E.gpu && dst->src[1] != nullptr) && (int64_t) tmp.size() < EC_EM_CHUNK*n_rows) {
++        tmp.resize((size_t) (EC_EM_CHUNK*n_rows));
++    }
+     const size_t  qrs    = ggml_row_size(tr->vec_dot_type, k);
+     const size_t  nb2    = w->nb[2]; // the slot stride
+     const size_t  eb     = T.eb;     // an expert's bytes and its stride in the file
+@@ -2710,7 +2768,8 @@ static void ec_em_mm(ggml_tensor * dst, int ith, int nth, void * userdata) {
+                     const int64_t kk = p % n_used;
+                     const int64_t t  = p / n_used;
+                     src[j] = (const char *) q->data + (size_t) (kk % ne11 + ne11*t)*qrs;
+-                    out[j] = (float *) ((char *) dst->data + kk*dst->nb[1] + t*dst->nb[2]);
++                    out[j] = wt != nullptr ? tmp.data() + (size_t) j*n_rows
++                                           : (float *) ((char *) dst->data + kk*dst->nb[1] + t*dst->nb[2]);
+                 }
+                 for (int64_t r = r0; r < r1; ++r) {
+                     const char * row = wd + (size_t) (r - r0)*nb1;
+@@ -2718,6 +2777,19 @@ static void ec_em_mm(ggml_tensor * dst, int ith, int nth, void * userdata) {
+                         tr->vec_dot((int) k, out[j] + r, 0, row, 0, src[j], 0, 1);
+                     }
+                 }
++                if (wt != nullptr) {
++                    for (int64_t j = 0; j < n_c; ++j) {
++                        const int64_t p  = pairs[c0 + j];
++                        const int64_t kk = p % n_used;
++                        const int64_t t  = p / n_used;
++                        const double  g  = ec_wt(wt, kk, t);
++                        double *      a  = C.em_acc.data() + (size_t) t*n_rows;
++                        std::lock_guard<std::mutex> lock(C.em_acc_mu[t % 16]);
++                        for (int64_t r = r0; r < r1; ++r) {
++                            a[r] += g*(double) out[j][r];
++                        }
++                    }
++                }
+             }
+         };
+         // the CPU never computes from a slot: a write-combined slot (XLLAMA_D3D12_WC_MIB) is uncached,
+@@ -2782,6 +2854,17 @@ static void ec_em_mm(ggml_tensor * dst, int ith, int nth, void * userdata) {
+     // the tensor's reads into the round's slots are done
+     if (E.done.fetch_add(1, std::memory_order_acq_rel) + 1 == nth) {
+         E.done.store(0, std::memory_order_relaxed);
++        if (wt != nullptr) {
++            // fused: every thread's sums are in (acq_rel), the last one out rounds them to dst
++            const double * a = C.em_acc.data();
++            for (int64_t t = 0; t < dst->ne[1]; ++t) {
++                float * o = (float *) ((char *) dst->data + t*dst->nb[1]);
++                for (int64_t r = 0; r < n_rows; ++r) {
++                    o[r] = (float) a[(size_t) t*n_rows + r];
++                }
++            }
++            C.em_wsum_n++;
++        }
+         L.em_state[E.pos] = 2;
+     }
+ }
+@@ -2824,6 +2907,7 @@ static void ec_em_check(llama_expert_cache & C) {
+         L.em_state.assign(L.tensors.size(), 0);
+     }
+     C.em_stage.resize(GGML_MAX_N_THREADS);
++    C.em_tmp.resize(GGML_MAX_N_THREADS);
+ #endif
+ }
+ 
+@@ -3023,6 +3107,13 @@ std::shared_ptr<llama_expert_cache> llama_expert_cache_init(uint32_t n_slots, ui
+         cache->em_resident = strcmp(res, "slot") == 0 || strcmp(res, "0") == 0 ? 0 :
+                              strcmp(res, "file") == 0 || strcmp(res, "1") == 0 ? 1 : 2;
+     }
++    // LLAMA_EXPERT_EM_WSUM=1: an expert-major ubatch's down projection, routing weights and expert sum
++    // as one op (0 = off, the default)
++    const char * ews = getenv("LLAMA_EXPERT_EM_WSUM");
++    cache->em_wsum = cache->em_max > 0 && ews != nullptr && *ews != '\0' && atoi(ews) != 0;
++    if (cache->em_wsum) {
++        LLAMA_LOG_INFO("%s: expert cache: expert-major down projections fused with the routing weights\n", __func__);
++    }
+     // LLAMA_EXPERT_HOST=<MiB>[:<keep MiB>]: a victim tier of host memory behind the slots (0 = off)
+     const char * ht = getenv("LLAMA_EXPERT_HOST");
+     if (ht != nullptr && *ht != '\0') {
+@@ -3382,6 +3473,46 @@ ggml_tensor * llama_expert_cache_build_mm_id(ggml_context * ctx, ggml_tensor * w
+ #endif
+ }
+ 
++ggml_tensor * llama_expert_cache_build_mm_id_wsum(ggml_context * ctx, ggml_tensor * w, ggml_tensor * b, ggml_tensor * ids,
++        ggml_tensor * weights) {
++    ec_layer * layer = ec_layer_of(w);
++    if (layer == nullptr || !layer->cache->em_wsum || !llama_expert_cache_is_expert_major(w, ids->ne[1])) {
++        return nullptr;
++    }
++#ifdef GGML_BACKEND_DL
++    GGML_UNUSED(ctx);
++    GGML_UNUSED(b);
++    GGML_UNUSED(weights);
++    return nullptr;
++#else
++    llama_expert_cache & C = *layer->cache;
++    ec_tensor & T = C.tensors[C.tensor_idx.at(w)];
++    // the unfused op's shapes, the weights one per (expert, token): anything else stays unfused
++    if (b->type != GGML_TYPE_F32 || b->nb[0] != sizeof(float) || b->ne[0] != w->ne[0] || b->ne[3] != 1 ||
++            ids->type != GGML_TYPE_I32 || ids->ne[1] != b->ne[2] || (b->ne[1] != 1 && b->ne[1] != ids->ne[0]) ||
++            weights->type != GGML_TYPE_F32 || weights->ne[0] != 1 || weights->ne[1] != ids->ne[0] ||
++            weights->ne[2] != ids->ne[1] || weights->ne[3] != 1) {
++        return nullptr;
++    }
++
++    const ggml_type vdt = ggml_get_type_traits_cpu(w->type)->vec_dot_type;
++    ggml_tensor * args[3] = { b, ids, weights }; // weights: the prep op zeroes the sums
++    const int64_t n_q = (int64_t) ggml_row_size(vdt, b->ne[0])*b->ne[1]*b->ne[2];
++    ggml_tensor * q = ggml_custom_4d(ctx, GGML_TYPE_I8, n_q, 1, 1, 1, args, 3, ec_em_prep, GGML_N_TASKS_MAX, T.em.get());
++    ggml_format_name(q, "%s-em_act", ggml_get_name(w));
++
++    // b always (the GPU path gathers from it), the weights third
++    ggml_tensor * srcs[3] = { q, b, weights };
++    ggml_tensor * res = ggml_custom_4d(ctx, GGML_TYPE_F32, w->ne[1], ids->ne[1], 1, 1, srcs, 3, ec_em_mm, GGML_N_TASKS_MAX, T.em.get());
++    ggml_format_name(res, "%s-em_wsum", ggml_get_name(w));
++    if (!C.em_wsum_logged.exchange(true)) {
++        LLAMA_LOG_INFO("expert cache: %s: expert-major down x weights -> sum fused ([%" PRId64 ", %" PRId64 "] instead of [%" PRId64 ", %" PRId64 ", %" PRId64 "] twice)\n",
++                ggml_get_name(w), w->ne[1], ids->ne[1], w->ne[1], ids->ne[0], ids->ne[1]);
++    }
++    return res;
++#endif
++}
++
+ ggml_tensor * llama_expert_cache_build_select(ggml_context * ctx, ggml_tensor * w, ggml_tensor * scores, int64_t n_used) {
+     ec_layer * layer = ec_layer_of(w);
+     if (layer == nullptr) {
+diff --git a/src/llama-expert-cache.h b/src/llama-expert-cache.h
+index 333eeb7..f3313e2 100644
+--- a/src/llama-expert-cache.h
++++ b/src/llama-expert-cache.h
+@@ -105,6 +105,12 @@ bool llama_expert_cache_is_expert_major(const ggml_tensor * w, int64_t n_tokens)
+ // [w->ne[0], 1 or n_used, n_tokens]); throws if the shapes are not mul_mat_id's
+ ggml_tensor * llama_expert_cache_build_mm_id(ggml_context * ctx, ggml_tensor * w, ggml_tensor * b, ggml_tensor * ids);
+ 
++// graph, LLAMA_EXPERT_EM_WSUM: sum over the experts of a token of weights x mul_mat_id(w, b, ids), F32
++// [w->ne[1], n_tokens], for an expert-major ubatch (weights F32 [1, n_used, n_tokens]); nullptr when
++// off or the shapes differ (the caller builds the unfused ops)
++ggml_tensor * llama_expert_cache_build_mm_id_wsum(ggml_context * ctx, ggml_tensor * w, ggml_tensor * b, ggml_tensor * ids,
++        ggml_tensor * weights);
++
+ // loader: buft is an expert-cache type and t (as in the GGUF) a stack of more experts than it keeps
+ bool llama_expert_cache_wants(ggml_backend_buffer_type_t buft, const ggml_tensor * t);
+ 
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 321b568..ddf2a3e 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2415,6 +2415,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             GGML_ABORT("fatal error");
+     }
+ 
++    // expert cache, LLAMA_EXPERT_EM_WSUM: an expert-major ubatch's down projection, weights and sum as one
++    // op, [n_embd, n_tokens] — the products and their weighted copy never take the compute buffer
++    if (!weight_before_ffn && down_exps_s == nullptr && down_exps_b == nullptr && arch != LLM_ARCH_MISTRAL4 &&
++            slot_ids == nullptr && loras->empty() && hparams.n_expert_used(il) == (uint32_t) n_expert_used &&
++            llama_expert_cache_is_expert_major(down_exps, n_tokens)) {
++        ggml_tensor * fused = llama_expert_cache_build_mm_id_wsum(ctx0, down_exps, cur, selected_experts, weights);
++        if (fused != nullptr) {
++            cb(fused, "ffn_moe_out", il);
++            return fused;
++        }
++    }
++
+     experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s, slot_ids); // [n_embd, n_expert_used, n_tokens]
+     if (arch == LLM_ARCH_MISTRAL4) {
+         // src1 can exceed F16 range

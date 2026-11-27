@@ -1,0 +1,138 @@
+--- a/src/llama-expert-cache.cpp
++++ b/src/llama-expert-cache.cpp
+@@ -335,6 +335,12 @@
+     bool io_split  = true; // a load op's reads split over all its threads (LLAMA_EXPERT_SPLIT)
+     int  io_qd     = 1;    // requests in flight per unbuffered read (LLAMA_EXPERT_IO_QD, Windows)
+     bool io_pad    = false; // slots padded so that unaligned experts read in place (LLAMA_EXPERT_PAD)
++    // LLAMA_EXPERT_POOL: every layer's slot tensors share ONE allocation. Decode walks layers in order
++    // and a layer reuses nothing, so only the current layer's experts must be resident; the rest alias
++    // the first layer's slots (view_src). Cuts (slots x n_layer) allocations down to one set of slots.
++    bool       pool       = false;
++    ec_layer * pool_owner = nullptr; // the layer whose experts currently occupy the shared pool
++    std::unordered_map<std::string, ggml_tensor *> pool_canon; // role+layout -> the tensor the rest alias
+ 
+     // pre-gating prefetch: pf_k predicted experts per token, read by I/O threads ahead of the plan.
+     // pf_ahead: layer il+1 is predicted from layer il's post-attention residual and queued right
+@@ -1308,6 +1314,27 @@
+     L.em_kept.clear();
+     std::fill(L.em_state.begin(), L.em_state.end(), 0);
+     L.em_open = false;
++}
++
++// LLAMA_EXPERT_POOL: hand the shared slot allocation to layer L, evicting the previous owner first.
++// Called at the first residency-touching op of each layer. The router scores that op needs depend on
++// the previous layer's output, so that layer's expert matmuls are finished and its slots are free.
++static void ec_pool_claim(ec_layer & L) {
++    llama_expert_cache & C = *L.cache;
++    if (!C.pool || C.pool_owner == &L) {
++        return;
++    }
++    if (ec_layer * P = C.pool_owner) {
++        ec_settle(*P);
++        ec_drop_unloaded(*P);
++        ec_em_end(*P);
++        for (int32_t s = 0; s < (int32_t) P->expert_of.size(); ++s) {
++            if (P->expert_of[s] >= 0) {
++                ec_evict(*P, s, P->expert_of[s]);
++            }
++        }
++    }
++    C.pool_owner = &L;
+ }
+ 
+ void llama_expert_cache::pf_shutdown() {
+@@ -1507,6 +1534,7 @@
+ 
+     ec_layer & L = *(ec_layer *) userdata;
+     llama_expert_cache & C = *L.cache;
++    ec_pool_claim(L); // take the shared pool before reading residency (stale maps would read wrong bytes)
+     const ggml_tensor * scores = dst->src[0];
+ 
+     const int64_t n_expert = scores->ne[0];
+@@ -1624,6 +1652,7 @@
+ 
+     ec_layer & L = *(ec_layer *) userdata;
+     llama_expert_cache & C = *L.cache;
++    ec_pool_claim(L); // take the shared pool before this layer plans or reads
+     const ggml_tensor * ids = dst->src[0];
+ 
+     const int64_t n_used   = ids->ne[0];
+@@ -2491,6 +2520,7 @@
+         return;
+     }
+ 
++    ec_pool_claim(L); // take the shared pool before the expert-major matmul reads slots
+     // the matmul reads the resident slots: no prefetch read may still be writing one
+     ec_settle(L);
+     L.n_pf = 0;
+@@ -3009,6 +3039,19 @@
+         }
+     }
+ 
++    // LLAMA_EXPERT_POOL=1: all layers share one slot allocation (see the field comment). Incompatible
++    // with prefetch, deferred admission and the host victim tier (they keep per-layer residents across
++    // tokens), so enabling the pool forces them off regardless of their own env vars.
++    const char * pool_env = getenv("LLAMA_EXPERT_POOL");
++    if (pool_env != nullptr && *pool_env != '\0' && atoi(pool_env) != 0) {
++        cache->pool     = true;
++        cache->pf_k     = 0;
++        cache->pf_ahead = false;
++        cache->defer_b  = 0.0;
++        cache->h_mib    = 0;
++        LLAMA_LOG_INFO("%s: expert cache: shared slot pool on (prefetch, defer and host tier forced off)\n", __func__);
++    }
++
+     cache->buft = {
+         /* .iface = */ {
+             /* .get_name         = */ ec_buft_get_name,
+@@ -3120,6 +3163,7 @@
+     if (kind == 0 || kind == 4 || L == nullptr) {
+         return;
+     }
++    ec_pool_claim(*L); // take the shared pool for this layer before settling/dropping
+     ec_settle(*L);
+     ec_drop_unloaded(*L);
+     ec_em_end(*L);
+@@ -3170,6 +3214,27 @@
+         t->nb[2] = eb + EC_DIRECT_ALIGN; // the gap the aligned span around an expert spills into
+     }
+     t->nb[3] = t->nb[2]*(size_t) t->ne[2];
++    if (cache->pool) {
++        // One slot allocation shared across layers: the first slot tensor of each role (the name after
++        // blk.N.) with this layout is canonical and really allocated; every later layer's same-role
++        // tensor aliases it (view_src), so ggml allocates one set of slots, not one per layer. bind()
++        // clears view_src and re-points t->data; ec_pool_claim keeps only one layer resident at a time.
++        llama_expert_cache * mcache = const_cast<llama_expert_cache *>(cache);
++        const char * nm   = ggml_get_name(t);
++        const char * dot  = strchr(nm + 4, '.');      // nm+4 skips "blk.", dot = the '.' after the index
++        const char * role = dot != nullptr ? dot + 1 : nm;
++        char lay[96];
++        snprintf(lay, sizeof(lay), "|%d|%lld|%lld|%zu|%zu", (int) t->type, (long long) t->ne[0],
++                 (long long) t->ne[1], (size_t) t->nb[1], (size_t) t->nb[2]);
++        const std::string key = std::string(role) + lay;
++        auto it = mcache->pool_canon.find(key);
++        if (it == mcache->pool_canon.end()) {
++            mcache->pool_canon.emplace(key, t); // canonical: keeps its own allocation
++        } else {
++            t->view_src  = it->second;          // alias the canonical tensor's slots
++            t->view_offs = 0;
++        }
++    }
+ }
+ 
+ bool llama_expert_cache_has(const ggml_tensor * t) {
+@@ -3198,6 +3263,14 @@
+     if (cache->tensor_idx.count(t) != 0) {
+         return; // bound already (and a padded one's data moved)
+     }
++    if (cache->pool && t->view_src != nullptr) {
++        // The allocator aliased this layer's slots onto the canonical tensor (t->data == canon->data).
++        // Clear the view so the D3D12 graph walker (base_of) treats it as its own root; the pad shift
++        // below then gives this layer its own alignment remainder from the shared base. One resident
++        // layer at a time keeps the shared bytes consistent.
++        t->view_src  = nullptr;
++        t->view_offs = 0;
++    }
+     if (pad) {
+         // slot s at data + s*nb[2] = the file offset of an expert modulo EC_DIRECT_ALIGN (eb is a
+         // multiple of it), at least one align past the allocation's start for slot 0's spill

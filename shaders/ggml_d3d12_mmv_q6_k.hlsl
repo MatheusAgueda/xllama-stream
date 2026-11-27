@@ -12,6 +12,30 @@
 
 #include "ggml_d3d12_common.hlsli"
 
+// Q6K_COOP 1 (XLLAMA_D3D12_SHADER_DIR variant, shaders/variants.txt): a chunk
+// lane's 16 threads first copy their NUM_ROWS 210-byte blocks to groupshared
+// memory as 53 aligned dwords each (14 coalesced loads per thread instead of
+// ~36), then read the fields from there: same bytes, same arithmetic, same
+// order. A block seen from its dword-aligned start ends within 212 bytes and
+// the last dword read is the one holding the block's last byte.
+#ifndef Q6K_COOP
+#define Q6K_COOP 0
+#endif
+#if Q6K_COOP
+#define Q6K_SLAB 53u
+groupshared uint slab[IN_FLIGHT * NUM_ROWS * Q6K_SLAB];
+
+uint s32(uint s, uint o) { // o even
+    const uint lo = slab[s + (o >> 2)];
+    if ((o & 2u) == 0u)
+        return lo;
+    return (lo >> 16) | (slab[s + (o >> 2) + 1u] << 16);
+}
+uint s16(uint s, uint o) { // o even
+    return (slab[s + (o >> 2)] >> (8u * (o & 2u))) & 0xffffu;
+}
+#endif
+
 // Four 6-bit values (0..63) packed one per byte.
 uint q6pack(uint ql, uint qh, uint ql_shift, uint qh_shift) {
     return ((ql >> ql_shift) & 0x0F0F0F0Fu) | (((qh >> qh_shift) & 0x03030303u) << 4);
@@ -37,6 +61,56 @@ void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
     for (uint r = 0; r < NUM_ROWS; ++r)
         acc[r] = 0.0;
 
+#if Q6K_COOP
+    const uint sbase = ix * (NUM_ROWS * Q6K_SLAB);
+    // Every lane runs the same trip count (a lane past nchunk idles), so the
+    // barriers are uniform.
+    for (uint b0 = 0; b0 < nchunk; b0 += IN_FLIGHT) {
+        const uint blk = b0 + ix;
+        const bool live = blk < nchunk;
+        if (live) {
+            [unroll]
+            for (uint m = 0; m < (NUM_ROWS * Q6K_SLAB + 15u) / 16u; ++m) {
+                const uint dd = itid + 16u * m;
+                if (dd < NUM_ROWS * Q6K_SLAB) {
+                    const uint r = dd / Q6K_SLAB;
+                    const uint row = min(row0 + r, n - 1u);
+                    const uint bb = row * w_row_bytes + blk * 210u;
+                    slab[sbase + dd] = W.Load((bb & ~3u) + 4u * (dd - r * Q6K_SLAB));
+                }
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (live) {
+            const uint xb = col * x_stride + blk * 292u;
+            const float dy = asfloat(X.Load(xb));
+            const uint x1 = X.Load(xb + 4u + e);
+            const uint x2 = X.Load(xb + 4u + e + 32u);
+            const uint x3 = X.Load(xb + 4u + e + 64u);
+            const uint x4 = X.Load(xb + 4u + e + 96u);
+            const int s1 = sum4(x1), s2 = sum4(x2), s3 = sum4(x3), s4 = sum4(x4);
+
+            [unroll]
+            for (uint r = 0; r < NUM_ROWS; ++r) {
+                const uint row = min(row0 + r, n - 1u);
+                const uint a = (row * w_row_bytes + blk * 210u) & 3u;
+                const uint s = sbase + r * Q6K_SLAB;
+                const uint ql_a = s32(s, a + 64u * v + l0);
+                const uint ql_b = s32(s, a + 64u * v + 32u + l0);
+                const uint qh = s32(s, a + 128u + 32u * v + l0);
+                const uint sc0 = s32(s, a + 192u + 8u * v);
+                const uint sc1 = s32(s, a + 192u + 8u * v + 4u);
+                const float d = f16tof32(s16(s, a + 208u));
+                const int t = sbyte(sc0, is) * (dot4(q6pack(ql_a, qh, 0u, 0u), x1) - 32 * s1) +
+                              sbyte(sc0, is + 2u) * (dot4(q6pack(ql_b, qh, 0u, 2u), x2) - 32 * s2) +
+                              sbyte(sc1, is) * (dot4(q6pack(ql_a, qh, 4u, 4u), x3) - 32 * s3) +
+                              sbyte(sc1, is + 2u) * (dot4(q6pack(ql_b, qh, 4u, 6u), x4) - 32 * s4);
+                acc[r] += (d * dy) * (float)t;
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+#else
     for (uint blk = ix; blk < nchunk; blk += IN_FLIGHT) {
         const uint xb = col * x_stride + blk * 292u;
         const float dy = asfloat(X.Load(xb));
@@ -63,5 +137,6 @@ void CSMain(uint tid : SV_GroupIndex, uint3 gid : SV_GroupID) {
             acc[r] += (d * dy) * (float)t;
         }
     }
+#endif
     reduce_store(acc, tid, row0, col);
 }

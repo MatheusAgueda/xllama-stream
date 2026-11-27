@@ -7,6 +7,39 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+- **LAN API (security):** two auth phases chosen at run time by `LocalState/api-auth.txt`
+  (phase 1, default: Bearer failures are counted per client at `GET /v1/auth/stats` and
+  still served; phase 2, `enforce`: `401` everywhere but `/health`, a missing or short
+  `api.key` included). The compute permit and hub lock are released before the final reply
+  write; a chat whose text passes 256 KiB is `413` before the permit; `/api/pull` takes
+  the permit first (busy is `503`, nothing written); `/v1/preferences` has size, rate and
+  file quotas; an unknown `model` spelling is `404` instead of a new session id.
+  `LLAMA_KV_ON_DEVICE` now parses like `XLLAMA_ATTN_GPU` (`""` and `"00"` are off).
+
+- **Session:** the disk prefix cache root is wiped the first time a process uses
+  it; later sessions keep the files of the live ones. Saves and lookups
+  remove entries older than `XLLAMA_PREFIX_CACHE_TTL_S` (default 30 minutes).
+
+- **Tools:** Qwen3 non-thinking models use the no-think template form for tool
+  proposals too; a boolean `chat_template_kwargs.enable_thinking` overrides it.
+
+- **LAN API:** normal completions and final SSE chunks include prefill/decode
+  timings and evaluated-token counts alongside the existing usage.
+
+- **LAN API:** `LocalState/api.key` optionally requires a bearer key on data routes;
+  preflight and liveness remain open. See [Bearer key](docs/api-endpoint.md#bearer-key).
+
+- **Session (hybrid models):** opt-in disk prefix cache for LAN API clients
+  that interleave conversations. With `XLLAMA_PREFIX_CACHE_MIB` set, the
+  prompt prefill saves the sequence state at its #170c checkpoints to
+  `prefix-cache/` (host: `XLLAMA_PREFIX_CACHE_DIR`), and a prompt that no
+  longer shares its history with the live cache restores the longest saved
+  prefix instead of prefilling it again. Entries are evicted least recently
+  used within the budget; a file whose size or token history does not match
+  is dropped and the prompt is prefilled in full. Off by default; with it on,
+  only requests that send `"xllama_prefix_cache": true` are written (the file
+  holds the prompt's token history), while any request may restore them.
+
 ## [1.7.0] - TBD
 
 User-facing notes: [docs/releases/v1.7.0.md](docs/releases/v1.7.0.md).

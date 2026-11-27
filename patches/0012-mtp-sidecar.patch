@@ -1,0 +1,69 @@
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -675,6 +675,65 @@
+ 
+             LLAMA_LOG_INFO("%s: additional %d GGUFs metadata loaded.\n",  __func__, n_split - 1);
+         }
++
++        // xllama patch 0012: MTP sidecar. XLLAMA_MTP_SIDECAR=<gguf> (an export of
++        // `convert_hf_to_gguf.py --mtp`) adds the sidecar's blk.* tensors this model lacks as one more
++        // file, so a target re-quantized without its MTP block drafts with the original head while the
++        // embeddings and the LM head stay the target's own. The caller declares the block by kv
++        // override (<arch>.block_count = trunk + 1, <arch>.nextn_predict_layers = 1).
++        const char * mtp_sidecar = getenv("XLLAMA_MTP_SIDECAR");
++        if (load_mtp && mtp_sidecar != nullptr && mtp_sidecar[0] != 0) {
++            struct ggml_context * ctx_sc = NULL;
++            struct gguf_init_params sc_params = {
++                /*.no_alloc = */ true,
++                /*.ctx      = */ &ctx_sc,
++            };
++            gguf_context_ptr ctx_gguf { gguf_init_from_file(mtp_sidecar, sc_params) };
++            if (!ctx_gguf) {
++                throw std::runtime_error(format("%s: failed to load MTP sidecar %s", __func__, mtp_sidecar));
++            }
++            {
++                std::string sc_arch;
++                const int kid_arch = gguf_find_key(ctx_gguf.get(), llm_kv(LLM_KV_GENERAL_ARCHITECTURE).c_str());
++                if (kid_arch >= 0) {
++                    sc_arch = gguf_get_val_str(ctx_gguf.get(), kid_arch);
++                }
++                if (sc_arch != arch_name) {
++                    throw std::runtime_error(format("%s: MTP sidecar %s is '%s', the model is '%s'", __func__,
++                                                    mtp_sidecar, sc_arch.c_str(), arch_name.c_str()));
++                }
++            }
++            // the sidecar declares the block it carries; an explicit caller override wins
++            for (const enum llm_kv which : { LLM_KV_BLOCK_COUNT, LLM_KV_NEXTN_PREDICT_LAYERS }) {
++                const std::string key = llm_kv(which);
++                const int kid = gguf_find_key(ctx_gguf.get(), key.c_str());
++                if (kid < 0 || gguf_get_kv_type(ctx_gguf.get(), kid) != GGUF_TYPE_UINT32 || kv_overrides.count(key) != 0) {
++                    continue;
++                }
++                llama_model_kv_override o = {};
++                o.tag = LLAMA_KV_OVERRIDE_TYPE_INT;
++                snprintf(o.key, sizeof(o.key), "%s", key.c_str());
++                o.val_i64 = (int64_t) gguf_get_val_u32(ctx_gguf.get(), kid);
++                kv_overrides.emplace(key, o);
++                LLAMA_LOG_INFO("%s: MTP sidecar sets %s = %lld\n", __func__, key.c_str(), (long long) o.val_i64);
++            }
++            files.emplace_back(new llama_file(mtp_sidecar, "rb", use_direct_io));
++            file_paths.emplace_back(mtp_sidecar);
++            contexts.emplace_back(ctx_sc);
++            const uint16_t sc_idx = (uint16_t) (files.size() - 1);
++            int n_added = 0;
++            for (ggml_tensor * cur = ggml_get_first_tensor(ctx_sc); cur; cur = ggml_get_next_tensor(ctx_sc, cur)) {
++                const std::string tensor_name = std::string(cur->name);
++                if (tensor_name.rfind("blk.", 0) != 0 || weights_map.find(tensor_name) != weights_map.end()) {
++                    continue;
++                }
++                n_elements += ggml_nelements(cur);
++                n_bytes    += ggml_nbytes(cur);
++                weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), sc_idx, ctx_gguf.get(), cur));
++                n_added++;
++            }
++            LLAMA_LOG_INFO("%s: MTP sidecar %s: %d tensors added\n", __func__, mtp_sidecar, n_added);
++        }
+     } else if (file != nullptr) {
+         struct ggml_context * ctx = NULL;
+         struct gguf_init_params params = {

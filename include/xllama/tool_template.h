@@ -39,12 +39,12 @@ struct ToolParseResult {
 ToolTemplateResult render_tool_prompt(const void* llama_model, const std::string& jinja_override,
                                       const std::vector<ChatMessage>& messages,
                                       const std::vector<ToolSpec>& tools, ToolChoice choice,
-                                      const std::string& forced_name);
+                                      const std::string& forced_name, bool enable_thinking = true);
 
 ToolParseResult parse_tool_generation(const void* llama_model, const std::string& jinja_override,
                                       const std::vector<ChatMessage>& messages,
                                       const std::vector<ToolSpec>& tools, ToolChoice choice,
                                       const std::string& forced_name, const std::string& raw_text,
-                                      bool hit_cap);
+                                      bool hit_cap, bool enable_thinking = true);
 
 } // namespace xllama
